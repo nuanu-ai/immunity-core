@@ -380,7 +380,7 @@ fn facts_carry_their_basis_and_reader_and_coverage_that_is_not_full_is_in_the_an
         lockfiles
             .lacks
             .iter()
-            .any(|l| l.name_text.as_deref() == Some("yarn.lock")),
+            .any(|l| l.name_text.as_deref() == Some("yarn.lock version 1")),
         "{:?}",
         lockfiles.lacks
     );

@@ -623,7 +623,7 @@ pub const NOT_COMPARED: Cause = Cause {
         "Known vulnerabilities are not yet compared with your installed software, your servers or projects of other kinds.",
         "Known vulnerabilities are not yet compared with your installed software, your servers or projects of other kinds.",
     ],
-    meaning: "The packages your projects list in package-lock.json, npm-shrinkwrap.json, pnpm-lock.yaml and Cargo.lock are compared. Applications, Homebrew packages, what your servers run, and projects in other languages are not yet, so this version does not tell you which vulnerabilities affect them.",
+    meaning: "The packages your projects list in package-lock.json, npm-shrinkwrap.json, pnpm-lock.yaml, yarn.lock, bun.lock and Cargo.lock are compared. Applications, Homebrew packages, what your servers run, and projects in other languages are not yet, so this version does not tell you which vulnerabilities affect them.",
     meaning_none: None,
     advice: "Nothing to do. This comes in a later version.",
 };
