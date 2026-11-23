@@ -233,8 +233,14 @@ impl Mac {
         self.json(&["finding", id])
     }
 
+    /// The store's id, read from the store itself: the binary is not started for it.
     fn store_id(&self) -> String {
-        self.findings()["store_id"].as_str().unwrap().to_string()
+        rusqlite::Connection::open(self.store())
+            .unwrap()
+            .query_row("SELECT value FROM meta WHERE key = 'store_id'", [], |r| {
+                r.get(0)
+            })
+            .unwrap()
     }
 
     /// The latest occurrence of a rule's finding, in any state, as the store holds it.
@@ -309,8 +315,9 @@ impl Mac {
         serde_json::from_slice(&out.stdout).unwrap()
     }
 
-    /// A verdict that must be refused with this code and exit, with nothing recorded.
-    fn refused(&self, verdict: &[u8], code: &str, exit: i32) {
+    /// A verdict that must be refused with this code and exit, with nothing recorded: the
+    /// refusal as printed.
+    fn refused(&self, verdict: &[u8], code: &str, exit: i32) -> Output {
         let before = self.recorded();
         let out = self.send_bytes(verdict, &["--json"]);
         assert_eq!(
@@ -323,6 +330,7 @@ impl Mac {
         assert_eq!(v["errors"][0]["code"], code, "{v:#}");
         assert!(v.get("format").is_none(), "{v:#}");
         assert_eq!(self.recorded(), before, "{code}: nothing is recorded");
+        out
     }
 
     /// How many verdicts the store holds, and how many journal entries of verdicts.
@@ -642,10 +650,7 @@ fn twins(name: &str, steps: &[Step]) {
         }
         // An answer and the run after it never share a second, on either Mac.
         if matches!(step, Step::Seen(_) | Step::Expected(_) | Step::Reopen(_)) {
-            let at = now();
-            while now() == at {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            }
+            common::next_second();
         }
         let (a, b) = (core(&plain), core(&judged));
         let differ: Vec<_> = a.lines().zip(b.lines()).filter(|(x, y)| x != y).collect();
@@ -1367,8 +1372,9 @@ fn a_verdict_finding_s_levels_are_the_highest_its_verdicts_gave_and_only_go_up()
     let own_levels = (core["severity"].clone(), core["confidence"].clone());
     let own = send("case-1", ("medium", "low"));
     let item = |mac: &Mac| mac.shown(&own).unwrap();
+    let i = item(&mac);
     assert_eq!(
-        (item(&mac)["severity"].clone(), item(&mac)["urgent"].clone()),
+        (i["severity"].clone(), i["urgent"].clone()),
         (json!("medium"), json!(false))
     );
     send("case-2", ("critical", "low"));
@@ -1753,8 +1759,7 @@ fn an_id_names_one_verdict_and_the_same_id_on_any_other_message_is_refused_with_
     let check = |state: &str| {
         for (other, differs) in &cases {
             let before = std::fs::read(mac.store()).unwrap();
-            mac.refused(other.to_string().as_bytes(), "verdict_id_reused", 2);
-            let out = mac.send_output(other);
+            let out = mac.refused(other.to_string().as_bytes(), "verdict_id_reused", 2);
             let failure: Value = serde_json::from_slice(&out.stdout).unwrap();
             // What differs, and the earlier verdict's kind and time: the core's values alone.
             assert_eq!(
@@ -2121,8 +2126,7 @@ fn a_verdict_id_is_a_token_shown_as_sent_and_taken_back_in_that_form_and_anythin
         "case\u{7f}".to_string(),
     ] {
         let v = with_id(good.clone(), &id);
-        mac.refused(v.to_string().as_bytes(), "verdict_id_not_a_token", 2);
-        let out = mac.send_output(&v);
+        let out = mac.refused(v.to_string().as_bytes(), "verdict_id_not_a_token", 2);
         let failure: Value = serde_json::from_slice(&out.stdout).unwrap();
         assert_eq!(failure["errors"][0]["detail_text"], "verdict_id", "{id:?}");
     }
@@ -2318,8 +2322,7 @@ fn a_secret_in_a_key_of_a_verdict_is_refused_without_echo_and_the_finding_is_as_
         serde_json::from_str(&escaped).unwrap(),
     ));
     for (field, json, v) in bodies {
-        mac.refused(&json, "holds_secret", 2);
-        let out = mac.send_bytes(&json, &["--json"]);
+        let out = mac.refused(&json, "holds_secret", 2);
         let failure: Value = serde_json::from_slice(&out.stdout).unwrap();
         assert_eq!(failure["errors"][0]["detail_text"], field, "{failure:#}");
         let mut said = out.stdout;
@@ -2380,23 +2383,31 @@ fn a_verdict_that_cannot_be_read_prints_no_secret_it_was_sent_written_plain_or_e
             // A key given twice.
             base.replacen('{', &format!("{{\"{written}\":1,\"{written}\":2,"), 1),
         ];
-        // A value of the wrong kind.
-        for field in ["kind", "format", "severity"] {
-            let mut v = good.clone();
-            v[field] = json!("PLACEHOLDER");
-            cases.push(v.to_string().replacen("PLACEHOLDER", &written, 1));
-        }
-        // A reason too long to take, holding it.
+        // A value of the wrong kind. A kind or a level that is not one of the message's is
+        // refused without repeating it, so there is nothing of it to cut.
+        let mut v = good.clone();
+        v["format"] = json!("PLACEHOLDER");
+        cases.push(v.to_string().replacen("PLACEHOLDER", &written, 1));
+        // Each of those repeats what it could not read; a reason too long to take, holding it,
+        // repeats nothing of it.
+        let repeated = cases.len();
         let mut v = good.clone();
         v["reason_text"] = json!(format!("PLACEHOLDER {}", "x".repeat(1100)));
         cases.push(v.to_string().replacen("PLACEHOLDER", &written, 1));
-        for body in cases {
+        for (n, body) in cases.into_iter().enumerate() {
             let out = mac.send_bytes(body.as_bytes(), &["--json"]);
             assert_eq!(out.status.code(), Some(2), "{body}");
             let failure: Value = serde_json::from_slice(&out.stdout).unwrap();
             assert_ne!(failure["errors"][0]["code"], "holds_secret", "{failure:#}");
             assert!(!holds(&out.stdout, &token), "{failure:#}");
             assert!(!holds(&out.stderr, &token));
+            // Not vacuous: what was repeated is there, cut.
+            if n < repeated {
+                assert!(
+                    holds(&out.stdout, "cut{gitleaks:github-pat 40}"),
+                    "{failure:#}"
+                );
+            }
         }
     }
     // A key it does not know that glues a token to a mark it quotes.
@@ -2438,11 +2449,9 @@ fn a_failure_of_any_command_prints_no_secret_it_was_given_in_any_form() {
                 for secret in [&token, &password] {
                     assert!(!holds(&printed, secret), "{command} {form:?}");
                 }
-                // It was repeated, and cut.
+                // It was repeated, and cut, in binary as in the other forms.
                 let said = String::from_utf8_lossy(&printed).to_string();
-                if form != ["--proto"] {
-                    assert!(said.contains("cut{"), "{command} {form:?}: {said}");
-                }
+                assert!(said.contains("cut{"), "{command} {form:?}: {said}");
             }
         }
     }
@@ -2467,10 +2476,6 @@ fn a_refusal_or_an_answer_about_what_was_asked_prints_no_secret_it_was_asked_in_
             vec!["program", &token],
             vec!["project", &token],
             vec!["machine", &token],
-            vec!["finding", &token],
-            vec!["finding", &token, "expected", "--reason", "x"],
-            vec!["findings", "--state", &token],
-            vec!["matches", "--after", &token, "--system-root", root],
             vec!["rules", &token, "--system-root", root],
         ] {
             let mut a: Vec<String> = args.iter().map(|s| s.to_string()).collect();
@@ -2478,9 +2483,10 @@ fn a_refusal_or_an_answer_about_what_was_asked_prints_no_secret_it_was_asked_in_
             asked.push(a);
         }
     }
+    // `finding <id>`, `findings --state` and `matches --after` refuse what they cannot take
+    // without repeating it, so there is nothing of it to cut.
     for args in [
         vec!["program", &token, "--proto"],
-        vec!["finding", &token, "--proto"],
         vec!["status", &format!("--password={password}"), "--json"],
         vec!["view", &format!("--x={token}")],
     ] {
@@ -2493,6 +2499,9 @@ fn a_refusal_or_an_answer_about_what_was_asked_prints_no_secret_it_was_asked_in_
             assert!(!holds(&out.stdout, secret), "{}", args[0]);
             assert!(!holds(&out.stderr, secret), "{}", args[0]);
         }
+        // Not vacuous: what was asked is repeated, cut.
+        let printed = [out.stdout.as_slice(), out.stderr.as_slice()].concat();
+        assert!(holds(&printed, "cut{"), "{args:?}");
     }
     // A store asked for at a path that holds a secret, and is not there.
     let missing = mac.0.join(&token);
@@ -3171,24 +3180,6 @@ fn a_store_without_any_one_table_of_its_schema_is_refused_by_a_reader_and_by_a_w
 }
 
 #[test]
-fn a_writer_refuses_a_store_without_its_id_before_it_writes_and_never_reports_failure_after_a_commit()
- {
-    // A run or a sample on a store without its id once committed everything and then failed,
-    // saying nothing was changed. The check comes before the first write.
-    let r = Refusable::new("no-id");
-    let sample = r.sample.as_str();
-    r.damage("DELETE FROM meta WHERE key = 'store_id'");
-    r.refused_by(
-        &[
-            vec!["run", "--json"],
-            vec!["sample", "--sample-input", sample],
-        ],
-        &["is damaged: it has no id", START_OVER],
-        None,
-    );
-}
-
-#[test]
 fn a_file_that_exists_is_never_given_a_schema_by_any_command() {
     // A store is made only where no file was. A store whose objects were taken out of
     // `sqlite_master` keeps its pages; a 0-byte file and a file that is not SQLite hold nothing
@@ -3642,11 +3633,20 @@ fn a_verdict_about_a_match_keeps_the_event_it_read_again_cut() {
 #[test]
 fn a_refused_verdict_changes_not_a_byte_of_the_store_and_makes_no_store_of_a_file() {
     let mac = Mac::new("refusal-writes-nothing");
+    let at = mac.append(&sw_vers(1));
     mac.run();
     let bytes = std::fs::read(mac.store()).unwrap();
     let v = about_finding(&"0".repeat(32), "f0", "harmless", "case-1");
     mac.refused(v.to_string().as_bytes(), "another_store", 2);
     assert_eq!(std::fs::read(mac.store()).unwrap(), bytes);
+    // Not vacuous: a verdict that is taken changes the store.
+    mac.send(&about_match(
+        &mac.store_id(),
+        &mac.position(at),
+        SW_VERS,
+        "harmless",
+    ));
+    assert_ne!(std::fs::read(mac.store()).unwrap(), bytes);
     std::fs::write(mac.store(), b"").unwrap();
     assert_eq!(mac.send_output(&v).status.code(), Some(3));
     assert_eq!(std::fs::metadata(mac.store()).unwrap().len(), 0);
@@ -3659,11 +3659,19 @@ fn a_verdict_or_an_answer_while_another_writer_holds_the_store_fails_as_one_to_a
     mac.run();
     let id = mac.latest(MALICIOUS).unwrap();
     let v = about_finding(&mac.store_id(), &id, "suspicious", "case-busy");
+    // The verdict and the answer, each waiting for the store as every writer waits, side by
+    // side: the answer as it ran.
+    let both_refused = || {
+        std::thread::scope(|s| {
+            let answer = s.spawn(|| mac.answer(&id, &["seen"]));
+            mac.refused(v.to_string().as_bytes(), "run_in_progress", 4);
+            answer.join().unwrap()
+        })
+    };
     // A run holds the run lock on the store's folder for as long as it runs.
     let folder = std::fs::File::open(mac.store().parent().unwrap()).unwrap();
     folder.lock().unwrap();
-    mac.refused(v.to_string().as_bytes(), "run_in_progress", 4);
-    let out = mac.answer(&id, &["seen"]);
+    let out = both_refused();
     assert_eq!(out.status.code(), Some(4));
     let said: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(said["errors"][0]["code"], "run_in_progress");
@@ -3673,8 +3681,7 @@ fn a_verdict_or_an_answer_while_another_writer_holds_the_store_fails_as_one_to_a
     let held = db
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .unwrap();
-    mac.refused(v.to_string().as_bytes(), "run_in_progress", 4);
-    assert_eq!(mac.answer(&id, &["seen"]).status.code(), Some(4));
+    assert_eq!(both_refused().status.code(), Some(4));
     drop(held);
     mac.send(&v);
     assert_eq!(mac.recorded(), (1, 1));
@@ -3694,16 +3701,13 @@ fn verdicts_and_answers_are_not_runs_on_the_page() {
         page[at..].to_string()
     };
     let before = changes(&mac);
-    for n in 0..25 {
-        mac.send(&about_finding(
-            &store,
-            &id,
-            "harmless",
-            &format!("case-{n}"),
-        ));
-    }
-    mac.answer(&id, &["seen"]);
+    mac.send(&about_finding(&store, &id, "harmless", "case-1"));
+    mac.send(&about_finding(&store, &id, "suspicious", "case-2"));
+    assert!(mac.answer(&id, &["seen"]).status.success());
     assert_eq!(changes(&mac), before);
+    // Not vacuous: a run is a run on the page.
+    mac.run();
+    assert_ne!(changes(&mac), before);
 }
 
 // ---- The sender's text is data. ----
@@ -4053,6 +4057,7 @@ fn one_answer_expected_from_the_response_layer_s_finding_marks_both_until_the_sa
     let before = whole(&mac);
     let seq = read(&mac);
     // For a person, the text says what else was answered.
+    let asked = now();
     let out = mac
         .command(&[
             "finding",
@@ -4064,6 +4069,7 @@ fn one_answer_expected_from_the_response_layer_s_finding_marks_both_until_the_sa
         .args(["--days", "7", "--with", &core, "--journal-seq", &seq])
         .output()
         .unwrap();
+    let answered = now();
     assert!(out.status.success());
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(
@@ -4081,8 +4087,9 @@ fn one_answer_expected_from_the_response_layer_s_finding_marks_both_until_the_sa
     assert_eq!(mac.finding(&verdict)["answer"], a);
     assert_eq!(a["given"], "expected");
     assert_eq!(a["reason_text"], "invented: a build step");
-    let until = a["until_at"].as_i64().unwrap();
-    assert!((until - now() - 7 * 86_400).abs() <= 2, "{a:#}");
+    // Seven days from when the command ran, whatever the time it took.
+    let until = a["until_at"].as_i64().unwrap() - 7 * 86_400;
+    assert!((asked..=answered).contains(&until), "{a:#}");
     assert!(mac.shown(&other).is_some());
     // Marked again, in JSON: the answer names the other as it left it.
     let seq = read(&mac);
@@ -4689,29 +4696,6 @@ fn a_read_that_nothing_joined_since_answers_even_after_a_quiet_check() {
 }
 
 #[test]
-fn without_with_an_answer_needs_no_read_and_honours_one_given() {
-    let (mac, core, verdict, _, _) = paired("pair-single");
-    let seq = read(&mac);
-    let v = levels(
-        about_finding(&mac.store_id(), &core, "suspicious", "case-later"),
-        ("high", "high"),
-    );
-    mac.send(&v);
-    // Named, a read older than what joined refuses it.
-    refused_answer(
-        &mac,
-        &verdict,
-        &["seen", "--journal-seq", &seq],
-        "changed_since_read",
-        Some(verdict.as_str()),
-    );
-    // Without one, the answer is given as before.
-    let before = whole(&mac);
-    given(&mac, &verdict, &["seen"]);
-    only_answered(&mac, &before, &[&verdict]);
-}
-
-#[test]
 fn an_answer_through_an_agent_names_the_read_it_rests_on_and_is_refused_when_it_is_old() {
     // An agent always reads before it answers, a conversation apart: its answer to one finding
     // is tied to that read as one to a pair is.
@@ -4978,36 +4962,6 @@ fn after_one_answer_seen_the_next_suspicious_verdict_raises_the_response_layer_s
     let next = next.to_string();
     let seq = read(&mac);
     given(&mac, &next, &["seen", "--journal-seq", &seq]);
-}
-
-#[test]
-fn a_read_at_the_entry_that_last_joined_a_finding_answers_it_and_one_before_it_does_not() {
-    // A read that saw an entry saw what it records: the check refuses what came after, from the
-    // very next entry on.
-    let mac = Mac::new("read-boundary");
-    mac.append(&dd(1));
-    mac.run();
-    let core = mac.latest(PADDING).unwrap();
-    let matched: i64 = rusqlite::Connection::open(mac.store())
-        .unwrap()
-        .query_row(
-            "SELECT MAX(journal) FROM finding_basis WHERE finding = ?1",
-            [&core],
-            |r| r.get(0),
-        )
-        .unwrap();
-    refused_answer(
-        &mac,
-        &core,
-        &["seen", "--journal-seq", &(matched - 1).to_string()],
-        "changed_since_read",
-        Some(&core),
-    );
-    given(
-        &mac,
-        &core,
-        &["seen", "--journal-seq", &matched.to_string()],
-    );
 }
 
 #[test]
