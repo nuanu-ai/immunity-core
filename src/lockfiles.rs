@@ -87,10 +87,14 @@ const CACHE_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
 const CHECKOUT_MARK: &str = ".git";
 
 /// `npm-shrinkwrap.json` is in the format of `package-lock.json`, as npm documents it.
-const SUPPORTED: [&str; 4] = [
+/// `yarn.lock` is read in the format of Yarn 2 and later; one of Yarn 1 is named as a kind with
+/// no reader.
+const SUPPORTED: [&str; 6] = [
     "package-lock.json",
     "npm-shrinkwrap.json",
     "pnpm-lock.yaml",
+    "yarn.lock",
+    "bun.lock",
     "Cargo.lock",
 ];
 /// Lockfiles this build has no reader for, by name, with the ecosystem whose packages each
@@ -103,9 +107,7 @@ const SUPPORTED: [&str; 4] = [
 /// manifests that page lists beside the lockfiles (`go.mod`, `pom.xml`, `deps.json` and the
 /// like) are not lockfiles and are not here. A lockfile of a name on no list is not known to be
 /// one and cannot be said (docs/reference.md).
-const NOT_SUPPORTED: [(&str, Option<&str>); 25] = [
-    ("yarn.lock", Some("npm")),
-    ("bun.lock", Some("npm")),
+const NOT_SUPPORTED: [(&str, Option<&str>); 23] = [
     ("bun.lockb", Some("npm")),
     ("uv.lock", Some("PyPI")),
     ("poetry.lock", Some("PyPI")),
@@ -177,7 +179,11 @@ pub fn split_name(name: &str) -> (&str, Option<&'static str>) {
 /// here.
 pub fn ecosystem_of(kind: &str) -> Option<&'static str> {
     match kind.split_once(" version ").map_or(kind, |(kind, _)| kind) {
-        "package-lock.json" | "npm-shrinkwrap.json" | "pnpm-lock.yaml" => Some("npm"),
+        "package-lock.json"
+        | "npm-shrinkwrap.json"
+        | "pnpm-lock.yaml"
+        | "yarn.lock"
+        | "bun.lock" => Some("npm"),
         "Cargo.lock" => Some("crates.io"),
         _ => NOT_SUPPORTED
             .iter()
@@ -462,6 +468,8 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize) -> Option<Outcome> {
                 npm(&t, name)
             }
             Some(t) if name == "pnpm-lock.yaml" => pnpm(&t),
+            Some(t) if name == "yarn.lock" => yarn(&t),
+            Some(t) if name == "bun.lock" => bun(&t),
             Some(t) => cargo(&t),
         };
         let (ecosystem, found) = match parsed {
@@ -612,7 +620,8 @@ enum At {
     Line(usize),
     /// The key of `package-lock.json`'s `packages` map. It names an alias as it was
     /// installed, so a person finds the entry. For `pnpm-lock.yaml`, the key of its `packages`
-    /// map, or the path to a dependency as `<where>/<field>/<name>`.
+    /// map, or the path to a dependency as `<where>/<field>/<name>`. For `yarn.lock`, an entry's
+    /// key as written; for `bun.lock`, the install path that keys `packages`.
     Key(String),
 }
 
@@ -620,7 +629,8 @@ enum At {
 struct Dep {
     at: At,
     name: String,
-    /// `None` only for a linked entry whose target gives no version.
+    /// `None` only for an entry not from a registry that its lockfile gives no version, as a
+    /// linked entry whose target has none.
     version: Option<String>,
     source: Source,
 }
@@ -637,6 +647,9 @@ enum Parsed {
 /// bundled entry does, or names one here. An address here is the package's own only as
 /// `registry_tarball` says; any other is not its package. A mirror counts as another registry.
 const NPM_REGISTRY: &str = "https://registry.npmjs.org/";
+
+/// How an address of a git repository begins, in the lockfiles of npm and Bun.
+const GIT: [&str; 5] = ["git+", "git://", "github:", "gitlab:", "bitbucket:"];
 
 /// Whether `path`, the part of an address after `NPM_REGISTRY`, is the registry's file of the
 /// package `name` at `version`: exactly `<name>/-/<unscoped name>-<version>.tgz`, the unscoped
@@ -699,13 +712,7 @@ fn npm_entry(
         _ if link => Source::Path,
         None => Source::Registry,
         Some(r) if r.starts_with(NPM_REGISTRY) => Source::Registry,
-        Some(r)
-            if ["git+", "git://", "github:", "gitlab:", "bitbucket:"]
-                .iter()
-                .any(|p| r.starts_with(p)) =>
-        {
-            Source::Git
-        }
+        Some(r) if GIT.iter().any(|p| r.starts_with(p)) => Source::Git,
         Some(r) if r.starts_with("file:") => Source::Path,
         // Another registry, a tarball's address, or an address of a kind not known here:
         // whatever it is, it is not the public registry.
@@ -775,9 +782,9 @@ enum PnpmFormat {
     V9,
 }
 
-/// The lockfile versions pnpm has written, in the shape of the version field: digits, letters,
-/// dots and dashes, as `5.4` or `5.4-inlineSpecifiers`. Anything else is not a version.
-fn pnpm_version_shape(v: &str) -> bool {
+/// A version of a lockfile's format in the shape pnpm and Yarn write one: digits, letters, dots
+/// and dashes, as `5.4` or `5.4-inlineSpecifiers`. Anything else is not a version.
+fn version_shape(v: &str) -> bool {
     !v.is_empty()
         && v.len() <= 32
         && v.chars()
@@ -815,7 +822,7 @@ fn pnpm(text: &str) -> Parsed {
             "5" | "5.1" | "5.2" | "5.3" | "5.4" => PnpmFormat::V5,
             "6.0" => PnpmFormat::V6,
             "9.0" => PnpmFormat::V9,
-            v if pnpm_version_shape(v) => {
+            v if version_shape(v) => {
                 return Parsed::NoReader(format!("pnpm-lock.yaml version {v}"));
             }
             _ => return Parsed::Failed,
@@ -1042,6 +1049,204 @@ fn pnpm_links(
             });
         }
     }
+}
+
+/// The values of `__metadata.version` read in a `yarn.lock` of Yarn 2 and later: those found in
+/// Yarn's own `Project.ts` at its releases, 4 (2.4 and 3.0), 5 (3.1), 6 (3.2 to 3.6) and 8 to 10
+/// (4.0 to 4.19). Version 7 is described only at second hand and is not read. What 9 and 10
+/// changed is not known, but nothing this reader uses differs between them: it reads only an
+/// entry's `resolution` and `version`, and a resolution of a form it does not know is not told.
+const YARN_VERSIONS: [&str; 6] = ["4", "5", "6", "8", "9", "10"];
+
+/// `yarn.lock` of Yarn 2 and later, which is YAML: every entry by its `resolution`, which is what
+/// Yarn fetches, never by its key. A file that names itself `yarn lockfile v1`, as Yarn 1 writes
+/// it, is a kind with no reader, as Yarn 2 and later also take it for one they do not read.
+///
+/// Yarn reads every scalar as text; a value `serde_norway` reads as a number or a boolean where
+/// text is expected leaves the entry not told, never converted. A key given twice in one mapping
+/// fails the reading, as `serde_norway` refuses it.
+fn yarn(text: &str) -> Parsed {
+    use serde_norway::Value;
+    if text.contains("yarn lockfile v1") {
+        return Parsed::NoReader("yarn.lock version 1".to_string());
+    }
+    let Ok(Value::Mapping(lock)) = serde_norway::from_str::<Value>(text) else {
+        return Parsed::Failed;
+    };
+    let version = match lock.get("__metadata").and_then(|m| m.get("version")) {
+        Some(Value::String(v)) => v.clone(),
+        Some(Value::Number(n)) => n.to_string(),
+        _ => return Parsed::Failed,
+    };
+    match version.as_str() {
+        v if YARN_VERSIONS.contains(&v) => {}
+        v if version_shape(v) => return Parsed::NoReader(format!("yarn.lock version {v}")),
+        _ => return Parsed::Failed,
+    }
+    let (mut out, mut unknown) = (Vec::new(), Vec::new());
+    for (key, entry) in &lock {
+        let Some(key) = key.as_str() else {
+            return Parsed::Failed;
+        };
+        if key == "__metadata" {
+            continue;
+        }
+        match yarn_entry(key, entry) {
+            Some(Some(dep)) => out.push(dep),
+            Some(None) => {}
+            None => unknown.push(key.to_string()),
+        }
+    }
+    Parsed::Deps("npm", out, unknown)
+}
+
+/// One entry of a `yarn.lock` of Yarn 2 and later, by its resolution `<name>@<reference>`:
+/// `Some(None)` for a workspace, which is the project itself, and `None` when the lockfile does
+/// not tell what it is. The entry is the registry's only as `npm:<version>` with no `::`
+/// parameters, or as a `patch:` of exactly `<name>@npm%3A<version>`, compared as written; Yarn
+/// does not write which registry, and as for pnpm the one the project is set up with is taken
+/// for the public one. `__archiveUrl` names another registry's address. A `version` field that
+/// differs from the resolution's version leaves the entry not told.
+fn yarn_entry(key: &str, entry: &serde_norway::Value) -> Option<Option<Dep>> {
+    let text = |field: &str| match entry.get(field) {
+        None => Some(None),
+        Some(v) => v.as_str().map(Some),
+    };
+    let resolution = text("resolution")??;
+    let stated = text("version")?;
+    let at = resolution.get(1..)?.find('@')? + 1;
+    let (name, reference) = (&resolution[..at], &resolution[at + 1..]);
+    if !npm_name(name) {
+        return None;
+    }
+    let (source, version) = if let Some(npm) = reference.strip_prefix("npm:") {
+        match npm.split_once("::") {
+            None => (Source::Registry, npm),
+            Some((v, params)) if params.starts_with("__archiveUrl=") => (Source::OtherRegistry, v),
+            Some(_) => return None,
+        }
+    } else if let Some(patch) = reference.strip_prefix("patch:") {
+        // The patched package's locator ends at the `#` before the patch's own paths.
+        let inner = patch.split('#').next()?;
+        let version = inner.strip_prefix(name)?.strip_prefix("@npm%3A")?;
+        (Source::Registry, version)
+    } else {
+        let source = match reference {
+            r if r.starts_with("workspace:") => return Some(None),
+            r if ["file:", "portal:", "link:", "exec:"]
+                .iter()
+                .any(|p| r.starts_with(p)) =>
+            {
+                Source::Path
+            }
+            // Yarn writes every git resolution with the commit it fetched.
+            r if r.contains("#commit=") => Source::Git,
+            r if r.starts_with("https://") => Source::OtherRegistry,
+            _ => return None,
+        };
+        // Yarn writes this for a soft link, which has no version of its own.
+        let version = stated
+            .filter(|v| *v != "0.0.0-use.local")
+            .map(str::to_string);
+        let at = At::Key(key.to_string());
+        return Some(Some(Dep {
+            at,
+            name: name.to_string(),
+            version,
+            source,
+        }));
+    };
+    if semver::Version::parse(version).is_err() || stated.is_some_and(|s| s != version) {
+        return None;
+    }
+    Some(Some(Dep {
+        at: At::Key(key.to_string()),
+        name: name.to_string(),
+        version: Some(version.to_string()),
+        source,
+    }))
+}
+
+/// `bun.lock`, lockfile versions 0 to 3, whose rows of packages Bun writes in one shape: JSON
+/// with comments and trailing commas, read by `jsonc`, which allows nothing else. A key given
+/// twice with two values anywhere fails the reading. `packages` maps an install path to a row
+/// whose first item is `<name>@<resolution>`: the package is that, never the key. An npm row's
+/// second item is its address, empty for the registry the project is set up with, which is taken
+/// for the public one as for pnpm. `workspaces`, `overrides`, `catalog`, `catalogs`,
+/// `patchedDependencies` and `trustedDependencies` add no package and are not read.
+fn bun(text: &str) -> Parsed {
+    let Ok(crate::jsonc::Read {
+        value: Some(lock),
+        doubts,
+    }) = crate::jsonc::read(text.as_bytes(), true)
+    else {
+        return Parsed::Failed;
+    };
+    match lock.get("lockfileVersion").and_then(|v| v.as_u64()) {
+        _ if !doubts.is_empty() => return Parsed::Failed,
+        Some(0..=3) => {}
+        Some(n) => return Parsed::NoReader(format!("bun.lock version {n}")),
+        None => return Parsed::Failed,
+    }
+    // Bun refuses a file without `workspaces`, and writes no `packages` when there is none.
+    let empty = serde_json::Map::new();
+    let packages = match lock.get("packages") {
+        _ if !lock.get("workspaces").is_some_and(|w| w.is_object()) => return Parsed::Failed,
+        None => &empty,
+        Some(serde_json::Value::Object(p)) => p,
+        Some(_) => return Parsed::Failed,
+    };
+    let (mut out, mut unknown) = (Vec::new(), Vec::new());
+    for (key, row) in packages {
+        match bun_row(key, row) {
+            Some(Some(dep)) => out.push(dep),
+            Some(None) => {}
+            None => unknown.push(key.clone()),
+        }
+    }
+    Parsed::Deps("npm", out, unknown)
+}
+
+/// One row of `bun.lock`'s `packages`: `Some(None)` for a workspace or the root, which are the
+/// project itself, and `None` when the row does not tell what it is. The name ends at the first
+/// `@` after its first character, since a package's name holds none there and an address may.
+/// An npm row is the registry's when its address is empty or the registry's file of that name
+/// and version (`registry_tarball`).
+fn bun_row(key: &str, row: &serde_json::Value) -> Option<Option<Dep>> {
+    let row = row.as_array()?;
+    let first = row.first()?.as_str()?;
+    let at = first.get(1..)?.find('@')? + 1;
+    let (name, resolution) = (&first[..at], &first[at + 1..]);
+    if !npm_name(name) {
+        return None;
+    }
+    let mut version = None;
+    let source = match resolution {
+        r if r.starts_with("workspace:") || r.starts_with("root:") => return Some(None),
+        r if r.starts_with("file:") || r.starts_with("link:") => Source::Path,
+        r if GIT.iter().any(|p| r.starts_with(p)) => Source::Git,
+        r if r.starts_with("https://") => Source::OtherRegistry,
+        r if semver::Version::parse(r).is_ok() => {
+            version = Some(r.to_string());
+            match row.get(1)?.as_str()? {
+                "" => Source::Registry,
+                address => match address.strip_prefix(NPM_REGISTRY) {
+                    Some(path) if registry_tarball(path, name, r) => Source::Registry,
+                    Some(_) => return None,
+                    None => Source::OtherRegistry,
+                },
+            }
+        }
+        // A tarball on disk, by its path.
+        r if r.ends_with(".tgz") => Source::Path,
+        _ => return None,
+    };
+    Some(Some(Dep {
+        at: At::Key(key.to_string()),
+        name: name.to_string(),
+        version,
+        source,
+    }))
 }
 
 /// crates.io's index, in both forms Cargo writes it.
@@ -2352,6 +2557,524 @@ dependencies = [
         assert_eq!(
             o.lockfiles,
             [("dev/shop/bun.lockb".to_string(), text.len() as u64)]
+        );
+    }
+
+    /// A `yarn.lock` of Yarn 4 (`__metadata.version` 8) with every kind of resolution the
+    /// reader tells apart, keys sorted as Yarn sorts them. Names and addresses are invented.
+    const YARN: &str = r#"# This file is generated by running "yarn install" inside your project.
+# Manual changes might be lost - proceed with caution!
+
+__metadata:
+  version: 8
+  cacheKey: 10c0
+
+"@jrichman/ink@npm:^6.4.6":
+  version: 6.4.6
+  resolution: "@jrichman/ink@npm:6.4.6"
+  checksum: 10c0/aaaa
+  languageName: node
+  linkType: hard
+
+"@shop/ui@workspace:packages/ui":
+  version: 0.0.0-use.local
+  resolution: "@shop/ui@workspace:packages/ui"
+  languageName: unknown
+  linkType: soft
+
+"dev-tool@portal:../dev-tool::locator=shop%40workspace%3A.":
+  version: 0.0.0-use.local
+  resolution: "dev-tool@portal:../dev-tool::locator=shop%40workspace%3A."
+  languageName: node
+  linkType: soft
+
+"fsevents@patch:fsevents@npm%3A^2.3.2#optional!builtin<compat/fsevents>":
+  version: 2.3.3
+  resolution: "fsevents@patch:fsevents@npm%3A2.3.3#optional!builtin<compat/fsevents>::version=2.3.3&hash=df0bf1"
+  conditions: os=darwin
+  languageName: node
+  linkType: hard
+
+"gen-tool@exec:./scripts/gen-tool.js::locator=shop%40workspace%3A.":
+  version: 1.0.0
+  resolution: "gen-tool@exec:./scripts/gen-tool.js#./scripts/gen-tool.js::hash=cccc&locator=shop%40workspace%3A."
+  languageName: node
+  linkType: hard
+
+"left-pad@https://github.com/example/left-pad.git#commit=0123456789abcdef0123456789abcdef01234567":
+  version: 1.3.0
+  resolution: "left-pad@https://github.com/example/left-pad.git#commit=0123456789abcdef0123456789abcdef01234567"
+  languageName: node
+  linkType: hard
+
+"linked-dir@link:./vendor/linked-dir::locator=shop%40workspace%3A.":
+  version: 0.0.0-use.local
+  resolution: "linked-dir@link:./vendor/linked-dir::locator=shop%40workspace%3A."
+  languageName: node
+  linkType: soft
+
+"local-tool@file:./vendor/local-tool-1.0.0.tgz::locator=shop%40workspace%3A.":
+  version: 1.0.0
+  resolution: "local-tool@file:./vendor/local-tool-1.0.0.tgz#./vendor/local-tool-1.0.0.tgz::hash=dddd&locator=shop%40workspace%3A."
+  languageName: node
+  linkType: hard
+
+"private-lib@npm:^2.0.0":
+  version: 2.0.0
+  resolution: "private-lib@npm:2.0.0::__archiveUrl=https%3A%2F%2Fnpm.example.com%2Fprivate-lib%2F-%2Fprivate-lib-2.0.0.tgz"
+  languageName: node
+  linkType: hard
+
+"remote-tool@https://example.com/remote-tool-1.0.0.tgz":
+  version: 1.0.0
+  resolution: "remote-tool@https://example.com/remote-tool-1.0.0.tgz"
+  languageName: node
+  linkType: hard
+
+"shop@workspace:.":
+  version: 0.0.0-use.local
+  resolution: "shop@workspace:."
+  languageName: unknown
+  linkType: soft
+
+"string-width-cjs@npm:string-width@^4.2.0":
+  version: 4.2.3
+  resolution: "string-width@npm:4.2.3"
+  languageName: node
+  linkType: hard
+
+"string-width@npm:^5.1.2":
+  version: 5.1.2
+  resolution: "string-width@npm:5.1.2"
+  languageName: node
+  linkType: hard
+"#;
+
+    /// A `bun.lock` of lockfile version 1 with every kind of row the reader tells apart, and a
+    /// comment, which Bun reads. Names and addresses other than the public registry's are
+    /// invented.
+    const BUN: &str = r#"{
+  "lockfileVersion": 1,
+  "workspaces": {
+    "": {
+      "name": "shop",
+      "dependencies": {
+        "ink": "npm:@jrichman/ink@6.4.6",
+        "string-width": "^5.1.2",
+      },
+    },
+    "packages/ui": {
+      "name": "@shop/ui",
+    },
+  },
+  // Bun writes no comment, and reads one.
+  "packages": {
+    "@shop/ui": ["@shop/ui@workspace:packages/ui"],
+
+    "dev-tool": ["dev-tool@link:dev-tool", {}],
+
+    "ink": ["@jrichman/ink@6.4.6", "", { "dependencies": { "string-width": "^5.1.2" } }, "sha512-AAAA"],
+
+    "left-pad": ["left-pad@github:example/left-pad#0123456", {}, "example-left-pad-0123456"],
+
+    "local-dir": ["local-dir@file:vendor/local-dir", {}],
+
+    "local-tool": ["local-tool@vendor/local-tool-1.0.0.tgz", {}],
+
+    "private-lib": ["private-lib@2.0.0", "https://npm.example.com/private-lib/-/private-lib-2.0.0.tgz", {}, "sha512-BBBB"],
+
+    "remote-tool": ["remote-tool@https://example.com/remote-tool-1.0.0.tgz", {}],
+
+    "shop": ["shop@root:", {}],
+
+    "string-width": ["string-width@5.1.2", "", {}, "sha512-CCCC"],
+
+    "string-width-cjs": ["string-width@4.2.3", "", {}, "sha512-DDDD"],
+
+    "string-width-cjs/strip-ansi": ["strip-ansi@6.0.1", "https://registry.npmjs.org/strip-ansi/-/strip-ansi-6.0.1.tgz", {}, "sha512-EEEE"],
+
+    "tool-git": ["tool-git@git+ssh://git@github.com/example/tool-git.git#0123456789abcdef0123456789abcdef01234567", {}, "0123456789abcdef0123456789abcdef01234567"],
+  }
+}
+"#;
+
+    /// What a reading of `file` holding `text` says, and its reason.
+    fn read_one(tag: &str, file: &str, text: &str) -> (Vec<String>, Option<String>) {
+        let dir = Dir::new(tag, &[(file, text)]);
+        let (o, said) = dir.read();
+        (said, o.reason)
+    }
+
+    #[test]
+    fn a_yarn_entry_is_the_package_its_resolution_names_and_says_where_it_comes_from() {
+        // Yarn fetches by the resolution: an alias is the package it resolves to, a patch of a
+        // registry package is that package, and only an entry from the registry carries the bare
+        // name an advisory gives. A workspace is the project itself.
+        let dir = Dir::new("yarn", &[("yarn.lock", YARN)]);
+        let (o, said) = dir.read();
+        let at = "dev/shop/yarn.lock#";
+        let patch = "fsevents@patch:fsevents@npm%3A^2.3.2#optional!builtin<compat/fsevents>";
+        let git = "left-pad@https://github.com/example/left-pad.git#commit=0123456789abcdef0123456789abcdef01234567";
+        let local = "local-tool@file:./vendor/local-tool-1.0.0.tgz::locator=shop%40workspace%3A.";
+        let portal = "dev-tool@portal:../dev-tool::locator=shop%40workspace%3A.";
+        let exec = "gen-tool@exec:./scripts/gen-tool.js::locator=shop%40workspace%3A.";
+        let link = "linked-dir@link:./vendor/linked-dir::locator=shop%40workspace%3A.";
+        let remote = "remote-tool@https://example.com/remote-tool-1.0.0.tgz";
+        let cjs = "string-width-cjs@npm:string-width@^4.2.0";
+        let expected = [
+            format!("npm/@jrichman/ink|part_of|checkout|{at}@jrichman/ink@npm:^6.4.6"),
+            format!("npm/@jrichman/ink|has_version|6.4.6|{at}@jrichman/ink@npm:^6.4.6"),
+            format!("npm/dev-tool (path)|part_of|checkout|{at}{portal}"),
+            format!("npm/fsevents|part_of|checkout|{at}{patch}"),
+            format!("npm/fsevents|has_version|2.3.3|{at}{patch}"),
+            format!("npm/gen-tool (path)|part_of|checkout|{at}{exec}"),
+            format!("npm/gen-tool (path)|has_version|1.0.0|{at}{exec}"),
+            format!("npm/left-pad (git)|part_of|checkout|{at}{git}"),
+            format!("npm/left-pad (git)|has_version|1.3.0|{at}{git}"),
+            format!("npm/linked-dir (path)|part_of|checkout|{at}{link}"),
+            format!("npm/local-tool (path)|part_of|checkout|{at}{local}"),
+            format!("npm/local-tool (path)|has_version|1.0.0|{at}{local}"),
+            format!("npm/private-lib (other registry)|part_of|checkout|{at}private-lib@npm:^2.0.0"),
+            format!(
+                "npm/private-lib (other registry)|has_version|2.0.0|{at}private-lib@npm:^2.0.0"
+            ),
+            format!("npm/remote-tool (other registry)|part_of|checkout|{at}{remote}"),
+            format!("npm/remote-tool (other registry)|has_version|1.0.0|{at}{remote}"),
+            format!("npm/string-width|part_of|checkout|{at}{cjs}"),
+            format!("npm/string-width|has_version|4.2.3|{at}{cjs}"),
+            format!("npm/string-width|has_version|5.1.2|{at}string-width@npm:^5.1.2"),
+        ];
+        assert_eq!(said, expected);
+        assert_eq!((o.completeness, o.reason), ("full", None));
+    }
+
+    #[test]
+    fn a_yarn_entry_whose_package_cannot_be_told_is_never_guessed_and_makes_the_reading_partial() {
+        // No false calm. Each of these would answer for a package or a version Yarn may not
+        // install: the entry is not told and the reading is partial.
+        let width = "  version: 5.1.2\n  resolution: \"string-width@npm:5.1.2\"";
+        let patch = "resolution: \"fsevents@patch:fsevents@npm%3A2.3.3#";
+        let patch_key = "fsevents@patch:fsevents@npm%3A^2.3.2#optional!builtin<compat/fsevents>";
+        for (from, to, key) in [
+            // A `version` field of another version than the resolution's.
+            (
+                width,
+                "  version: 5.1.3\n  resolution: \"string-width@npm:5.1.2\"",
+            ),
+            // A number where Yarn reads text: never converted, never taken as absent.
+            (
+                width,
+                "  version: 5.1\n  resolution: \"string-width@npm:5.1.2\"",
+            ),
+            (
+                width,
+                "  version: 5.1.2\n  resolution: [string-width@npm:5.1.2]",
+            ),
+            (width, "  version: 5.1.2"),
+            // A range where Yarn writes a version, with no `version` field to compare it with.
+            (width, "  resolution: \"string-width@npm:^5.1.2\""),
+            (
+                width,
+                "  version: 5.1.2\n  resolution: \"string-width@npm:5.1.2::x=1\"",
+            ),
+            (
+                width,
+                "  version: 5.1.2\n  resolution: \"string-width@jsr:5.1.2\"",
+            ),
+            (
+                width,
+                "  version: 5.1.2\n  resolution: \"string width@npm:5.1.2\"",
+            ),
+            (width, "  version: 5.1.2\n  resolution: \"@npm:5.1.2\""),
+        ]
+        .map(|(from, to)| (from, to, "string-width@npm:^5.1.2"))
+        .into_iter()
+        .chain([
+            // A patch of another package, or of a package not from the registry.
+            (
+                patch,
+                "resolution: \"fsevents@patch:chokidar@npm%3A2.3.3#",
+                patch_key,
+            ),
+            (
+                patch,
+                "resolution: \"fsevents@patch:fsevents@https%3A//example.com/f.tgz#",
+                patch_key,
+            ),
+        ]) {
+            let (said, reason) = read_one("yarn-not-told", "yarn.lock", &YARN.replace(from, to));
+            let at = format!("yarn.lock#{key}");
+            assert!(!said.iter().any(|s| s.ends_with(&at)), "{to}: {said:?}");
+            assert_eq!(reason, one_not_told(&at), "{to}");
+        }
+    }
+
+    #[test]
+    fn the_package_is_what_a_yarn_resolution_or_a_bun_row_names_never_its_key() {
+        // Yarn fetches by the resolution and Bun installs the row's first item into the key's
+        // folder: a key that names another package is not what is installed.
+        let (said, reason) = read_one(
+            "yarn-key",
+            "yarn.lock",
+            &YARN.replace(
+                "5.1.2\n  resolution: \"string-width@npm:5.1.2\"",
+                "9.0.0\n  resolution: \"evil-width@npm:9.0.0\"",
+            ),
+        );
+        let fact = "npm/evil-width|has_version|9.0.0|dev/shop/yarn.lock#string-width@npm:^5.1.2";
+        assert!(said.contains(&fact.to_string()), "{said:?}");
+        assert!(!said.iter().any(|s| s.contains("|5.1.2|")), "{said:?}");
+        assert_eq!(reason, None);
+        let (said, reason) = read_one(
+            "bun-key",
+            "bun.lock",
+            &BUN.replace("[\"string-width@5.1.2\"", "[\"evil-width@9.0.0\""),
+        );
+        let fact = "npm/evil-width|has_version|9.0.0|dev/shop/bun.lock#string-width";
+        assert!(said.contains(&fact.to_string()), "{said:?}");
+        assert!(!said.iter().any(|s| s.contains("|5.1.2|")), "{said:?}");
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn a_yarn_lockfile_yarn_would_not_read_as_written_is_a_failed_reading() {
+        // serde_norway refuses a key given twice in a mapping, where Yarn keeps the later one:
+        // the two readings would differ, so the file is not read. So is anything else that is
+        // not one YAML mapping with Yarn's `__metadata`.
+        let width = "\"string-width@npm:^5.1.2\":\n  version: 5.1.2\n  resolution: \"string-width@npm:5.1.2\"\n";
+        for (tag, text) in [
+            ("twice", format!("{YARN}\n{width}")),
+            (
+                "twice-field",
+                YARN.replace(
+                    "  resolution: \"string-width@npm:5.1.2\"",
+                    "  resolution: \"string-width@npm:5.1.2\"\n  resolution: \"string-width@npm:5.0.0\"",
+                ),
+            ),
+            ("no-metadata", YARN.replace("__metadata:", "metadata:")),
+            ("number-key", format!("{YARN}\n1.5:\n  version: 1.5.0\n")),
+            ("two-documents", format!("{YARN}---\n{width}")),
+            ("not-yaml", format!("{YARN}\n\"x: [\n")),
+            ("empty", String::new()),
+        ] {
+            let (said, reason) = read_one(tag, "yarn.lock", &text);
+            assert!(said.is_empty(), "{tag}: {said:?}");
+            assert_eq!(reason.as_deref(), Some("could not be read: yarn.lock"), "{tag}");
+        }
+    }
+
+    #[test]
+    fn a_yarn_lockfile_of_yarn_1_or_of_a_version_not_read_here_is_named_as_a_kind_without_a_reader()
+    {
+        // Yarn 1's file has a format of its own; a `__metadata.version` this reader was not
+        // written against may mean something else. Each is named and leaves npm unknown.
+        let v1 = "# THIS IS AN AUTOGENERATED FILE. DO NOT EDIT THIS FILE DIRECTLY.\n# yarn lockfile v1\n\n\nleft-pad@^1.3.0:\n  version \"1.3.0\"\n";
+        let metadata = "__metadata:\n  version: 8\n";
+        for (tag, text, kind) in [
+            ("yarn-v1", v1.to_string(), "yarn.lock version 1"),
+            (
+                "yarn-7",
+                YARN.replace(metadata, "__metadata:\n  version: 7\n"),
+                "yarn.lock version 7",
+            ),
+            (
+                "yarn-11",
+                YARN.replace(metadata, "__metadata:\n  version: \"11\"\n"),
+                "yarn.lock version 11",
+            ),
+        ] {
+            let dir = Dir::new(tag, &[("yarn.lock", &text)]);
+            let (o, said) = dir.read();
+            assert!(said.is_empty(), "{tag}: {said:?}");
+            assert_eq!(lacks(&o), [format!("{LOCKFILE_KIND} {kind}")], "{tag}");
+            assert_eq!(unknown_for(&o), [true, false], "{tag}");
+        }
+        for version in ["4", "5", "6", "\"6\"", "9", "10"] {
+            let text = YARN.replace(metadata, &format!("__metadata:\n  version: {version}\n"));
+            let (said, reason) = read_one("yarn-read", "yarn.lock", &text);
+            assert_eq!((said.len(), reason), (19, None), "{version}");
+        }
+        let (said, reason) = read_one(
+            "yarn-odd",
+            "yarn.lock",
+            &YARN.replace(metadata, "__metadata:\n  version: \"8 or so\"\n"),
+        );
+        assert!(said.is_empty());
+        assert_eq!(reason.as_deref(), Some("could not be read: yarn.lock"));
+    }
+
+    #[test]
+    fn a_bun_row_is_the_package_its_first_item_names_and_says_where_it_comes_from() {
+        // The name ends at the first `@` after its first character, so a git address holding
+        // `git@` stays the address. Only an npm row with no address or the registry's own file
+        // carries the bare name an advisory gives. A workspace and the root are the project.
+        let dir = Dir::new("bun", &[("bun.lock", BUN)]);
+        let (o, said) = dir.read();
+        let at = "dev/shop/bun.lock#";
+        let expected = [
+            format!("npm/@jrichman/ink|part_of|checkout|{at}ink"),
+            format!("npm/@jrichman/ink|has_version|6.4.6|{at}ink"),
+            format!("npm/dev-tool (path)|part_of|checkout|{at}dev-tool"),
+            format!("npm/left-pad (git)|part_of|checkout|{at}left-pad"),
+            format!("npm/local-dir (path)|part_of|checkout|{at}local-dir"),
+            format!("npm/local-tool (path)|part_of|checkout|{at}local-tool"),
+            format!("npm/private-lib (other registry)|part_of|checkout|{at}private-lib"),
+            format!("npm/private-lib (other registry)|has_version|2.0.0|{at}private-lib"),
+            format!("npm/remote-tool (other registry)|part_of|checkout|{at}remote-tool"),
+            format!("npm/string-width|part_of|checkout|{at}string-width"),
+            format!("npm/string-width|has_version|4.2.3|{at}string-width-cjs"),
+            format!("npm/string-width|has_version|5.1.2|{at}string-width"),
+            format!("npm/strip-ansi|part_of|checkout|{at}string-width-cjs/strip-ansi"),
+            format!("npm/strip-ansi|has_version|6.0.1|{at}string-width-cjs/strip-ansi"),
+            format!("npm/tool-git (git)|part_of|checkout|{at}tool-git"),
+        ];
+        assert_eq!(said, expected);
+        assert_eq!((o.completeness, o.reason), ("full", None));
+    }
+
+    #[test]
+    fn a_bun_row_whose_package_cannot_be_told_is_never_guessed_and_makes_the_reading_partial() {
+        // No false calm: the registry's address of another version's or another package's file,
+        // an address that is not text, and a row of a shape Bun does not write.
+        let strip = "[\"strip-ansi@6.0.1\", \"https://registry.npmjs.org/strip-ansi/-/strip-ansi-6.0.1.tgz\"";
+        let width = "[\"string-width@5.1.2\", \"\"";
+        for (from, to, key) in [
+            (
+                strip,
+                "[\"strip-ansi@6.0.1\", \"https://registry.npmjs.org/strip-ansi/-/strip-ansi-6.0.0.tgz\"",
+                "string-width-cjs/strip-ansi",
+            ),
+            (
+                strip,
+                "[\"strip-ansi@6.0.1\", \"https://registry.npmjs.org/strip-ansi/-/ansi-regex-6.0.1.tgz\"",
+                "string-width-cjs/strip-ansi",
+            ),
+            (width, "[\"string-width@5.1.2\", null", "string-width"),
+            (width, "[\"string-width@^5.1.2\", \"\"", "string-width"),
+            (width, "[\"string-width\", \"\"", "string-width"),
+            (width, "[\"string width@5.1.2\", \"\"", "string-width"),
+            (width, "[5, \"\"", "string-width"),
+            (
+                "\"string-width\": [\"string-width@5.1.2\", \"\", {}, \"sha512-CCCC\"]",
+                "\"string-width\": {}",
+                "string-width",
+            ),
+            (
+                "[\"string-width@5.1.2\", \"\", {}, \"sha512-CCCC\"]",
+                "[\"string-width@5.1.2\"]",
+                "string-width",
+            ),
+        ] {
+            let (said, reason) = read_one("bun-not-told", "bun.lock", &BUN.replace(from, to));
+            let at = format!("bun.lock#{key}");
+            assert!(!said.iter().any(|s| s.ends_with(&at)), "{to}: {said:?}");
+            assert_eq!(reason, one_not_told(&at), "{to}");
+        }
+    }
+
+    #[test]
+    fn a_bun_lockfile_bun_would_not_read_as_written_is_a_failed_reading() {
+        // A key given twice anywhere is read one way by a reader that keeps the first and another
+        // by one that keeps the last. Bun allows comments and trailing commas and nothing else.
+        let ink = "\"ink\": [\"@jrichman/ink@6.4.6\"";
+        for (tag, text) in [
+            (
+                "bun-twice",
+                BUN.replace(ink, &format!("\"ink\": [\"ink@1.0.0\", \"\"],\n    {ink}")),
+            ),
+            (
+                "bun-twice-top",
+                BUN.replace(
+                    "\"lockfileVersion\": 1,",
+                    "\"lockfileVersion\": 1, \"lockfileVersion\": 9,",
+                ),
+            ),
+            (
+                "bun-twice-info",
+                BUN.replace(
+                    "{ \"string-width\": \"^5.1.2\" }",
+                    "{ \"string-width\": \"^5.1.2\", \"string-width\": \"^4.0.0\" }",
+                ),
+            ),
+            (
+                "bun-quotes",
+                BUN.replace("\"sha512-AAAA\"", "'sha512-AAAA'"),
+            ),
+            ("bun-no-version", BUN.replace("\"lockfileVersion\": 1,", "")),
+            (
+                "bun-version-text",
+                BUN.replace("\"lockfileVersion\": 1,", "\"lockfileVersion\": \"1\","),
+            ),
+            (
+                "bun-no-workspaces",
+                BUN.replace("\"workspaces\"", "\"members\""),
+            ),
+            (
+                "bun-packages-list",
+                "{\"lockfileVersion\": 1, \"workspaces\": {}, \"packages\": []}".to_string(),
+            ),
+            ("bun-empty", String::new()),
+        ] {
+            let (said, reason) = read_one(tag, "bun.lock", &text);
+            assert!(said.is_empty(), "{tag}: {said:?}");
+            assert_eq!(
+                reason.as_deref(),
+                Some("could not be read: bun.lock"),
+                "{tag}"
+            );
+        }
+        // With no package, Bun writes no `packages`.
+        let (said, reason) = read_one(
+            "bun-no-packages",
+            "bun.lock",
+            "{\"lockfileVersion\": 1, \"workspaces\": {\"\": {\"name\": \"shop\"}}}",
+        );
+        assert_eq!((said.len(), reason), (0, None));
+    }
+
+    #[test]
+    fn a_bun_lockfile_of_a_version_not_read_here_is_named_as_a_kind_without_a_reader() {
+        // Versions 0 to 3 write rows of one shape; a later one is named and leaves npm unknown.
+        for version in [0, 2, 3] {
+            let text = BUN.replace(
+                "\"lockfileVersion\": 1,",
+                &format!("\"lockfileVersion\": {version},"),
+            );
+            let (said, reason) = read_one("bun-read", "bun.lock", &text);
+            assert_eq!((said.len(), reason), (15, None), "{version}");
+        }
+        let text = BUN.replace("\"lockfileVersion\": 1,", "\"lockfileVersion\": 4,");
+        let dir = Dir::new("bun-4", &[("bun.lock", &text)]);
+        let (o, said) = dir.read();
+        assert!(said.is_empty());
+        assert_eq!(lacks(&o), [format!("{LOCKFILE_KIND} bun.lock version 4")]);
+        assert_eq!(unknown_for(&o), [true, false]);
+    }
+
+    #[test]
+    fn yarn_and_bun_lockfiles_beside_a_package_lock_are_each_read_and_none_hides_another() {
+        // No lockfile says which manager runs: a package of another version in each comes out
+        // at every version, and every one is read as text for the indicators.
+        let dir = Dir::new(
+            "node-beside",
+            &[
+                ("package-lock.json", NPM),
+                ("yarn.lock", &YARN.replace("5.1.2", "5.1.4")),
+                ("bun.lock", &BUN.replace("5.1.2", "5.1.5")),
+            ],
+        );
+        let (o, said) = dir.read();
+        for fact in [
+            "npm/string-width|has_version|5.1.2|dev/shop/package-lock.json#node_modules/string-width",
+            "npm/string-width|has_version|5.1.4|dev/shop/yarn.lock#string-width@npm:^5.1.4",
+            "npm/string-width|has_version|5.1.5|dev/shop/bun.lock#string-width",
+        ] {
+            assert!(said.contains(&fact.to_string()), "{fact}: {said:?}");
+        }
+        assert_eq!((o.completeness, o.reason), ("full", None));
+        assert_eq!(
+            read_as_text(&dir.0).opened,
+            ["bun.lock", "package-lock.json", "yarn.lock"]
         );
     }
 
