@@ -659,30 +659,32 @@ fn published_lines(s: &Screen, f: &v1::Finding, p: &v1::PublishedRuleMatched) ->
 }
 
 /// Which files of a package or of an app's code outside its bundle changed: the counts on one
-/// line, then the names the message holds, each kind under its word, with how many more there are.
+/// line, with how many of each are named when not all are, then the names the message holds,
+/// each kind under its word. No line of its own says how many more there are: a name sits at the
+/// same indent and could be made to read like one.
 fn files_lines(s: &Screen, p: &v1::FilesChanged) -> Vec<String> {
     let e = |label: &str, parts: &[(&str, Style)]| field(s, 4, EVIDENCE_LABEL, label, parts);
     let n = crate::overview::grouped;
+    let kinds = [
+        ("added", "Added", p.added, &p.added_text),
+        ("removed", "Removed", p.removed, &p.removed_text),
+        ("changed", "Changed", p.changed, &p.changed_text),
+    ];
+    let counts: Vec<String> = kinds
+        .iter()
+        .map(|(word, _, count, names)| match names.len() as u64 {
+            named if named < *count => format!("{} {word} ({} named)", n(*count), n(named)),
+            _ => format!("{} {word}", n(*count)),
+        })
+        .collect();
     let counts = format!(
-        "changed while the version stayed the same, since the reading before: {} added, {} removed, {} changed",
-        n(p.added),
-        n(p.removed),
-        n(p.changed)
+        "changed while the version stayed the same, since the reading before: {}",
+        counts.join(", ")
     );
     let mut out = e("Files", &[(&counts, PLAIN)]);
-    for (word, count, names) in [
-        ("Added", p.added, &p.added_text),
-        ("Removed", p.removed, &p.removed_text),
-        ("Changed", p.changed, &p.changed_text),
-    ] {
-        let mut label = word;
-        for name in names {
-            out.extend(e(label, &[(name, PLAIN)]));
-            label = "";
-        }
-        let more = count.saturating_sub(names.len() as u64);
-        if more > 0 {
-            out.extend(e(label, &[(&format!("… {} more", n(more)), DIM)]));
+    for (_, label, _, names) in kinds {
+        for (i, name) in names.iter().enumerate() {
+            out.extend(e(if i == 0 { label } else { "" }, &[(name, PLAIN)]));
         }
     }
     out
@@ -1627,10 +1629,7 @@ mod tests {
                     "From",
                 ],
             ),
-            (
-                "files changed",
-                &["Files", "Added", "Removed", "Changed", "… 3 more"],
-            ),
+            ("files changed", &["Files", "Added", "Removed", "Changed"]),
         ];
         for ((kind, body), (name, labels)) in bodies("odd").into_iter().zip(evidence) {
             assert_eq!(kind, *name);

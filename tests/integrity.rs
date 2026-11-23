@@ -1370,7 +1370,11 @@ fn more_than_twenty_files_of_a_kind_are_counted_exactly_and_twenty_are_named_in_
     assert_eq!(evidence["files"]["added"], 25);
     let named: Vec<String> = (0..20).map(|i| format!("lib/{i:02}.rb")).collect();
     assert_eq!(evidence["files"]["added_text"], serde_json::json!(named));
-    assert!(text.lines().any(|l| l.trim() == "… 5 more"), "{text}");
+    assert!(
+        text.contains(": 25 added (20 named), 0 removed, 0 changed\n"),
+        "{text}"
+    );
+    assert!(!text.contains("more"), "{text}");
     let labelled = text.lines().filter(|l| l.trim_start().starts_with("Added"));
     assert_eq!(labelled.count(), 1, "{text}");
 }
@@ -1419,14 +1423,67 @@ fn without_a_list_from_the_reading_before_or_with_one_gone_or_damaged_nothing_is
             |r| r.get(0),
         )
         .unwrap();
-    let kept = std::fs::read_to_string(e.0.join(&told)).unwrap();
-    let to = serde_json::from_str::<serde_json::Value>(&kept).unwrap()["to"].clone();
-    std::fs::write(
-        e.0.join(&told),
-        kept.replace(to.as_str().unwrap(), "stat:0"),
-    )
-    .unwrap();
+    let kept: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(e.0.join(&told)).unwrap()).unwrap();
+    let forge = |edit: &dyn Fn(&mut serde_json::Value), pad: usize| {
+        let mut v = kept.clone();
+        edit(&mut v);
+        std::fs::write(e.0.join(&told), format!("{v}{}", " ".repeat(pad))).unwrap();
+    };
+    let kind = |count: u64, names: Vec<String>| serde_json::json!({"count": count, "names": names});
+    forge(&|v| v["to"] = "stat:0".into(), 0);
     unsaid(&e);
+    // What is shown is bounded whatever the file holds: a record that tells no file, or names
+    // more than it counts, is none; so is a file over 64 KiB; 20 names of each kind are passed
+    // on, each cut to 1,024 bytes.
+    assert_eq!(
+        (&kept["added"]["count"], &kept["removed"]["count"]),
+        (&0.into(), &0.into())
+    );
+    forge(&|v| v["changed"] = kind(0, Vec::new()), 0);
+    unsaid(&e);
+    forge(
+        &|v| v["changed"] = kind(1, vec!["bin/a".into(), "bin/b".into()]),
+        0,
+    );
+    unsaid(&e);
+    forge(&|_| {}, 64 << 10);
+    unsaid(&e);
+    let mut many: Vec<String> = (0..25).map(|i| format!("bin/{i}")).collect();
+    // Cut at the end of a character: the 1,024th byte is inside `é`.
+    many[0] = format!("{}é{}", "a".repeat(1_023), "a".repeat(1_000));
+    forge(&|v| v["changed"] = kind(30, many.clone()), 0);
+    let files = e.changed(KEG).0["files"].clone();
+    assert_eq!(files["changed"], 30);
+    assert_eq!(files["changed_text"].as_array().unwrap().len(), 20);
+    assert_eq!(files["changed_text"][0], "a".repeat(1_023));
+    // A path in that table of another shape than the store writes is no copy: what it names is
+    // not shown, not read as the list before and not removed.
+    let point = |like: &str, path: &Path| {
+        let sql = "UPDATE raw_input SET path = ?1 WHERE input LIKE ?2";
+        let at = path.to_str().unwrap();
+        e.db().execute(sql, [at, like]).unwrap();
+    };
+    let (shown, listed) = (e.0.join("elsewhere.json"), e.0.join("elsewhere.txt"));
+    std::fs::copy(e.0.join(&told), &shown).unwrap();
+    std::fs::write(&listed, "/bin/other\u{0}1.0\n").unwrap();
+    point("changes/%", &shown);
+    unsaid(&e);
+    point("files/%", &listed);
+    e.run();
+    assert!(listed.exists());
+    let changes = || -> PathBuf {
+        let sql = "SELECT path FROM raw_input WHERE input LIKE 'changes/%'";
+        let path: String = e.db().query_row(sql, [], |r| r.get(0)).unwrap();
+        PathBuf::from(path)
+    };
+    assert_eq!(changes(), shown);
+    // A list kept before over its cap, 20,000 lines of 1,100 bytes, is no list: nothing is
+    // compared with it.
+    let over = format!("/{}\u{0}1.0\n", "a".repeat(22_000_001));
+    std::fs::write(list(&e), over).unwrap();
+    e.run();
+    assert_eq!(changes(), shown);
     // A list that is damaged, and one that is gone: what was told of the change before is not
     // told of this one.
     std::fs::write(list(&e), "/bin/tool\u{0}1.0\n").unwrap();
@@ -1452,9 +1509,9 @@ fn a_file_name_with_an_escape_sequence_or_a_line_break_is_shown_as_data_and_brea
         "bin/x\\u{1b}[31mRED\\u{a}evil"
     );
     assert!(!text.contains('\u{1b}'), "{text}");
-    for line in text.lines().filter(|l| l.contains("evil")) {
-        assert!(line.starts_with("    Added "), "{line:?}\n{text}");
-    }
+    let holding: Vec<&str> = text.lines().filter(|l| l.contains("evil")).collect();
+    assert_eq!(holding.len(), 1, "{text}");
+    assert!(holding[0].starts_with("    Added "), "{text}");
 }
 
 #[test]

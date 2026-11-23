@@ -1114,6 +1114,25 @@ pub fn changes_input(subject: &str) -> String {
     format!("changes/{}.json", crate::sha256::hex(subject.as_bytes()))
 }
 
+/// The file of a raw copy of `input` under the store's folder, from its path as `raw_input`
+/// holds it: only of the shape `Run::keep_raw` writes, `raw/<one folder>/<input>`. Another
+/// program can write that table, so a path of any other shape, absolute or with `..`, is none.
+pub fn kept_file(folder: &Path, path: &str, input: &str) -> Option<PathBuf> {
+    let run = path
+        .strip_prefix("raw/")?
+        .strip_suffix(input)?
+        .strip_suffix('/')?;
+    let one = !run.is_empty() && !run.contains('/') && run != "." && run != "..";
+    one.then(|| folder.join(path))
+}
+
+/// The most a list kept before is read: a line for each of `MAX_FILES` files, of a path as long
+/// as macOS allows and its change time. A larger file is no list.
+pub const LIST_CAP: u64 = MAX_FILES as u64 * 1_100;
+/// The most of what changed that is read, and the longest name passed on, in bytes.
+const CHANGES_CAP: u64 = 64 << 10;
+const NAME_CAP: usize = 1_024;
+
 /// How many names of each kind of change are kept, in the list's order; the counts are exact.
 const NAMED: usize = 20;
 
@@ -1207,16 +1226,30 @@ pub fn files_changed(
     let Some((subject, Some(from), Some(to))) = change else {
         return Ok(None);
     };
-    let Some(path) = crate::store::last_raw(conn, READER, &changes_input(&subject))? else {
+    let input = changes_input(&subject);
+    let Some(path) = crate::store::last_raw(conn, READER, &input)? else {
         return Ok(None);
     };
-    // Raw copies are kept in the store's folder, as paths from it.
+    // Raw copies are kept in the store's folder, as paths from it. What is read is bounded,
+    // whatever the file holds.
     let folder = conn.path().map(Path::new).and_then(Path::parent);
     let kept = folder
-        .and_then(|f| std::fs::read(f.join(path)).ok())
+        .and_then(|f| kept_file(f, &path, &input))
+        .and_then(|file| crate::autorun::read_capped_resolved(&file, CHANGES_CAP).ok())
         .and_then(|bytes| serde_json::from_slice::<Changes>(&bytes).ok())
         .filter(|c| c.from == from && c.to == to);
-    let names = |n: &Named| n.names.iter().map(|s| crate::known::whole(s)).collect();
+    let told = |n: &Named| n.count >= n.names.len() as u64;
+    let kept = kept.filter(|c| {
+        let kinds = [&c.added, &c.removed, &c.changed];
+        kinds.iter().any(|n| n.count > 0) && kinds.iter().all(|n| told(n))
+    });
+    let names = |n: &Named| {
+        n.names
+            .iter()
+            .take(NAMED)
+            .map(|s| crate::known::whole(cut(s)))
+            .collect()
+    };
     Ok(kept.map(|c| crate::contract::v1::FilesChanged {
         added: c.added.count,
         removed: c.removed.count,
@@ -1225,6 +1258,15 @@ pub fn files_changed(
         removed_text: names(&c.removed),
         changed_text: names(&c.changed),
     }))
+}
+
+/// A name cut to `NAME_CAP` bytes, at the end of a character.
+fn cut(name: &str) -> &str {
+    let mut end = name.len().min(NAME_CAP);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
 }
 
 /// What the rules are told changed when a fact of an installed thing changed in place.
@@ -1448,7 +1490,31 @@ pub fn message(s: &Summary) -> crate::contract::v1::Integrity {
 
 #[cfg(test)]
 mod tests {
-    use super::{bundle_version, compare};
+    use super::{bundle_version, compare, kept_file};
+    use std::path::Path;
+
+    #[test]
+    fn a_kept_copy_is_a_file_only_at_a_path_of_the_shape_the_store_writes() {
+        // The table of raw copies is data another program can write: a path from it never
+        // reaches a file outside the store's folder of raw copies.
+        let (store, input) = (Path::new("/Users/example/store"), "files/ab.txt");
+        let file = kept_file(store, "raw/1795400000-000000001/files/ab.txt", input);
+        assert_eq!(
+            file,
+            Some(store.join("raw/1795400000-000000001/files/ab.txt"))
+        );
+        for path in [
+            "/Users/example/store/raw/1795400000-000000001/files/ab.txt",
+            "raw/../files/ab.txt",
+            "raw/./files/ab.txt",
+            "raw//files/ab.txt",
+            "raw/1795400000-000000001/../../files/ab.txt",
+            "other/1795400000-000000001/files/ab.txt",
+            "raw/1795400000-000000001/files/cd.txt",
+        ] {
+            assert_eq!(kept_file(store, path, input), None, "{path}");
+        }
+    }
 
     #[test]
     fn lists_that_tell_no_file_apart_are_never_told_as_no_file_changed() {
