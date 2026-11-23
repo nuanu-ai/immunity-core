@@ -79,4 +79,65 @@ else
     fail "$file: the step that saves the cache is not the one scripts/lint.sh holds"
 fi
 
+# No file is longer than one read of a file returns to an agent in the tools this project is
+# built with, so an agent working on a file sees all of it. Counted is every file git holds as
+# text, except Cargo.lock, the code generated from the schema and what lies under a folder
+# holding a NOTICE, which is copied from another project. The files longer than that today are
+# listed; the list only shrinks, and a file on it is split when it is next reworked.
+ceiling=2000
+longer_today='
+src/agent_folders.rs
+src/answers_text.rs
+src/autorun.rs
+src/events.rs
+src/finding_text.rs
+src/findings.rs
+src/lists.rs
+src/lockfiles.rs
+src/main.rs
+src/overview.rs
+src/pages.rs
+src/secrets.rs
+src/sigma.rs
+src/store.rs
+src/view.rs
+src/vulnerabilities.rs
+src/watch.rs
+tests/event_level.rs
+tests/matches.rs
+tests/program_and_machine.rs
+tests/promises.rs
+tests/runs_by_itself.rs
+tests/verdict.rs
+tests/vulnerability_data.rs
+tests/watch.rs
+'
+if held=$(git -c core.quotePath=false ls-files --eol); then
+  counted=$(printf '%s\n' "$held" | /usr/bin/awk -F '\t' '
+    $1 !~ /^i\/-text/ { file[++n] = $2 }
+    $2 ~ /\/NOTICE$/ { copied[substr($2, 1, length($2) - 6)] = 1 }
+    END { for (i = 1; i <= n; i++) { keep = 1; for (d in copied) if (index(file[i], d) == 1) keep = 0
+      if (keep) print file[i] } }')
+  over=
+  while IFS= read -r f; do
+    case $f in Cargo.lock | contract/src/immunity.v1.rs) continue ;; esac
+    lines=$(/usr/bin/wc -l <"$f") || { fail "could not read $f to count its lines"; continue; }
+    [ $((lines)) -le "$ceiling" ] && continue
+    over="$over$f
+"
+    printf '%s\n' "$longer_today" | /usr/bin/grep -qxF -e "$f" ||
+      fail "$f is longer than $ceiling lines, more than one read shows an agent: split it"
+  done <<EOF
+$counted
+EOF
+  while IFS= read -r f; do
+    [ -z "$f" ] || printf '%s' "$over" | /usr/bin/grep -qxF -e "$f" || fail "$f is on the list" \
+      "of files longer than $ceiling lines in scripts/lint.sh but is not, or is gone: take it off"
+  done <<EOF
+$longer_today
+EOF
+else
+  fail "could not list the files git holds, whose length is checked"
+fi
+
 exit "$failed"

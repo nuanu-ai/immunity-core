@@ -52,11 +52,44 @@ impl Tools {
             "scripts/event-level/install",
             "Cargo.toml",
             ".github/workflows/check.yml",
-        ] {
+            "contract/src/immunity.v1.rs",
+        ]
+        .into_iter()
+        .chain(longer_today().iter().map(String::as_str))
+        {
             let destination = self.0.join(rel);
             std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
             std::fs::copy(Path::new(ROOT).join(rel), destination).unwrap();
         }
+        // The lint counts the lines of what git holds.
+        self.git(&["init", "-q"]);
+        self.git(&["add", "-A"]);
+    }
+
+    fn git(&self, args: &[&str]) {
+        let out = Command::new("/usr/bin/git")
+            .args(args)
+            .current_dir(&self.0)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+    }
+
+    /// Writes a file of `lines` lines and has git hold it.
+    fn lines(&self, rel: &str, lines: usize) {
+        let path = self.0.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "line\n".repeat(lines)).unwrap();
+        self.git(&["add", rel]);
+    }
+
+    /// scripts/lint.sh run on its own: whether it passed, and what it said.
+    fn lint(&self) -> (bool, String) {
+        let out = self.run("scripts/lint.sh", &[]);
+        (
+            out.status.success(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
     }
 
     fn run(&self, script: &str, args: &[&str]) -> std::process::Output {
@@ -92,6 +125,14 @@ impl Tools {
             String::from_utf8_lossy(&out.stderr).into_owned(),
         )
     }
+}
+
+/// The files scripts/lint.sh lists as longer than its ceiling today.
+fn longer_today() -> Vec<String> {
+    let lint = std::fs::read_to_string(Path::new(ROOT).join("scripts/lint.sh")).unwrap();
+    let list = lint.split_once("longer_today='\n").unwrap().1;
+    let list = list.split_once('\'').unwrap().0;
+    list.lines().map(str::to_string).collect()
 }
 
 impl Drop for Tools {
@@ -181,6 +222,58 @@ fn the_core_build_and_checks_use_cargos_external_artifact() {
         "case \"$1\" in --version) echo 'cargo 1.89.0' ;; esac",
     );
     assert_eq!(t.run("build", &[]).status.code(), Some(2));
+}
+
+#[test]
+fn a_new_file_longer_than_one_read_of_an_agent_fails_the_lint_unless_copied_or_generated() {
+    let t = Tools::new("ceiling-new");
+    t.checkout();
+    assert_eq!(t.lint(), (true, String::new()));
+    // Copied data under a folder with a NOTICE, the lockfile and a binary file are not counted.
+    t.lines("tests/copied/data.json", 2001);
+    t.lines("tests/copied/NOTICE", 1);
+    t.lines("Cargo.lock", 2001);
+    std::fs::write(t.0.join("tests/picture.bin"), b"\0\n".repeat(2001)).unwrap();
+    t.git(&["add", "tests/picture.bin"]);
+    assert_eq!(t.lint(), (true, String::new()));
+
+    t.lines("src/at ceiling.rs", 2000);
+    assert_eq!(t.lint(), (true, String::new()));
+    t.lines("src/long one.rs", 2001);
+    let (passed, said) = t.lint();
+    assert!(!passed);
+    assert!(
+        said.contains("src/long one.rs is longer than 2000 lines"),
+        "{said}"
+    );
+}
+
+#[test]
+fn a_listed_file_no_longer_over_the_ceiling_fails_the_lint_until_taken_off_the_list() {
+    let t = Tools::new("ceiling-list");
+    t.checkout();
+    let listed = &longer_today()[0];
+    t.lines(listed, 2000);
+    let (passed, said) = t.lint();
+    assert!(!passed);
+    assert!(
+        said.contains(&format!("{listed} is on the list")) && said.contains("take it off"),
+        "{said}"
+    );
+
+    // What cannot be read fails, and is not taken for short.
+    std::fs::remove_file(t.0.join(listed)).unwrap();
+    let (passed, said) = t.lint();
+    assert!(
+        !passed && said.contains(&format!("could not read {listed}")),
+        "{said}"
+    );
+    common::remove(&t.0.join(".git"));
+    let (passed, said) = t.lint();
+    assert!(
+        !passed && said.contains("could not list the files git holds"),
+        "{said}"
+    );
 }
 
 #[test]
