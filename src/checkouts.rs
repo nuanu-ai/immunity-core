@@ -33,6 +33,10 @@ pub const MOVED: &str = "is no longer a folder there, as when a link to a folder
 /// How the reading says which folders the walk did not go down into because they are on another
 /// file system than its root; they follow, named as checkouts are.
 pub const ANOTHER_FILE_SYSTEM: &str = "on another file system, not walked: ";
+/// How the reading says which checkouts the store holds have a link on their path (`Linked`);
+/// they follow, named as checkouts are.
+pub const UNDER_LINK: &str =
+    "known checkouts with a link on their path, not followed, kept as they were: ";
 
 /// The device of the file system `path` is on: of what it leads to when `follow`, as the
 /// walk's root is taken, since a home folder may be reached through a link; of `path` itself
@@ -106,9 +110,10 @@ pub fn start(given: Option<&Path>, home: &Path) -> Start {
 /// as the walk goes, down real folders from `root`, taken as given, following no link and
 /// looking up nothing past one. First, as written, it may be in a folder macOS asks
 /// permission for under `home` that the walk was not given. Then, one part at a time, it is
-/// gone where a part is missing or a part above it is no longer a folder, a link included,
-/// since that path is no longer there; something other than a folder at its own place is it
-/// in another form, kept. `None` when every part is a folder.
+/// gone where a part is missing or a part above it is neither a folder nor a link, since that
+/// path cannot hold it. A link above it is not followed, so the checkout was not looked at
+/// (`Linked`); something other than a folder at its own place is it in another form, kept.
+/// `None` when every part is a folder.
 fn look(root: &Path, under: &Path, home: &Path) -> Option<Again> {
     if let Some(g) = guarded::folder_of(&root.join(under), home)
         && !root.starts_with(&g)
@@ -122,6 +127,7 @@ fn look(root: &Path, under: &Path, home: &Path) -> Option<Again> {
         match std::fs::symlink_metadata(&at) {
             Ok(m) if m.is_dir() => {}
             Ok(_) if parts.peek().is_none() => return Some(Again::Kept),
+            Ok(m) if m.is_symlink() => return Some(Again::Linked),
             Ok(_) => return Some(Again::Gone),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Again::Gone),
             Err(_) => return Some(Again::NotTold),
@@ -210,6 +216,9 @@ pub enum Again {
     Kept,
     /// The disk could not say.
     NotTold,
+    /// A folder above it is now a link, which the walk does not follow: it was not looked at,
+    /// and what was known of it is kept.
+    Linked,
     /// It is in this folder macOS asks permission for, which was not entered.
     Guarded(PathBuf),
 }
