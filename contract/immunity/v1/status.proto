@@ -1,7 +1,7 @@
 // What the last finished check left, read from the store alone: the answer to `immunity status`,
-// and to `immunity run` once its check finished. Version 1 of the contract between the core and a
-// program that runs it. How a message is printed and read, and the conventions for text,
-// references, times and changes, are in `common.proto`.
+// and to `immunity run` once its check finished; and `Sample`, the answer to `immunity sample`.
+// Version 1 of the contract between the core and a program that runs it. How a message is printed
+// and read, and the conventions for text, references, times and changes, are in `common.proto`.
 //
 // The status is what the app and the person's agent read to decide whether this Mac is in order,
 // so nothing in it reads as calm that the core has not established:
@@ -352,7 +352,8 @@ message EventLevel {
   // Why the core's reading failed, with the secrets the core recognises cut out, each a mark as in
   // `ProgramStart.args_text`.
   optional string reason_text = 15;
-  // After how many seconds without a line the level is `silent`.
+  // After how many seconds of time the Mac was awake without a line the level is `silent`. Time
+  // the Mac was asleep or off is not counted.
   uint64 silent_after_seconds = 16;
   // What the level cannot see on this Mac, in the core's words.
   repeated string cannot_see = 17;

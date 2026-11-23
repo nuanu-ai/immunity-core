@@ -20,6 +20,6 @@ Anything in this repository: the `immunity` program and the collector scripts in
 - Immunity Core sends something about the Mac over the network, or makes a request that depends on what is on it.
 - A finding is closed or hidden without the answer being recorded and shown in the app.
 
-Some limits are known and documented in the README, such as answers not being signed, the collector's log holding command lines with any secret in them for a day, the forms of secret Immunity Core does not recognise, and `eslogger` not being a stable interface. A report that shows one of them is worse than documented is welcome.
+Some limits are known and documented: answers are not signed ([AGENTS.md](AGENTS.md#agent-first)), the collector's log holds command lines with any secret in them for a day ([docs/event-level.md](docs/event-level.md#who-can-read-the-log)), some forms of secret are not recognised ([docs/reference.md](docs/reference.md#secrets-in-what-immunity-core-keeps-and-prints)), and `eslogger` is not a stable interface (the README). A report that shows one of them is worse than documented is welcome.
 
 A problem in a SigmaHQ rule itself, such as a rule that misses a technique or matches too much, belongs upstream at https://github.com/SigmaHQ/sigma. Immunity Core ships those rules unchanged.

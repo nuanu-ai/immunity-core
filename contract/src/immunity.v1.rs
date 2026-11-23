@@ -1455,7 +1455,8 @@ pub enum CollectorState {
     /// Its scripts print errors.
     #[serde(rename = "failing")]
     Failing = 4,
-    /// Nothing was written for 15 minutes.
+    /// Nothing was written while the Mac was awake for 15 minutes. Time the Mac was asleep or off
+    /// is not counted.
     #[serde(rename = "silent")]
     Silent = 5,
     /// The core's reading failed. Only `status_state` holds this: an answer whose reading fails
@@ -3320,7 +3321,8 @@ pub struct EventLevel {
     /// `ProgramStart.args_text`.
     #[prost(string, optional, tag = "15")]
     pub reason_text: ::core::option::Option<::prost::alloc::string::String>,
-    /// After how many seconds without a line the level is `silent`.
+    /// After how many seconds of time the Mac was awake without a line the level is `silent`. Time
+    /// the Mac was asleep or off is not counted.
     #[prost(uint64, tag = "16")]
     pub silent_after_seconds: u64,
     /// What the level cannot see on this Mac, in the core's words.

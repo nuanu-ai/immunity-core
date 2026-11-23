@@ -245,7 +245,8 @@ enum CollectorState {
   COLLECTOR_STATE_REFUSED = 3;
   // Its scripts print errors.
   COLLECTOR_STATE_FAILING = 4;
-  // Nothing was written for 15 minutes.
+  // Nothing was written while the Mac was awake for 15 minutes. Time the Mac was asleep or off
+  // is not counted.
   COLLECTOR_STATE_SILENT = 5;
   // The core's reading failed. Only `status_state` holds this: an answer whose reading fails
   // is not given.
