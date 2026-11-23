@@ -1307,6 +1307,23 @@ fn a_log_file_is_kept_one_day_and_what_the_root_side_prints_stays_small() {
 }
 
 #[test]
+fn the_file_being_written_is_never_deleted_by_age_after_a_mac_slept_for_more_than_a_day() {
+    // Asleep for more than a day, the file being written was last written more than a day ago.
+    // Deleted, the writer would write on into a file with no name and its lines would be lost.
+    let dir = Dir::new("slept");
+    let log = dir.0.join("log");
+    std::fs::create_dir_all(&log).unwrap();
+    let from = now_secs();
+    // Over the cap by itself, it stays then too.
+    aged(&log, "exec-20261002T01.jsonl", 10, 30);
+    aged(&log, "exec-20261002T02.jsonl", 3 * GIB, 26);
+    let out = tidy(&log, &(2 * GIB).to_string());
+    assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
+    assert_eq!(files(&log), ["exec-20261002T02.jsonl", "removed"]);
+    assert_eq!(notes(&log, from), ["exec-20261002T01.jsonl 10 age"]);
+}
+
+#[test]
 fn over_the_cap_the_files_written_longest_ago_go_first_and_never_the_one_being_written() {
     // A Mac building at a hundred starts a second writes more in a day than the cap allows:
     // the files written longest ago are deleted first, each noted with `cap`, and the one

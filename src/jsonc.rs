@@ -1,8 +1,8 @@
 //! JSON with comments, as editors and some coding agents read their settings, read with the
 //! `jsonc-parser` crate (dprint). Its tree keeps every property of an object in order, so two
-//! equal keys are both seen: what a reader that keeps the last sees is the value here, and
-//! where an earlier equal key held something else is said apart, as a doubt. Nothing is
-//! stripped by hand.
+//! equal keys are both seen: what a reader that keeps the last sees is the value here, what one
+//! that keeps the first sees is beside it, and where an earlier equal key held something else
+//! is said apart, as a doubt. Nothing is stripped by hand.
 //!
 //! Only comments and, where the tool takes them, trailing commas are allowed: every other
 //! extension the crate offers (single quotes, unquoted keys, hexadecimal and other loose
@@ -19,6 +19,8 @@ use serde_json::Value;
 pub struct Read {
     /// `None` for a file of comments only, or empty.
     pub value: Option<Value>,
+    /// What a reader that keeps the first of two equal keys sees.
+    pub first: Option<Value>,
     /// JSON pointers where an earlier equal key held another value than the last.
     pub doubts: Vec<String>,
 }
@@ -42,11 +44,18 @@ pub fn read(bytes: &[u8], commas: bool) -> Result<Read, String> {
     let parsed = jsonc_parser::parse_to_ast(text, &CollectOptions::default(), &options)
         .map_err(|e| e.to_string())?;
     let mut doubts = Vec::new();
-    let value = match parsed.value {
-        Some(v) => Some(convert(&v, "", &mut doubts)?),
-        None => None,
+    let (value, first) = match parsed.value {
+        Some(v) => (
+            Some(convert(&v, "", false, &mut doubts)?),
+            Some(convert(&v, "", true, &mut Vec::new())?),
+        ),
+        None => (None, None),
     };
-    Ok(Read { value, doubts })
+    Ok(Read {
+        value,
+        first,
+        doubts,
+    })
 }
 
 /// Where strict JSON gives a key twice in one object, at any depth of objects, as a JSON
@@ -90,7 +99,14 @@ pub fn twice(bytes: &[u8]) -> Result<Option<String>, String> {
     Ok(parsed.value.as_ref().and_then(|v| first(v, "")))
 }
 
-fn convert(v: &ast::Value, at: &str, doubts: &mut Vec<String>) -> Result<Value, String> {
+/// The value as a reader that keeps the last of two equal keys sees it, or the first when
+/// `first`.
+fn convert(
+    v: &ast::Value,
+    at: &str,
+    first: bool,
+    doubts: &mut Vec<String>,
+) -> Result<Value, String> {
     Ok(match v {
         ast::Value::StringLit(s) => Value::String(s.value.to_string()),
         ast::Value::NumberLit(n) => serde_json::from_str(n.value)
@@ -101,15 +117,18 @@ fn convert(v: &ast::Value, at: &str, doubts: &mut Vec<String>) -> Result<Value, 
             a.elements
                 .iter()
                 .enumerate()
-                .map(|(i, e)| convert(e, &format!("{at}/{i}"), doubts))
+                .map(|(i, e)| convert(e, &format!("{at}/{i}"), first, doubts))
                 .collect::<Result<_, _>>()?,
         ),
         ast::Value::Object(o) => {
             let mut map = serde_json::Map::new();
             for p in &o.properties {
                 let name = p.name.as_str().to_string();
+                if first && map.contains_key(&name) {
+                    continue;
+                }
                 let here = format!("{at}/{}", name.replace('~', "~0").replace('/', "~1"));
-                let value = convert(&p.value, &here, doubts)?;
+                let value = convert(&p.value, &here, first, doubts)?;
                 if let Some(before) = map.insert(name, value.clone())
                     && before != value
                     && !doubts.contains(&here)

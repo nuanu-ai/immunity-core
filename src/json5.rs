@@ -36,8 +36,6 @@ unsafe extern "C" {
     fn CFStringGetCString(s: CFTypeRef, buffer: *mut c_char, size: CFIndex, encoding: u32) -> u8;
     fn CFErrorCopyUserInfo(error: CFTypeRef) -> CFTypeRef;
     fn CFDictionaryGetValue(dict: CFTypeRef, key: CFTypeRef) -> CFTypeRef;
-    fn CFDataGetLength(data: CFTypeRef) -> CFIndex;
-    fn CFDataGetBytePtr(data: CFTypeRef) -> *const u8;
 }
 
 #[link(name = "Foundation", kind = "framework")]
@@ -122,8 +120,7 @@ pub fn first_of_equal_keys(bytes: &[u8]) -> Result<Vec<u8>, String> {
             if data.is_null() {
                 return Err(describe(error));
             }
-            let len = CFDataGetLength(data) as usize;
-            Ok(std::slice::from_raw_parts(CFDataGetBytePtr(data), len).to_vec())
+            Ok(crate::codesign::data_bytes(data))
         }
     })
 }

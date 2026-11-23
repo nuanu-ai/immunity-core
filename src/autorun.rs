@@ -1544,7 +1544,7 @@ pub fn select(bytes: &[u8], format: Format, keys: &[&str]) -> Selected {
     if format != Strict {
         return match crate::jsonc::read(bytes, format == CommentsAndCommas) {
             Err(e) => Selected::Whole(format!("not JSON with comments as its tool reads it: {e}")),
-            Ok(r) => pick(r.value.as_ref(), keys, |pointer| {
+            Ok(r) => pick(r.value.as_ref(), r.first.as_ref(), keys, |pointer| {
                 r.doubts.iter().any(|d| related(d, pointer))
             }),
         };
@@ -1553,13 +1553,6 @@ pub fn select(bytes: &[u8], format: Format, keys: &[&str]) -> Selected {
         Ok(v) => v,
         Err(e) => return Selected::Whole(format!("not strict JSON: {e}")),
     };
-    let mut pointers = Vec::new();
-    for key in keys {
-        expand(&last, key, String::new(), &mut pointers);
-    }
-    if pointers.is_empty() {
-        return Selected::Values(Vec::new());
-    }
     let first: Value = match crate::json5::first_of_equal_keys(bytes)
         .map_err(|e| e.to_string())
         .and_then(|b| serde_json::from_slice(&b).map_err(|e| e.to_string()))
@@ -1567,20 +1560,28 @@ pub fn select(bytes: &[u8], format: Format, keys: &[&str]) -> Selected {
         Ok(v) => v,
         Err(why) => return Selected::Whole(format!("not read alike by a second reader: {why}")),
     };
-    pick(Some(&last), keys, |pointer| {
+    pick(Some(&last), Some(&first), keys, |pointer| {
         last.pointer(pointer) != first.pointer(pointer)
     })
 }
 
-/// The parts at `keys` of a value, unless `doubt` says of one that a tool could read it
-/// otherwise.
-fn pick(v: Option<&Value>, keys: &[&str], doubt: impl Fn(&str) -> bool) -> Selected {
-    let Some(v) = v else {
+/// The parts at `keys` of the value a reader that keeps the last of two equal keys sees,
+/// unless `doubt` says of one that a tool could read it otherwise. The keys are looked for in
+/// what a reader that keeps the first sees too, so a part only it holds is asked as well.
+fn pick(
+    last: Option<&Value>,
+    first: Option<&Value>,
+    keys: &[&str],
+    doubt: impl Fn(&str) -> bool,
+) -> Selected {
+    let Some(v) = last else {
         return Selected::Values(Vec::new());
     };
     let mut pointers = Vec::new();
-    for key in keys {
-        expand(v, key, String::new(), &mut pointers);
+    for seen in [Some(v), first].into_iter().flatten() {
+        for key in keys {
+            expand(seen, key, String::new(), &mut pointers);
+        }
     }
     let mut out = Vec::new();
     for pointer in pointers {
@@ -1680,13 +1681,15 @@ fn read_capped_with(path: &Path, cap: u64, flags: libc::c_int) -> Result<Vec<u8>
 ///
 /// For the task file: the editor runs a task whose `runOptions.runOn` is `folderOpen`, at the
 /// task or under a platform's own settings. Of two equal keys the editor keeps the last; where
-/// an earlier equal `runOn` said something else, the file is taken as holding such a task, so
-/// that it errs only toward watching.
+/// an earlier equal `runOn` said something else, or a reader that keeps the first of two equal
+/// keys finds such a task, the file is taken as holding one, so that it errs only toward
+/// watching.
 pub fn whole_when(bytes: &[u8], format: Format, key: &str, holds: &str) -> Result<bool, String> {
     let text = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
     let r = crate::jsonc::read(text, format == CommentsAndCommas)?;
     let doubt = r.doubts.iter().any(|d| d.rsplit('/').next() == Some(key));
-    Ok(doubt || r.value.as_ref().is_some_and(|v| anywhere(v, key, holds)))
+    let seen = [r.value.as_ref(), r.first.as_ref()];
+    Ok(doubt || seen.into_iter().flatten().any(|v| anywhere(v, key, holds)))
 }
 
 fn anywhere(v: &Value, key: &str, holds: &str) -> bool {
@@ -2111,6 +2114,14 @@ mod tests {
     }
 
     #[test]
+    fn a_task_that_runs_on_open_only_in_the_first_of_two_equal_keys_is_still_found() {
+        // The false calm: an editor that keeps the first of two equal keys runs the task, and
+        // the later `runOptions` holds no `runOn` for a doubt at that key to be named by.
+        let file = br#"{"tasks": [{"runOptions": {"runOn": "folderOpen"}, "runOptions": {}}]}"#;
+        assert_eq!(runs_on_open(file), Ok(true));
+    }
+
+    #[test]
     fn a_file_that_cannot_be_read_is_an_error_and_one_of_comments_only_holds_no_task() {
         assert!(runs_on_open(b"{\"tasks\": [ {\"label\": } ]}").is_err());
         assert!(runs_on_open(b"{} {}").is_err());
@@ -2246,6 +2257,34 @@ mod tests {
             select(elsewhere, CommentsAndCommas, keys),
             Selected::Values(vec![("/servers/a".to_string(), hash("{}"), false)])
         );
+    }
+
+    #[test]
+    fn a_selected_key_only_one_of_two_equal_keys_holds_is_read_whole_whichever_one_holds_it() {
+        // The false calm: a tool that keeps the first of two equal keys runs a script that a
+        // reader keeping the last never sees, so the file must not read as holding no entry.
+        let keys = &["/scripts/postinstall", "/servers/*"];
+        for format in [Strict, CommentsAndCommas] {
+            for file in [
+                &br#"{"scripts": {"postinstall": "x"}, "scripts": {}}"#[..],
+                br#"{"scripts": {}, "scripts": {"postinstall": "x"}}"#,
+                br#"{"servers": {"a": {}}, "servers": {}}"#,
+            ] {
+                assert_eq!(
+                    select(file, format, keys),
+                    Selected::Whole(EQUAL_KEYS.to_string()),
+                    "{format:?} {}",
+                    String::from_utf8_lossy(file)
+                );
+            }
+            // No selected key in either reading: no entry, equal keys or not.
+            for file in [
+                &br#"{"scripts": {"test": "x"}}"#[..],
+                br#"{"name": "a", "name": "b", "scripts": {}}"#,
+            ] {
+                assert_eq!(select(file, format, keys), Selected::Values(vec![]));
+            }
+        }
     }
 
     #[test]
