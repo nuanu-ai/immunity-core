@@ -348,7 +348,7 @@ fn facts_carry_their_basis_and_reader_and_coverage_that_is_not_full_is_in_the_an
     let h = Home::new("basis");
     h.checkout("dev/shop");
     h.put("dev/shop/package-lock.json", &package_lock("left-pad"));
-    h.put("dev/shop/web/yarn.lock", "# yarn lockfile v1\n");
+    h.put("dev/shop/web/yarn.lock", "# yarn lockfile v2\n");
     h.run(&[]);
     let k = h.known("~/dev/shop");
     let component = "component:checkout:machine:mac/dev/shop/npm/left-pad";
@@ -380,7 +380,7 @@ fn facts_carry_their_basis_and_reader_and_coverage_that_is_not_full_is_in_the_an
         lockfiles
             .lacks
             .iter()
-            .any(|l| l.name_text.as_deref() == Some("yarn.lock version 1")),
+            .any(|l| l.name_text.as_deref() == Some("yarn.lock version 2")),
         "{:?}",
         lockfiles.lacks
     );
@@ -492,7 +492,7 @@ fn the_binary_answer_and_the_json_answer_are_one_message() {
     let h = Home::new("forms");
     h.checkout("dev/shop");
     h.put("dev/shop/package-lock.json", &package_lock("left-pad"));
-    h.put("dev/shop/web/yarn.lock", "# yarn lockfile v1\n");
+    h.put("dev/shop/web/yarn.lock", "# yarn lockfile v2\n");
     h.run(&[]);
     for what in ["~/dev/shop", "~/dev/ghost"] {
         let binary = h.known(what);
