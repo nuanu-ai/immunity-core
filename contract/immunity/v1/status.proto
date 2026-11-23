@@ -13,7 +13,7 @@
 //   it, in `not_covered`, and is never counted in it.
 //
 // Values that will be added. A reader meets values of `ThisMacState`, `FeedOutcome`, `Judged`,
-// `NotWatchingReason` and `ReadingClass`, and those the other files name, that it does not know:
+// `NotWatchingReason`, `ReadingClass` and `CheckStage`, and those the other files name, that it does not know:
 // the core adds them within version 1. It treats one it does not know as each enum's comment
 // says.
 
@@ -119,6 +119,34 @@ message Status {
   // says how Immunity Core went off: false, by `immunity off`; true, by something else, since the job
   // `immunity on` loaded is gone. Since 1.20.0.
   optional bool turned_on_latest = 32;
+  // The stage the full check that runs now is in, as the check noted it, and when that stage
+  // began. Present only while `running` is true and the stage could be read; absent otherwise,
+  // never a guess. A stage never says that a check ran or finished: `running`, `last_run` and
+  // `last_finished_run` say that. Since 1.24.0.
+  optional CheckStage check_stage = 33;
+  optional int64 check_stage_started_at = 34;
+}
+
+// The stage of a full check, in the order a check goes through them. `UNSPECIFIED`, or a value
+// the reader does not know, is read as a stage it cannot name, of a check that is still running.
+enum CheckStage {
+  CHECK_STAGE_UNSPECIFIED = 0;
+  // Downloading the vulnerability data and the catalogue of exploited vulnerabilities.
+  CHECK_STAGE_DOWNLOADING = 1;
+  // Reading Homebrew's packages and what a sweep of the servers left.
+  CHECK_STAGE_PACKAGES = 2;
+  // Looking for projects: checkouts, and the folders agents worked in.
+  CHECK_STAGE_PROJECTS = 3;
+  // Reading the projects' lockfiles.
+  CHECK_STAGE_LOCKFILES = 4;
+  // Reading the watched places and what runs by itself.
+  CHECK_STAGE_PLACES = 5;
+  // Looking for software changed in place, and matching the list of indicators.
+  CHECK_STAGE_SOFTWARE = 6;
+  // Reading the events and the local traces of servers.
+  CHECK_STAGE_EVENTS = 7;
+  // Matching packages to the vulnerability data, counting and saving what the check read.
+  CHECK_STAGE_SAVING = 8;
 }
 
 // The store's file.

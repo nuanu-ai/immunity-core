@@ -86,6 +86,7 @@ mod worktrees;
 mod common;
 
 use baseline::{Unit, Verdict};
+use contract::v1::CheckStage;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -1261,7 +1262,17 @@ fn status_read(store: &Path, now: i64) -> Result<(status::State, contract::v1::S
         Some(l) => osv::check_in_progress(&home(store), &l.id).map_err(|e| Stop::of(&e))?,
         None => false,
     };
-    let m = status::message(Some(&tx), Some(&st), running, &path, now)?;
+    let mut m = status::message(Some(&tx), Some(&st), running, &path, now)?;
+    // The stage is read only of the check its lock says runs, and changes nothing else.
+    if let Some((stage, at)) = st
+        .last
+        .as_ref()
+        .filter(|_| running)
+        .and_then(|l| osv::check_stage(&home(store), &l.id))
+    {
+        m.check_stage = Some(stage as i32);
+        m.check_stage_started_at = Some(at);
+    }
     Ok((st, m))
 }
 
@@ -2430,7 +2441,8 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     let _fetching = osv::lock_fetch(&home)
         .map_err(|e| format!("cannot write in the store's folder {}: {e}", home.display()))?
         .ok_or(Stop::RunInProgress)?;
-    let _check = osv::lock_check(&home, &run_id)?;
+    let mut check = osv::lock_check(&home, &run_id)?;
+    let mut stage = |s| check.stage(s, now_secs());
     // The check has started, downloads and all: its start is written now, under the run lock
     // for that write alone, so that a status says from the first minute when it started.
     {
@@ -2438,6 +2450,7 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
         let conn = store::open_or_make(&args.store).map_err(Stop::from)?;
         store::journal_note(&conn, at, &run_id, "run_started", "")?;
     }
+    stage(CheckStage::Downloading);
     let feeds = get_feeds(read_only.as_ref(), args, &home, at)?;
     let catalogue = get_catalogue(read_only.as_ref(), args)?;
     drop(read_only);
@@ -2458,9 +2471,11 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
         notes: Vec::new(),
         readers: 0,
     };
+    stage(CheckStage::Packages);
     read_brew(&mut run, args)?;
     let servers = args.servers_input.clone();
     read_servers(&mut run, servers.as_deref())?;
+    stage(CheckStage::Projects);
     let (walked, walk_failure) = read_checkouts(&mut run, args)?;
     let from_agents = read_agent_folders(&mut run, args, agent_folders::LOOK_LIMIT)?;
     let any_checkouts = walked.is_some() || !from_agents.is_empty();
@@ -2468,9 +2483,11 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     let mut found = walked.unwrap_or_default();
     let known: BTreeSet<String> = found.iter().map(|c| c.rel.clone()).collect();
     found.extend(from_agents.into_iter().filter(|c| !known.contains(&c.rel)));
+    stage(CheckStage::Lockfiles);
     if any_checkouts {
         read_lockfiles(&mut run, args, &found)?;
     }
+    stage(CheckStage::Places);
     let (watched, mut opened) = watch_places(&mut run, args, &found, None, walk_failure)?;
     // What was set aside as no longer read, by this run or by a watcher since the last run's
     // line, is said once, here: a watcher's own line is not where a person is told.
@@ -2483,11 +2500,14 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
         ));
     }
     read_other_autoruns(&mut run, &args.home, &found, walk_failure)?;
+    stage(CheckStage::Software);
     let mut changed = read_integrity(&mut run, args)?;
     changed.extend(read_indicators(&mut run, args, &found, walk_failure)?);
     opened += findings::detect(run.tx, run.run_id, run.at, &changed)?;
+    stage(CheckStage::Events);
     opened += read_events(&mut run, args)?;
     read_traces(&mut run, args)?;
+    stage(CheckStage::Saving);
     resolve(&mut run)?;
     read_threats(&run, catalogue)?;
     read_feeds(&run, feeds)?;
