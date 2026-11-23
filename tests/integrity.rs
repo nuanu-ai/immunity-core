@@ -15,6 +15,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const BUNDLE: &str = "component:machine:mac/macos-app/org.example.tiny";
 const KEG: &str = "file:machine:mac//opt/homebrew/Cellar/tool/1.0";
 const PACKAGE: &str = "component:machine:mac/npm/tool";
+const APP_CODE: &str = "file:machine:mac/Library/Application Support/Tiny";
 
 /// The estate's folder, and the store when it is kept somewhere else than in it.
 struct Estate(PathBuf, Option<PathBuf>);
@@ -171,6 +172,29 @@ impl Estate {
             .collect()
     }
 
+    /// The open finding about `about`: its `changed_in_place` evidence, and its text for a person.
+    fn changed(&self, about: &str) -> (serde_json::Value, String) {
+        let list = self.contract(&["findings"]);
+        let id = list["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|f| f["finding"]["about_text"] == about && f["finding"]["state"] == "open")
+            .unwrap_or_else(|| panic!("no finding about {about}: {list}"))["finding"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let out = Command::new(env!("CARGO_BIN_EXE_immunity"))
+            .args(["finding", &id, "--store"])
+            .arg(self.store())
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let one = self.contract(&["finding", &id]);
+        let evidence = one["evidence"]["changed_in_place"].clone();
+        (evidence, String::from_utf8(out.stdout).unwrap())
+    }
+
     /// The `integrity` section of `immunity status --json`.
     fn status(&self) -> serde_json::Value {
         let out = Command::new(env!("CARGO_BIN_EXE_immunity"))
@@ -290,6 +314,19 @@ fn code_appended_inside_a_signed_bundle_at_the_same_version_is_one_changed_event
             "does not verify: a sealed resource is missing or invalid".to_string()
         )]
     );
+    // A bundle's evidence is its seal: no list of its files is kept, and none is told.
+    let (evidence, text) = e.changed(BUNDLE);
+    assert!(evidence["files"].is_null(), "{evidence}");
+    assert!(text.contains("Became"), "{text}");
+    let lists: i64 = e
+        .db()
+        .query_row(
+            "SELECT COUNT(*) FROM raw_input WHERE input LIKE 'files/%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(lists, 0);
 }
 
 #[test]
@@ -1271,4 +1308,151 @@ fn package_managers_this_version_does_not_read_are_named_by_kind_as_a_limit_and_
         )
         .unwrap();
     assert_eq!(folders, "none|not looked into: ~/Documents");
+}
+
+#[test]
+fn files_added_removed_and_rewritten_in_code_outside_a_bundle_a_keg_or_a_package_are_told_by_name_and_count()
+ {
+    // The digest says only that a thing changed; the list it is made over says which files did.
+    let e = Estate::new("files");
+    bundle(&e.app(), "1.0");
+    package(&e.package(), "1.0.0");
+    let dirs = [
+        e.home().join("Library/Application Support/Tiny"),
+        e.keg(),
+        e.package(),
+    ];
+    for dir in &dirs {
+        put(&dir.join("1.0/old.js"), "a\n");
+        put(&dir.join("1.0/main.js"), "a\n");
+    }
+    e.run();
+    for dir in &dirs {
+        std::fs::remove_file(dir.join("1.0/old.js")).unwrap();
+        put(&dir.join("2.0/new.js"), "b\n");
+        append(&dir.join("1.0/main.js"), "steal();\n");
+    }
+    e.run();
+    for about in [APP_CODE, KEG, PACKAGE] {
+        let (evidence, text) = e.changed(about);
+        assert_eq!(
+            evidence["files"],
+            serde_json::json!({
+                "added": 1, "removed": 1, "changed": 1,
+                "added_text": ["2.0/new.js"],
+                "removed_text": ["1.0/old.js"],
+                "changed_text": ["1.0/main.js"],
+            }),
+            "{about}"
+        );
+        for line in [
+            "    Files        changed while the version stayed the same, since the reading before: 1 added, 1 removed, 1 changed",
+            "    Added        2.0/new.js",
+            "    Removed      1.0/old.js",
+            "    Changed      1.0/main.js",
+        ] {
+            assert!(text.lines().any(|l| l == line), "{line}\n{text}");
+        }
+        assert!(!text.contains("more"), "{text}");
+    }
+}
+
+#[test]
+fn more_than_twenty_files_of_a_kind_are_counted_exactly_and_twenty_are_named_in_order() {
+    let e = Estate::new("many");
+    put(&e.keg().join("bin/tool"), "a\n");
+    e.run();
+    for i in 0..25 {
+        put(&e.keg().join(format!("lib/{i:02}.rb")), "a\n");
+    }
+    e.run();
+    let (evidence, text) = e.changed(KEG);
+    assert_eq!(evidence["files"]["added"], 25);
+    let named: Vec<String> = (0..20).map(|i| format!("lib/{i:02}.rb")).collect();
+    assert_eq!(evidence["files"]["added_text"], serde_json::json!(named));
+    assert!(text.lines().any(|l| l.trim() == "… 5 more"), "{text}");
+    let labelled = text.lines().filter(|l| l.trim_start().starts_with("Added"));
+    assert_eq!(labelled.count(), 1, "{text}");
+}
+
+#[test]
+fn without_a_list_from_the_reading_before_or_with_one_gone_or_damaged_nothing_is_said_of_files() {
+    let e = Estate::new("unlisted");
+    let tool = e.keg().join("bin/tool");
+    put(&tool, "a\n");
+    e.run();
+    // A store as the build before left it: the same format and readings, and no list.
+    e.db()
+        .execute("DELETE FROM raw_input WHERE input LIKE 'files/%'", [])
+        .unwrap();
+    // Raised by the digest as before, saying nothing of files, and never a zero.
+    let unsaid = |e: &Estate| {
+        let (evidence, text) = e.changed(KEG);
+        assert!(evidence["files"].is_null(), "{evidence}");
+        assert!(text.contains("which file changed is not shown"), "{text}");
+        assert!(!text.contains("0 added"), "{text}");
+    };
+    append(&tool, "b\n");
+    e.run();
+    unsaid(&e);
+    // The list that reading kept tells the next change.
+    append(&tool, "c\n");
+    e.run();
+    assert_eq!(e.changed(KEG).0["files"]["changed_text"][0], "bin/tool");
+    let list = |e: &Estate| -> PathBuf {
+        let path: String = e
+            .db()
+            .query_row(
+                "SELECT path FROM raw_input WHERE input LIKE 'files/%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        e.0.join(path)
+    };
+    // What was told of a change is told only of that change.
+    let told: String = e
+        .db()
+        .query_row(
+            "SELECT path FROM raw_input WHERE input LIKE 'changes/%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let kept = std::fs::read_to_string(e.0.join(&told)).unwrap();
+    let to = serde_json::from_str::<serde_json::Value>(&kept).unwrap()["to"].clone();
+    std::fs::write(
+        e.0.join(&told),
+        kept.replace(to.as_str().unwrap(), "stat:0"),
+    )
+    .unwrap();
+    unsaid(&e);
+    // A list that is damaged, and one that is gone: what was told of the change before is not
+    // told of this one.
+    std::fs::write(list(&e), "/bin/tool\u{0}1.0\n").unwrap();
+    append(&tool, "d\n");
+    e.run();
+    unsaid(&e);
+    std::fs::remove_file(list(&e)).unwrap();
+    append(&tool, "e\n");
+    e.run();
+    unsaid(&e);
+}
+
+#[test]
+fn a_file_name_with_an_escape_sequence_or_a_line_break_is_shown_as_data_and_breaks_no_line() {
+    let e = Estate::new("odd-name");
+    put(&e.keg().join("bin/tool"), "a\n");
+    e.run();
+    put(&e.keg().join("bin/x\u{1b}[31mRED\nevil"), "b\n");
+    e.run();
+    let (evidence, text) = e.changed(KEG);
+    assert_eq!(
+        evidence["files"]["added_text"][0],
+        "bin/x\\u{1b}[31mRED\\u{a}evil"
+    );
+    assert!(!text.contains('\u{1b}'), "{text}");
+    for line in text.lines().filter(|l| l.contains("evil")) {
+        assert!(line.starts_with("    Added "), "{line:?}\n{text}");
+    }
 }

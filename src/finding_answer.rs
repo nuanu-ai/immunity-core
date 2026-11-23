@@ -264,6 +264,7 @@ pub fn evidence(conn: &Connection, f: &Found) -> rusqlite::Result<Option<v1::evi
         match f.rule.split_once('.').map(|(family, _)| family) {
             Some("integrity") => Body::ChangedInPlace(v1::ChangedInPlace {
                 became_text: became(),
+                files: crate::integrity::files_changed(conn, &f.id)?,
             }),
             Some("indicator") => Body::IndicatorMatched(v1::IndicatorMatched {
                 indicators_text: became(),

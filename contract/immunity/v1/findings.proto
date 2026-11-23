@@ -279,6 +279,29 @@ message ChangedInPlace {
   // <why>`, or who signs it now. Absent for files of a package or code an app keeps outside
   // itself, whose digest is what changed.
   optional string became_text = 1;
+  // Which files changed at the latest occurrence, for files of a package or code an app keeps
+  // outside itself. Absent for an application, and whenever the core cannot say: when the reading
+  // before kept no list of the files, as at the first reading by a build that keeps lists, when
+  // that list is gone or damaged, and when what was kept is not of the latest occurrence. Absent
+  // never means that no file changed. Since 1.25.0.
+  FilesChanged files = 2;
+}
+
+// The files of an installed thing that changed between two readings, by their paths from the
+// thing's folder. A file counts as changed when its change time moved; its content is never read.
+// The counts are exact; each list holds at most 20 names, in the order of the thing's files.
+// Since 1.25.0.
+message FilesChanged {
+  // Files in the newer reading only.
+  uint64 added = 1;
+  // Files in the older reading only.
+  uint64 removed = 2;
+  // Files in both whose change time differs.
+  uint64 changed = 3;
+  // The first names of each, as the file system gives them.
+  repeated string added_text = 4;
+  repeated string removed_text = 5;
+  repeated string changed_text = 6;
 }
 
 // A match of the indicator list.

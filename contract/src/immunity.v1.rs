@@ -1918,6 +1918,38 @@ pub struct ChangedInPlace {
     /// itself, whose digest is what changed.
     #[prost(string, optional, tag = "1")]
     pub became_text: ::core::option::Option<::prost::alloc::string::String>,
+    /// Which files changed at the latest occurrence, for files of a package or code an app keeps
+    /// outside itself. Absent for an application, and whenever the core cannot say: when the reading
+    /// before kept no list of the files, as at the first reading by a build that keeps lists, when
+    /// that list is gone or damaged, and when what was kept is not of the latest occurrence. Absent
+    /// never means that no file changed. Since 1.25.0.
+    #[prost(message, optional, tag = "2")]
+    pub files: ::core::option::Option<FilesChanged>,
+}
+/// The files of an installed thing that changed between two readings, by their paths from the
+/// thing's folder. A file counts as changed when its change time moved; its content is never read.
+/// The counts are exact; each list holds at most 20 names, in the order of the thing's files.
+/// Since 1.25.0.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FilesChanged {
+    /// Files in the newer reading only.
+    #[prost(uint64, tag = "1")]
+    pub added: u64,
+    /// Files in the older reading only.
+    #[prost(uint64, tag = "2")]
+    pub removed: u64,
+    /// Files in both whose change time differs.
+    #[prost(uint64, tag = "3")]
+    pub changed: u64,
+    /// The first names of each, as the file system gives them.
+    #[prost(string, repeated, tag = "4")]
+    pub added_text: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "5")]
+    pub removed_text: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "6")]
+    pub changed_text: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// A match of the indicator list.
 #[derive(serde::Serialize, serde::Deserialize)]

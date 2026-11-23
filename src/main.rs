@@ -4697,6 +4697,7 @@ fn read_integrity(run: &mut Run, args: &Args) -> Result<Vec<findings::Observed>,
     let kinds = integrity::read(run.tx, &roots, &machine)?;
     let (raw, lines) = integrity::raw(&kinds);
     let raw_file = run.keep_raw(integrity::READER, integrity::RAW, raw.as_bytes())?;
+    keep_lists(run, &kinds)?;
     for (k, lines) in kinds.iter().zip(&lines) {
         let reading = Reading {
             reader: integrity::READER,
@@ -4726,6 +4727,27 @@ fn read_integrity(run: &mut Run, args: &Args) -> Result<Vec<findings::Observed>,
     guarded.dedup();
     not_looked_into_when_met(run, integrity::READER, &guarded, &args.home)?;
     Ok(integrity::observed(run.tx, &run_id)?)
+}
+
+/// Keeps each thing's list of files as a raw copy of its own, written again only when it moved,
+/// and when it moved from a list kept before, what changed between the two: a finding of the
+/// change reads it (`integrity::files_changed`).
+fn keep_lists(run: &Run, kinds: &[integrity::Kind]) -> Result<(), Box<dyn Error>> {
+    for t in kinds.iter().flat_map(|k| &k.things) {
+        let Some(list) = &t.list else { continue };
+        let input = integrity::list_input(&t.subject);
+        let before = store::last_raw(run.tx, integrity::READER, &input)?
+            .and_then(|path| std::fs::read(run.home.join(path)).ok());
+        if before.as_ref() == Some(list) {
+            continue;
+        }
+        run.keep_raw(integrity::READER, &input, list)?;
+        if let Some(changes) = before.and_then(|b| integrity::compare(&b, list)) {
+            let input = integrity::changes_input(&t.subject);
+            run.keep_raw(integrity::READER, &input, &serde_json::to_vec(&changes)?)?;
+        }
+    }
+    Ok(())
 }
 
 /// The package managers on this Mac that no reader reads, named by kind: none read, with
