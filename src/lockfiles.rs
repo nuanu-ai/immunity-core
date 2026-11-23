@@ -446,12 +446,16 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize) -> Option<Outcome> {
             continue;
         }
         let path = checkout.path.join(rel);
-        let text = std::fs::read(&path).ok();
-        lockfiles.push((source.clone(), text.as_ref().map_or(0, |t| t.len() as u64)));
+        // A kind with no reader is never opened: its size is the file's own, 0 when that cannot
+        // be had, as for a lockfile that could not be read.
         if !SUPPORTED.contains(&name) {
+            let size = std::fs::symlink_metadata(&path).map_or(0, |m| m.len());
+            lockfiles.push((source, size));
             not_supported.insert(name.to_string());
             continue;
         }
+        let text = std::fs::read(&path).ok();
+        lockfiles.push((source.clone(), text.as_ref().map_or(0, |t| t.len() as u64)));
         let parsed = match text.and_then(|t| String::from_utf8(t).ok()) {
             None => Parsed::Failed,
             Some(t) if name == "package-lock.json" || name == "npm-shrinkwrap.json" => {
@@ -883,7 +887,7 @@ fn pnpm_document(
 }
 
 /// One entry of `packages`, or `None` when the lockfile does not tell what it is: a name that is
-/// not a package's, no version, a name its key and its `name` field disagree on, no resolution,
+/// not a package's, no version, a name or a version its key and its field disagree on, no resolution,
 /// or a registry address that is not the file of the entry's name and version
 /// (`registry_tarball`).
 fn pnpm_package(format: PnpmFormat, key: &str, entry: &serde_norway::Value) -> Option<Dep> {
@@ -902,10 +906,11 @@ fn pnpm_package(format: PnpmFormat, key: &str, entry: &serde_norway::Value) -> O
     if !npm_name(name) {
         return None;
     }
-    let version = match text(entry, "version")? {
-        Some("") => return None,
-        Some(v) => v,
-        None => key_version?,
+    let version = match (text(entry, "version")?, key_version) {
+        (Some(""), _) => return None,
+        (Some(field), Some(key)) if field != key => return None,
+        (Some(version), _) | (None, Some(version)) => version,
+        (None, None) => return None,
     };
     let resolution = entry.get("resolution")?;
     // A key that does not start with a slash, in 5.x and 6.0, names a host or a source.
@@ -2330,6 +2335,43 @@ dependencies = [
         assert_eq!(unknown_for(&o), [true, false]);
         let texts = read_as_text(&dir.0);
         assert!(texts.opened.is_empty() && texts.not_opened.is_empty());
+    }
+
+    #[test]
+    fn a_lockfile_of_a_kind_with_no_reader_is_never_opened_and_is_listed_with_its_size() {
+        // Its size comes from the folder, so one this user may not open is still named as a
+        // kind with no reader and listed with its size.
+        use std::os::unix::fs::PermissionsExt;
+        let text = "bun-lockfile-format-v0\n";
+        let dir = Dir::new("lockb-closed", &[("bun.lockb", text)]);
+        let lockb = dir.0.join("bun.lockb");
+        std::fs::set_permissions(&lockb, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let (o, _) = dir.read();
+        std::fs::set_permissions(&lockb, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(lacks(&o), [format!("{LOCKFILE_KIND} bun.lockb")]);
+        assert_eq!(
+            o.lockfiles,
+            [("dev/shop/bun.lockb".to_string(), text.len() as u64)]
+        );
+    }
+
+    #[test]
+    fn a_pnpm_entry_whose_version_field_disagrees_with_its_key_is_never_read_as_either() {
+        // pnpm fetches by the key: a `version` field of another version would answer for a
+        // version that is not installed. The same version in both is read.
+        let ms = "  ms@2.1.3:\n    resolution: {integrity: sha512-FFFF}\n";
+        for (version, read) in [("9.9.9", false), ("2.1.3", true)] {
+            let text = PNPM_9.replace(ms, &format!("{ms}    version: {version}\n"));
+            let dir = Dir::new("pnpm-version-field", &[("pnpm-lock.yaml", &text)]);
+            let (o, said) = dir.read();
+            let fact = "npm/ms|has_version|2.1.3|dev/shop/pnpm-lock.yaml#ms@2.1.3".to_string();
+            assert_eq!(said.contains(&fact), read, "{version}: {said:?}");
+            assert!(!said.iter().any(|s| s.contains("9.9.9")), "{said:?}");
+            let reason = (!read)
+                .then(|| one_not_told("pnpm-lock.yaml#ms@2.1.3"))
+                .flatten();
+            assert_eq!(o.reason, reason, "{version}");
+        }
     }
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
