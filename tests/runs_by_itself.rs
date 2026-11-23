@@ -7695,7 +7695,7 @@ fn a_startup_item_that_could_not_be_read_keeps_its_programs_and_is_said_as_not_r
 }
 
 #[test]
-fn an_item_whose_program_cannot_be_told_at_its_first_check_leaves_the_reading_partial() {
+fn an_item_whose_program_cannot_be_told_at_its_first_check_leaves_the_reading_not_full() {
     use std::os::unix::fs::PermissionsExt;
     let e = Estate::new("target-untold");
     put(&e.agent("broken"), "not a property list\n");
@@ -7715,7 +7715,7 @@ fn an_item_whose_program_cannot_be_told_at_its_first_check_leaves_the_reading_pa
     assert_eq!(
         e.coverage(TARGET_KIND),
         format!(
-            "partial|not read in full: startup items that could not be read and whose programs are kept as last read: 3; {AT_CHECKS}"
+            "none|not read in full: startup items that could not be read and whose programs are kept as last read: 3; {AT_CHECKS}"
         )
     );
 }

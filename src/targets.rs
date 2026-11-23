@@ -139,35 +139,55 @@ impl Targets {
         }
     }
 
-    /// The reading's completeness, its reason or note, and its gap: never full while anything
-    /// named was not read or not judged. What is in a guarded folder was not given, what could
-    /// not be opened or told failed, and the rest has no reader in this build.
-    pub fn coverage(&self) -> (&'static str, Option<String>, Gap) {
-        let said = (self.counts.iter())
+    /// What the reading counts, by why, and what it always says of when it reads.
+    fn said(&self) -> String {
+        (self.counts.iter())
             .map(|(why, n)| format!("{why}: {n}; "))
             .collect::<String>()
-            + AT_CHECKS;
-        let short: Vec<&str> = (self.counts.keys().copied())
-            .filter(|why| !NOTES.contains(why))
-            .collect();
-        if short.is_empty() {
-            return ("full", Some(said), Gap::default());
+            + AT_CHECKS
+    }
+
+    /// What was not read or not judged, beside what the reading names and is no gap in it.
+    fn short(&self) -> impl Iterator<Item = &'static str> + '_ {
+        (self.counts.keys().copied()).filter(|why| !NOTES.contains(why))
+    }
+
+    /// Says in `look` that the reading is short while anything named was not read or not
+    /// judged, with the worst cause.
+    fn short_of(&self, look: &mut Look) {
+        if let Some(worst) = Cause::worst(self.short().map(cause)) {
+            look.short(worst, format!("not read in full: {}", self.said()));
         }
-        let cause = |why: &str| match why {
-            GUARDED => Cause::NotGiven,
-            FAILED | ITEMS => Cause::Failed,
-            _ => Cause::NoReader,
-        };
-        let lacks = (short.iter().filter(|why| cause(why) == Cause::NoReader))
+    }
+
+    /// The reading's completeness, its reason or note, and its gap, as `look` says them: never
+    /// full while anything named was not read or not judged (`read`).
+    pub fn coverage(&self, look: &Look) -> (&'static str, Option<String>, Gap) {
+        let lacks = (self.short().filter(|why| cause(why) == Cause::NoReader))
             .map(|why| Lack::new(why, None))
             .collect();
-        let cause = Cause::worst(short.iter().map(|w| cause(w)));
-        let reason = format!("not read in full: {said}");
-        ("partial", Some(reason), Gap { cause, lacks })
+        let gap = Gap {
+            cause: look.cause(),
+            lacks,
+        };
+        match look.completeness() {
+            ("full", _) => ("full", Some(self.said()), gap),
+            (completeness, reason) => (completeness, reason, gap),
+        }
     }
 
     fn count(&mut self, why: &'static str) {
         *self.counts.entry(why).or_default() += 1;
+    }
+}
+
+/// Why a target was not read or not judged, as a cause: what is in a guarded folder was not
+/// given, what could not be opened or told failed, and the rest has no reader in this build.
+fn cause(why: &str) -> Cause {
+    match why {
+        GUARDED => Cause::NotGiven,
+        FAILED | ITEMS => Cause::Failed,
+        _ => Cause::NoReader,
     }
 }
 
@@ -254,7 +274,7 @@ pub fn read(
     let mut named: BTreeMap<Unit, BTreeSet<String>> = BTreeMap::new();
     let prefix = format!("file:{machine}/");
     let mut unread: BTreeSet<String> = (items.iter().flat_map(|l| l.not_read()))
-        .map(|(unit, _)| format!("{prefix}{unit}"))
+        .map(|u| format!("{prefix}{}", u.unit))
         .collect();
     for e in items.iter().flat_map(|l| &l.entries) {
         let Some(runs) = runs_of(e.watched_as) else {
@@ -310,7 +330,7 @@ pub fn read(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for (target, item, unit) in held {
-        let hidden = items.iter().any(|l| !l.retracts(Some(&unit)));
+        let hidden = items.iter().any(|l| l.hides(&unit));
         if let Some(path) = target.strip_prefix(&prefix)
             && (hidden || unread.contains(&item))
         {
@@ -328,7 +348,7 @@ pub fn read(
         let theirs = others.iter().find_map(|l| {
             let entry = l.entries.iter().find(|e| e.unit == unit);
             let read = entry.map(|e| matches!(e.content, Content::Hash(_) | Content::Value(_)));
-            read.or_else(|| l.not_read().any(|(u, _)| *u == unit).then_some(false))
+            read.or_else(|| l.not_read().any(|u| u.unit == unit).then_some(false))
         });
         let (content, link) = if let Some(read) = theirs {
             let why = if read { ELSEWHERE } else { NOT_THERE };
@@ -356,6 +376,7 @@ pub fn read(
             bytes,
         });
     }
+    t.short_of(&mut look);
     Ok((look, t))
 }
 
@@ -709,7 +730,14 @@ mod tests {
         let mut t = Targets::default();
         t.count(ABSENT);
         t.count(ELSEWHERE);
-        let (completeness, reason, gap) = t.coverage();
+        // One program named and read.
+        let said = |t: &Targets| {
+            let mut look = Look::default();
+            look.read(Unit::whole("/usr/local/bin/example"));
+            t.short_of(&mut look);
+            t.coverage(&look)
+        };
+        let (completeness, reason, gap) = said(&t);
         assert_eq!(completeness, "full");
         assert_eq!(
             reason.as_deref(),
@@ -717,7 +745,18 @@ mod tests {
         );
         assert_eq!(gap.cause, None);
         t.count(NOT_FULL);
-        assert_eq!(t.coverage().0, "partial");
+        let (completeness, reason, gap) = said(&t);
+        assert_eq!(completeness, "partial");
+        assert_eq!(
+            reason.as_deref(),
+            Some(
+                format!(
+                    "not read in full: {ABSENT}: 1; {NOT_FULL}: 1; {ELSEWHERE}: 1; {AT_CHECKS}"
+                )
+                .as_str()
+            )
+        );
+        assert_eq!(gap.cause, Some(Cause::NoReader));
     }
 
     #[test]

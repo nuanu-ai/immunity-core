@@ -1097,21 +1097,17 @@ fn hooks_named_under_a_regular_file_leave_nothing_unwatched_and_are_read_when_th
 
 #[test]
 fn hooks_named_where_nothing_can_be_now_leave_nothing_unwatched() {
-    // A link in a loop, a link that leads nowhere, a name longer than a file's name can be,
-    // alone and in a path longer than FSEvents takes, and `..` after a folder that is not
+    // A link that leads nowhere, a name longer than a file's name can be in a folder that is
+    // not there, in a path longer than FSEvents takes, and `..` after a folder that is not
     // there: nothing can be there now, which is not a failure.
     let mac = Mac::new("nothing-there");
     let dev = mac.home().join("dev");
     std::fs::create_dir_all(dev.join("target")).unwrap();
     let link = |to: &str, at: &str| std::os::unix::fs::symlink(to, dev.join(at)).unwrap();
-    link("loop-b", "loop-a");
-    link("loop-a", "loop-b");
     link("nowhere", "broken");
     link("target", "link");
     let long = "l".repeat(256);
     for (repo, hooks) in [
-        ("a", dev.join("loop-a/hooks")),
-        ("b", dev.join(&long).join("hooks")),
         ("c", dev.join("missing/../hooks")),
         ("d", dev.join("x/".repeat(400)).join(&long).join("hooks")),
         ("e", dev.join(format!("gone/{}hooks", "../".repeat(40)))),
@@ -1128,6 +1124,43 @@ fn hooks_named_where_nothing_can_be_now_leave_nothing_unwatched() {
     let mut w = mac.watch().started();
     assert!(w.lines("problem").is_empty(), "{:?}", w.lines("problem"));
     assert_eq!(failing(&mac), (true.into(), vec![]));
+}
+
+#[test]
+fn hooks_named_through_a_link_in_a_loop_or_by_a_name_too_long_are_never_watched_as_not_there() {
+    // The reader could not look at either and says so. A watcher that took them for places
+    // where nothing is would wait calmly for a change no reading can see (`look::Absent`).
+    let mac = Mac::new("not-looked-at");
+    let dev = mac.home().join("dev");
+    std::fs::create_dir_all(&dev).unwrap();
+    let link = |to: &str, at: &str| std::os::unix::fs::symlink(to, dev.join(at)).unwrap();
+    link("loop-b", "loop-a");
+    link("loop-a", "loop-b");
+    let long = "l".repeat(256);
+    for (repo, hooks) in [
+        ("a", dev.join("loop-a/hooks")),
+        ("b", dev.join(&long).join("hooks")),
+    ] {
+        mac.put(&format!("dev/{repo}/.git/HEAD"), "ref: refs/heads/main\n");
+        mac.put(
+            &format!("dev/{repo}/.git/config"),
+            &format!("[core]\n hooksPath = {}\n", hooks.display()),
+        );
+    }
+    mac.run();
+    let mut w = mac.watch().started();
+    let problems: Vec<String> = (w.lines("problem").iter())
+        .filter(|p| p["code"] == "place_not_watched")
+        .map(|p| p["detail_text"].as_str().unwrap_or_default().to_string())
+        .collect();
+    // Each said with what the system said of it.
+    for why in ["Too many levels of symbolic links", "File name too long"] {
+        assert!(
+            problems.iter().any(|p| p.contains(why)),
+            "{why}: {problems:?}"
+        );
+    }
+    assert_eq!(failing(&mac), (false.into(), vec!["places".into()]));
 }
 
 #[test]

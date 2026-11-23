@@ -18,6 +18,9 @@
 //! - A time from the future proves nothing: `fresh`.
 //! - Not present on this Mac is not applicable: a full reading with a note. Present and
 //!   unreadable is a failed reading with its reason (`completeness`, `cause`).
+//! - The completeness, the cause and the reason follow from what was read and what was not,
+//!   a unit or something that is no unit of the reading (`short`), and from nothing else: a
+//!   reading that read no unit in full is `none` (`completeness_noted`).
 
 use crate::autorun::{self, POINTS, Point};
 use crate::baseline::{self, Unit};
@@ -49,6 +52,16 @@ impl Absent {
 /// The note of a full reading when none of its places is on this machine.
 pub const NOT_HERE: &str = "none of these places is on this machine";
 
+/// A unit a reading did not read, with why: it failed, or it leads into a folder macOS asks
+/// permission for, which the owner did not give (`Cause::NotGiven`). Whether it holds anything
+/// is not known.
+#[derive(Debug)]
+pub struct Unread {
+    pub unit: Unit,
+    pub cause: Cause,
+    pub why: String,
+}
+
 /// What looking at the places of one reading found.
 #[derive(Default)]
 pub struct Look {
@@ -58,11 +71,12 @@ pub struct Look {
     /// Every folder macOS asks permission for that was met, a link's target among them, for
     /// the reader's coverage.
     pub guarded: Vec<PathBuf>,
-    /// Units there, or whose presence is not known, that could not be read, with the reason.
-    failed: Vec<(Unit, String)>,
-    /// Units not looked into because they lead into a folder macOS asks permission for, each
-    /// with why: whether they hold anything is not known.
-    unreached: Vec<(Unit, String)>,
+    /// The units not read, in the order they were met.
+    unread: Vec<Unread>,
+    /// What the reading did not read that is no unit of it, each with its cause and why:
+    /// checkouts not looked into, the folder Git's configuration names for hooks when it
+    /// could not be told, hooks kept where this build does not read them.
+    short: Vec<(Cause, String)>,
     /// The units read in full, by their paths as ids name them: a file looked at, found or
     /// absent, and a folder listed or found absent (`baseline.rs`).
     read: Vec<Unit>,
@@ -96,20 +110,31 @@ impl Look {
     /// A unit there that could not be read, with why.
     pub fn unread(&mut self, unit: Unit, why: String) {
         self.seen.push(unit.clone());
-        self.failed.push((unit, why));
+        self.not_looked_at(unit, why);
     }
 
     /// A unit that could not be looked at, with why: whether it is there is not known. A part
     /// of a file that could not be read is one too: only it is not known.
     pub fn not_looked_at(&mut self, unit: Unit, why: String) {
-        self.failed.push((unit, why));
+        let cause = Cause::Failed;
+        self.unread.push(Unread { unit, cause, why });
     }
 
     /// A unit that leads into a guarded folder: not looked into, and said.
     pub fn not_into(&mut self, unit: Unit, folder: PathBuf, home: &Path) {
-        self.unreached
-            .push((unit, crate::guarded::leads_into(&folder, home)));
+        let (cause, why) = (Cause::NotGiven, crate::guarded::leads_into(&folder, home));
+        self.unread.push(Unread { unit, cause, why });
         self.met(folder);
+    }
+
+    /// Something the reading did not read that is no unit of it, with its cause and why.
+    pub fn short(&mut self, cause: Cause, why: String) {
+        self.short.push((cause, why));
+    }
+
+    /// Whether the reading did not read something that is no unit of it.
+    pub fn is_short(&self) -> bool {
+        !self.short.is_empty()
     }
 
     /// A unit there that leads into a guarded folder.
@@ -135,18 +160,16 @@ impl Look {
         &self.seen
     }
 
-    pub fn failed(&self) -> &[(Unit, String)] {
-        &self.failed
-    }
-
-    pub fn unreached(&self) -> &[(Unit, String)] {
-        &self.unreached
-    }
-
     /// Every unit not read, with why: those that failed, then those not looked into. The store
     /// judges each (`baseline.rs`): losing sight of a unit read before is a change.
-    pub fn not_read(&self) -> impl Iterator<Item = &(Unit, String)> {
-        self.failed.iter().chain(&self.unreached)
+    pub fn not_read(&self) -> impl Iterator<Item = &Unread> {
+        let failed = |u: &&Unread| u.cause != Cause::NotGiven;
+        (self.unread.iter().filter(failed)).chain(self.unread.iter().filter(move |u| !failed(u)))
+    }
+
+    /// Whether a unit this reading did not read hides `unit`: what was known of it is kept.
+    pub fn hides(&self, unit: &Unit) -> bool {
+        self.unread.iter().any(|u| u.unit.hides(unit))
     }
 
     /// Whether this reading may retract what was known of a unit: whenever no unit it did not
@@ -154,56 +177,64 @@ impl Look {
     /// checkout no longer found or one whose `.git` is gone takes along what was read inside
     /// it. What it cannot place, `None`, only when it read everything it looked at.
     pub fn retracts(&self, unit: Option<&Unit>) -> bool {
-        let Some(unit) = unit else {
-            return self.failed.is_empty() && self.unreached.is_empty();
-        };
-        !self.not_read().any(|(u, _)| u.hides(unit))
+        match unit {
+            Some(unit) => !self.hides(unit),
+            None => self.cause().is_none(),
+        }
     }
 
     /// The completeness of the reading of which entries are there, and its reason or note. A
     /// reading of places none of which is here is full, with the note that says so.
     pub fn completeness(&self) -> (&'static str, Option<String>) {
-        if self.failed.is_empty() && self.unreached.is_empty() {
-            let note = (self.present == 0).then(|| NOT_HERE.to_string());
-            return ("full", note);
-        }
-        let mut reasons = Vec::new();
-        if !self.failed.is_empty() {
-            let failed: Vec<String> = self
-                .failed
-                .iter()
-                .map(|(path, why)| format!("{path} ({why})"))
-                .collect();
-            reasons.push(format!("could not be read: {}", failed.join("; ")));
-        }
-        if !self.unreached.is_empty() {
-            let unreached: Vec<String> = self
-                .unreached
-                .iter()
-                .map(|(path, why)| format!("{path}: {why}"))
-                .collect();
-            reasons.push(format!(
-                "{}{}",
-                crate::guarded::NOT_LOOKED_INTO,
-                unreached.join("; ")
-            ));
-        }
-        let reason = Some(reasons.join("; "));
-        if self.present == 0 {
-            ("none", reason)
-        } else {
-            ("partial", reason)
+        match self.completeness_noted(None) {
+            ("full", _) => ("full", (self.present == 0).then(|| NOT_HERE.to_string())),
+            said => said,
         }
     }
 
-    /// Why a reading that is not full is not: it failed, or what it did not look into is
-    /// only what macOS asks permission for, which the owner did not give.
-    pub fn cause(&self) -> Cause {
-        if self.failed.is_empty() && !self.unreached.is_empty() {
-            Cause::NotGiven
-        } else {
-            Cause::Failed
-        }
+    /// The completeness of the reading and its reason, with `note` said after the units not
+    /// read and before what else it did not read; a full reading says the note alone. A
+    /// reading that did not read everything is `none` when it read no unit in full, or when
+    /// the units it could not read are all it met that is there; else `partial`.
+    pub fn completeness_noted(&self, note: Option<String>) -> (&'static str, Option<String>) {
+        let said = |given: bool, head: &str, how: fn(&Unread) -> String| {
+            let units = self
+                .unread
+                .iter()
+                .filter(|u| (u.cause == Cause::NotGiven) == given);
+            let units: Vec<String> = units.map(how).collect();
+            (!units.is_empty()).then(|| format!("{head}{}", units.join("; ")))
+        };
+        let reasons: Vec<String> = [
+            said(false, "could not be read: ", |u| {
+                format!("{} ({})", u.unit, u.why)
+            }),
+            said(true, crate::guarded::NOT_LOOKED_INTO, |u| {
+                format!("{}: {}", u.unit, u.why)
+            }),
+            note,
+        ]
+        .into_iter()
+        .flatten()
+        .chain(self.short.iter().map(|(_, why)| why.clone()))
+        .collect();
+        let reason = (!reasons.is_empty()).then(|| reasons.join("; "));
+        let completeness = match self.cause() {
+            None => "full",
+            Some(_) if self.read.is_empty() || self.present == 0 && !self.unread.is_empty() => {
+                "none"
+            }
+            Some(_) => "partial",
+        };
+        (completeness, reason)
+    }
+
+    /// Why a reading that is not full is not: the worst cause of what it did not read, `None`
+    /// when it read everything. What it did not look into because macOS asks permission for it
+    /// was not given; the rest failed or, as hooks kept elsewhere, has no reader.
+    pub fn cause(&self) -> Option<Cause> {
+        let units = self.unread.iter().map(|u| u.cause);
+        Cause::worst(units.chain(self.short.iter().map(|(cause, _)| *cause)))
     }
 }
 
@@ -515,6 +546,13 @@ mod tests {
             Path::new("/Users/example"),
         );
         assert!(!guarded.retracts(None));
+        // Nor has one that did not look into every checkout the store holds.
+        let mut short = Look::default();
+        short.short(
+            Cause::NotGiven,
+            "known checkouts were not looked into".into(),
+        );
+        assert!(!short.retracts(None));
     }
 
     #[test]
@@ -554,14 +592,14 @@ mod tests {
         let failed = mac.way(".mcp.json", Scope::Checkout).look;
         let said = |look: &Look| -> Vec<(String, bool)> {
             look.not_read()
-                .map(|(u, why)| (u.to_string(), !why.is_empty()))
+                .map(|u| (u.unit.to_string(), !u.why.is_empty()))
                 .collect()
         };
         assert_eq!(said(&place), [("Library/LaunchAgents".to_string(), true)]);
         assert_eq!(said(&guarded), [(".cursor/hooks.json".to_string(), true)]);
         assert_eq!(said(&failed), [("dev/a/.mcp.json".to_string(), true)]);
-        assert_eq!(place.cause(), Cause::Failed);
-        assert_eq!(guarded.cause(), Cause::NotGiven);
+        assert_eq!(place.cause(), Some(Cause::Failed));
+        assert_eq!(guarded.cause(), Some(Cause::NotGiven));
         for look in [&place, &guarded, &failed] {
             assert_ne!(look.completeness().0, "full");
         }
@@ -576,7 +614,7 @@ mod tests {
         assert!(place.read_units().contains(&Unit::whole(".zshrc")));
         let mcp = row(".mcp.json", Scope::Checkout);
         let way = mac.way(".mcp.json", Scope::Checkout);
-        assert_eq!(way.coverage(mcp, None).0, "full");
+        assert_eq!(way.coverage(mcp).0, "full");
         assert!(
             way.look
                 .read_units()
@@ -595,16 +633,95 @@ mod tests {
                 place.completeness().1,
                 place.cause(),
             ),
-            (
-                way.coverage(mcp, None).0,
-                way.coverage(mcp, None).1,
-                way.look.cause(),
-            ),
+            (way.coverage(mcp).0, way.coverage(mcp).1, way.look.cause()),
         ] {
             assert_eq!(completeness, "none");
             assert!(reason.is_some_and(|r| r.starts_with("could not be read: ")));
-            assert_eq!(cause, Cause::Failed);
+            assert_eq!(cause, Some(Cause::Failed));
         }
+    }
+
+    #[test]
+    fn the_reasons_a_reading_writes_keep_their_spelling() {
+        // Other code parses the reasons the store keeps (`covered.rs`, `known.rs`,
+        // `vulnerabilities.rs`): a reason spelt otherwise is a store of another shape.
+        let home = Path::new("/Users/example");
+        let mut look = Look::default();
+        look.not_into(Unit::whole("Documents/b"), home.join("Documents"), home);
+        look.not_looked_at(Unit::whole("a"), "denied".to_string());
+        look.there_not_into(Unit::whole("d"), PathBuf::from("/Volumes/Backup"), home);
+        look.unread(Unit::part("c.json", "/x"), "not JSON".to_string());
+        look.read(Unit::whole("e"));
+        look.present = 1;
+        let failed = "could not be read: a (denied); c.json#/x (not JSON)";
+        let unreached = "not looked into: Documents/b: it leads into ~/Documents, which macOS \
+                         asks permission for; d: it leads into /Volumes/Backup, which macOS asks \
+                         permission for";
+        let both = format!("{failed}; {unreached}");
+        assert_eq!(look.completeness(), ("partial", Some(both.clone())));
+        // The run's rows and the journal take them in the same order.
+        let order: Vec<String> = look.not_read().map(|u| u.unit.to_string()).collect();
+        assert_eq!(order, ["a", "c.json#/x", "Documents/b", "d"]);
+        // Beside them, what a row read whole and the checkouts it did not look into.
+        let mcp = row(".mcp.json", Scope::Checkout);
+        let missed = "known checkouts were not looked into";
+        let whole = "read whole, not by key: dev/a/.mcp.json (two equal keys)";
+        let mut looked = autorun::Looked {
+            look: Look::default(),
+            whole: vec![("dev/a/.mcp.json".to_string(), "two equal keys".to_string())],
+        };
+        assert_eq!(looked.coverage(mcp), ("full", Some(whole.to_string())));
+        looked.look.short(Cause::NotGiven, missed.to_string());
+        assert_eq!(
+            looked.coverage(mcp),
+            ("none", Some(format!("{whole}; {missed}")))
+        );
+        looked.look = look;
+        looked.look.short(Cause::NotGiven, missed.to_string());
+        let said = format!("{both}; {whole}; {missed}");
+        assert_eq!(looked.coverage(mcp), ("partial", Some(said)));
+    }
+
+    #[test]
+    fn a_home_folder_on_a_volume_has_its_rows_said_not_looked_into_and_never_read_in_full() {
+        // Every folder under `/Volumes` is one macOS asks permission for. A row of a home folder
+        // there that said "there is no such file" would be calm with nothing looked at.
+        let home = Path::new("/Volumes/Example/Users/example");
+        let p = row(".cursor/hooks.json", Scope::Home);
+        let looked = autorun::look_all(p, [(home, "")].into_iter(), home);
+        assert_eq!(looked.coverage(p).0, "none");
+        assert_eq!(looked.look.cause(), Some(Cause::NotGiven));
+        let file = Unit::whole(".cursor/hooks.json");
+        assert!(looked.look.not_read().any(|u| u.unit == file));
+        assert_eq!(looked.look.guarded, [PathBuf::from("/Volumes/Example")]);
+    }
+
+    #[test]
+    fn a_reading_of_hooks_that_read_nothing_says_it_read_nothing() {
+        // `.git/hooks` is a file and the folder Git's configuration names for hooks is one macOS
+        // asks permission for: nothing of the checkout's hooks was read, and `partial` would be
+        // counted as a reading that holds facts.
+        let mac = Mac::new("hooks-none");
+        mac.put("dev/a/.git/hooks", "a file, not a folder\n");
+        let home = mac.home();
+        let homes = watched::homes(&home);
+        let checkout = crate::checkouts::Checkout {
+            rel: "dev/a".to_string(),
+            path: home.join("dev/a"),
+        };
+        let hooks = home.join("Documents/hooks");
+        let folder = crate::git_hooks::Folder::Configured {
+            worktree: hooks.clone(),
+            receive: hooks,
+        };
+        let watched::Hooks::Looked(look) =
+            watched::look_checkout(&checkout, &home, [&homes[0], &homes[1]], folder, &[])
+        else {
+            panic!("the checkout's .git is a folder");
+        };
+        assert!(look.read_units().is_empty());
+        assert_eq!(look.completeness().0, "none");
+        assert_eq!(look.cause(), Some(Cause::Failed));
     }
 
     #[test]
