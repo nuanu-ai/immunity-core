@@ -2967,7 +2967,7 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
     // it read, outside the walk's root, and otherwise as looking again says. One the walk met
     // comes back gone, as one the disk names as a checkout the walk met: it is held already.
     let prefix = format!("checkout:{machine}/");
-    let (mut kept, mut unknown) = (Vec::new(), Vec::new());
+    let (mut kept, mut unknown, mut linked) = (Vec::new(), Vec::new(), Vec::new());
     for rel in store::live_subjects(run.tx, checkouts::READER)?
         .into_iter()
         .filter_map(|id| id.strip_prefix(&prefix).map(str::to_string))
@@ -2982,6 +2982,10 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
             checkouts::Again::Kept => kept.push(rel),
             checkouts::Again::NotTold => {
                 unknown.push(rel.clone());
+                kept.push(rel);
+            }
+            checkouts::Again::Linked => {
+                linked.push(rel.clone());
                 kept.push(rel);
             }
             checkouts::Again::Guarded(g) => {
@@ -3048,6 +3052,12 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
         let rels = unknown.join(", ");
         let why = format!("known checkouts that could not be looked at, kept as they were: {rels}");
         look.short(Cause::Failed, why);
+    }
+    // A known checkout there through a link on its path was not walked into, as a folder on
+    // another file system is not: nothing in it was read.
+    if !linked.is_empty() {
+        let why = format!("{}{}", checkouts::UNDER_LINK, linked.join(", "));
+        look.short(Cause::NotGiven, why);
     }
     let failure = (!walk.unlisted.is_empty()).then(|| {
         let folders: Vec<String> = walk.unlisted.iter().map(|(f, _)| f.clone()).collect();
@@ -5157,8 +5167,9 @@ fn read_indicators(
     // its own. A text not read now is made again where this run did not look: a unit it did
     // not read or left aside hides the file, whatever its spelling on a volume that ignores
     // case; the checkout the file belongs to (`Visited::owner`) was not looked into; or the
-    // file is not one that checkout's reading looks for there. Otherwise that walk listed the
-    // folder where the file was, or a folder above it, in full and found no text: it goes.
+    // file is not one that checkout's reading looks for there. Otherwise, in a checkout this run
+    // looked into, that walk listed the folder where the file was, or a folder above it, in
+    // full and found no text: it goes. In none, nothing looked at the file: it is retired.
     let on_list: BTreeMap<String, &indicators::Indicator> =
         list.matched.iter().map(|i| (i.literal(), i)).collect();
     let in_files = format!("file:{machine}/");
@@ -5185,11 +5196,23 @@ fn read_indicators(
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
+    // A match whose file no project this run looked into holds was not looked at: it is set
+    // aside as retired, never told as removed.
+    let match_kind = on_machine(indicators::MATCH_KIND);
+    let unowned = |path: &str| visited.owner(path).is_none();
+    let mut retired = 0;
     for (subject, object, source_ref) in &live {
         let Some(i) = on_list.get(object) else {
             continue;
         };
-        if i.kind == indicators::SHA256 || read.contains(subject) || !kept(subject) {
+        if i.kind == indicators::SHA256 || read.contains(subject) {
+            continue;
+        }
+        if !kept(subject) {
+            if subject.strip_prefix(&in_files).is_some_and(unowned) {
+                let why = indicators::NO_PROJECT;
+                retired += look::retire_facts(run.tx, &match_kind, subject, Some(object), why)?;
+            }
             continue;
         }
         statements.push(Statement {
@@ -5214,9 +5237,15 @@ fn read_indicators(
         gap: &gap,
         compared: "full",
     };
+    if retired > 0 {
+        let n = things(retired as i64, "match", "matches");
+        run.notes.push(format!(
+            "Set aside and not counted as removed: {n} of the indicator list whose file no \
+             project this run looked into holds."
+        ));
+    }
     let with_basis: Vec<(&str, &Statement)> =
         statements.iter().map(|s| (indicators::BASIS, s)).collect();
-    let match_kind = on_machine(indicators::MATCH_KIND);
     run.apply_judged(&match_kind, &applied, &with_basis, &mut |_| {
         Ok(Verdict::Change)
     })?;

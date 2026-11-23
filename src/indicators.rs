@@ -38,6 +38,9 @@ pub const MATCH_KIND: &str = "indicators matched against watched files and texts
 pub const UNMATCHED_KIND: &str = "indicators against what this build does not match them with";
 /// The rule's kind: what a run saw.
 pub const MATCHED: &str = "match of an indicator from the list";
+/// Why a match in a text not read is set aside, not removed: no project this run looked into
+/// holds its file, so nothing looked at the file.
+pub const NO_PROJECT: &str = "no project this run looked into holds its file";
 /// What this build has no matcher for: a kind of indicator, by its object path.
 pub const NO_MATCHER: &str = "indicator kind with no matcher";
 /// What a kind of indicator is not matched against, by kind and place.
