@@ -2875,7 +2875,7 @@ fn a_quiet_mac_needs_no_look_whatever_is_not_covered_and_a_planted_change_does()
     let mac = Mac::new("quiet");
     mac.put(".zshrc", "export A=1\n");
     mac.put("dev/shop/.git/HEAD", "ref: refs/heads/main\n");
-    mac.put("dev/shop/yarn.lock", "# yarn lockfile v1\n");
+    mac.put("dev/shop/yarn.lock", "# yarn lockfile v2\n");
     let servers = mac.root.join("servers");
     std::fs::create_dir_all(&servers).unwrap();
     std::fs::write(servers.join("web-1.txt"), SERVER).unwrap();
