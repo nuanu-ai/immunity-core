@@ -78,6 +78,7 @@ mod vulnerabilities;
 mod watch;
 mod watched;
 mod worktrees;
+mod yarn1;
 
 /// The tests' own folders under the temporary folder, removed when a test ends; shared with
 /// the integration tests.
