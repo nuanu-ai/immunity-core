@@ -83,6 +83,13 @@ serde = { version = "1.0.229", features = ["derive"] }
 # Without the feature `hash` the frame's checksum is read and not checked. Its encoder is
 # never used.
 ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
+# The lockfiles reader parses Cargo.lock, which is TOML, a format someone else defines: read by
+# hand, a comment after a header or a string in single quotes lost a crate or kept its quotes.
+# toml is the crate Cargo itself reads it with (toml-rs). Only `parse` is on, for its parsed
+# tree with the place of each key (`DeTable`), so serde, the writer and display are left out. It
+# brings `toml_parser`, `winnow`, `serde_spanned` and `toml_datetime`, which have no
+# dependencies of their own here. The nesting limit stays on (no `unbounded`).
+toml = { version = "1.2.2", default-features = false, features = ["parse"] }
 
 [dev-dependencies]
 # The test that keeps the committed types equal to what the schema gives generates them again
