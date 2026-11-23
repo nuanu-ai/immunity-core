@@ -59,5 +59,6 @@ One question decides: does it widen what published detection rules can be evalua
 - One command runs all checks: `./check`.
 - Commit messages follow Conventional Commits and are written in English.
 - `Cargo.lock` is committed.
+- A new file is at most 2,000 lines, the most one read of a file shows an agent. A file on the list in `scripts/lint.sh` is longer already and is split when it is next reworked; the list only shrinks.
 - A change that a person, their agent or a program built on the commands would notice gets a line in `CHANGELOG.md` under Unreleased, in the pull request that makes it.
 - Never put anything real from your own Mac into the repository: paths, host names, addresses, command lines. Examples and fixtures are invented.
