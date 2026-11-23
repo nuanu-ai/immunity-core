@@ -1199,6 +1199,7 @@ fn bun(text: &str) -> Parsed {
     let Ok(crate::jsonc::Read {
         value: Some(lock),
         doubts,
+        ..
     }) = crate::jsonc::read(text.as_bytes(), true)
     else {
         return Parsed::Failed;
