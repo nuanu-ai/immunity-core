@@ -4717,6 +4717,7 @@ fn read_integrity(run: &mut Run, args: &Args) -> Result<Vec<findings::Observed>,
     let kinds = integrity::read(run.tx, &roots, &machine)?;
     let (raw, lines) = integrity::raw(&kinds);
     let raw_file = run.keep_raw(integrity::READER, integrity::RAW, raw.as_bytes())?;
+    keep_lists(run, kinds.iter().flat_map(|k| &k.things));
     for (k, lines) in kinds.iter().zip(&lines) {
         let reading = Reading {
             reader: integrity::READER,
@@ -4746,6 +4747,54 @@ fn read_integrity(run: &mut Run, args: &Args) -> Result<Vec<findings::Observed>,
     guarded.dedup();
     not_looked_into_when_met(run, integrity::READER, &guarded, &args.home)?;
     Ok(integrity::observed(run.tx, &run_id)?)
+}
+
+/// Keeps each thing's list of files as a raw copy of its own, written again only when it moved,
+/// and when it moved from a list kept before, what changed between the two: a finding of the
+/// change reads it (`integrity::files_changed`). Only the latest of each is kept. These copies
+/// are optional: a thing whose list or changes cannot be kept is skipped, and nothing here fails
+/// or holds up the reading.
+fn keep_lists<'a>(run: &Run, things: impl Iterator<Item = &'a integrity::Thing>) {
+    for t in things {
+        let Some(list) = &t.list else { continue };
+        let input = integrity::list_input(&t.subject);
+        let Ok(kept) = store::last_raw(run.tx, integrity::READER, &input) else {
+            continue;
+        };
+        let before = kept
+            .as_deref()
+            .and_then(|path| integrity::kept_file(run.home, path, &input))
+            .and_then(|file| autorun::read_capped_resolved(&file, integrity::LIST_CAP).ok());
+        // Most lists do not move between checks: this spares `keep_raw` reading each again.
+        if before.as_ref() == Some(list) {
+            continue;
+        }
+        replace_raw(run, &input, kept, list);
+        if let Some(changes) = before.and_then(|b| integrity::compare(&b, list)) {
+            let input = integrity::changes_input(&t.subject);
+            if let (Ok(kept), Ok(bytes)) = (
+                store::last_raw(run.tx, integrity::READER, &input),
+                serde_json::to_vec(&changes),
+            ) {
+                replace_raw(run, &input, kept, &bytes);
+            }
+        }
+    }
+}
+
+/// Keeps a raw copy of an input of the integrity reader that no assertion points at, and then
+/// removes the copy kept before, `kept`, once the new one is written and its row set. A copy that
+/// cannot be kept leaves everything as it was. A copy left as it was, equal to the new bytes,
+/// stays, and so does one at a path of another shape than `keep_raw` writes; a removal that
+/// fails is ignored.
+fn replace_raw(run: &Run, input: &str, kept: Option<String>, bytes: &[u8]) {
+    let Ok(path) = run.keep_raw(integrity::READER, input, bytes) else {
+        return;
+    };
+    let old = kept.filter(|old| *old != path);
+    if let Some(file) = old.and_then(|old| integrity::kept_file(run.home, &old, input)) {
+        let _ = std::fs::remove_file(file);
+    }
 }
 
 /// The package managers on this Mac that no reader reads, named by kind: none read, with
@@ -6145,5 +6194,39 @@ mod tests {
             names(&[vec![forged.to_string(), "linux".to_string()]]),
             [[shown.to_string(), "linux".to_string()]]
         );
+    }
+
+    #[test]
+    fn a_list_that_cannot_be_kept_is_skipped_and_the_reading_goes_on() {
+        // An optional copy never fails a check: the facts of the reading are applied after it.
+        let dir = crate::common::Scratch::new("unkept-list");
+        let mut conn = store::open_or_make(&dir.join("store.db")).unwrap();
+        let tx = conn.transaction().unwrap();
+        let run = Run {
+            tx: &tx,
+            home: &dir,
+            run_id: "run-1",
+            at: 1,
+            machine: "machine:mac",
+            notes: Vec::new(),
+            readers: 0,
+        };
+        let thing = |subject: &str| integrity::Thing {
+            subject: subject.to_string(),
+            shown: String::new(),
+            facts: Vec::new(),
+            how: String::new(),
+            list: Some(b"/bin/tool\x001.5\n".to_vec()),
+        };
+        let (blocked, next) = (thing("file:machine:mac//a"), thing("file:machine:mac//b"));
+        // A folder where the first list's file goes: it cannot be written.
+        let input = |t: &integrity::Thing| integrity::list_input(&t.subject);
+        std::fs::create_dir_all(dir.join("raw/run-1").join(input(&blocked))).unwrap();
+
+        keep_lists(&run, [&blocked, &next].into_iter());
+
+        let kept = |t| store::last_raw(&tx, integrity::READER, &input(t)).unwrap();
+        assert_eq!(kept(&blocked), None);
+        assert_eq!(kept(&next), Some(format!("raw/run-1/{}", input(&next))));
     }
 }

@@ -80,3 +80,5 @@ Findings of one group can be answered with one command too: `--with <id>` given 
 A `ListedFinding` whose evidence is a place that changed carries `change`, always the value of `PlaceChanged.change` in its `Finding`, so a list can say which change it was without reading each finding. It is absent for every other finding. Since 1.23.0.
 
 While a full check runs, `Status` carries `check_stage`, the stage the check is in, and `check_stage_started_at`, when that stage began, so a client can show a person what the check is doing. Both are absent when no check runs and when the stage cannot be read. A value the client does not know is a stage it cannot name, of a check that still runs. Only `running` says that a check runs, and only `last_run` and `last_finished_run` say that one finished. Since 1.24.0.
+
+A `ChangedInPlace` about a keg, a global npm package or a folder of code an application keeps may carry `files`: how many files were added, removed and changed at the latest occurrence, and the first 20 names of each. Absent means the core cannot say, never that no file changed. Since 1.25.0.

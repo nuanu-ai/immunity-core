@@ -658,6 +658,38 @@ fn published_lines(s: &Screen, f: &v1::Finding, p: &v1::PublishedRuleMatched) ->
     out
 }
 
+/// Which files of a package or of an app's code outside its bundle changed: the counts on one
+/// line, with how many of each are named when not all are, then the names the message holds,
+/// each kind under its word. No line of its own says how many more there are: a name sits at the
+/// same indent and could be made to read like one.
+fn files_lines(s: &Screen, p: &v1::FilesChanged) -> Vec<String> {
+    let e = |label: &str, parts: &[(&str, Style)]| field(s, 4, EVIDENCE_LABEL, label, parts);
+    let n = crate::overview::grouped;
+    let kinds = [
+        ("added", "Added", p.added, &p.added_text),
+        ("removed", "Removed", p.removed, &p.removed_text),
+        ("changed", "Changed", p.changed, &p.changed_text),
+    ];
+    let counts: Vec<String> = kinds
+        .iter()
+        .map(|(word, _, count, names)| match names.len() as u64 {
+            named if named < *count => format!("{} {word} ({} named)", n(*count), n(named)),
+            _ => format!("{} {word}", n(*count)),
+        })
+        .collect();
+    let counts = format!(
+        "changed while the version stayed the same, since the reading before: {}",
+        counts.join(", ")
+    );
+    let mut out = e("Files", &[(&counts, PLAIN)]);
+    for (_, label, _, names) in kinds {
+        for (i, name) in names.iter().enumerate() {
+            out.extend(e(if i == 0 { label } else { "" }, &[(name, PLAIN)]));
+        }
+    }
+    out
+}
+
 /// What the finding rests on, by its kind; none for a kind this build does not shape.
 fn evidence_lines(s: &Screen, f: &v1::Finding) -> Vec<String> {
     use v1::evidence::Body;
@@ -667,9 +699,10 @@ fn evidence_lines(s: &Screen, f: &v1::Finding) -> Vec<String> {
     };
     let lines = match body {
         Body::PlaceChanged(p) => place_lines(s, f, p),
-        Body::ChangedInPlace(p) => match &p.became_text {
-            Some(became) => e("Became", &[(became, PLAIN)]),
-            None => e(
+        Body::ChangedInPlace(p) => match (&p.became_text, &p.files) {
+            (Some(became), _) => e("Became", &[(became, PLAIN)]),
+            (None, Some(files)) => files_lines(s, files),
+            (None, None) => e(
                 "Files",
                 &[(
                     "changed while the version stayed the same: one checksum covers them all, so which file changed is not shown",
@@ -1235,6 +1268,7 @@ mod tests {
                 "changed in place",
                 Body::ChangedInPlace(v1::ChangedInPlace {
                     became_text: Some(format!("does not verify: {odd}")),
+                    files: None,
                 }),
             ),
             (
@@ -1293,6 +1327,20 @@ mod tests {
                 Body::VerdictGiven(v1::VerdictGiven {
                     rule: "watched.shell-profile".to_string(),
                     events: events(odd),
+                }),
+            ),
+            (
+                "files changed",
+                Body::ChangedInPlace(v1::ChangedInPlace {
+                    became_text: None,
+                    files: Some(v1::FilesChanged {
+                        added: 1,
+                        removed: 1,
+                        changed: 23,
+                        added_text: vec![format!("2.0/{odd}.js")],
+                        removed_text: vec![format!("1.0/{odd}")],
+                        changed_text: (0..20).map(|i| format!("lib/{i}{odd}.js")).collect(),
+                    }),
                 }),
             ),
         ]
@@ -1581,6 +1629,7 @@ mod tests {
                     "From",
                 ],
             ),
+            ("files changed", &["Files", "Added", "Removed", "Changed"]),
         ];
         for ((kind, body), (name, labels)) in bodies("odd").into_iter().zip(evidence) {
             assert_eq!(kind, *name);
