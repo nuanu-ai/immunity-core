@@ -113,6 +113,16 @@ impl Dir {
             .unwrap();
     }
 
+    /// Takes out what the latest reading kept of the time the Mac was awake, so the time since
+    /// the last line is counted on the calendar. A test cannot make the Mac's own awake time
+    /// pass, and a line dated before a reading that did not see it is not a long quiet then.
+    fn forget_awake(&self) {
+        rusqlite::Connection::open(self.store())
+            .unwrap()
+            .execute("DELETE FROM meta WHERE key = 'event_level_awake'", [])
+            .unwrap();
+    }
+
     /// Deletes a log file as the root side's tidy job does, with its note.
     fn tidy_away(&self, name: &str) {
         let bytes = std::fs::metadata(self.log().join(name)).unwrap().len();
@@ -1790,6 +1800,7 @@ fn a_collector_that_records_nothing_is_said_so_with_what_it_printed() {
     std::fs::remove_file(dir.log().join("eslogger.err")).unwrap();
     dir.append(H01, "");
     dir.touch(H01, SystemTime::now() + Duration::from_secs(3 * 3600));
+    dir.forget_awake();
     assert_eq!(dir.matches(&[])["collector"]["state"], "silent");
 }
 

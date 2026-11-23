@@ -141,6 +141,8 @@ struct Held {
     findings: BTreeMap<String, v1::FindingRef>,
     /// What arrives, as the latest reading stored it: not yet known before any.
     arrivals: Arrivals,
+    /// What the time the Mac was awake is counted from.
+    awake: events::Awake,
 }
 
 fn read(args: &MatchesArgs, now: i64) -> Result<v1::Matches, Failure> {
@@ -161,9 +163,11 @@ fn read_with(rules: &Rules, args: &MatchesArgs, now: i64) -> Result<v1::Matches,
         state: events::state_read(&tx).map_err(|e| unreadable(&e))?,
         findings: finding_refs(&tx, now).map_err(|e| unreadable(&e))?,
         arrivals: events::arrivals(&tx).map_err(|e| unreadable(&e))?,
+        awake: events::Awake::read(&tx).map_err(|e| unreadable(&e))?,
     };
     let after = args.after.as_ref();
-    let queue = events::queue(&args.system_root, after.map(|(_, p)| p), args.limit, now);
+    let after_place = after.map(|(_, p)| p);
+    let queue = events::queue(&args.system_root, after_place, args.limit, now, &held.awake);
     let mut answer = v1::Matches {
         format: FORMAT,
         answered_at: now,
@@ -1139,5 +1143,49 @@ mod tests {
         );
         assert!(answer.unevaluated.is_empty(), "{:?}", answer.unevaluated);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn matches_counts_the_time_awake_from_the_core_s_row_and_leaves_the_row_as_it_was() {
+        // The last line is five hours old by the calendar, and the core's reading kept that
+        // the Mac has been awake no time without one, as after a night asleep.
+        let dir = crate::common::Scratch::at(
+            std::env::temp_dir().join(format!("immunity-matches-awake-{}", std::process::id())),
+        );
+        let root = dir.join("root");
+        std::fs::create_dir_all(root.join(events::LOG)).unwrap();
+        let plist = root.join(events::PLIST);
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        std::fs::write(&plist, "<plist/>").unwrap();
+        log_file(&root, "exec-20261004T00.jsonl", &dd(1, "kept"), 5 * 3600);
+        let store = dir.join("store.db");
+        core_reads(&store, &root);
+        let row = || -> String {
+            let conn = crate::store::open(&store).unwrap();
+            let sql = "SELECT value FROM meta WHERE key = 'event_level_awake'";
+            conn.query_row(sql, [], |r| r.get(0)).unwrap()
+        };
+        let slept = row().rsplit_once(' ').unwrap().0.to_string() + " 0";
+        crate::store::open(&store)
+            .unwrap()
+            .execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'event_level_awake'",
+                [&slept],
+            )
+            .unwrap();
+        let args = MatchesArgs {
+            store: store.clone(),
+            form: answer::Form::Json,
+            after: None,
+            limit: 10,
+            single: true,
+            system_root: root.clone(),
+        };
+        let answer = read(&args, 1_791_090_010).ok().unwrap();
+        let state = answer.collector.unwrap().state;
+        let left = row();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(state, v1::CollectorState::Running as i32);
+        assert_eq!(left, slept);
     }
 }

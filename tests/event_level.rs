@@ -115,6 +115,16 @@ impl Dir {
         f.write_all(text.as_bytes()).unwrap();
     }
 
+    /// Takes out what the latest reading kept of the time the Mac was awake, so the next one
+    /// counts the time since the last line on the calendar. A test cannot make the Mac's own
+    /// awake time pass, and a log dated back in time with that count kept is not a new line.
+    fn forget_awake(&self) {
+        rusqlite::Connection::open(self.store())
+            .unwrap()
+            .execute("DELETE FROM meta WHERE key = 'event_level_awake'", [])
+            .unwrap();
+    }
+
     /// A full run that reads nothing real but the event level under the temporary root.
     fn run(&self) -> String {
         self.run_text();
@@ -1939,6 +1949,7 @@ fn a_refusal_is_served_with_what_eslogger_said_as_data_and_a_quiet_level_as_sile
             .set_modified(hour_ago)
             .unwrap();
     }
+    dir.forget_awake();
     dir.run();
     let r = dir.status();
     assert_eq!(r["event_level"]["state"], "silent");
@@ -2600,6 +2611,7 @@ fn rules_judge_only_what_was_read_and_say_so_and_none_watches_while_the_level_is
             .set_modified(hour_ago)
             .unwrap();
     }
+    dir.forget_awake();
     dir.run();
     let r = dir.status();
     assert_eq!(r["event_level"]["state"], "silent");

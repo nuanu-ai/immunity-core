@@ -212,12 +212,15 @@ pub const REMOVED: &str = "removed";
 /// (`Key`).
 const PREFIX: &str = "exec-";
 const SUFFIX: &str = ".jsonl";
-/// No line written for this long means the level does not record. The root side's tidy job
-/// runs every ten minutes, and the programs it starts are themselves program starts
-/// `eslogger` records, so a level that runs on a Mac that is awake writes at least that
-/// often. Right after a wake from sleep a reading may say silent before the first start is
-/// written; the next one says otherwise.
+/// No line written while the Mac was awake for this long means the level does not record. The
+/// root side's tidy job runs every ten minutes, and the programs it starts are themselves
+/// program starts `eslogger` records, so a level that runs on a Mac that is awake writes at
+/// least that often. A Mac that is asleep or off writes nothing, so that time is not counted
+/// (`quiet_awake`).
 pub const SILENT_AFTER: i64 = 15 * 60;
+/// The key in `meta` under which a reading keeps what the next one counts from (`Before`). It is
+/// data in a table every store has, so the format stays.
+const AWAKE: &str = "event_level_awake";
 /// The span the log keeps, and the span over which counts are served and coverage is judged:
 /// a loss in it is a gap in what the log holds.
 const DAY: i64 = 24 * 60 * 60;
@@ -1165,6 +1168,8 @@ struct Log {
     arrivals: Arrivals,
     /// The filter's markers no gap has taken in yet.
     pending: u64,
+    /// What the next reading counts the time awake from, when it is known (`quiet_awake`).
+    kept: Option<Before>,
 }
 
 /// Where the last reading left off: each file's inode and offset, the last sequence number of
@@ -1181,8 +1186,8 @@ struct Left {
 }
 
 /// Reads the log under `root` from where `left` says, at `now`, and evaluates every program
-/// start read against `rules`.
-fn look(root: &Path, left: &Left, now: i64, rules: &'static Rules) -> Found {
+/// start read against `rules`. The time the Mac was awake is counted from `awake`.
+fn look(root: &Path, left: &Left, now: i64, rules: &'static Rules, awake: &Awake) -> Found {
     let opened = match open(root) {
         Ok(opened) => opened,
         Err(None) => return Found::NotInstalled,
@@ -1244,7 +1249,7 @@ fn look(root: &Path, left: &Left, now: i64, rules: &'static Rules) -> Found {
         }
     }
     let written = times.iter().copied().max();
-    let (state, said) = judge(&dir, installed_at, times, now);
+    let (state, said, kept) = judge(&dir, installed_at, &times, now, awake);
     Found::Read(Box::new(Log {
         tally,
         file_tally,
@@ -1259,6 +1264,7 @@ fn look(root: &Path, left: &Left, now: i64, rules: &'static Rules) -> Found {
         collects,
         arrivals,
         pending,
+        kept,
     }))
 }
 
@@ -2104,22 +2110,45 @@ fn count_seq(
 }
 
 /// The state the root side's own evidence gives: refused or failing when `eslogger` or the
-/// scripts printed something after the log was last written to, silent when nothing has been
-/// written for `SILENT_AFTER` since the last write or, before any, the install, else running.
-/// `written` is when each log file was last written to. A time ahead of `now` by more than
+/// scripts printed something after the log was last written to, silent when the Mac has been
+/// awake for more than `SILENT_AFTER` with nothing written since the last write or, before any,
+/// the install (`quiet_awake`), else running. With it, what the next reading counts from, when
+/// the clocks can be read and the time has an age.
+/// `times` is when each log file was last written to. A time ahead of `now` by more than
 /// the clock's allowance (`store::age`) is no sign of life: a file's time can be set ahead, and
 /// a clock set back leaves the times written before ahead of it. A time ahead by less is the
 /// collector writing while this reading went on, since `now` is when the reading began.
 fn judge(
     dir: &Path,
     installed_at: i64,
-    written: impl IntoIterator<Item = i64>,
+    times: &[i64],
     now: i64,
-) -> (&'static str, Option<(&'static str, String)>) {
-    let written = written
-        .into_iter()
+    awake: &Awake,
+) -> (&'static str, Option<(&'static str, String)>, Option<Before>) {
+    let written = times
+        .iter()
+        .copied()
         .filter(|w| crate::store::age(*w, now).is_some())
         .max();
+    let quiet = quiet_awake(
+        written.unwrap_or(installed_at),
+        written,
+        awake.before.as_ref(),
+        awake.clocks.as_ref(),
+        now,
+    );
+    // The last write kept never goes down, so a line out of sight for one reading, as after a
+    // clock set back, is not taken for a new one when it is seen again.
+    let latest = written.max(awake.before.as_ref().and_then(|b| b.written));
+    let kept = awake
+        .clocks
+        .clone()
+        .zip(quiet)
+        .map(|(clocks, quiet)| Before {
+            clocks,
+            written: latest,
+            quiet,
+        });
     for (by, name) in [("eslogger", ESLOGGER_SAID), ("scripts", SCRIPTS_SAID)] {
         let path = dir.join(name);
         let Ok(meta) = std::fs::metadata(&path) else {
@@ -2141,14 +2170,185 @@ fn judge(
         } else {
             FAILING
         };
-        return (state, Some((by, last)));
+        return (state, Some((by, last)), kept);
     }
-    let quiet_since = written.unwrap_or(installed_at);
-    if crate::store::age(quiet_since, now).is_none_or(|age| age > SILENT_AFTER) {
-        (SILENT, None)
-    } else {
-        (RUNNING, None)
+    match quiet.is_none_or(|q| q > SILENT_AFTER) {
+        true => (SILENT, None, kept),
+        false => (RUNNING, None, kept),
     }
+}
+
+/// What the clocks say at a reading: which boot this is, as `kern.bootsessionuuid` names it,
+/// and how long the Mac has been awake since, in whole seconds, by `CLOCK_UPTIME_RAW`, which
+/// does not go on while the system is asleep (`clock_gettime(3)`).
+#[derive(Clone, Debug, PartialEq)]
+struct Clocks {
+    boot: String,
+    up: i64,
+}
+
+impl Clocks {
+    /// The clocks now, or `None` when one cannot be read.
+    fn now() -> Option<Clocks> {
+        let mut t = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `t` is a plain C structure that clock_gettime fills, and it outlives the call.
+        if unsafe { libc::clock_gettime(libc::CLOCK_UPTIME_RAW, &mut t) } != 0 {
+            return None;
+        }
+        let mut buf = [0u8; 64];
+        let mut len = buf.len();
+        // SAFETY: the name ends in NUL, `buf` holds `len` bytes, and nothing is set.
+        let r = unsafe {
+            libc::sysctlbyname(
+                c"kern.bootsessionuuid".as_ptr(),
+                buf.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        // sysctl(3) does not say what the buffer holds after a failure.
+        if r != 0 {
+            return None;
+        }
+        Some(Clocks {
+            boot: boot_id(buf.get(..len)?)?,
+            up: t.tv_sec,
+        })
+    }
+}
+
+/// The boot's id from the bytes `sysctlbyname` gave, with or without the NUL that ends a string:
+/// a text that is not empty and holds no space or control character, or `None`.
+fn boot_id(bytes: &[u8]) -> Option<String> {
+    let id = std::str::from_utf8(bytes.strip_suffix(b"\0").unwrap_or(bytes)).ok()?;
+    let fit = !id.is_empty() && !id.chars().any(|c| c == ' ' || c.is_control());
+    fit.then(|| id.to_string())
+}
+
+/// What a reading keeps for the next: the clocks then, the log's last write as it saw it, and
+/// how long the Mac had been awake with no new line.
+#[derive(Debug, PartialEq)]
+struct Before {
+    clocks: Clocks,
+    written: Option<i64>,
+    quiet: i64,
+}
+
+/// What a reading counts the time the Mac was awake from: what the reading before kept, and
+/// the clocks now. With either missing, the calendar decides.
+#[derive(Default)]
+pub struct Awake {
+    before: Option<Before>,
+    clocks: Option<Clocks>,
+}
+
+impl Awake {
+    /// What the reading before kept in `conn`, and the clocks now.
+    pub fn read(conn: &Connection) -> rusqlite::Result<Awake> {
+        Ok(Awake {
+            before: before(conn)?,
+            clocks: Clocks::now(),
+        })
+    }
+}
+
+/// What the reading before kept, read from its row of `meta` alone: `<boot> <up> <written> <quiet>`,
+/// with `-` for no write. A value of any other shape is no record, and the calendar decides: one
+/// that is not text, not UTF-8 or longer than 128 bytes among them. What the value holds never
+/// fails the reading.
+fn before(conn: &Connection) -> rusqlite::Result<Option<Before>> {
+    let value = conn
+        .query_row("SELECT value FROM meta WHERE key = ?1", [AWAKE], |r| {
+            Ok(match r.get_ref(0)? {
+                rusqlite::types::ValueRef::Text(t) if t.len() <= 128 => {
+                    std::str::from_utf8(t).ok().map(str::to_string)
+                }
+                _ => None,
+            })
+        })
+        .optional()?
+        .flatten();
+    Ok(value.and_then(|v| {
+        let [boot, up, written, quiet] = v.split(' ').collect::<Vec<_>>()[..] else {
+            return None;
+        };
+        let written = match written {
+            "-" => None,
+            w => Some(w.parse().ok()?),
+        };
+        let clocks = Clocks {
+            boot: boot.to_string(),
+            up: up.parse().ok()?,
+        };
+        let quiet = quiet.parse().ok()?;
+        Some(Before {
+            clocks,
+            written,
+            quiet,
+        })
+    }))
+}
+
+/// Keeps what this reading counts the next from, or nothing when it is not known.
+fn put_awake(tx: &Transaction, kept: Option<&Before>) -> rusqlite::Result<()> {
+    tx.execute("DELETE FROM meta WHERE key = ?1", [AWAKE])?;
+    if let Some(b) = kept {
+        let written = b.written.map_or("-".to_string(), |w| w.to_string());
+        let value = format!("{} {} {written} {}", b.clocks.boot, b.clocks.up, b.quiet);
+        tx.execute(
+            "INSERT INTO meta (key, value) VALUES (?1, ?2)",
+            params![AWAKE, value],
+        )?;
+    }
+    Ok(())
+}
+
+/// How long the Mac has been awake with nothing written since `quiet_since`, at `now`; `None`
+/// when that time has no age (`store::age`). The count is never more than the calendar's.
+///
+/// With no record, or clocks that cannot be read, the calendar decides. After a boot it is the
+/// time awake since the boot: awake time before the shutdown is not known, so after a boot the
+/// count starts again. In the same boot, `d` is the time awake since the reading before. When
+/// the log's last write `written` is later than the one the record saw, the line came after that
+/// reading, so the count is `d`, never less than the time awake since the line: it errs toward
+/// silent by at most the time awake between that reading and the line. An older write or none,
+/// as when the tidy job removed a file, is not a new line, and the count adds `d`.
+///
+/// Three limits are taken. When more than `SILENT_AFTER` of awake time with sleep among it passes
+/// between two readings and a line was written early in it, a collector that runs can be told
+/// silent once. A full check judges by the time it started, so a count it keeps can be short by
+/// the time the check took. A clock set back shortens the count at that reading.
+///
+/// The record is data a program could write. One row written once can delay silent by up to
+/// `SILENT_AFTER` of awake time; holding it longer takes writing it again before the readings,
+/// as rewriting the level's own row could already.
+fn quiet_awake(
+    quiet_since: i64,
+    written: Option<i64>,
+    before: Option<&Before>,
+    clocks: Option<&Clocks>,
+    now: i64,
+) -> Option<i64> {
+    let calendar = crate::store::age(quiet_since, now)?;
+    let counted = || {
+        let (b, c) = (before?, clocks?);
+        if b.quiet < 0 || b.clocks.up < 0 {
+            return None;
+        }
+        if b.clocks.boot != c.boot {
+            return Some(c.up);
+        }
+        let d = Some(c.up - b.clocks.up).filter(|d| *d >= 0)?;
+        Some(match written > b.written {
+            true => d,
+            false => b.quiet.saturating_add(d),
+        })
+    };
+    Some(counted().map_or(calendar, |q| q.min(calendar)))
 }
 
 /// The last `SAID_TAIL` bytes of a file, as text.
@@ -2236,7 +2436,14 @@ pub fn read(
     now: i64,
 ) -> rusqlite::Result<Outcome> {
     let left = left(tx)?;
-    let found = look(root, &left, now, Rules::shipped());
+    let awake = Awake::read(tx)?;
+    let found = look(root, &left, now, Rules::shipped(), &awake);
+    // The row stands on its own, so a failed reading leaves it for the next one.
+    match &found {
+        Found::Read(log) => put_awake(tx, log.kept.as_ref())?,
+        Found::NotInstalled => put_awake(tx, None)?,
+        Found::Failed(_) => {}
+    }
     let mut opened = 0;
     let state = match &found {
         Found::NotInstalled => NOT_INSTALLED,
@@ -2659,7 +2866,13 @@ pub enum Replay {
 /// Evaluates the rules over every line of the event log under `root` as it is now, from the
 /// start of each file: what would have matched, for tuning before the findings are trusted.
 pub fn replay(root: &Path, now: i64) -> Replay {
-    match look(root, &Left::default(), now, Rules::shipped()) {
+    match look(
+        root,
+        &Left::default(),
+        now,
+        Rules::shipped(),
+        &Awake::default(),
+    ) {
         Found::NotInstalled => Replay::NotInstalled,
         Found::Failed(why) => Replay::Failed(why),
         Found::Read(log) => Replay::Read {
@@ -3069,7 +3282,7 @@ pub enum Queue {
 /// had lines the place had not read when the root side's note of its deletion says it held
 /// more than the offset, or, with no note, when it was not finished: then the answer says the
 /// lines are `gone`.
-pub fn queue(root: &Path, after: Option<&Place>, limit: usize, now: i64) -> Queue {
+pub fn queue(root: &Path, after: Option<&Place>, limit: usize, now: i64, awake: &Awake) -> Queue {
     let Opened {
         installed_at,
         collects,
@@ -3213,7 +3426,7 @@ pub fn queue(root: &Path, after: Option<&Place>, limit: usize, now: i64) -> Queu
     });
     let times: Vec<i64> = files.iter().map(|f| f.mtime.0).collect();
     let written = times.iter().copied().max();
-    let (state, said) = judge(&dir, installed_at, times, now);
+    let (state, said, _) = judge(&dir, installed_at, &times, now, awake);
     Queue::Read(Box::new(Stretch {
         hits: sink.hits,
         tally,
@@ -3394,7 +3607,7 @@ fn covered(state: &str, t: &Tally) -> (&'static str, Option<String>, Option<Caus
         _ => (
             "none",
             Some(format!(
-                "nothing has been written to the event level's log for more than {} minutes",
+                "nothing has been written to the event level's log while the Mac was awake for more than {} minutes",
                 SILENT_AFTER / 60
             )),
             Some(Cause::NotGiven),
@@ -5329,7 +5542,13 @@ mod tests {
         std::fs::write(dir.join(LOG).join("exec-20261004T00.jsonl"), &text).unwrap();
         let rules = Rules::shipped();
         let t = std::time::Instant::now();
-        let found = look(&dir, &Left::default(), 1_791_000_000, rules);
+        let found = look(
+            &dir,
+            &Left::default(),
+            1_791_000_000,
+            rules,
+            &Awake::default(),
+        );
         let took = t.elapsed();
         let _ = std::fs::remove_dir_all(&dir);
         let Found::Read(log) = found else {
@@ -5404,7 +5623,13 @@ mod tests {
         }
         std::fs::write(dir.join(LOG).join("exec-20261004T00.jsonl"), &text).unwrap();
         let t = std::time::Instant::now();
-        let found = look(&dir, &Left::default(), 1_791_000_000, Rules::shipped());
+        let found = look(
+            &dir,
+            &Left::default(),
+            1_791_000_000,
+            Rules::shipped(),
+            &Awake::default(),
+        );
         let took = t.elapsed();
         let _ = std::fs::remove_dir_all(&dir);
         let Found::Read(log) = found else {
@@ -5910,7 +6135,7 @@ mod tests {
     /// A reading of the log under `root` on from `left`: what it says arrives, and where it left
     /// off, for the next.
     fn looked(root: &Path, left: &Left, now: i64) -> Left {
-        let Found::Read(log) = look(root, left, now, Rules::shipped()) else {
+        let Found::Read(log) = look(root, left, now, Rules::shipped(), &Awake::default()) else {
             panic!("the log is read");
         };
         Left {
@@ -6202,5 +6427,330 @@ mod tests {
         assert_eq!(a.0[1], Arrival::NoLonger(6));
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    const BOOT: &str = "00000000-0000-4000-8000-000000000001";
+    const T0: i64 = 1_790_000_000;
+    const INSTALLED: i64 = T0 - 86_400;
+    /// The time awake since the boot at `T0`.
+    const U0: i64 = 50_000;
+
+    fn up(up: i64) -> Option<Clocks> {
+        Some(Clocks {
+            boot: BOOT.to_string(),
+            up,
+        })
+    }
+
+    /// A Mac read again and again, which keeps its record from one reading to the next as
+    /// `read` keeps it.
+    #[derive(Default)]
+    struct Mac(Awake);
+
+    impl Mac {
+        /// The state a reading at `now` tells of log files last written at `written`.
+        fn read(&mut self, written: &[i64], clocks: Option<Clocks>, now: i64) -> &'static str {
+            self.0.clocks = clocks;
+            let (state, _, kept) = judge(Path::new("/invented"), INSTALLED, written, now, &self.0);
+            self.0.before = kept;
+            state
+        }
+
+        fn quiet(&self) -> Option<i64> {
+            self.0.before.as_ref().map(|b| b.quiet)
+        }
+    }
+
+    /// What today's calendar rule tells at `now` of log files last written at `written`.
+    fn calendar(written: &[i64], now: i64) -> &'static str {
+        Mac::default().read(written, None, now)
+    }
+
+    #[test]
+    fn a_mac_that_slept_the_night_is_not_silent_on_waking_and_is_after_fifteen_awake_minutes() {
+        // A line 5 minutes before a reading, the lid closed right after it for nine hours,
+        // and a watcher that reads every ten seconds once the Mac wakes.
+        let mut mac = Mac::default();
+        let line = [T0 - 300];
+        assert_eq!(mac.read(&line, up(U0), T0), RUNNING);
+        let woke = T0 + 9 * 3600;
+        assert_eq!(calendar(&line, woke + 10), SILENT);
+        // An hour of readings at most, so that broken code fails here and does not spin.
+        let first_silent = (1..360)
+            .map(|k| woke + 10 * k)
+            .find(|t| mac.read(&line, up(U0 + t - woke), *t) == SILENT);
+        // 5 minutes before the night and 10 after it are not more than fifteen; ten seconds
+        // more are.
+        assert_eq!(first_silent, Some(woke + 610));
+    }
+
+    #[test]
+    fn an_awake_mac_whose_collector_writes_nothing_is_told_silent_as_soon_as_the_calendar_says() {
+        // A line just before the first reading and one a little later, then none.
+        let line = |t: i64| [if t < T0 + 100 { T0 - 5 } else { T0 + 100 }];
+        for every in [10, 3600] {
+            let mut mac = Mac::default();
+            let times: Vec<i64> = (0..10_000 / every).map(|k| T0 + k * every).collect();
+            let told: Vec<_> = times
+                .iter()
+                .map(|t| mac.read(&line(*t), up(U0 + t - T0), *t))
+                .collect();
+            let calendar: Vec<_> = times.iter().map(|t| calendar(&line(*t), *t)).collect();
+            assert_eq!(told, calendar, "a reading every {every} seconds");
+            assert!(told.contains(&SILENT));
+        }
+    }
+
+    #[test]
+    fn a_new_line_starts_the_count_of_awake_time_again() {
+        // Awake 890 seconds with no line at the reading before; a line 5 seconds after it,
+        // then an hour asleep, and 30 seconds awake by the next reading.
+        let mut mac = Mac(Awake {
+            before: Some(Before {
+                clocks: up(U0).unwrap(),
+                written: Some(T0 - 890),
+                quiet: 890,
+            }),
+            clocks: None,
+        });
+        assert_eq!(mac.read(&[T0 + 5], up(U0 + 30), T0 + 3630), RUNNING);
+        assert_eq!(mac.quiet(), Some(30));
+    }
+
+    #[test]
+    fn a_line_written_after_a_long_sleep_in_the_same_gap_counts_the_awake_time_since() {
+        // Read at 2000, asleep from 2010 to 5610, a line at 5620, read at 6620.
+        let mut mac = Mac::default();
+        assert_eq!(mac.read(&[T0 + 1995], up(U0), T0 + 2000), RUNNING);
+        assert_eq!(mac.read(&[T0 + 5620], up(U0 + 1020), T0 + 6620), SILENT);
+        assert_eq!(mac.quiet(), Some(1000));
+        // The line at 2005 instead, before the sleep: the time awake since the reading before,
+        // less than the calendar's.
+        let mut mac = Mac::default();
+        mac.read(&[T0 + 1995], up(U0), T0 + 2000);
+        assert_eq!(mac.read(&[T0 + 2005], up(U0 + 1020), T0 + 6620), SILENT);
+        assert_eq!(mac.quiet(), Some(1020));
+    }
+
+    #[test]
+    fn a_line_out_of_sight_for_one_reading_does_not_start_the_count_again_when_seen() {
+        let mut mac = Mac::default();
+        mac.read(&[T0 - 100], up(U0), T0);
+        // The clock set back an hour: the line is dated ahead of it and has no age.
+        mac.read(&[T0 - 100], up(U0 + 10), T0 + 10 - 3600);
+        // The clock right again: the line is seen, and it is not a new one.
+        mac.read(&[T0 - 100], up(U0 + 20), T0 + 20);
+        assert_eq!(mac.quiet(), Some(120));
+    }
+
+    #[test]
+    fn a_boot_id_is_taken_only_as_a_text_with_no_space_or_control_character() {
+        let id = Some("AA16C49E-B983".to_string());
+        assert_eq!(
+            (boot_id(b"AA16C49E-B983\0"), boot_id(b"AA16C49E-B983")),
+            (id.clone(), id)
+        );
+        for bad in [
+            &b""[..],
+            b"\0",
+            b"AA16 B983\0",
+            b"AA16\x01\0",
+            b"AA\0B\0",
+            b"\xff\xfe\0",
+        ] {
+            assert_eq!(boot_id(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_line_written_just_before_a_long_sleep_is_not_silence_at_the_first_reading_after() {
+        let mut mac = Mac::default();
+        assert_eq!(mac.read(&[T0 - 5], up(U0), T0), RUNNING);
+        // A line 5 seconds later, asleep a second after it for nine hours.
+        let read = T0 + 6 + 9 * 3600 + 10;
+        assert_eq!(mac.read(&[T0 + 5], up(U0 + 16), read), RUNNING);
+        assert_eq!(mac.quiet(), Some(16));
+    }
+
+    #[test]
+    fn a_mac_that_was_off_is_not_silent_for_that_time_and_is_after_fifteen_awake_minutes() {
+        let mut mac = Mac::default();
+        let line = [T0 - 5];
+        assert_eq!(mac.read(&line, up(U0), T0), RUNNING);
+        // Shut down soon after, booted eight hours on; nothing written since.
+        let booted = T0 + 8 * 3600;
+        let after = |up| {
+            Some(Clocks {
+                boot: "00000000-0000-4000-8000-000000000002".to_string(),
+                up,
+            })
+        };
+        assert_eq!(calendar(&line, booted + 30), SILENT);
+        let first_silent = (0..360)
+            .map(|k| booted + 30 + 10 * k)
+            .find(|t| mac.read(&line, after(t - booted), *t) == SILENT);
+        assert_eq!(first_silent, Some(booted + 910));
+    }
+
+    #[test]
+    fn a_log_file_removed_or_dated_ahead_is_not_taken_for_a_new_line() {
+        let mut mac = Mac::default();
+        assert_eq!(mac.read(&[T0 - 5, T0 - 2], up(U0), T0), RUNNING);
+        // The tidy job removed the newest file: the count goes on.
+        mac.read(&[T0 - 5], up(U0 + 10), T0 + 10);
+        assert_eq!(mac.quiet(), Some(12));
+        // It removed every file.
+        mac.read(&[], up(U0 + 20), T0 + 20);
+        assert_eq!(mac.quiet(), Some(22));
+        // A file dated two hours ahead.
+        mac.read(&[T0 + 7200], up(U0 + 30), T0 + 30);
+        assert_eq!(mac.quiet(), Some(32));
+    }
+
+    #[test]
+    fn a_clock_set_back_or_forward_moves_the_count_only_as_far_as_the_calendar_allows() {
+        // Awake 100 seconds with no line at the reading before, 10 more by the next.
+        let count = |now| {
+            let before = Before {
+                clocks: up(U0).unwrap(),
+                written: Some(T0 - 100),
+                quiet: 100,
+            };
+            quiet_awake(
+                T0 - 100,
+                Some(T0 - 100),
+                Some(&before),
+                up(U0 + 10).as_ref(),
+                now,
+            )
+        };
+        assert_eq!(count(T0 + 10), Some(110));
+        assert_eq!(count(T0 + 10 + 3600), Some(110));
+        assert_eq!(count(T0 + 10 - 120), Some(0));
+        assert_eq!(count(T0 - 3600), None);
+        // A time with no age is silent, as today.
+        assert_eq!(calendar(&[], INSTALLED - 3600), SILENT);
+    }
+
+    #[test]
+    fn with_no_record_or_one_that_does_not_hold_the_calendar_decides() {
+        // Ten seconds awake since a record of 100 seconds with no line, a calendar of an hour.
+        let now = T0 + 3600;
+        let record = |up, quiet| Before {
+            clocks: Clocks {
+                boot: BOOT.to_string(),
+                up,
+            },
+            written: Some(T0),
+            quiet,
+        };
+        let held = record(U0, 100);
+        let records = [None, Some(&record(U0 + 20, 100)), Some(&record(U0, -1))];
+        for before in records {
+            let quiet = quiet_awake(T0, Some(T0), before, up(U0 + 10).as_ref(), now);
+            assert_eq!(quiet, Some(3600), "{before:?}");
+        }
+        let quiet = quiet_awake(T0, Some(T0), Some(&record(-1, 100)), up(10).as_ref(), now);
+        assert_eq!(quiet, Some(3600));
+        assert_eq!(
+            quiet_awake(T0, Some(T0), Some(&held), None, now),
+            Some(3600)
+        );
+        // A record made at the boot, one of no time without a line, and a reading in the same
+        // second as the one before are records that hold.
+        let at_boot = quiet_awake(T0, Some(T0), Some(&record(0, 100)), up(10).as_ref(), now);
+        let none_yet = quiet_awake(
+            T0,
+            Some(T0),
+            Some(&record(U0, 0)),
+            up(U0 + 10).as_ref(),
+            now,
+        );
+        let same_second = quiet_awake(T0, Some(T0), Some(&held), up(U0).as_ref(), now);
+        assert_eq!(
+            (at_boot, none_yet, same_second),
+            (Some(110), Some(10), Some(100))
+        );
+        let quiet = quiet_awake(T0, Some(T0), Some(&held), up(U0 + 10).as_ref(), now);
+        assert_eq!(quiet, Some(110));
+    }
+
+    #[test]
+    fn a_reading_keeps_its_record_in_meta_and_the_store_still_opens_and_a_bad_record_is_none() {
+        let dir = installed("awake");
+        let path = dir.join("store.db");
+        let now = crate::now_secs();
+        write_at(
+            &dir,
+            "exec-20261004T00.jsonl",
+            &(exec(1, OBJECT) + "\n"),
+            now,
+        );
+        let read_at = |root: &Path| {
+            let mut conn = crate::store::open_or_make(&path).unwrap();
+            let tx = conn.transaction().unwrap();
+            crate::store::put_entity(&tx, "machine:mac").unwrap();
+            let state = read(&tx, "events-1", "machine:mac", root, now)
+                .unwrap()
+                .state;
+            tx.commit().unwrap();
+            state
+        };
+        read_at(&dir);
+        let conn = crate::store::open(&path).unwrap();
+        let b = before(&conn).unwrap().expect("the record is kept");
+        assert_eq!((b.written, b.quiet), (Some(now), 0));
+        assert_eq!(b.clocks.boot, Clocks::now().unwrap().boot);
+        let set = |value: &dyn rusqlite::ToSql| {
+            let sql = "UPDATE meta SET value = ?1 WHERE key = ?2";
+            conn.execute(sql, params![value, AWAKE]).unwrap();
+            before(&conn).unwrap()
+        };
+        for bad in [
+            "",
+            "b 1 2",
+            "b 1 2 3 4",
+            "b x 2 3",
+            "b 1  2 3",
+            "b 1 2 3.5",
+            "b 1 none 3",
+        ] {
+            assert_eq!(set(&bad), None, "{bad:?}");
+        }
+        assert_eq!(set(&7), None);
+        assert_eq!(set(&vec![0xffu8, 0xfe]), None);
+        assert_eq!(set(&format!("{} 1 - 3", "b".repeat(123))), None);
+        assert!(set(&format!("{} 1 - 3", "b".repeat(122))).is_some());
+        assert_eq!(set(&"b 1 - 3").map(|b| b.written), Some(None));
+        // Text that is not UTF-8: no record, and the reading judges and writes the row again.
+        let sql = "UPDATE meta SET value = CAST(x'ff2031202d2033' AS TEXT) WHERE key = ?1";
+        conn.execute(sql, [AWAKE]).unwrap();
+        assert_eq!(before(&conn).unwrap(), None);
+        drop(conn);
+        assert_eq!(read_at(&dir), RUNNING);
+        let conn = crate::store::open(&path).unwrap();
+        assert!(before(&conn).unwrap().is_some());
+        // After a sleep the line is five hours old; a reading that fails keeps the row, so the
+        // next one counts the time awake and not the calendar's.
+        let clocks = Clocks::now().unwrap();
+        let line = now - 5 * 3600;
+        let row = format!("{} {} {line} 0", clocks.boot, clocks.up);
+        let set_row = "UPDATE meta SET value = ?1 WHERE key = ?2";
+        conn.execute(set_row, params![row, AWAKE]).unwrap();
+        drop(conn);
+        write_at(&dir, "exec-20261004T00.jsonl", "", line);
+        let (log, aside) = (dir.join(LOG), dir.join("log-aside"));
+        std::fs::rename(&log, &aside).unwrap();
+        std::fs::write(&log, "").unwrap();
+        assert_eq!(read_at(&dir), FAILED);
+        std::fs::remove_file(&log).unwrap();
+        std::fs::rename(&aside, &log).unwrap();
+        assert_eq!(read_at(&dir), RUNNING);
+        // A reading that finds no level keeps nothing to count from.
+        std::fs::remove_file(dir.join(PLIST)).unwrap();
+        read_at(&dir);
+        let left = before(&crate::store::open(&path).unwrap()).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(left, None);
     }
 }
