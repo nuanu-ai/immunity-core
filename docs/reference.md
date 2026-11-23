@@ -8,7 +8,7 @@ An event is something that happened on the Mac and that the collector recorded i
 
 A match is one rule that matched one event. On its own it claims nothing. There are many, and the app does not list them; [`immunity matches`](#immunity-matches) gives every one, of every level, for a program that judges them.
 
-A finding is what Immunity Core decided a person should look at. There are few, and each stays open until the person answers it, except a finding about a state, which Immunity Core clears when the state goes. [`immunity findings`](#immunity-findings-and-immunity-finding-id) lists them.
+A finding is what Immunity Core decided a person should look at. There are few, and each stays open until the person answers it, except a finding about a state, which Immunity Core clears when a check shows the state is over; a check that cannot tell leaves it as it was. [`immunity findings`](#immunity-findings-and-immunity-finding-id) lists them.
 
 A match of a rule marked below high, or of a rule whose set states no level, raises nothing. A match of a rule marked high or critical also raises that rule's finding or adds to the one it has, so it is in both answers. Many findings rest on no event at all, such as one about a malicious package in a lockfile or a shell startup file that changed.
 
