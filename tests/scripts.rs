@@ -51,6 +51,7 @@ impl Tools {
             "scripts/probe.sh",
             "scripts/event-level/install",
             "Cargo.toml",
+            ".github/workflows/check.yml",
         ] {
             let destination = self.0.join(rel);
             std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
@@ -119,20 +120,40 @@ fn the_checks_refuse_an_old_macos_and_say_which_is_needed() {
     assert_eq!(t.prerequisites("rust"), (Some(0), String::new()));
 }
 
+/// What `cargo build --release --message-format=json-render-diagnostics` prints for this
+/// package, one message a line, in the shape the cargo of rust-toolchain.toml prints: a
+/// dependency, a build script compiled and run, the contract's library, the binary, the end.
+/// Before the binary, the message cargo prints for it when it is only checked and not built,
+/// with no executable. The binary was built by an earlier run and is `fresh`, the rest are not,
+/// as on a warm build. Paths are invented. `TARGET` stands for the target folder, which a cargo
+/// configuration or CARGO_TARGET_DIR may put anywhere.
+const CARGO_BUILD: &str = r#"{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#serde@1.0.229","manifest_path":"/example/registry/serde-1.0.229/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"serde","src_path":"/example/registry/serde-1.0.229/src/lib.rs","edition":"2021","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"3","debuginfo":0,"debug_assertions":false,"overflow_checks":false,"test":false},"features":["default","std"],"filenames":["TARGET/release/deps/libserde-0a1b2c3d4e5f6a7b.rlib","TARGET/release/deps/libserde-0a1b2c3d4e5f6a7b.rmeta"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"registry+https://github.com/rust-lang/crates.io-index#libsqlite3-sys@0.39.1","manifest_path":"/example/registry/libsqlite3-sys-0.39.1/Cargo.toml","target":{"kind":["custom-build"],"crate_types":["bin"],"name":"build-script-build","src_path":"/example/registry/libsqlite3-sys-0.39.1/build.rs","edition":"2021","doc":false,"doctest":false,"test":false},"profile":{"opt_level":"0","debuginfo":0,"debug_assertions":false,"overflow_checks":false,"test":false},"features":["bundled"],"filenames":["TARGET/release/build/libsqlite3-sys-1b2c3d4e5f6a7b8c/build-script-build"],"executable":null,"fresh":false}
+{"reason":"build-script-executed","package_id":"registry+https://github.com/rust-lang/crates.io-index#libsqlite3-sys@0.39.1","linked_libs":["static=sqlite3"],"linked_paths":["native=TARGET/release/build/libsqlite3-sys-2c3d4e5f6a7b8c9d/out"],"cfgs":[],"env":[],"out_dir":"TARGET/release/build/libsqlite3-sys-2c3d4e5f6a7b8c9d/out"}
+{"reason":"compiler-artifact","package_id":"path+file:///example/immunity-core/contract#immunity-contract@1.26.0","manifest_path":"/example/immunity-core/contract/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"immunity_contract","src_path":"/example/immunity-core/contract/src/lib.rs","edition":"2024","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"3","debuginfo":0,"debug_assertions":false,"overflow_checks":false,"test":false},"features":[],"filenames":["TARGET/release/deps/libimmunity_contract-3d4e5f6a7b8c9d0e.rlib","TARGET/release/deps/libimmunity_contract-3d4e5f6a7b8c9d0e.rmeta"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"path+file:///example/immunity-core#immunity-core@0.1.0","manifest_path":"/example/immunity-core/Cargo.toml","target":{"kind":["bin"],"crate_types":["bin"],"name":"immunity","src_path":"/example/immunity-core/src/main.rs","edition":"2024","doc":true,"doctest":false,"test":true},"profile":{"opt_level":"3","debuginfo":0,"debug_assertions":false,"overflow_checks":false,"test":false},"features":[],"filenames":["TARGET/release/deps/libimmunity-4e5f6a7b8c9d0e1f.rmeta"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"path+file:///example/immunity-core#immunity-core@0.1.0","manifest_path":"/example/immunity-core/Cargo.toml","target":{"kind":["bin"],"crate_types":["bin"],"name":"immunity","src_path":"/example/immunity-core/src/main.rs","edition":"2024","doc":true,"doctest":false,"test":true},"profile":{"opt_level":"3","debuginfo":0,"debug_assertions":false,"overflow_checks":false,"test":false},"features":[],"filenames":["TARGET/release/immunity"],"executable":"TARGET/release/immunity","fresh":true}
+{"reason":"build-finished","success":true}
+"#;
+
 #[test]
 fn the_core_build_and_checks_use_cargos_external_artifact() {
     let t = Tools::new("core-only");
     t.mac("15.6", "1.89.0");
     t.checkout();
-    t.tool("elsewhere/core with spaces", "exit 99");
-    let core = t.0.join("elsewhere/core with spaces");
-    let artifact = serde_json::json!({
-        "reason": "compiler-artifact", "target": {"name": "immunity", "kind": ["bin"]},
-        "executable": core,
-    });
+    // The build takes the binary from where cargo says it built it, here a target folder that is
+    // not target/, read from a recorded stream of cargo's messages, not from a second build.
+    let target = t.0.join("elsewhere/cargo target");
+    t.tool("elsewhere/cargo target/release/immunity", "exit 99");
+    let core = target.join("release/immunity");
+    let stream = CARGO_BUILD.replace("TARGET", target.to_str().unwrap());
+    std::fs::write(t.0.join("cargo-build.jsonl"), stream).unwrap();
+    // Cargo prints its messages only when the build asks for them.
     t.tool("bin/cargo", &format!(
-        "case \"$1\" in --version) echo 'cargo 1.89.0' ;; build) echo '{}' ;; fmt|clippy|test) exit 0 ;; *) exit 1 ;; esac",
-        artifact,
+        "case \"$1\" in --version) echo 'cargo 1.89.0' ;; \
+         build) case \" $* \" in *' --message-format=json-render-diagnostics '*) cat '{}' ;; esac ;; \
+         fmt|clippy|test) exit 0 ;; *) exit 1 ;; esac",
+        t.0.join("cargo-build.jsonl").display(),
     ));
     let out = t.run("build", &[]);
     assert!(
@@ -194,53 +215,4 @@ fn the_two_halves_of_the_tests_hold_every_test_binary_exactly_once() {
     expected.sort();
     assert_eq!(seen, expected);
     // A library target's tests are in neither half: scripts/lint.sh refuses one.
-}
-
-#[test]
-fn the_build_takes_the_binary_from_where_cargo_says_it_built_it() {
-    // A target folder set in CARGO_TARGET_DIR or in a cargo configuration is not target/:
-    // the path is taken from cargo's own messages, here a real build of this package.
-    let cargo = Command::new(env!("CARGO"))
-        .args([
-            "build",
-            "--locked",
-            "--message-format=json-render-diagnostics",
-        ])
-        .current_dir(ROOT)
-        .output()
-        .unwrap();
-    assert!(
-        cargo.status.success(),
-        "{}",
-        String::from_utf8_lossy(&cargo.stderr)
-    );
-    let found = |messages: &[u8]| {
-        let mut child = Command::new(Path::new(ROOT).join("scripts/cargo-built.sh"))
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap();
-        use std::io::Write;
-        child.stdin.take().unwrap().write_all(messages).unwrap();
-        let out = child.wait_with_output().unwrap();
-        assert!(out.status.success());
-        String::from_utf8(out.stdout).unwrap().trim().to_string()
-    };
-    assert_eq!(found(&cargo.stdout), env!("CARGO_BIN_EXE_immunity"));
-
-    // The same messages with the target folder elsewhere.
-    let target = Path::new(env!("CARGO_BIN_EXE_immunity"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .display()
-        .to_string();
-    let moved = String::from_utf8(cargo.stdout)
-        .unwrap()
-        .replace(&target, "/elsewhere/cargo-target");
-    assert_eq!(
-        found(moved.as_bytes()),
-        "/elsewhere/cargo-target/debug/immunity"
-    );
 }
