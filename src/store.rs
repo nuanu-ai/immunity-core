@@ -1847,6 +1847,248 @@ mod tests {
         assert!(said.contains("it holds a table sqlite_stat1"), "{said}");
     }
 
+    /// A store made from empty and then changed by `sql`, as something other than Immunity Core
+    /// would change it.
+    fn changed(sql: &str) -> (crate::common::Scratch, std::path::PathBuf) {
+        let dir = crate::common::Scratch::new("changed");
+        let path = dir.join("store.db");
+        drop(open_or_make(&path).unwrap());
+        Connection::open(&path)
+            .unwrap()
+            .execute_batch(&format!("PRAGMA foreign_keys = OFF; {sql}"))
+            .unwrap();
+        (dir, path)
+    }
+
+    /// Every way a command opens a store, to write, to read and to make one where no file is,
+    /// refuses the file at `path` in the same words, saying each of `said`, and leaves it byte for
+    /// byte as it was with nothing beside it. The words.
+    fn refused(path: &Path, said: &[&str]) -> String {
+        let before = std::fs::read(path).ok();
+        type Opens = fn(&Path) -> Res<Connection>;
+        let ways: [(&str, Opens); 3] = [
+            ("open", open),
+            ("open_read_only", open_read_only),
+            ("open_or_make", open_or_make),
+        ];
+        let words: Vec<String> = ways
+            .iter()
+            .map(|(way, opened)| {
+                let words = opened(path)
+                    .err()
+                    .unwrap_or_else(|| panic!("{way}"))
+                    .to_string();
+                for s in said {
+                    assert!(words.contains(s), "{way}: {words}");
+                }
+                assert_eq!(std::fs::read(path).ok(), before, "{way}");
+                let beside: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+                    .unwrap()
+                    .flatten()
+                    .map(|e| e.file_name())
+                    .collect();
+                assert_eq!(beside, [std::ffi::OsString::from("store.db")], "{way}");
+                words
+            })
+            .collect();
+        assert!(words.iter().all(|w| *w == words[0]), "{words:#?}");
+        words[0].clone()
+    }
+
+    #[test]
+    fn a_store_that_lacks_a_table_a_column_or_its_id_or_holds_one_too_many_fails_the_check() {
+        // A store of this format holds exactly the schema this build makes, and its id; none is
+        // made again, empty, in a store that lost it.
+        for damage in [
+            "DROP TABLE finding",
+            "DROP TABLE threat",
+            "ALTER TABLE threat DROP COLUMN vendor",
+            "ALTER TABLE finding ADD COLUMN extra TEXT",
+            "CREATE TABLE extra (a TEXT)",
+            "DROP INDEX journal_run",
+            "DROP INDEX journal_run; CREATE INDEX journal_run ON journal (run_id)",
+            // The same columns, without the reference a row of it must keep.
+            "ALTER TABLE coverage_lack RENAME TO old;
+             CREATE TABLE coverage_lack (coverage INTEGER NOT NULL, what TEXT NOT NULL, name TEXT);
+             DROP TABLE old;
+             CREATE INDEX coverage_lack_of ON coverage_lack (coverage);",
+            // A trigger of the format's name that no longer keeps the journal from shrinking.
+            "DROP TRIGGER journal_no_delete;
+             CREATE TRIGGER journal_no_delete BEFORE DELETE ON journal BEGIN SELECT 1; END;",
+            "DELETE FROM meta WHERE key = 'store_id'",
+        ] {
+            let (_dir, path) = changed(damage);
+            refused(&path, &["is damaged", START_OVER]);
+        }
+    }
+
+    #[test]
+    fn a_store_without_any_one_table_of_its_schema_fails_the_check() {
+        // Driven by the schema itself, so a table added later is covered. Without `meta` the
+        // store names no format; without any other table it is damaged.
+        let tables: Vec<&str> = expected()
+            .keys()
+            .filter_map(|object| object.strip_prefix("table "))
+            .filter(|name| !name.starts_with("sqlite_"))
+            .collect();
+        assert!(tables.len() > 40, "{tables:?}");
+        for table in tables {
+            let (_dir, path) = changed(&format!("DROP TABLE {table}"));
+            let said = match table {
+                "meta" => "does not name exactly one format",
+                _ => "is damaged",
+            };
+            refused(&path, &[said, START_OVER]);
+        }
+    }
+
+    #[test]
+    fn a_store_whose_table_differs_only_in_a_check_a_unique_without_rowid_a_collation_or_autoincrement_fails_the_check()
+     {
+        // The comparison is of each object's text as SQLite keeps it, so what lives only there is
+        // compared too. Each table is made again with the one difference and its rows.
+        for (table, made) in [
+            // Without the CHECK that a threat gone has a run that saw it go.
+            (
+                "threat",
+                "CREATE TABLE threat (source TEXT NOT NULL, id TEXT NOT NULL, vendor TEXT NOT NULL,
+                 product TEXT NOT NULL, name TEXT NOT NULL, date_added TEXT NOT NULL,
+                 first_run TEXT NOT NULL, first_seen_at INTEGER NOT NULL, gone_at INTEGER,
+                 gone_run TEXT, PRIMARY KEY (source, id))",
+            ),
+            // Without the UNIQUE of a basis' strength.
+            (
+                "basis_kind",
+                "CREATE TABLE basis_kind (name TEXT PRIMARY KEY, strength INTEGER NOT NULL)",
+            ),
+            (
+                "raw_input",
+                "CREATE TABLE raw_input (reader TEXT NOT NULL, input TEXT NOT NULL,
+                 path TEXT NOT NULL, run_id TEXT NOT NULL, PRIMARY KEY (reader, input)) WITHOUT ROWID",
+            ),
+            (
+                "coverage_kind",
+                "CREATE TABLE coverage_kind (name TEXT COLLATE NOCASE PRIMARY KEY)",
+            ),
+            (
+                "feed_reading",
+                "CREATE TABLE feed_reading (id INTEGER PRIMARY KEY AUTOINCREMENT,
+                 source TEXT NOT NULL, run_id TEXT NOT NULL, at INTEGER NOT NULL,
+                 outcome TEXT NOT NULL CHECK (outcome IN ('read', 'unchanged', 'failed')),
+                 reason TEXT, etag TEXT, sha256 TEXT, raw_path TEXT, entries INTEGER,
+                 CHECK ((outcome = 'failed') = (reason IS NOT NULL)))",
+            ),
+        ] {
+            let (_dir, path) = changed(&format!(
+                "PRAGMA legacy_alter_table = ON;
+                 ALTER TABLE {table} RENAME TO old_{table};
+                 {made};
+                 INSERT INTO {table} SELECT * FROM old_{table};
+                 DROP TABLE old_{table};"
+            ));
+            refused(&path, &["is damaged", START_OVER]);
+        }
+    }
+
+    #[test]
+    fn a_store_whose_id_or_format_has_another_form_fails_the_check() {
+        for (damage, said) in [
+            (
+                "UPDATE meta SET value = ' ' WHERE key = 'store_id'",
+                "it has no id of the form",
+            ),
+            (
+                "UPDATE meta SET value = 'x' WHERE key = 'store_id'",
+                "it has no id of the form",
+            ),
+            (
+                "UPDATE meta SET value = upper(value) || '' WHERE key = 'store_id'",
+                "it has no id of the form",
+            ),
+            (
+                "UPDATE meta SET value = substr(value, 2) WHERE key = 'store_id'",
+                "it has no id of the form",
+            ),
+            // Two rows of the format, in a `meta` made again without its key: the one that names
+            // a newer format is not taken for the store's.
+            (
+                "ALTER TABLE meta RENAME TO old_meta;
+                 CREATE TABLE meta (key TEXT, value TEXT NOT NULL);
+                 INSERT INTO meta SELECT * FROM old_meta;
+                 DROP TABLE old_meta;
+                 INSERT INTO meta VALUES ('format_version', '10');",
+                "does not name exactly one format",
+            ),
+            (
+                "UPDATE meta SET value = '07' WHERE key = 'format_version'",
+                "names a format this version does not know",
+            ),
+            (
+                "UPDATE meta SET value = ' 7' WHERE key = 'format_version'",
+                "names a format this version does not know",
+            ),
+        ] {
+            let (_dir, path) = changed(damage);
+            refused(&path, &[said, START_OVER]);
+        }
+    }
+
+    #[test]
+    fn a_store_of_another_format_fails_the_check_and_an_older_or_a_newer_one_is_told_as_another_build_s()
+     {
+        // An older or a newer format is the condition every command words once for a person
+        // (`condition`); a format that is no number is shown as the check words it.
+        for (version, said, what_to_do, other_build) in [
+            ("8", "is from an older format (8)", START_OVER, true),
+            ("5", "is from an older format (5)", START_OVER, true),
+            (
+                "10",
+                "is from a newer format (10)",
+                "Use the version of Immunity Core that made it",
+                true,
+            ),
+            (
+                "six",
+                "names a format this version does not know",
+                START_OVER,
+                false,
+            ),
+        ] {
+            let (_dir, path) = changed(&format!(
+                "UPDATE meta SET value = '{version}' WHERE key = 'format_version'"
+            ));
+            let words = refused(&path, &[said, what_to_do]);
+            let at = path.to_str().unwrap();
+            let told = match other_build {
+                true => Condition::OtherFormat(at),
+                false => Condition::Other,
+            };
+            assert_eq!(condition(&words), told, "{version}");
+        }
+    }
+
+    #[test]
+    fn a_file_that_exists_is_never_given_a_schema_and_fails_the_check() {
+        // A store is made only where no file was. A store whose objects were taken out of
+        // `sqlite_master` keeps its pages; a 0-byte file and a file that is not SQLite hold
+        // nothing of a store. Each is refused as it is, and none is made a store under a new id.
+        let (_dir, path) = changed("PRAGMA writable_schema = ON; DELETE FROM sqlite_master;");
+        refused(
+            &path,
+            &[
+                "is an SQLite file that holds no tables, not a store",
+                NOT_A_STORE,
+            ],
+        );
+        std::fs::write(&path, b"").unwrap();
+        refused(&path, &["is an empty file, not a store", NOT_A_STORE]);
+        std::fs::write(&path, b"invented notes, not a database\n").unwrap();
+        refused(
+            &path,
+            &["is not a store: it is not an SQLite file", NOT_A_STORE],
+        );
+    }
+
     #[test]
     fn a_time_more_than_a_few_minutes_ahead_of_the_clock_has_no_age_and_a_little_ahead_is_now() {
         // Two clocks differ by seconds; a reading dated later than that is not fresh forever.
