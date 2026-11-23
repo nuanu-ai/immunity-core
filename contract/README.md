@@ -24,7 +24,7 @@ A match of a rule marked below high raises nothing, and its `raised` is `below_h
 
 ## What the contract covers
 
-The messages of the contract are the answers of `immunity matches`, `immunity findings`, `immunity finding`, `immunity project`, `immunity program`, `immunity machine`, `immunity status`, `immunity rules`, `immunity vulnerabilities`, `immunity owner` and `immunity sample`, the `Verdict` a program sends to `immunity verdict` and the `VerdictRecorded` it gets back, and `Failure`.
+The messages of the contract are the answers of `immunity matches`, `immunity findings`, `immunity finding`, `immunity project`, `immunity program`, `immunity machine`, `immunity status`, `immunity run`, `immunity rules`, `immunity vulnerabilities`, `immunity vulnerability`, `immunity owner`, `immunity sample`, `immunity on` and `immunity off`, the `Verdict` a program sends to `immunity verdict` and the `VerdictRecorded` it gets back, and `Failure`.
 
 Unknown is never zero and never false. A count, a total or a yes-or-no the core could not establish is an optional field that is absent (null in JSON), or it sits inside a message that is absent. A section the core could not give is absent and named in `not_computed` with the reason; a list that is there and empty means there is nothing in it. A reader that takes an absent number as 0 or an absent yes-or-no as `false` reads calm the core did not establish.
 
