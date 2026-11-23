@@ -202,12 +202,26 @@ fn number(value: CFTypeRef) -> i64 {
 
 /// The bytes of a data object lent by a dictionary, as lowercase hex.
 fn hex(value: CFTypeRef) -> String {
-    // SAFETY: `value` is a live data object; its bytes are valid for its length while it lives.
-    let bytes = unsafe {
-        let length = CFDataGetLength(value).max(0) as usize;
-        std::slice::from_raw_parts(CFDataGetBytePtr(value), length)
-    };
+    // SAFETY: `value` is a live data object.
+    let bytes = unsafe { data_bytes(value) };
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A copy of the bytes of a data object. An empty one gives none without its pointer, which may
+/// then be null, and a slice is never made from a null pointer. `plist.rs` and `json5.rs` read
+/// their data with it too.
+///
+/// # Safety
+/// `data` is a live data object.
+pub(crate) unsafe fn data_bytes(data: CFTypeRef) -> Vec<u8> {
+    // SAFETY: as the caller promises; the bytes are valid for their length while it lives.
+    unsafe {
+        let length = CFDataGetLength(data).max(0) as usize;
+        if length == 0 {
+            return Vec::new();
+        }
+        std::slice::from_raw_parts(CFDataGetBytePtr(data), length).to_vec()
+    }
 }
 
 /// The status codes of `CSCommon.h` a seal is most often broken with, with the header's own

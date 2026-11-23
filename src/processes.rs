@@ -31,7 +31,7 @@ use crate::findings::Observed;
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
-use std::ffi::{c_int, c_void};
+use std::ffi::{OsString, c_int, c_void};
 use std::mem::{offset_of, size_of};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::os::unix::fs::MetadataExt;
@@ -291,6 +291,9 @@ pub struct Reading {
     /// Processes that ended between the list and their reading.
     pub ended: usize,
     pub sockets_unreadable: usize,
+    /// This process's own arguments did not read as it was started with, so no process's
+    /// arguments are taken: see `layout_known`.
+    pub arguments_layout_unknown: bool,
 }
 
 /// A process as the rule reads it: nothing from its command line but the derived literal.
@@ -316,6 +319,7 @@ pub struct Sample {
     pub ended: usize,
     pub sockets_unreadable: usize,
     pub args_unreadable: usize,
+    pub arguments_layout_unknown: bool,
 }
 
 /// Derives what the rule reads from a reading, and drops every command line in it.
@@ -337,7 +341,8 @@ pub fn derive(r: Reading) -> Sample {
                 .and_then(|e| e.rsplit('/').next())
                 .unwrap_or(&p.name);
             let kind = interpreter(file_name);
-            let shape = match (kind, p.args) {
+            let args = p.args.filter(|_| !r.arguments_layout_unknown);
+            let shape = match (kind, args) {
                 (Some(i), Some(args)) => inline_code(i, &args).then_some(INLINE_CODE),
                 (Some(_), None) => {
                     args_unreadable += 1;
@@ -365,6 +370,7 @@ pub fn derive(r: Reading) -> Sample {
         ended: r.ended,
         sockets_unreadable: r.sockets_unreadable,
         args_unreadable,
+        arguments_layout_unknown: r.arguments_layout_unknown,
     }
 }
 
@@ -730,11 +736,12 @@ fn cover(
             &Gap::of(Cause::NotGiven),
         )?;
     }
+    let layout = s.arguments_layout_unknown.then_some(LAYOUT_UNKNOWN);
     let kinds = [
-        (PROGRAMS_KIND, s.unreadable, "programs"),
-        (CONNECTIONS_KIND, s.sockets_unreadable, "sockets"),
+        (PROGRAMS_KIND, s.unreadable, "programs", layout),
+        (CONNECTIONS_KIND, s.sockets_unreadable, "sockets", None),
     ];
-    for (kind, failed, why) in kinds {
+    for (kind, failed, why, also) in kinds {
         tx.execute(
             "DELETE FROM coverage WHERE reader = ?1 AND scope = ?2 AND kind = ?3",
             params![READER, w.machine, kind],
@@ -747,10 +754,16 @@ fn cover(
             at: s.at,
             observed_at: s.at,
         };
-        if failed == 0 {
+        let counted = (failed > 0).then(|| format!("{why} that could not be read: {failed}"));
+        let reasons: Vec<String> = also
+            .map(str::to_string)
+            .into_iter()
+            .chain(counted)
+            .collect();
+        if reasons.is_empty() {
             crate::store::put_coverage(tx, &reading, "full", None, &Gap::default())?;
         } else {
-            let reason = format!("{why} that could not be read: {failed}");
+            let reason = reasons.join("; ");
             crate::store::put_coverage(
                 tx,
                 &reading,
@@ -885,6 +898,7 @@ impl Reading {
             unreadable: count("unreadable"),
             ended: count("ended"),
             sockets_unreadable: count("sockets_unreadable"),
+            arguments_layout_unknown: v["arguments_layout_unknown"].as_bool() == Some(true),
         })
     }
 }
@@ -1082,24 +1096,46 @@ fn argmax() -> usize {
 }
 
 /// The area `KERN_PROCARGS2` gives: the argument count as an `int`, the path the program was
-/// started by, padding, then the arguments, then the environment, each ending in a zero byte.
-/// No system function parses it; this is the layout Apple's `ps` reads. Only the path and the
-/// arguments are taken; the environment is never read.
+/// started by, then the arguments, then the environment, each ending in a zero byte. The path
+/// with its zero byte is padded with zero bytes to a multiple of eight, as the kernel aligns it
+/// to a pointer. No system function parses it; this is the layout Apple's `ps` reads, except
+/// that `ps` skips every zero byte after the path, so an empty first argument would read as
+/// padding there. An empty argument is a string of length zero. Exactly the count of strings
+/// after the padding are taken, and the environment is never read. Only zero bytes are skipped
+/// as padding, and no further than that multiple, so on a kernel that pads less no argument
+/// loses its first bytes. No system function parses
+/// this area, so a later kernel could lay it out otherwise and shift every argument without a
+/// word: each reading first reads its own process's arguments through this code and checks them
+/// against the ones it was started with (`layout_known`), and takes no arguments when they
+/// differ.
 fn parse_procargs(b: &[u8]) -> Option<(String, Vec<String>)> {
     let argc = i32::from_ne_bytes(b.get(..4)?.try_into().ok()?);
     let rest = &b[4..];
     let end = rest.iter().position(|&c| c == 0)?;
     let exec = String::from_utf8_lossy(&rest[..end]).into_owned();
-    let mut rest = &rest[end..];
+    let pad = (end + 1).next_multiple_of(8) - (end + 1);
+    let rest = &rest[end + 1..];
+    let zeros = rest.iter().take(pad).take_while(|&&c| c == 0).count();
+    let mut rest = &rest[zeros..];
     let mut args = Vec::new();
     for _ in 0..argc.max(0) {
-        let from = rest.iter().position(|&c| c != 0)?;
-        rest = &rest[from..];
         let end = rest.iter().position(|&c| c == 0)?;
         args.push(String::from_utf8_lossy(&rest[..end]).into_owned());
-        rest = &rest[end..];
+        rest = &rest[end + 1..];
     }
     Some((exec, args))
+}
+
+/// Why no process's arguments are taken in a reading.
+const LAYOUT_UNKNOWN: &str = "arguments not read: this program's own arguments, read from the \
+     kernel's argument area, are not the ones it was started with, so that area's layout is not \
+     the one this build knows";
+
+/// Whether this process's own arguments, as `arguments` read them, are the ones it was started
+/// with. When they are not, the layout `parse_procargs` reads is not the kernel's.
+fn layout_known(read: Option<(String, Vec<String>)>, own: impl Iterator<Item = OsString>) -> bool {
+    let own: Vec<String> = own.map(|a| a.to_string_lossy().into_owned()).collect();
+    read.is_some_and(|(_, args)| args == own)
 }
 
 /// Where a process's executable is: where the kernel says, or else, when its file is gone, the
@@ -1245,8 +1281,11 @@ pub fn read_system(at: i64) -> Reading {
         unreadable: 0,
         ended: 0,
         sockets_unreadable: 0,
+        arguments_layout_unknown: false,
     };
     let mut buf = vec![0u8; argmax()];
+    let own = arguments(std::process::id() as i32, &mut buf);
+    r.arguments_layout_unknown = !layout_known(own, std::env::args_os());
     for pid in mine {
         // SAFETY: all-zero is a valid `proc_bsdinfo`.
         let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
@@ -1401,6 +1440,7 @@ mod tests {
             unreadable: 0,
             ended: 0,
             sockets_unreadable: 0,
+            arguments_layout_unknown: false,
         });
         let got: Vec<_> = s
             .processes
@@ -1624,14 +1664,82 @@ mod tests {
 
     #[test]
     fn the_argument_area_is_read_to_its_count_and_the_environment_is_not() {
-        let mut area = 2i32.to_ne_bytes().to_vec();
-        area.extend_from_slice(b"/bin/sh\0\0\0\0sh\0-c\0SECRET=1\0");
+        // The path with its zero byte is padded to a multiple of eight bytes: "/bin/zsh" by
+        // seven, "/bin/sh" by none.
+        let area = |argc: i32, rest: &[u8]| [&argc.to_ne_bytes()[..], rest].concat();
+        let read = |argc, rest: &[u8]| parse_procargs(&area(argc, rest)).map(|(_, args)| args);
+        let zsh = |tail: &[u8]| [&b"/bin/zsh\0\0\0\0\0\0\0\0"[..], tail].concat();
         assert_eq!(
-            parse_procargs(&area),
-            Some(("/bin/sh".to_string(), strings(&["sh", "-c"])))
+            parse_procargs(&area(2, &zsh(b"sh\0-c\0SECRET=1\0"))),
+            Some(("/bin/zsh".to_string(), strings(&["sh", "-c"])))
         );
-        area[0] = 4;
-        assert_eq!(parse_procargs(&area), None);
-        assert_eq!(parse_procargs(&area[..2]), None);
+        // An empty argument is a string of length zero, first, in the middle or last; the
+        // arguments after it stay in place and no string of the environment is taken.
+        let cases: [(i32, &[u8], &[&str]); 4] = [
+            (3, b"sh\0\0x\0SECRET=1\0", &["sh", "", "x"]),
+            (3, b"sh\0x\0\0SECRET=1\0", &["sh", "x", ""]),
+            (2, b"\0x\0SECRET=1\0", &["", "x"]),
+            (1, b"\0SECRET=1\0", &[""]),
+        ];
+        for (argc, tail, want) in cases {
+            assert_eq!(read(argc, &zsh(tail)), Some(strings(want)), "{tail:?}");
+        }
+        assert_eq!(
+            read(2, b"/bin/sh\0\0x\0SECRET=1\0"),
+            Some(strings(&["", "x"]))
+        );
+        // A count larger than the strings there reads nothing.
+        assert_eq!(read(4, &zsh(b"sh\0-c\0SECRET=1\0")), None);
+        assert_eq!(parse_procargs(&[2, 0]), None);
+    }
+
+    #[test]
+    fn only_zero_bytes_are_skipped_after_the_path_so_no_argument_loses_its_first_bytes() {
+        let area = |argc: i32, rest: &[u8]| [&argc.to_ne_bytes()[..], rest].concat();
+        // Padded by three, short of eight: the first argument is read whole.
+        assert_eq!(
+            parse_procargs(&area(2, b"/bin/zsh\0\0\0\0sh\0-c\0SECRET=1\0")),
+            Some(("/bin/zsh".to_string(), strings(&["sh", "-c"])))
+        );
+        // No arguments and nothing after the path: none, as the count says.
+        assert_eq!(
+            parse_procargs(&area(0, b"/bin/zsh\0")),
+            Some(("/bin/zsh".to_string(), Vec::new()))
+        );
+    }
+
+    #[test]
+    fn the_layout_is_known_only_when_the_readers_own_arguments_read_as_it_was_started_with() {
+        let own = || {
+            ["immunity", "", "sample"]
+                .map(std::ffi::OsString::from)
+                .into_iter()
+        };
+        let read = |a: &[&str]| Some(("/x/immunity".to_string(), strings(a)));
+        assert!(layout_known(read(&["immunity", "", "sample"]), own()));
+        // Shifted by one, an extra empty first argument, or not read at all.
+        assert!(!layout_known(read(&["", "sample", "SECRET=1"]), own()));
+        assert!(!layout_known(read(&["", "immunity", ""]), own()));
+        assert!(!layout_known(None, own()));
+    }
+
+    /// The layout of an empty first argument on this kernel, read from a child this test
+    /// starts with invented arguments and environment.
+    #[test]
+    fn an_empty_first_argument_of_a_running_process_is_read_as_it_is() {
+        use std::os::unix::process::CommandExt;
+        let mut child = Command::new("/bin/sleep")
+            .arg0("")
+            .arg("30")
+            .env_clear()
+            .env("SECRET", "1")
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut area = vec![0u8; argmax()];
+        let read = arguments(child.id() as i32, &mut area);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert_eq!(read, Some(("/bin/sleep".to_string(), strings(&["", "30"]))));
     }
 }

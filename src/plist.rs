@@ -63,7 +63,6 @@ unsafe extern "C" {
     fn CFDataGetTypeID() -> usize;
     fn CFDataCreate(allocator: CFTypeRef, bytes: *const u8, length: CFIndex) -> CFTypeRef;
     fn CFDataGetLength(data: CFTypeRef) -> CFIndex;
-    fn CFDataGetBytePtr(data: CFTypeRef) -> *const u8;
     fn CFPropertyListCreateWithData(
         allocator: CFTypeRef,
         data: CFTypeRef,
@@ -350,13 +349,8 @@ fn binary(value: CFTypeRef) -> Option<Vec<u8>> {
     let data = Owned::take(unsafe {
         CFPropertyListCreateData(std::ptr::null(), value, BINARY, 0, std::ptr::null_mut())
     })?;
-    // SAFETY: `data` is a live data object; its bytes are valid for its length while it lives,
-    // and they are copied before it is released.
-    let bytes = unsafe {
-        let length = CFDataGetLength(data.0).max(0) as usize;
-        std::slice::from_raw_parts(CFDataGetBytePtr(data.0), length).to_vec()
-    };
-    Some(bytes)
+    // SAFETY: `data` is a live data object, copied before it is released.
+    Some(unsafe { crate::codesign::data_bytes(data.0) })
 }
 
 #[cfg(test)]
@@ -391,6 +385,15 @@ mod tests {
             .step_by(2)
             .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
             .collect()
+    }
+
+    #[test]
+    fn an_empty_data_value_gives_no_bytes_and_no_slice_of_a_null_pointer() {
+        // SAFETY: no bytes are read for a length of zero. Owned: `Create`.
+        let empty = Owned::take(unsafe { CFDataCreate(std::ptr::null(), std::ptr::null(), 0) });
+        let empty = empty.unwrap();
+        // SAFETY: a live data object.
+        assert_eq!(unsafe { crate::codesign::data_bytes(empty.0) }, b"");
     }
 
     #[test]
