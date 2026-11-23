@@ -553,22 +553,27 @@ impl Matched {
     /// checkout's lockfiles of its ecosystem were read in full in this run and either no longer
     /// hold the package, or hold it and every answer for it is known, on current data.
     pub fn known(&self, conn: &Connection, about: &str) -> rusqlite::Result<bool> {
-        // The checkout whose lockfiles the reader read the component in, kept after it went. A
-        // thing the store holds no such fact of has no checkout, so nothing is known of it.
-        let (checkout, gone): (String, bool) = conn
-            .query_row(
-                "SELECT scope, scope IN (SELECT id FROM gone_entity) FROM assertion
-                 WHERE subject = ?1 AND reader = ?2 LIMIT 1",
-                params![about, crate::lockfiles::READER],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?
-            .unwrap_or_default();
-        let read = about
-            .strip_prefix(&format!("component:{checkout}/"))
-            .and_then(|rest| rest.split_once('/'))
-            .is_some_and(|(eco, _)| self.read.iter().any(|(c, e)| *c == checkout && *e == eco));
-        Ok(gone || (read && !self.untold.contains(about)))
+        // Every checkout whose lockfiles the reader read a component of this id in, kept after
+        // it went. A package name may hold `/`, so one id can name packages of two checkouts,
+        // one inside the other; the thing is known only when it is known in each. A thing the
+        // store holds no such fact of has no checkout, so nothing is known of it.
+        let checkouts: Vec<(String, bool)> = conn
+            .prepare(
+                "SELECT DISTINCT scope, scope IN (SELECT id FROM gone_entity) FROM assertion
+                 WHERE subject = ?1 AND reader = ?2",
+            )?
+            .query_map(params![about, crate::lockfiles::READER], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        let known_in = |(checkout, gone): &(String, bool)| {
+            let read = about
+                .strip_prefix(&format!("component:{checkout}/"))
+                .and_then(|rest| rest.split_once('/'))
+                .is_some_and(|(eco, _)| self.read.iter().any(|(c, e)| c == checkout && *e == eco));
+            *gone || (read && !self.untold.contains(about))
+        };
+        Ok(!checkouts.is_empty() && checkouts.iter().all(known_in))
     }
 }
 
@@ -2350,6 +2355,80 @@ mod tests {
         };
         let about = format!("component:{checkout}/npm/left-pad");
         assert!(!matched.known(&conn, &about).unwrap());
+    }
+
+    #[test]
+    fn a_component_id_two_checkouts_share_is_known_only_when_it_is_known_in_each() {
+        // `nested/crates.io/widget` in `app` and `widget` in `app/crates.io/nested` have one id.
+        // The outer checkout is gone; the inner one's package cannot be told, so the finding
+        // about that id stands. Once the inner one is told too, it is known.
+        let dir = crate::common::Scratch::new("known-shared-id");
+        let mut conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
+        let (outer, inner) = (
+            "checkout:machine:mac/app",
+            "checkout:machine:mac/app/crates.io/nested",
+        );
+        let about = format!("component:{inner}/crates.io/widget");
+        let tx = conn.transaction().unwrap();
+        let fact = |layer: &str,
+                    subject: &str,
+                    predicate: &str,
+                    object: &str,
+                    reader: &str,
+                    scope: &str| {
+            for id in [subject, scope] {
+                crate::store::put_entity(&tx, id).unwrap();
+            }
+            tx.execute(
+                "INSERT INTO assertion (layer, subject, predicate, object, reader, scope, kind,
+                                        source_ref, basis, observed_at, run_id, retracted_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, '', ?8, 1, 'r1',
+                         CASE WHEN ?1 = 'retracted' THEN 2 END)",
+                params![
+                    layer,
+                    subject,
+                    predicate,
+                    object,
+                    reader,
+                    scope,
+                    crate::lockfiles::KIND,
+                    crate::lockfiles::BASIS
+                ],
+            )
+            .unwrap();
+        };
+        fact(
+            "retracted",
+            outer,
+            "located_on",
+            "machine:mac",
+            "checkouts",
+            outer,
+        );
+        fact(
+            "retracted",
+            &about,
+            "part_of",
+            outer,
+            crate::lockfiles::READER,
+            outer,
+        );
+        fact(
+            "live",
+            &about,
+            "part_of",
+            inner,
+            crate::lockfiles::READER,
+            inner,
+        );
+        let mut matched = Matched {
+            affected: BTreeMap::new(),
+            read: HashSet::from([(inner.to_string(), "crates.io")]),
+            untold: HashSet::from([about.clone()]),
+        };
+        assert!(!matched.known(&tx, &about).unwrap());
+        matched.untold.clear();
+        assert!(matched.known(&tx, &about).unwrap());
     }
 
     fn v(s: &str) -> Version {
