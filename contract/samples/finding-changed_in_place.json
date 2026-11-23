@@ -1,7 +1,7 @@
 {
   "advice": "If you did not edit it yourself, reinstall that package and look for what else changed.",
   "answer": null,
-  "answered_at": 1795416811,
+  "answered_at": 1795422055,
   "answered_together": [],
   "answered_with": null,
   "answers_note": "Answer a finding only after the owner has agreed in this conversation, having been told what it is and what the options are. Pass --via agent and the reason the owner agreed to. The app shows every answer given this way.",
@@ -10,13 +10,17 @@
       "became_text": null,
       "files": {
         "added": 0,
-        "added_text": [],
+        "added_paths": [],
         "changed": 1,
-        "changed_text": [
-          "bin/tool"
+        "changed_paths": [
+          {
+            "files": 1,
+            "folder": false,
+            "path_text": "bin/tool"
+          }
         ],
         "removed": 0,
-        "removed_text": []
+        "removed_paths": []
       }
     }
   },
@@ -29,31 +33,31 @@
     "state": "open",
     "urgent": true
   },
-  "first_seen_at": 1795416810,
+  "first_seen_at": 1795422054,
   "folder_text": null,
   "format": 1,
   "group": null,
   "journal_seq": 44,
   "kind": "installed package changed in place",
   "kind_title": "Package changed in place",
-  "last_seen_at": 1795416810,
+  "last_seen_at": 1795422054,
   "meaning": "Package managers put in a new version rather than change an installed one, so this is rare; it happens when something adds code to a tool you run.",
   "rests_on": [
     {
       "entry": "changed",
       "kind": "Homebrew kegs",
-      "new_value_text": "stat:795c88c1ddf3090f152b44b93aa42391b30c35a3c1d5c7afc088edd251d71fec",
-      "old_value_text": "stat:888057ff1a2f9f19f54c49520dc5fa24b899a3e23455400bc3c886ecac302b74",
+      "new_value_text": "stat:aca6cb77bc59a53dec5bcd43274d446def8372ee3ba63aede85a190a50fcb672",
+      "old_value_text": "stat:20303de342788e1e3ade82d07d15e6d5ab8953d39cd932f722ac21395a37dd4b",
       "predicate": "has_digest",
       "reader": "integrity",
-      "recorded_at": 1795416810,
-      "run_id": "1795416810-259478000",
+      "recorded_at": 1795422054,
+      "run_id": "1795422054-821574000",
       "seq": 33,
       "subject_text": "file:machine:mac//opt/homebrew/Cellar/tool/1.0"
     }
   ],
   "short_title": "Program files changed in place",
-  "store_id": "0b0d757bb3f1390e37adb3507c28ea4b",
+  "store_id": "67a5564840d7fe7330b031366a20e154",
   "technique_text": "T1554",
   "thing": null,
   "title": "Files of an installed command-line tool or package were changed in place, while its version stayed the same.",
@@ -78,7 +82,7 @@
             "length": 18
           }
         ],
-        "recorded_at": 1795416810,
+        "recorded_at": 1795422055,
         "verdict": {
           "case_text": "case-samples",
           "confidence": "high",
@@ -89,7 +93,7 @@
           "kind": "suspicious",
           "reason_text": "invented: the package was published by an account taken over; it ran tool --password=\\cut{immunity:flag-value 18}",
           "severity": "critical",
-          "store_id": "0b0d757bb3f1390e37adb3507c28ea4b",
+          "store_id": "67a5564840d7fe7330b031366a20e154",
           "verdict_id": null
         }
       }

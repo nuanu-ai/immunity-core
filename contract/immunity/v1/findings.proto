@@ -289,19 +289,39 @@ message ChangedInPlace {
 
 // The files of an installed thing that changed between two readings, by their paths from the
 // thing's folder. A file counts as changed when its change time moved; its content is never read.
-// The counts are exact; each list holds at most 20 names, in the order of the thing's files.
-// Since 1.25.0.
+// The counts are exact. Since 1.25.0.
 message FilesChanged {
+  // Lists of names, the first 20 of each kind, given by 1.25.0 alone.
+  reserved 4 to 6;
+  reserved "added_text", "removed_text", "changed_text";
   // Files in the newer reading only.
   uint64 added = 1;
   // Files in the older reading only.
   uint64 removed = 2;
   // Files in both whose change time differs.
   uint64 changed = 3;
-  // The first names of each, as the file system gives them.
-  repeated string added_text = 4;
-  repeated string removed_text = 5;
-  repeated string changed_text = 6;
+  // What was added, removed and changed, told by structure, in path order: a folder every file
+  // under which, in either reading, changed in that way, at the outermost such folder, and every
+  // other file of the kind alone. When the whole thing changed in one way (it had no file
+  // before, every file went, or every file changed), the one entry is the thing's own folder,
+  // `.`. The entries of a kind cover every file it counts unless the record of the change grew
+  // too large to keep whole: they stop in path order, and the files they leave out are the count
+  // less the sum of their `files`. Since 1.26.0.
+  repeated ChangedPath added_paths = 7;
+  repeated ChangedPath removed_paths = 8;
+  repeated ChangedPath changed_paths = 9;
+}
+
+// One entry of `FilesChanged`: a folder that changed whole, or a file. Since 1.26.0.
+message ChangedPath {
+  // The path from the thing's folder, as the file system gives it, cut to 1,024 bytes; `.` for
+  // the thing's folder itself.
+  string path_text = 1;
+  // Whether it is a folder. A folder is an entry only when it holds more than one file of the
+  // kind; a folder of one is told as that file.
+  bool folder = 2;
+  // How many files of the kind it holds: 1 for a file.
+  uint64 files = 3;
 }
 
 // A match of the indicator list.

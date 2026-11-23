@@ -1311,9 +1311,10 @@ fn package_managers_this_version_does_not_read_are_named_by_kind_as_a_limit_and_
 }
 
 #[test]
-fn files_added_removed_and_rewritten_in_code_outside_a_bundle_a_keg_or_a_package_are_told_by_name_and_count()
+fn a_new_version_beside_an_old_one_is_a_folder_added_and_a_folder_removed_and_the_one_file_changed_beside_them_is_named()
  {
-    // The digest says only that a thing changed; the list it is made over says which files did.
+    // The digest says only that a thing changed; the list it is made over says which files did,
+    // by structure: a folder that came or went whole is one entry with its count.
     let e = Estate::new("files");
     bundle(&e.app(), "1.0");
     package(&e.package(), "1.0.0");
@@ -1322,61 +1323,53 @@ fn files_added_removed_and_rewritten_in_code_outside_a_bundle_a_keg_or_a_package
         e.keg(),
         e.package(),
     ];
+    let code = ["a.js", "b.js", "lib/c.js"];
     for dir in &dirs {
-        put(&dir.join("1.0/old.js"), "a\n");
-        put(&dir.join("1.0/main.js"), "a\n");
+        for file in code {
+            put(&dir.join("1.0").join(file), "a\n");
+        }
+        put(&dir.join("shared/main.js"), "a\n");
+        put(&dir.join("shared/other.js"), "a\n");
     }
     e.run();
     for dir in &dirs {
-        std::fs::remove_file(dir.join("1.0/old.js")).unwrap();
-        put(&dir.join("2.0/new.js"), "b\n");
-        append(&dir.join("1.0/main.js"), "steal();\n");
+        std::fs::remove_dir_all(dir.join("1.0")).unwrap();
+        for file in code {
+            put(&dir.join("2.0").join(file), "b\n");
+        }
+        append(&dir.join("shared/main.js"), "steal();\n");
     }
     e.run();
+    let entry = |path: &str, folder: bool, files: u64| serde_json::json!({"path_text": path, "folder": folder, "files": files});
     for about in [APP_CODE, KEG, PACKAGE] {
         let (evidence, text) = e.changed(about);
         assert_eq!(
             evidence["files"],
             serde_json::json!({
-                "added": 1, "removed": 1, "changed": 1,
-                "added_text": ["2.0/new.js"],
-                "removed_text": ["1.0/old.js"],
-                "changed_text": ["1.0/main.js"],
+                "added": 3, "removed": 3, "changed": 1,
+                "added_paths": [entry("2.0", true, 3)],
+                "removed_paths": [entry("1.0", true, 3)],
+                "changed_paths": [entry("shared/main.js", false, 1)],
             }),
             "{about}"
         );
-        for line in [
-            "    Files        changed while the version stayed the same, since the reading before: 1 added, 1 removed, 1 changed",
-            "    Added        2.0/new.js",
-            "    Removed      1.0/old.js",
-            "    Changed      1.0/main.js",
-        ] {
-            assert!(text.lines().any(|l| l == line), "{line}\n{text}");
-        }
-        assert!(!text.contains("more"), "{text}");
+        let lines = [
+            "    Files        changed while the version stayed the same, since the reading before: 3 added, 3 removed, 1 changed",
+            "    Added        2.0/ (3 files)",
+            "    Removed      1.0/ (3 files)",
+            "    Changed      shared/main.js",
+        ];
+        let at: Vec<usize> = lines
+            .iter()
+            .map(|line| {
+                text.lines()
+                    .position(|l| l == *line)
+                    .unwrap_or_else(|| panic!("{line}\n{text}"))
+            })
+            .collect();
+        assert!(at.windows(2).all(|w| w[1] == w[0] + 1), "{text}");
+        assert!(!text.contains("not listed"), "{text}");
     }
-}
-
-#[test]
-fn more_than_twenty_files_of_a_kind_are_counted_exactly_and_twenty_are_named_in_order() {
-    let e = Estate::new("many");
-    put(&e.keg().join("bin/tool"), "a\n");
-    e.run();
-    for i in 0..25 {
-        put(&e.keg().join(format!("lib/{i:02}.rb")), "a\n");
-    }
-    e.run();
-    let (evidence, text) = e.changed(KEG);
-    assert_eq!(evidence["files"]["added"], 25);
-    let named: Vec<String> = (0..20).map(|i| format!("lib/{i:02}.rb")).collect();
-    assert_eq!(evidence["files"]["added_text"], serde_json::json!(named));
-    assert!(
-        text.contains(": 25 added (20 named), 0 removed, 0 changed\n"),
-        "{text}"
-    );
-    assert!(!text.contains("more"), "{text}");
-    let labelled = text.lines().filter(|l| l.trim_start().starts_with("Added"));
-    assert_eq!(labelled.count(), 1, "{text}");
 }
 
 #[test]
@@ -1402,7 +1395,10 @@ fn without_a_list_from_the_reading_before_or_with_one_gone_or_damaged_nothing_is
     // The list that reading kept tells the next change.
     append(&tool, "c\n");
     e.run();
-    assert_eq!(e.changed(KEG).0["files"]["changed_text"][0], "bin/tool");
+    assert_eq!(
+        e.changed(KEG).0["files"]["changed_paths"][0]["path_text"],
+        "bin/tool"
+    );
     let list = |e: &Estate| -> PathBuf {
         let path: String = e
             .db()
@@ -1430,33 +1426,50 @@ fn without_a_list_from_the_reading_before_or_with_one_gone_or_damaged_nothing_is
         edit(&mut v);
         std::fs::write(e.0.join(&told), format!("{v}{}", " ".repeat(pad))).unwrap();
     };
-    let kind = |count: u64, names: Vec<String>| serde_json::json!({"count": count, "names": names});
+    let kind = |count: u64, paths: &[&str]| {
+        let entries: Vec<_> = paths
+            .iter()
+            .map(|p| serde_json::json!({"path": p, "folder": false, "files": 1}))
+            .collect();
+        serde_json::json!({"count": count, "entries": entries})
+    };
     forge(&|v| v["to"] = "stat:0".into(), 0);
     unsaid(&e);
-    // What is shown is bounded whatever the file holds: a record that tells no file, or names
-    // more than it counts, is none; so is a file over 64 KiB; 20 names of each kind are passed
-    // on, each cut to 1,024 bytes.
+    // What is shown is bounded whatever the file holds: a record that tells no file, or whose
+    // entries cover more files than it counts, is none; so is a file over 64 KiB, and a record
+    // of the shape 1.25.0 wrote, with names in place of entries. Each path is cut to 1,024 bytes.
     assert_eq!(
         (&kept["added"]["count"], &kept["removed"]["count"]),
         (&0.into(), &0.into())
     );
-    forge(&|v| v["changed"] = kind(0, Vec::new()), 0);
+    forge(&|v| v["changed"] = kind(0, &[]), 0);
     unsaid(&e);
+    forge(&|v| v["changed"] = kind(1, &["bin/a", "bin/b"]), 0);
+    unsaid(&e);
+    // Entries whose files add up past what a count can hold, and would wrap round to 1.
     forge(
-        &|v| v["changed"] = kind(1, vec!["bin/a".into(), "bin/b".into()]),
+        &|v| {
+            v["changed"] = kind(1, &["bin/a", "bin/b"]);
+            v["changed"]["entries"][0]["files"] = u64::MAX.into();
+        },
         0,
     );
     unsaid(&e);
     forge(&|_| {}, 64 << 10);
     unsaid(&e);
-    let mut many: Vec<String> = (0..25).map(|i| format!("bin/{i}")).collect();
+    forge(
+        &|v| v["changed"] = serde_json::json!({"count": 1, "names": ["bin/tool"]}),
+        0,
+    );
+    unsaid(&e);
     // Cut at the end of a character: the 1,024th byte is inside `é`.
-    many[0] = format!("{}é{}", "a".repeat(1_023), "a".repeat(1_000));
-    forge(&|v| v["changed"] = kind(30, many.clone()), 0);
+    let long = format!("{}é{}", "a".repeat(1_023), "a".repeat(1_000));
+    forge(&|v| v["changed"] = kind(30, &[&long, "bin/b"]), 0);
     let files = e.changed(KEG).0["files"].clone();
     assert_eq!(files["changed"], 30);
-    assert_eq!(files["changed_text"].as_array().unwrap().len(), 20);
-    assert_eq!(files["changed_text"][0], "a".repeat(1_023));
+    let paths = files["changed_paths"].as_array().unwrap();
+    assert_eq!(paths.len(), 2);
+    assert_eq!(paths[0]["path_text"], "a".repeat(1_023));
     // A path in that table of another shape than the store writes is no copy: what it names is
     // not shown, not read as the list before and not removed.
     let point = |like: &str, path: &Path| {
@@ -1505,7 +1518,7 @@ fn a_file_name_with_an_escape_sequence_or_a_line_break_is_shown_as_data_and_brea
     e.run();
     let (evidence, text) = e.changed(KEG);
     assert_eq!(
-        evidence["files"]["added_text"][0],
+        evidence["files"]["added_paths"][0]["path_text"],
         "bin/x\\u{1b}[31mRED\\u{a}evil"
     );
     assert!(!text.contains('\u{1b}'), "{text}");
@@ -1543,6 +1556,6 @@ fn a_folder_of_code_that_changed_three_times_leaves_one_list_and_one_changes_fil
     kept.retain(|input| input == "files" || input == "changes");
     kept.sort();
     assert_eq!(kept, ["changes", "files"]);
-    let told = &e.changed(APP_CODE).0["files"]["changed_text"];
-    assert_eq!(told[0], "1.0/main.js");
+    let told = &e.changed(APP_CODE).0["files"]["changed_paths"];
+    assert_eq!(told[0]["path_text"], "1.0/main.js");
 }

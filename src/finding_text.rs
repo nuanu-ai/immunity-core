@@ -659,22 +659,28 @@ fn published_lines(s: &Screen, f: &v1::Finding, p: &v1::PublishedRuleMatched) ->
 }
 
 /// Which files of a package or of an app's code outside its bundle changed: the counts on one
-/// line, with how many of each are named when not all are, then the names the message holds,
-/// each kind under its word. No line of its own says how many more there are: a name sits at the
-/// same indent and could be made to read like one.
+/// line, with how many of each the entries leave out when they do, then the entries, each kind
+/// under its word, a folder with a trailing `/` and its number of files, a file by its path. No
+/// line of its own says how many are left out: an entry sits at the same indent and could be
+/// made to read like one.
 fn files_lines(s: &Screen, p: &v1::FilesChanged) -> Vec<String> {
     let e = |label: &str, parts: &[(&str, Style)]| field(s, 4, EVIDENCE_LABEL, label, parts);
     let n = crate::overview::grouped;
     let kinds = [
-        ("added", "Added", p.added, &p.added_text),
-        ("removed", "Removed", p.removed, &p.removed_text),
-        ("changed", "Changed", p.changed, &p.changed_text),
+        ("added", "Added", p.added, &p.added_paths),
+        ("removed", "Removed", p.removed, &p.removed_paths),
+        ("changed", "Changed", p.changed, &p.changed_paths),
     ];
     let counts: Vec<String> = kinds
         .iter()
-        .map(|(word, _, count, names)| match names.len() as u64 {
-            named if named < *count => format!("{} {word} ({} named)", n(*count), n(named)),
-            _ => format!("{} {word}", n(*count)),
+        .map(|(word, _, total, paths)| {
+            let listed = paths
+                .iter()
+                .fold(0u64, |sum, x| sum.saturating_add(x.files));
+            match total.saturating_sub(listed) {
+                0 => format!("{} {word}", n(*total)),
+                left => format!("{} {word} ({} not listed)", n(*total), n(left)),
+            }
         })
         .collect();
     let counts = format!(
@@ -682,9 +688,13 @@ fn files_lines(s: &Screen, p: &v1::FilesChanged) -> Vec<String> {
         counts.join(", ")
     );
     let mut out = e("Files", &[(&counts, PLAIN)]);
-    for (_, label, _, names) in kinds {
-        for (i, name) in names.iter().enumerate() {
-            out.extend(e(if i == 0 { label } else { "" }, &[(name, PLAIN)]));
+    for (_, label, _, paths) in kinds {
+        for (i, x) in paths.iter().enumerate() {
+            let shown = match x.folder {
+                true => format!("{}/ ({})", x.path_text, count(x.files, "file", "files")),
+                false => x.path_text.clone(),
+            };
+            out.extend(e(if i == 0 { label } else { "" }, &[(&shown, PLAIN)]));
         }
     }
     out
@@ -1334,16 +1344,27 @@ mod tests {
                 Body::ChangedInPlace(v1::ChangedInPlace {
                     became_text: None,
                     files: Some(v1::FilesChanged {
-                        added: 1,
+                        added: 250,
                         removed: 1,
                         changed: 23,
-                        added_text: vec![format!("2.0/{odd}.js")],
-                        removed_text: vec![format!("1.0/{odd}")],
-                        changed_text: (0..20).map(|i| format!("lib/{i}{odd}.js")).collect(),
+                        added_paths: vec![path(&format!("2.0/{odd}"), 250)],
+                        removed_paths: vec![path(&format!("1.0/{odd}"), 1)],
+                        changed_paths: (0..20)
+                            .map(|i| path(&format!("lib/{i}{odd}.js"), 1))
+                            .collect(),
                     }),
                 }),
             ),
         ]
+    }
+
+    /// An entry of `FilesChanged`: a folder when it holds more than one file.
+    fn path(path: &str, files: u64) -> v1::ChangedPath {
+        v1::ChangedPath {
+            path_text: path.to_string(),
+            folder: files > 1,
+            files,
+        }
     }
 
     /// A finding with this evidence, every text from a source holding `odd`: open, urgent, with
@@ -1577,6 +1598,32 @@ mod tests {
                 assert!(text.contains("f1e26d7c725"), "{width}\n{text}");
             }
         }
+    }
+
+    #[test]
+    fn files_the_entries_leave_out_are_counted_on_the_line_of_counts_and_a_folder_shows_its_files()
+    {
+        let files = v1::FilesChanged {
+            added: 250,
+            removed: 3,
+            changed: 4_000,
+            added_paths: vec![path("app/2.0", 250)],
+            removed_paths: vec![path(".", 3)],
+            changed_paths: (0..3).map(|i| path(&format!("d{i}/a.js"), 1)).collect(),
+        };
+        let text = files_lines(&Screen::pipe(), &files).join("\n");
+        assert_eq!(
+            text,
+            [
+                "    Files        changed while the version stayed the same, since the reading before: 250 added, 3 removed, 4,000 changed (3,997 not listed)",
+                "    Added        app/2.0/ (250 files)",
+                "    Removed      ./ (3 files)",
+                "    Changed      d0/a.js",
+                "                 d1/a.js",
+                "                 d2/a.js",
+            ]
+            .join("\n")
+        );
     }
 
     /// Where each of `wanted` first begins a line of a text.

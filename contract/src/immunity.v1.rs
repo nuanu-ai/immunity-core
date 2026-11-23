@@ -1911,7 +1911,7 @@ pub struct PlaceChanged {
 /// `rests_on`, as `has_digest`, `has_seal` and `signed_by`.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ChangedInPlace {
     /// What an application's seal or signer became, as the reader wrote it: `does not verify:
     /// <why>`, or who signs it now. Absent for files of a package or code an app keeps outside
@@ -1928,11 +1928,10 @@ pub struct ChangedInPlace {
 }
 /// The files of an installed thing that changed between two readings, by their paths from the
 /// thing's folder. A file counts as changed when its change time moved; its content is never read.
-/// The counts are exact; each list holds at most 20 names, in the order of the thing's files.
-/// Since 1.25.0.
+/// The counts are exact. Since 1.25.0.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct FilesChanged {
     /// Files in the newer reading only.
     #[prost(uint64, tag = "1")]
@@ -1943,13 +1942,36 @@ pub struct FilesChanged {
     /// Files in both whose change time differs.
     #[prost(uint64, tag = "3")]
     pub changed: u64,
-    /// The first names of each, as the file system gives them.
-    #[prost(string, repeated, tag = "4")]
-    pub added_text: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "5")]
-    pub removed_text: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
-    #[prost(string, repeated, tag = "6")]
-    pub changed_text: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// What was added, removed and changed, told by structure, in path order: a folder every file
+    /// under which, in either reading, changed in that way, at the outermost such folder, and every
+    /// other file of the kind alone. When the whole thing changed in one way (it had no file
+    /// before, every file went, or every file changed), the one entry is the thing's own folder,
+    /// `.`. The entries of a kind cover every file it counts unless the record of the change grew
+    /// too large to keep whole: they stop in path order, and the files they leave out are the count
+    /// less the sum of their `files`. Since 1.26.0.
+    #[prost(message, repeated, tag = "7")]
+    pub added_paths: ::prost::alloc::vec::Vec<ChangedPath>,
+    #[prost(message, repeated, tag = "8")]
+    pub removed_paths: ::prost::alloc::vec::Vec<ChangedPath>,
+    #[prost(message, repeated, tag = "9")]
+    pub changed_paths: ::prost::alloc::vec::Vec<ChangedPath>,
+}
+/// One entry of `FilesChanged`: a folder that changed whole, or a file. Since 1.26.0.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ChangedPath {
+    /// The path from the thing's folder, as the file system gives it, cut to 1,024 bytes; `.` for
+    /// the thing's folder itself.
+    #[prost(string, tag = "1")]
+    pub path_text: ::prost::alloc::string::String,
+    /// Whether it is a folder. A folder is an entry only when it holds more than one file of the
+    /// kind; a folder of one is told as that file.
+    #[prost(bool, tag = "2")]
+    pub folder: bool,
+    /// How many files of the kind it holds: 1 for a file.
+    #[prost(uint64, tag = "3")]
+    pub files: u64,
 }
 /// A match of the indicator list.
 #[derive(serde::Serialize, serde::Deserialize)]
