@@ -3,8 +3,9 @@
 #   /bin/sh tidy.sh <log folder> <most bytes of log>
 # A log file holds at most an hour, or 128 MiB. One not written to for a day holds only lines
 # older than a day, and is deleted. Then, while the log files together are larger than the
-# cap, the one written longest ago is deleted, never the one written last, which is the one
-# being written. So the log is larger than its cap by at most the file being written and what
+# cap, the one written longest ago is deleted. The one written last is the one being written
+# and is deleted neither way: after a Mac slept for more than a day, it too was last written a
+# day ago. So the log is larger than its cap by at most the file being written and what
 # is written while this runs. Files are taken in the order they were last written, not by
 # name: a clock set back gives a new file an earlier name.
 #
@@ -70,23 +71,29 @@ remove() {
     echo "$now $1 $size $2" >>removed
 }
 
+# Oldest first by when each was last written, to the nanosecond; the last that is still there
+# is the one being written. The collector's names hold no space, newline or pattern character.
+files=$(/bin/ls -1tr -- exec-*.jsonl 2>/dev/null)
+set -f
+newest=
+for f in $files; do
+    [ -f "$f" ] && newest=$f
+done
+set +f
+
 for f in exec-*.jsonl; do
-    [ -f "$f" ] || continue
+    [ -f "$f" ] && [ "$f" != "$newest" ] || continue
     if [ -n "$(/usr/bin/find "$f" -prune -mmin +1440)" ]; then
         remove "$f" age
     fi
 done
 
-# Oldest first by when each was last written, to the nanosecond; the last is the one being
-# written. The names hold no space, newline or pattern character, being the collector's own.
 files=$(/bin/ls -1tr -- exec-*.jsonl 2>/dev/null)
 set -f
 total=0
-newest=
 for f in $files; do
     size=$(/usr/bin/stat -f %z "$f") || continue
     total=$((total + size))
-    newest=$f
 done
 for f in $files; do
     [ "$total" -gt "$cap" ] || break

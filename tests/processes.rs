@@ -393,6 +393,45 @@ fn a_command_line_is_never_kept_in_the_store_nor_printed() {
 }
 
 #[test]
+fn an_argument_area_this_build_cannot_read_leaves_every_argument_unread_and_says_why() {
+    // The reader found its own arguments read otherwise than it was started with: the area's
+    // layout is not the one it knows, so no process's arguments are taken, the one that was
+    // given code is not seen as given it, each interpreter is counted, and the reading of
+    // programs says why.
+    let dir = Dir::new("layout");
+    let input = dir.0.join("reading.json");
+    let reading = json!({ "at": T, "processes": table(T), "arguments_layout_unknown": true });
+    std::fs::write(&input, reading.to_string()).unwrap();
+    let args = [
+        "sample",
+        "--json",
+        "--sample-input",
+        input.to_str().unwrap(),
+    ];
+    let out = immunity(&dir, &args);
+    assert!(out.status.success(), "{out:?}");
+    let said: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(said["interpreters"]["inline_code"], 0);
+    assert_eq!(said["interpreters"]["seen"], 5);
+    assert_eq!(said["interpreters"]["arguments_unreadable"], 5);
+    let conn = rusqlite::Connection::open(dir.store()).unwrap();
+    let programs: String = conn
+        .query_row(
+            "SELECT completeness || '|' || reason FROM coverage WHERE reader = 'processes'
+             AND kind = 'running programs of this user, sampled'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        programs.starts_with("partial|arguments not read: "),
+        "{programs}"
+    );
+    let status = contract(&dir, &["status"]).to_string();
+    assert!(status.contains("so that area's layout is not the one this build knows"));
+}
+
+#[test]
 fn every_sample_names_its_level_of_access_and_what_it_cannot_see() {
     let dir = Dir::new("coverage");
     let mut processes = table(T);
