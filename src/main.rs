@@ -5380,6 +5380,7 @@ fn match_dependencies(run: &Run) -> Result<usize, Box<dyn Error>> {
             .or_default()
             .push((component.clone(), basis));
     }
+    let known = |about: &str| matched.known(run.tx, about);
     let mut opened = 0;
     for rule in [
         findings::MALICIOUS_PACKAGE,
@@ -5387,7 +5388,7 @@ fn match_dependencies(run: &Run) -> Result<usize, Box<dyn Error>> {
         findings::EXPLOITED_VULNERABILITY,
     ] {
         let now = held.remove(rule).unwrap_or_default();
-        opened += findings::hold(run.tx, rule, &now, run.run_id, run.at)?;
+        opened += findings::hold(run.tx, rule, &now, &known, run.run_id, run.at)?;
     }
     Ok(opened)
 }
