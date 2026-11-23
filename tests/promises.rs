@@ -8293,7 +8293,7 @@ fn a_watched_folder_that_cannot_be_listed_retracts_nothing_and_reports_no_change
         )]
     );
     assert!(
-        printed.contains("0 new, 0 changed, 0 gone since the last reading; not read in full: launch agents and daemons (partial), programs that launch agents, daemons and login hooks run (partial)."),
+        printed.contains("0 new, 0 changed, 0 gone since the last reading; not read in full: launch agents and daemons (partial), programs that launch agents, daemons and login hooks run (nothing read)."),
         "{printed}"
     );
     // Each place not read is named with why where a failure is said: under "Failed", in the
@@ -8318,7 +8318,7 @@ fn a_watched_folder_that_cannot_be_listed_retracts_nothing_and_reports_no_change
         "{coverage:?}"
     );
     assert!(
-        printed.contains("not read in full: launch agents and daemons (partial), ssh access files (nothing read), programs that launch agents, daemons and login hooks run (partial)."),
+        printed.contains("not read in full: launch agents and daemons (partial), ssh access files (nothing read), programs that launch agents, daemons and login hooks run (nothing read)."),
         "{printed}"
     );
     // Something of the kind could be read: the reading is partial.
@@ -8506,7 +8506,7 @@ fn a_checkout_that_is_gone_takes_its_hooks_with_it() {
     put(&shop, ".git/hooks/pre-commit", "#!/bin/sh\nexit 0\n");
     put(&shop, ".git/hooks/post-merge", "#!/bin/sh\n");
     put(&shop, ".git/hooks/pre-push.sample", "#!/bin/sh\n");
-    // A worktree keeps its hooks elsewhere: its reading is partial and says why.
+    // A worktree keeps its hooks elsewhere: its reading read nothing and says why.
     put(
         w.home(),
         "dev/tree/.git",
@@ -8543,7 +8543,7 @@ fn a_checkout_that_is_gone_takes_its_hooks_with_it() {
     assert_eq!(
         w.coverage("checkout:machine:mac/dev/tree", hooks),
         [
-            "partial|.git is a file, as in a worktree or a submodule: the hooks are kept elsewhere and were not read"
+            "none|.git is a file, as in a worktree or a submodule: the hooks are kept elsewhere and were not read"
         ]
     );
     assert_eq!(
@@ -8555,9 +8555,7 @@ fn a_checkout_that_is_gone_takes_its_hooks_with_it() {
         ["none|could not be read: dev/locked/.git/hooks (Permission denied (os error 13))"]
     );
     assert!(
-        report.contains(
-            "not read in full: hooks in 1 checkout (nothing read), hooks in 1 checkout (partial)."
-        ),
+        report.contains("not read in full: hooks in 2 checkouts (nothing read)."),
         "{report}"
     );
     // Checkouts with hooks and no lockfile are still listed as having no lockfile, and a
@@ -10328,7 +10326,7 @@ fn unknown_is_never_given_as_zero_or_full() {
     assert_eq!(hooks["coverage"], "partial", "{hooks}");
     assert_eq!(
         hooks["readings"],
-        serde_json::json!({"full": 1, "partial": 1, "none": 0})
+        serde_json::json!({"full": 1, "partial": 0, "none": 1})
     );
     assert!(
         hooks["reason_text"]
@@ -10347,10 +10345,11 @@ fn unknown_is_never_given_as_zero_or_full() {
     );
     assert_eq!(c["failed"], 1, "{c:#}");
     assert_eq!(c["no_reader"], 2, "{c:#}");
-    // The second reading of nothing is this Mac's program starts: no event level here.
+    // The other readings of nothing are this Mac's program starts, with no event level here,
+    // and the hooks of the worktree, kept elsewhere.
     assert_eq!(
         (c["partial"].clone(), c["none"].clone()),
-        (2.into(), 2.into()),
+        (1.into(), 3.into()),
         "{c:#}"
     );
     let classes = [
