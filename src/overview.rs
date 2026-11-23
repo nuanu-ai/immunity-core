@@ -968,6 +968,36 @@ fn not_fresh(s: &v1::Status, screen: &Screen) -> Option<String> {
     ))
 }
 
+/// The line of a check that started and has not finished: it runs, with the stage it noted and
+/// for how long, or it died. The stage is said only beside `running`, which alone says it runs.
+fn unfinished(s: &v1::Status, screen: &Screen, started_at: i64) -> (String, Style) {
+    use v1::CheckStage as C;
+    let started = screen.time(started_at, s.answered_at);
+    if !s.running {
+        let said = format!(
+            "started {started} and has not finished: it died, and nothing it read is in the store"
+        );
+        return (said, RED);
+    }
+    let words = match s.check_stage.and_then(|v| C::try_from(v).ok()) {
+        Some(C::Downloading) => "downloading vulnerability data",
+        Some(C::Packages) => "reading packages and servers",
+        Some(C::Projects) => "looking for projects",
+        Some(C::Lockfiles) => "reading lockfiles",
+        Some(C::Places) => "reading what runs by itself",
+        Some(C::Software) => "looking for software changed in place",
+        Some(C::Events) => "reading events",
+        Some(C::Saving) => "matching and saving",
+        Some(C::Unspecified) | None => "",
+    };
+    let stage = match s.check_stage_started_at {
+        Some(at) if !words.is_empty() => format!(", {words} {}", screen.since(at, s.answered_at)),
+        _ => String::new(),
+    };
+    let said = format!("started {started} and has not finished: it is running{stage}");
+    (said, YELLOW)
+}
+
 /// What a screen about the store says after its headline and what needs a look, the same for
 /// `immunity status` and `immunity run`, so that a run never says less than the status of the same
 /// store: a run that did not finish, freshness, how this Mac is watched, the event level,
@@ -983,21 +1013,7 @@ pub(crate) fn context(
     let now = s.answered_at;
     let mut lines: Vec<(&str, Parts)> = own;
     if let Some(l) = s.last_run.as_ref().filter(|l| l.finished_at.is_none()) {
-        let (how, style) = if s.running {
-            ("it is running", YELLOW)
-        } else {
-            ("it died, and nothing it read is in the store", RED)
-        };
-        lines.push((
-            "Last run",
-            vec![(
-                format!(
-                    "started {} and has not finished: {how}",
-                    screen.time(l.started_at, now)
-                ),
-                style,
-            )],
-        ));
+        lines.push(("Last run", vec![unfinished(s, screen, l.started_at)]));
     }
     if let Some(said) = not_fresh(s, screen) {
         lines.push(("Not fresh", vec![(said, YELLOW)]));
@@ -1458,19 +1474,10 @@ fn coverage_text(s: &v1::Status, screen: &Screen, out: &mut Vec<String>) {
                 ),
                 PLAIN,
             )),
-            None => lines.push((
-                "Last run",
-                format!(
-                    "started {} and has not finished: {}",
-                    screen.time(l.started_at, now),
-                    if s.running {
-                        "it is running"
-                    } else {
-                        "it died, and nothing it read is in the store"
-                    }
-                ),
-                if s.running { YELLOW } else { RED },
-            )),
+            None => {
+                let (said, style) = unfinished(s, screen, l.started_at);
+                lines.push(("Last run", said, style));
+            }
         },
     }
     match &s.last_finished_run {
@@ -2727,6 +2734,42 @@ mod tests {
             s.running = running;
             s.this_mac.as_mut().unwrap().checked_at = checked_at;
             assert!(status(&s, &Screen::pipe(), false).contains("no full check has finished"));
+        }
+    }
+
+    #[test]
+    fn a_running_check_says_its_stage_and_since_when_and_nothing_else_says_a_stage() {
+        let mut s = status_of("x");
+        s.running = true;
+        s.check_stage = Some(v1::CheckStage::Events as i32);
+        s.check_stage_started_at = Some(NOW - 120);
+        let since = Screen::pipe().since(NOW - 120, NOW);
+        for coverage in [false, true] {
+            let text = status(&s, &Screen::pipe(), coverage);
+            let said = format!("has not finished: it is running, reading events {since}\n");
+            assert!(text.contains(&said), "{text}");
+        }
+        // A stage this build cannot name, or one without its time, is no stage; a check that
+        // died is in none, whatever the message carries.
+        let events = Some(v1::CheckStage::Events as i32);
+        for (stage, at, running) in [
+            (Some(99), Some(NOW - 120), true),
+            (Some(0), Some(NOW - 120), true),
+            (events, None, true),
+            (events, Some(NOW - 120), false),
+        ] {
+            (s.check_stage, s.check_stage_started_at, s.running) = (stage, at, running);
+            for coverage in [false, true] {
+                let text = status(&s, &Screen::pipe(), coverage);
+                let said = match running {
+                    true => "has not finished: it is running\n",
+                    false => "has not finished: it died",
+                };
+                assert!(
+                    text.contains(said) && !text.contains("reading events"),
+                    "{text}"
+                );
+            }
         }
     }
 

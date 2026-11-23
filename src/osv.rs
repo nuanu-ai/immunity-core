@@ -15,6 +15,7 @@
 //! Nothing is matched here: the projects' lockfiles are matched against this data in
 //! `vulnerabilities.rs`.
 
+use crate::contract::v1::CheckStage;
 use crate::sha256;
 use crate::threats::{self, Answer};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
@@ -230,7 +231,7 @@ pub fn lock_fetch(home: &Path) -> std::io::Result<Option<std::fs::File>> {
 /// for the one waiting to write its start, nor a check of another store in the same folder for
 /// this store's. Every other such file is of a run that has ended, held by none, and is removed;
 /// one that cannot be is left, and says nothing.
-pub fn lock_check(home: &Path, run_id: &str) -> std::io::Result<std::fs::File> {
+pub fn lock_check(home: &Path, run_id: &str) -> std::io::Result<Check> {
     for entry in std::fs::read_dir(home.join(FOLDER))? {
         let path = entry?.path();
         if path
@@ -240,9 +241,52 @@ pub fn lock_check(home: &Path, run_id: &str) -> std::io::Result<std::fs::File> {
             let _ = std::fs::remove_file(path);
         }
     }
-    let handle = std::fs::File::create(check_lock(home, run_id))?;
-    handle.lock()?;
-    Ok(handle)
+    let file = std::fs::File::create(check_lock(home, run_id))?;
+    file.lock()?;
+    Ok(Check { file, noted: 0 })
+}
+
+/// A full run's lock on its file (`lock_check`), held while this lives, and the stage the run
+/// noted last in the file, which `check_stage` reads for `immunity status`. The store cannot
+/// hold the stage: the run writes it in a transaction no reader sees until the end.
+pub struct Check {
+    file: std::fs::File,
+    noted: i32,
+}
+
+impl Check {
+    /// Notes that the run entered `stage` at `at`: the stage's name as the schema spells it,
+    /// after the time on a line of its own. The file is emptied first, so a reader meanwhile, or
+    /// after a write that failed, finds no stage rather than an earlier one or a mix of two.
+    pub fn stage(&mut self, stage: CheckStage, at: i64) {
+        debug_assert_eq!(
+            stage as i32,
+            self.noted + 1,
+            "a check notes its stages in order"
+        );
+        self.noted = stage as i32;
+        let text = format!("{at}\n{}", stage.as_str_name());
+        let _ = self.file.set_len(0).and_then(|()| {
+            std::os::unix::fs::FileExt::write_all_at(&self.file, text.as_bytes(), 0)
+        });
+    }
+}
+
+/// The stage the run `run_id` noted last in its file, and when it entered it, read as data: only
+/// a time and a stage's name exactly as `Check::stage` writes them are taken, and anything else,
+/// or a file that cannot be read, is no stage. Whether the run is under way is not said here:
+/// `check_in_progress` says that, and a run that ended leaves its last stage in the file.
+pub fn check_stage(home: &Path, run_id: &str) -> Option<(CheckStage, i64)> {
+    let mut text = String::new();
+    // The longest text written is under 64 bytes, so a file of megabytes is never read whole.
+    std::fs::File::open(check_lock(home, run_id))
+        .ok()?
+        .take(64)
+        .read_to_string(&mut text)
+        .ok()?;
+    let (at, name) = text.split_once('\n')?;
+    let stage = CheckStage::from_str_name(name).filter(|s| *s != CheckStage::Unspecified)?;
+    Some((stage, at.parse().ok()?))
 }
 
 fn check_lock(home: &Path, run_id: &str) -> PathBuf {
@@ -1382,6 +1426,64 @@ mod tests {
             .join(ecosystem)
             .join(format!("{id}.json"));
         std::fs::read(path).unwrap()
+    }
+
+    /// What `immunity status` reads of a running check's stage: each stage as it is noted, with
+    /// when it began, a stage after a longer one with nothing of the longer left over, and from
+    /// a file that anything may have written, only what the core writes and nothing else.
+    #[test]
+    fn a_check_stage_is_read_back_as_noted_and_nothing_else_in_its_file_is_taken() {
+        use crate::contract::v1::CheckStage as C;
+        let dir = Dir::new("stage");
+        std::fs::create_dir_all(dir.0.join(super::FOLDER)).unwrap();
+        let mut check = super::lock_check(&dir.0, "7").unwrap();
+        assert_eq!(super::check_stage(&dir.0, "7"), None);
+        for (i, stage) in [
+            C::Downloading,
+            C::Packages,
+            C::Projects,
+            C::Lockfiles,
+            C::Places,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            check.stage(stage, 1_800_000_000 + i as i64);
+            let read = super::check_stage(&dir.0, "7");
+            assert_eq!(read, Some((stage, 1_800_000_000 + i as i64)));
+        }
+        let file = dir.0.join(super::FOLDER).join("check-7.lock");
+        for text in [
+            "1800000000\nCHECK_STAGE_UNSPECIFIED",
+            "1800000000\nCHECK_STAGE_STOPPED",
+            "1800000000\nCHECK_STAGE_EVENTS\n",
+            "1800000000\ncheck_stage_events",
+            "soon\nCHECK_STAGE_EVENTS",
+            "1800000000 CHECK_STAGE_EVENTS",
+        ] {
+            std::fs::write(&file, text).unwrap();
+            assert_eq!(super::check_stage(&dir.0, "7"), None, "{:.40}", text);
+        }
+        std::fs::write(&file, b"1800000000\nCHECK_STAGE_\xffVENTS").unwrap();
+        assert_eq!(super::check_stage(&dir.0, "7"), None);
+        // A file with no end is read no further than the longest text the core writes.
+        std::fs::remove_file(&file).unwrap();
+        std::os::unix::fs::symlink("/dev/zero", &file).unwrap();
+        assert_eq!(super::check_stage(&dir.0, "7"), None);
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert_eq!(super::check_stage(&dir.0, "7"), None);
+    }
+
+    /// The stages of a check are noted in the order it goes through them: a debug build, which
+    /// every test of a full check runs, stops at a stage noted out of turn.
+    #[test]
+    #[should_panic(expected = "a check notes its stages in order")]
+    fn a_check_stage_noted_out_of_turn_stops_a_debug_build() {
+        let dir = Dir::new("stage-order");
+        std::fs::create_dir_all(dir.0.join(super::FOLDER)).unwrap();
+        let mut check = super::lock_check(&dir.0, "7").unwrap();
+        check.stage(crate::contract::v1::CheckStage::Projects, 1_800_000_000);
     }
 
     const NPM: [&str; 4] = [

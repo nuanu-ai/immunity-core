@@ -2997,6 +2997,18 @@ pub struct Status {
     /// `immunity on` loaded is gone. Since 1.20.0.
     #[prost(bool, optional, tag = "32")]
     pub turned_on_latest: ::core::option::Option<bool>,
+    /// The stage the full check that runs now is in, as the check noted it, and when that stage
+    /// began. Present only while `running` is true and the stage could be read; absent otherwise,
+    /// never a guess. A stage never says that a check ran or finished: `running`, `last_run` and
+    /// `last_finished_run` say that. Since 1.24.0.
+    #[prost(enumeration = "CheckStage", optional, tag = "33")]
+    #[serde(
+        serialize_with = "crate::optional_enum_name::<CheckStage, _>",
+        deserialize_with = "crate::optional_enum_from_name::<CheckStage, _>"
+    )]
+    pub check_stage: ::core::option::Option<i32>,
+    #[prost(int64, optional, tag = "34")]
+    pub check_stage_started_at: ::core::option::Option<i64>,
 }
 /// The store's file.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -4079,6 +4091,73 @@ pub struct SampleConnections {
     pub matched_indicators: u64,
     #[prost(uint64, tag = "3")]
     pub unreadable: u64,
+}
+/// The stage of a full check, in the order a check goes through them. `UNSPECIFIED`, or a value
+/// the reader does not know, is read as a stage it cannot name, of a check that is still running.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum CheckStage {
+    #[serde(rename = "unspecified")]
+    Unspecified = 0,
+    /// Downloading the vulnerability data and the catalogue of exploited vulnerabilities.
+    #[serde(rename = "downloading")]
+    Downloading = 1,
+    /// Reading Homebrew's packages and what a sweep of the servers left.
+    #[serde(rename = "packages")]
+    Packages = 2,
+    /// Looking for projects: checkouts, and the folders agents worked in.
+    #[serde(rename = "projects")]
+    Projects = 3,
+    /// Reading the projects' lockfiles.
+    #[serde(rename = "lockfiles")]
+    Lockfiles = 4,
+    /// Reading the watched places and what runs by itself.
+    #[serde(rename = "places")]
+    Places = 5,
+    /// Looking for software changed in place, and matching the list of indicators.
+    #[serde(rename = "software")]
+    Software = 6,
+    /// Reading the events and the local traces of servers.
+    #[serde(rename = "events")]
+    Events = 7,
+    /// Matching packages to the vulnerability data, counting and saving what the check read.
+    #[serde(rename = "saving")]
+    Saving = 8,
+}
+impl CheckStage {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "CHECK_STAGE_UNSPECIFIED",
+            Self::Downloading => "CHECK_STAGE_DOWNLOADING",
+            Self::Packages => "CHECK_STAGE_PACKAGES",
+            Self::Projects => "CHECK_STAGE_PROJECTS",
+            Self::Lockfiles => "CHECK_STAGE_LOCKFILES",
+            Self::Places => "CHECK_STAGE_PLACES",
+            Self::Software => "CHECK_STAGE_SOFTWARE",
+            Self::Events => "CHECK_STAGE_EVENTS",
+            Self::Saving => "CHECK_STAGE_SAVING",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "CHECK_STAGE_UNSPECIFIED" => Some(Self::Unspecified),
+            "CHECK_STAGE_DOWNLOADING" => Some(Self::Downloading),
+            "CHECK_STAGE_PACKAGES" => Some(Self::Packages),
+            "CHECK_STAGE_PROJECTS" => Some(Self::Projects),
+            "CHECK_STAGE_LOCKFILES" => Some(Self::Lockfiles),
+            "CHECK_STAGE_PLACES" => Some(Self::Places),
+            "CHECK_STAGE_SOFTWARE" => Some(Self::Software),
+            "CHECK_STAGE_EVENTS" => Some(Self::Events),
+            "CHECK_STAGE_SAVING" => Some(Self::Saving),
+            _ => None,
+        }
+    }
 }
 /// How much of the last day the rules judged. `UNSPECIFIED`, or a value the reader does not know,
 /// is read as `none`.
