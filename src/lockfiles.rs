@@ -650,6 +650,9 @@ const NPM_REGISTRY: &str = "https://registry.npmjs.org/";
 
 /// How an address of a git repository begins, in the lockfiles of npm and Bun.
 const GIT: [&str; 5] = ["git+", "git://", "github:", "gitlab:", "bitbucket:"];
+/// How the address of a tarball on the web begins, in the lockfiles of Yarn and Bun: another
+/// registry's, or no registry's.
+const WEB: [&str; 2] = ["https://", "http://"];
 
 /// Whether `path`, the part of an address after `NPM_REGISTRY`, is the registry's file of the
 /// package `name` at `version`: exactly `<name>/-/<unscoped name>-<version>.tgz`, the unscoped
@@ -1103,10 +1106,12 @@ fn yarn(text: &str) -> Parsed {
 /// One entry of a `yarn.lock` of Yarn 2 and later, by its resolution `<name>@<reference>`:
 /// `Some(None)` for a workspace, which is the project itself, and `None` when the lockfile does
 /// not tell what it is. The entry is the registry's only as `npm:<version>` with no `::`
-/// parameters, or as a `patch:` of exactly `<name>@npm%3A<version>`, compared as written; Yarn
-/// does not write which registry, and as for pnpm the one the project is set up with is taken
-/// for the public one. `__archiveUrl` names another registry's address. A `version` field that
-/// differs from the resolution's version leaves the entry not told.
+/// parameters, or as a `patch:` of exactly `<name>@npm%3A<version>`, compared as written, by one
+/// patch Yarn ships itself (`builtin<…>`); Yarn does not write which registry, and as for pnpm
+/// the one the project is set up with is taken for the public one. A patch of the project's own
+/// changes the package's files, so that package is a path's. `__archiveUrl` names another
+/// registry's address. A `version` field that differs from the resolution's version leaves the
+/// entry not told.
 fn yarn_entry(key: &str, entry: &serde_norway::Value) -> Option<Option<Dep>> {
     let text = |field: &str| match entry.get(field) {
         None => Some(None),
@@ -1126,10 +1131,24 @@ fn yarn_entry(key: &str, entry: &serde_norway::Value) -> Option<Option<Dep>> {
             Some(_) => return None,
         }
     } else if let Some(patch) = reference.strip_prefix("patch:") {
-        // The patched package's locator ends at the `#` before the patch's own paths.
-        let inner = patch.split('#').next()?;
+        // The patched package's locator, then after `#` the patches, joined by `&`, then the
+        // outer `::` parameters.
+        let (inner, paths) = patch.split_once('#')?;
         let version = inner.strip_prefix(name)?.strip_prefix("@npm%3A")?;
-        (Source::Registry, version)
+        let paths = paths.split("::").next().unwrap_or_default();
+        // One patch Yarn ships itself, as Yarn 4 and Yarn 3 write it, leaves the registry's
+        // package; a patch of the project's own changes it, as a file of the project would.
+        let builtin = ["optional!builtin<", "~builtin<"]
+            .iter()
+            .any(|p| paths.starts_with(p))
+            && paths.ends_with('>')
+            && !paths.contains('&');
+        let source = if builtin {
+            Source::Registry
+        } else {
+            Source::Path
+        };
+        (source, version)
     } else {
         let source = match reference {
             r if r.starts_with("workspace:") => return Some(None),
@@ -1141,7 +1160,7 @@ fn yarn_entry(key: &str, entry: &serde_norway::Value) -> Option<Option<Dep>> {
             }
             // Yarn writes every git resolution with the commit it fetched.
             r if r.contains("#commit=") => Source::Git,
-            r if r.starts_with("https://") => Source::OtherRegistry,
+            r if WEB.iter().any(|p| r.starts_with(p)) => Source::OtherRegistry,
             _ => return None,
         };
         // Yarn writes this for a soft link, which has no version of its own.
@@ -1169,11 +1188,13 @@ fn yarn_entry(key: &str, entry: &serde_norway::Value) -> Option<Option<Dep>> {
 
 /// `bun.lock`, lockfile versions 0 to 3, whose rows of packages Bun writes in one shape: JSON
 /// with comments and trailing commas, read by `jsonc`, which allows nothing else. A key given
-/// twice with two values anywhere fails the reading. `packages` maps an install path to a row
-/// whose first item is `<name>@<resolution>`: the package is that, never the key. An npm row's
-/// second item is its address, empty for the registry the project is set up with, which is taken
-/// for the public one as for pnpm. `workspaces`, `overrides`, `catalog`, `catalogs`,
-/// `patchedDependencies` and `trustedDependencies` add no package and are not read.
+/// twice with two values anywhere fails the reading, and so does a missing `packages` while a
+/// workspace declares a dependency. `packages` maps an install path to a row whose first item is
+/// `<name>@<resolution>`: the package is that, never the key. An npm row's second item is its
+/// address, empty for the registry the project is set up with, which is taken for the public one
+/// as for pnpm. `workspaces` is read only for whether it declares a dependency; `overrides`,
+/// `catalog`, `catalogs`, `patchedDependencies` and `trustedDependencies` add no package and are
+/// not read.
 fn bun(text: &str) -> Parsed {
     let Ok(crate::jsonc::Read {
         value: Some(lock),
@@ -1188,13 +1209,29 @@ fn bun(text: &str) -> Parsed {
         Some(n) => return Parsed::NoReader(format!("bun.lock version {n}")),
         None => return Parsed::Failed,
     }
-    // Bun refuses a file without `workspaces`, and writes no `packages` when there is none.
+    // Bun refuses a file without `workspaces`. It writes no `packages` when there is none, which
+    // holds only while no workspace declares a dependency.
+    let Some(workspaces) = lock.get("workspaces").and_then(|w| w.as_object()) else {
+        return Parsed::Failed;
+    };
+    let declares = |w: &serde_json::Value| {
+        [
+            "dependencies",
+            "devDependencies",
+            "optionalDependencies",
+            "peerDependencies",
+        ]
+        .iter()
+        .any(|f| {
+            w.get(f)
+                .is_some_and(|d| d.as_object().is_none_or(|d| !d.is_empty()))
+        })
+    };
     let empty = serde_json::Map::new();
     let packages = match lock.get("packages") {
-        _ if !lock.get("workspaces").is_some_and(|w| w.is_object()) => return Parsed::Failed,
-        None => &empty,
         Some(serde_json::Value::Object(p)) => p,
-        Some(_) => return Parsed::Failed,
+        None if !workspaces.values().any(declares) => &empty,
+        _ => return Parsed::Failed,
     };
     let (mut out, mut unknown) = (Vec::new(), Vec::new());
     for (key, row) in packages {
@@ -1225,7 +1262,7 @@ fn bun_row(key: &str, row: &serde_json::Value) -> Option<Option<Dep>> {
         r if r.starts_with("workspace:") || r.starts_with("root:") => return Some(None),
         r if r.starts_with("file:") || r.starts_with("link:") => Source::Path,
         r if GIT.iter().any(|p| r.starts_with(p)) => Source::Git,
-        r if r.starts_with("https://") => Source::OtherRegistry,
+        r if WEB.iter().any(|p| r.starts_with(p)) => Source::OtherRegistry,
         r if semver::Version::parse(r).is_ok() => {
             version = Some(r.to_string());
             match row.get(1)?.as_str()? {
@@ -2746,6 +2783,59 @@ __metadata:
         ];
         assert_eq!(said, expected);
         assert_eq!((o.completeness, o.reason), ("full", None));
+        // A tarball by `http://` is another registry's as one by `https://` is.
+        let http = YARN.replace(
+            "resolution: \"remote-tool@https://",
+            "resolution: \"remote-tool@http://",
+        );
+        let (said, reason) = read_one("yarn-http", "yarn.lock", &http);
+        assert_eq!((said, reason), (expected.to_vec(), None));
+    }
+
+    #[test]
+    fn a_yarn_patch_of_the_projects_own_is_never_the_registrys_package_and_one_yarn_ships_is() {
+        // A patch changes the package's files. One Yarn ships itself, as Yarn 4 and Yarn 3 write
+        // it, is on nearly every project and leaves the registry's package; one from the
+        // project's own files, alone or beside a builtin one, makes it a path's, so an advisory
+        // on it is never answered "not affected".
+        let builtin = "#optional!builtin<compat/fsevents>::version=2.3.3&hash=df0bf1\"";
+        let key = "fsevents@patch:fsevents@npm%3A^2.3.2#optional!builtin<compat/fsevents>";
+        for (paths, component) in [
+            (
+                "#~builtin<compat/fsevents>::version=2.3.3&hash=df0bf1\"",
+                "fsevents",
+            ),
+            (
+                "#~/.yarn/patches/fsevents-npm-2.3.3-0123456789.patch::version=2.3.3&hash=aaaa&locator=shop%40workspace%3A.\"",
+                "fsevents (path)",
+            ),
+            (
+                "#./patches/fsevents.patch::version=2.3.3&hash=aaaa\"",
+                "fsevents (path)",
+            ),
+            (
+                "#optional!builtin<compat/fsevents>&./patches/fsevents.patch::version=2.3.3\"",
+                "fsevents (path)",
+            ),
+            ("#optional!builtin<compat/fsevents>x\"", "fsevents (path)"),
+            (
+                "#optional!builtin<compat/fsevents>&./p.patch&optional!builtin<compat/fsevents>\"",
+                "fsevents (path)",
+            ),
+        ] {
+            let (said, reason) = read_one("yarn-patch", "yarn.lock", &YARN.replace(builtin, paths));
+            let fact = format!("npm/{component}|has_version|2.3.3|dev/shop/yarn.lock#{key}");
+            assert!(said.contains(&fact), "{paths}: {said:?}");
+            assert_eq!(reason, None, "{paths}");
+        }
+        // With no `#`, the patch names no patch: not told.
+        let (said, reason) = read_one(
+            "yarn-patch-bare",
+            "yarn.lock",
+            &YARN.replace(builtin, "::version=2.3.3&hash=df0bf1\""),
+        );
+        assert!(!said.iter().any(|s| s.contains("fsevents")), "{said:?}");
+        assert_eq!(reason, one_not_told(&format!("yarn.lock#{key}")));
     }
 
     #[test]
@@ -2930,6 +3020,10 @@ __metadata:
         ];
         assert_eq!(said, expected);
         assert_eq!((o.completeness, o.reason), ("full", None));
+        // A tarball by `http://` is another registry's as one by `https://` is.
+        let http = BUN.replace("[\"remote-tool@https://", "[\"remote-tool@http://");
+        let (said, reason) = read_one("bun-http", "bun.lock", &http);
+        assert_eq!((said, reason), (expected.to_vec(), None));
     }
 
     #[test]
@@ -3023,13 +3117,37 @@ __metadata:
                 "{tag}"
             );
         }
-        // With no package, Bun writes no `packages`.
-        let (said, reason) = read_one(
-            "bun-no-packages",
-            "bun.lock",
-            "{\"lockfileVersion\": 1, \"workspaces\": {\"\": {\"name\": \"shop\"}}}",
-        );
-        assert_eq!((said.len(), reason), (0, None));
+        // With no package, Bun writes no `packages`, and that is read as none. While a workspace
+        // declares a dependency, a missing `packages` would leave it in no fact: not read.
+        let workspace = |more: &str| {
+            format!(
+                "{{\"lockfileVersion\": 1, \"workspaces\": {{\"\": {{\"name\": \"shop\"}}, \"packages/ui\": {{\"name\": \"ui\"{more}}}}}}}"
+            )
+        };
+        for more in ["", ", \"dependencies\": {}"] {
+            let (said, reason) = read_one("bun-no-packages", "bun.lock", &workspace(more));
+            assert_eq!((said.len(), reason), (0, None), "{more}");
+        }
+        for field in [
+            "dependencies",
+            "devDependencies",
+            "optionalDependencies",
+            "peerDependencies",
+        ] {
+            for map in ["{\"left-pad\": \"^1.3.0\"}", "\"left-pad\""] {
+                let (said, reason) = read_one(
+                    "bun-no-packages-declared",
+                    "bun.lock",
+                    &workspace(&format!(", \"{field}\": {map}")),
+                );
+                assert!(said.is_empty(), "{field}");
+                assert_eq!(
+                    reason.as_deref(),
+                    Some("could not be read: bun.lock"),
+                    "{field} {map}"
+                );
+            }
+        }
     }
 
     #[test]
