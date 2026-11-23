@@ -244,7 +244,8 @@ struct Walk {
     lockfiles: Vec<(String, &'static str, Where)>,
     /// Folders that could not be listed in full, each with the system's error.
     unlisted: Vec<(String, String)>,
-    /// Folders not looked through by design: never entered, or set aside by a mark.
+    /// What the walk passes over by design: every entry of a folder it listed that it neither
+    /// goes into nor opens, and a folder a mark sets aside.
     aside: Vec<String>,
     /// Whether folders were left that the look limit kept it from looking through.
     stopped: bool,
@@ -312,16 +313,21 @@ fn walk(checkout: &Path, limit: usize) -> Walk {
                 && (name == CHECKOUT_MARK
                     || (file_type.is_dir() && name == CONDA_MARK)
                     || (file_type.is_file() && cache_tag(&name, &entry.path())));
-            if file_type.is_dir() && NEVER_ENTERED.contains(&name.as_str()) {
-                out.aside.push(format!("{rel}{name}/"));
-            } else if file_type.is_dir() {
+            if file_type.is_dir() && !NEVER_ENTERED.contains(&name.as_str()) {
                 folders.push((name, entry.path()));
-            } else if let Some(kind) = lockfile_kind(&name) {
-                if file_type.is_symlink() {
-                    files.push((name, kind, Where::Linked));
-                } else if file_type.is_file() {
-                    files.push((name, kind, at));
-                }
+                continue;
+            }
+            // A file is known by its name: nothing lies under it.
+            if file_type.is_file() {
+                files.extend(lockfile_kind(&name).map(|kind| (name, kind, at)));
+                continue;
+            }
+            // Neither gone into nor opened, whatever the reason: a folder never entered, a link
+            // of any kind, which is not followed, or an entry of another kind. What was known
+            // under it is kept (`Walk::aside`); a lockfile that is a link is also said.
+            out.aside.push(format!("{rel}{name}"));
+            if file_type.is_symlink() {
+                files.extend(lockfile_kind(&name).map(|kind| (name, kind, Where::Linked)));
             }
         }
         out.unlisted.extend(missed.map(|e| (rel.clone(), e)));
@@ -2545,8 +2551,9 @@ snapshots:
         // Each is told to the indicators reader as a folder left aside, so that what was known
         // in it is kept.
         let aside = read_as_text(&dir.0).aside;
-        for folder in ["node_modules/", "target/", ".git/", ".cache/", ".conda/"] {
-            assert!(aside.iter().any(|a| a == folder), "{folder} {aside:?}");
+        for folder in ["node_modules", "target", ".git", ".cache", ".conda"] {
+            let at = |a: &String| a.trim_end_matches('/') == folder;
+            assert!(aside.iter().any(at), "{folder} {aside:?}");
         }
         let dir = Dir::new(
             "unsigned-tag",

@@ -4932,6 +4932,69 @@ fn a_match_in_a_lockfile_a_cache_mark_sets_aside_stays_in_a_run_that_is_partial_
 }
 
 #[test]
+fn a_match_under_a_folder_that_became_a_link_stays_with_or_without_a_folder_beside_it_that_could_not_be_listed()
+ {
+    // A link is not followed: the run never looked at the file under it.
+    let e = Estate::new("match-under-link");
+    let shop = shop_match(&e, "web/package-lock.json", &naming("a.sample.invalid"));
+    let elsewhere = e.home().join("elsewhere");
+    std::fs::rename(shop.join("web"), &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, shop.join("web")).unwrap();
+    put(&elsewhere.join("package-lock.json"), LOCK);
+    let kept = [matched(
+        "dev/shop/web/package-lock.json",
+        "a.sample.invalid",
+    )];
+    e.run();
+    assert_eq!(indicator_matches(&e), kept);
+    assert_eq!(e.coverage(MATCH_KIND), "full|");
+    let shut = shop.join("shut");
+    std::fs::create_dir_all(&shut).unwrap();
+    mode(&shut, 0o000);
+    e.run();
+    mode(&shut, 0o755);
+    assert_eq!(indicator_matches(&e), kept);
+}
+
+#[test]
+fn a_match_in_a_lockfile_below_the_folders_opened_stays_while_it_is_there() {
+    // A project read alone, five folders inside another; its `.git` goes, and the outer
+    // project's walk finds the lockfile by name below the folders it opens.
+    let e = Estate::new("match-deep");
+    e.checkout("dev/shop");
+    let inner = e.checkout("dev/shop/a/b/c/d/e");
+    put(
+        &inner.join("package-lock.json"),
+        &naming("a.sample.invalid"),
+    );
+    e.list(LIST_AB);
+    e.run_in(&inner);
+    std::fs::remove_dir_all(inner.join(".git")).unwrap();
+    e.full();
+    assert_eq!(
+        indicator_matches(&e),
+        [matched(
+            "dev/shop/a/b/c/d/e/package-lock.json",
+            "a.sample.invalid"
+        )]
+    );
+}
+
+#[test]
+fn a_match_whose_lockfile_is_gone_from_a_folder_listed_in_full_goes_beside_a_link_and_a_folder_set_aside()
+ {
+    let e = Estate::new("match-gone-beside-aside");
+    let shop = shop_match(&e, "package-lock.json", &naming("a.sample.invalid"));
+    put(&shop.join("node_modules/x/package-lock.json"), LOCK);
+    std::fs::create_dir_all(e.home().join("elsewhere")).unwrap();
+    std::os::unix::fs::symlink(e.home().join("elsewhere"), shop.join("link")).unwrap();
+    std::fs::remove_file(shop.join("package-lock.json")).unwrap();
+    e.run();
+    assert!(indicator_matches(&e).is_empty());
+    assert_eq!(e.coverage(MATCH_KIND), "full|");
+}
+
+#[test]
 fn a_match_is_kept_when_its_file_is_met_under_another_spelling_and_cannot_be_opened() {
     // On a volume that ignores case the lockfile renamed so is the same file, not read.
     let e = Estate::new("match-spelled");
