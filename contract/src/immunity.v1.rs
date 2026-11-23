@@ -1945,8 +1945,8 @@ pub struct FilesChanged {
     /// What was added, removed and changed, told by structure, in path order: a folder every file
     /// under which, in either reading, changed in that way, at the outermost such folder, and every
     /// other file of the kind alone. When the whole thing changed in one way (it had no file
-    /// before, every file went, or every file changed), the one entry is the thing's own folder,
-    /// `.`. The entries of a kind cover every file it counts unless the record of the change grew
+    /// before, every file went, or every file changed) and holds more than one file, the one entry
+    /// is the thing's own folder, `.`. The entries of a kind cover every file it counts unless the record of the change grew
     /// too large to keep whole: they stop in path order, and the files they leave out are the count
     /// less the sum of their `files`. Since 1.26.0.
     #[prost(message, repeated, tag = "7")]
