@@ -2137,13 +2137,16 @@ fn judge(
         awake.clocks.as_ref(),
         now,
     );
+    // The last write kept never goes down, so a line out of sight for one reading, as after a
+    // clock set back, is not taken for a new one when it is seen again.
+    let latest = written.max(awake.before.as_ref().and_then(|b| b.written));
     let kept = awake
         .clocks
         .clone()
         .zip(quiet)
         .map(|(clocks, quiet)| Before {
             clocks,
-            written,
+            written: latest,
             quiet,
         });
     for (by, name) in [("eslogger", ESLOGGER_SAID), ("scripts", SCRIPTS_SAID)] {
@@ -2211,15 +2214,19 @@ impl Clocks {
         if r != 0 {
             return None;
         }
-        let boot = std::ffi::CStr::from_bytes_until_nul(&buf)
-            .ok()?
-            .to_str()
-            .ok()?;
         Some(Clocks {
-            boot: boot.to_string(),
+            boot: boot_id(buf.get(..len)?)?,
             up: t.tv_sec,
         })
     }
+}
+
+/// The boot's id from the bytes `sysctlbyname` gave, with or without the NUL that ends a string:
+/// a text that is not empty and holds no space or control character, or `None`.
+fn boot_id(bytes: &[u8]) -> Option<String> {
+    let id = std::str::from_utf8(bytes.strip_suffix(b"\0").unwrap_or(bytes)).ok()?;
+    let fit = !id.is_empty() && !id.chars().any(|c| c == ' ' || c.is_control());
+    fit.then(|| id.to_string())
 }
 
 /// What a reading keeps for the next: the clocks then, the log's last write as it saw it, and
@@ -2250,15 +2257,21 @@ impl Awake {
 }
 
 /// What the reading before kept, read from its row of `meta` alone: `<boot> <up> <written> <quiet>`,
-/// with `-` for no write. A value of any other shape is no record, and the calendar decides.
+/// with `-` for no write. A value of any other shape is no record, and the calendar decides: one
+/// that is not text, not UTF-8 or longer than 128 bytes among them. What the value holds never
+/// fails the reading.
 fn before(conn: &Connection) -> rusqlite::Result<Option<Before>> {
-    let value: Option<String> = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key = ?1 AND typeof(value) = 'text'",
-            [AWAKE],
-            |r| r.get(0),
-        )
-        .optional()?;
+    let value = conn
+        .query_row("SELECT value FROM meta WHERE key = ?1", [AWAKE], |r| {
+            Ok(match r.get_ref(0)? {
+                rusqlite::types::ValueRef::Text(t) if t.len() <= 128 => {
+                    std::str::from_utf8(t).ok().map(str::to_string)
+                }
+                _ => None,
+            })
+        })
+        .optional()?
+        .flatten();
     Ok(value.and_then(|v| {
         let [boot, up, written, quiet] = v.split(' ').collect::<Vec<_>>()[..] else {
             return None;
@@ -2305,8 +2318,14 @@ fn put_awake(tx: &Transaction, kept: Option<&Before>) -> rusqlite::Result<()> {
 /// silent by at most the time awake between that reading and the line. An older write or none,
 /// as when the tidy job removed a file, is not a new line, and the count adds `d`.
 ///
-/// The record is data a program could write. A made-up one can delay silent only while it is
-/// rewritten before every reading, as rewriting the level's own row could already.
+/// Three limits are taken. When more than `SILENT_AFTER` of awake time with sleep among it passes
+/// between two readings and a line was written early in it, a collector that runs can be told
+/// silent once. A full check judges by the time it started, so a count it keeps can be short by
+/// the time the check took. A clock set back shortens the count at that reading.
+///
+/// The record is data a program could write. One row written once can delay silent by up to
+/// `SILENT_AFTER` of awake time; holding it longer takes writing it again before the readings,
+/// as rewriting the level's own row could already.
 fn quiet_awake(
     quiet_since: i64,
     written: Option<i64>,
@@ -2419,13 +2438,12 @@ pub fn read(
     let left = left(tx)?;
     let awake = Awake::read(tx)?;
     let found = look(root, &left, now, Rules::shipped(), &awake);
-    put_awake(
-        tx,
-        match &found {
-            Found::Read(log) => log.kept.as_ref(),
-            _ => None,
-        },
-    )?;
+    // The row stands on its own, so a failed reading leaves it for the next one.
+    match &found {
+        Found::Read(log) => put_awake(tx, log.kept.as_ref())?,
+        Found::NotInstalled => put_awake(tx, None)?,
+        Found::Failed(_) => {}
+    }
     let mut opened = 0;
     let state = match &found {
         Found::NotInstalled => NOT_INSTALLED,
@@ -6506,6 +6524,42 @@ mod tests {
         assert_eq!(mac.read(&[T0 + 1995], up(U0), T0 + 2000), RUNNING);
         assert_eq!(mac.read(&[T0 + 5620], up(U0 + 1020), T0 + 6620), SILENT);
         assert_eq!(mac.quiet(), Some(1000));
+        // The line at 2005 instead, before the sleep: the time awake since the reading before,
+        // less than the calendar's.
+        let mut mac = Mac::default();
+        mac.read(&[T0 + 1995], up(U0), T0 + 2000);
+        assert_eq!(mac.read(&[T0 + 2005], up(U0 + 1020), T0 + 6620), SILENT);
+        assert_eq!(mac.quiet(), Some(1020));
+    }
+
+    #[test]
+    fn a_line_out_of_sight_for_one_reading_does_not_start_the_count_again_when_seen() {
+        let mut mac = Mac::default();
+        mac.read(&[T0 - 100], up(U0), T0);
+        // The clock set back an hour: the line is dated ahead of it and has no age.
+        mac.read(&[T0 - 100], up(U0 + 10), T0 + 10 - 3600);
+        // The clock right again: the line is seen, and it is not a new one.
+        mac.read(&[T0 - 100], up(U0 + 20), T0 + 20);
+        assert_eq!(mac.quiet(), Some(120));
+    }
+
+    #[test]
+    fn a_boot_id_is_taken_only_as_a_text_with_no_space_or_control_character() {
+        let id = Some("AA16C49E-B983".to_string());
+        assert_eq!(
+            (boot_id(b"AA16C49E-B983\0"), boot_id(b"AA16C49E-B983")),
+            (id.clone(), id)
+        );
+        for bad in [
+            &b""[..],
+            b"\0",
+            b"AA16 B983\0",
+            b"AA16\x01\0",
+            b"AA\0B\0",
+            b"\xff\xfe\0",
+        ] {
+            assert_eq!(boot_id(bad), None, "{bad:?}");
+        }
     }
 
     #[test]
@@ -6636,8 +6690,11 @@ mod tests {
             let mut conn = crate::store::open_or_make(&path).unwrap();
             let tx = conn.transaction().unwrap();
             crate::store::put_entity(&tx, "machine:mac").unwrap();
-            read(&tx, "events-1", "machine:mac", root, now).unwrap();
+            let state = read(&tx, "events-1", "machine:mac", root, now)
+                .unwrap()
+                .state;
             tx.commit().unwrap();
+            state
         };
         read_at(&dir);
         let conn = crate::store::open(&path).unwrap();
@@ -6662,8 +6719,33 @@ mod tests {
         }
         assert_eq!(set(&7), None);
         assert_eq!(set(&vec![0xffu8, 0xfe]), None);
+        assert_eq!(set(&format!("{} 1 - 3", "b".repeat(123))), None);
+        assert!(set(&format!("{} 1 - 3", "b".repeat(122))).is_some());
         assert_eq!(set(&"b 1 - 3").map(|b| b.written), Some(None));
+        // Text that is not UTF-8: no record, and the reading judges and writes the row again.
+        let sql = "UPDATE meta SET value = CAST(x'ff2031202d2033' AS TEXT) WHERE key = ?1";
+        conn.execute(sql, [AWAKE]).unwrap();
+        assert_eq!(before(&conn).unwrap(), None);
         drop(conn);
+        assert_eq!(read_at(&dir), RUNNING);
+        let conn = crate::store::open(&path).unwrap();
+        assert!(before(&conn).unwrap().is_some());
+        // After a sleep the line is five hours old; a reading that fails keeps the row, so the
+        // next one counts the time awake and not the calendar's.
+        let clocks = Clocks::now().unwrap();
+        let line = now - 5 * 3600;
+        let row = format!("{} {} {line} 0", clocks.boot, clocks.up);
+        let set_row = "UPDATE meta SET value = ?1 WHERE key = ?2";
+        conn.execute(set_row, params![row, AWAKE]).unwrap();
+        drop(conn);
+        write_at(&dir, "exec-20261004T00.jsonl", "", line);
+        let (log, aside) = (dir.join(LOG), dir.join("log-aside"));
+        std::fs::rename(&log, &aside).unwrap();
+        std::fs::write(&log, "").unwrap();
+        assert_eq!(read_at(&dir), FAILED);
+        std::fs::remove_file(&log).unwrap();
+        std::fs::rename(&aside, &log).unwrap();
+        assert_eq!(read_at(&dir), RUNNING);
         // A reading that finds no level keeps nothing to count from.
         std::fs::remove_file(dir.join(PLIST)).unwrap();
         read_at(&dir);
