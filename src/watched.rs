@@ -382,8 +382,8 @@ pub fn look_machine(roots: &Roots, kind: &str) -> Look {
 
 /// How the hooks of one checkout could be looked at.
 pub enum Hooks {
-    /// What was read, and why the folder Git's configuration names could not be told.
-    Looked(Look, Option<(Cause, String)>),
+    /// What was read, short of the folder Git's configuration names when it could not be told.
+    Looked(Look),
     /// `.git` is a file: the hooks are elsewhere.
     GitFile,
 }
@@ -431,12 +431,14 @@ pub fn look_checkout(
         let unit = Unit::whole(crate::checkouts::rel(at.homes[0], path));
         configured_hooks(&mut look, path, unit.clone(), names, &at);
         // A folder that could not be looked at is not told yet.
-        told &= !look.not_read().any(|(u, _)| *u == unit);
+        told &= !look.not_read().any(|u| u.unit == unit);
     }
-    if told {
-        look.read(hooks_told(&checkout.rel));
+    match untold {
+        Some((cause, why)) => look.short(cause, why),
+        None if told => look.read(hooks_told(&checkout.rel)),
+        None => {}
     }
-    Hooks::Looked(look, untold)
+    Hooks::Looked(look)
 }
 
 /// Reads the hooks Git runs by `names` from a configured folder, `path` as written and
@@ -444,7 +446,7 @@ pub fn look_checkout(
 fn configured_hooks(look: &mut Look, path: &Path, unit: Unit, names: &[&str], at: &Where) {
     // The checkout's hooks were looked at, whatever this folder turns out to be.
     look.present += 1;
-    if look.not_read().any(|(u, _)| *u == unit) {
+    if look.not_read().any(|u| u.unit == unit) {
         return;
     }
     let folder = match guarded::real_in(path, &at.homes, at.given) {

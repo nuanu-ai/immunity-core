@@ -1249,12 +1249,9 @@ pub struct Looked {
 }
 
 impl Looked {
-    /// The completeness of the reading and its reason or note.
-    pub fn coverage(
-        &self,
-        p: &Point,
-        missed_checkouts: Option<&str>,
-    ) -> (&'static str, Option<String>) {
+    /// The completeness of the reading and its reason or note: what `Look` says, with the files
+    /// read whole said beside what it did not read.
+    pub fn coverage(&self, p: &Point) -> (&'static str, Option<String>) {
         let whole = (!self.whole.is_empty()).then(|| {
             let files: Vec<String> = self
                 .whole
@@ -1263,35 +1260,17 @@ impl Looked {
                 .collect();
             format!("read whole, not by key: {}", files.join("; "))
         });
-        let (mut completeness, mut reason) = self.look.completeness();
-        if completeness == "full" {
-            reason =
-                (whole.is_none() && missed_checkouts.is_none() && self.look.entries.is_empty())
-                    .then(|| p.nothing());
-            if missed_checkouts.is_some() {
-                completeness = if self.look.read_units().is_empty() {
-                    "none"
-                } else {
-                    "partial"
-                };
-            }
+        match self.look.completeness_noted(whole) {
+            ("full", None) if self.look.entries.is_empty() => ("full", Some(p.nothing())),
+            said => said,
         }
-        let reasons: Vec<_> = reason
-            .into_iter()
-            .chain(whole)
-            .chain(missed_checkouts.map(str::to_string))
-            .collect();
-        (
-            completeness,
-            (!reasons.is_empty()).then(|| reasons.join("; ")),
-        )
     }
 }
 
 /// Looks at one row read here in every place given, each as its folder and its path as ids
 /// name it: a checkout, or the home folder with an empty path. A place in the home folder that
-/// macOS asks permission for is never looked into, nor one a link leads into: that one is
-/// said. `home` is the home folder.
+/// macOS asks permission for is never looked into, nor one a link leads into, and each is said
+/// not looked into. `home` is the home folder.
 pub fn look_all<'a>(
     p: &Point,
     places: impl Iterator<Item = (&'a Path, &'a str)>,
@@ -1302,13 +1281,15 @@ pub fn look_all<'a>(
     let homes = [homes[0].as_path(), homes[1].as_path()];
     for (base, rel) in places {
         for pattern in p.paths {
-            if p.scope == Scope::Home
-                && crate::guarded::folder_of(&base.join(pattern), base).is_some()
-            {
-                continue;
-            }
             let (folder, _) = pattern.rsplit_once('/').unwrap_or(("", pattern));
-            let dir = match crate::guarded::under(base, Path::new(folder), &homes) {
+            // A home folder under `/Volumes` is a place macOS asks permission for whole.
+            let guarded = (p.scope == Scope::Home)
+                .then(|| crate::guarded::folder_of(&base.join(pattern), base))
+                .flatten();
+            let dir = match guarded.map_or_else(
+                || crate::guarded::under(base, Path::new(folder), &homes),
+                Err,
+            ) {
                 Ok(dir) => dir,
                 Err(g) => {
                     all.look.not_into(Unit::whole(shown(rel, pattern)), g, home);
@@ -2381,7 +2362,7 @@ mod tests {
     #[test]
     fn nothing_in_a_folder_macos_asks_permission_for_is_opened() {
         // Opening a file there raises a permission dialog. A row of the home folder that
-        // named such a place is neither read nor looked for.
+        // named such a place is neither read nor looked for, and is said not looked into.
         use std::os::unix::fs::PermissionsExt;
         let home = crate::common::Scratch::at(
             std::env::temp_dir().join(format!("immunity-autorun-guard-{}", std::process::id())),
@@ -2408,10 +2389,8 @@ mod tests {
         std::fs::set_permissions(home.join("Documents"), mode(0o755)).unwrap();
         let _ = std::fs::remove_dir_all(&home);
         let l = &looked.look;
-        assert_eq!(
-            (l.present, l.failed().len(), l.entries.len(), held),
-            (0, 0, 0, false)
-        );
+        assert_eq!((l.present, l.entries.len(), held), (0, 0, false));
+        assert_eq!(l.cause(), Some(crate::store::Cause::NotGiven));
     }
 
     #[test]

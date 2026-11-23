@@ -106,6 +106,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 
 use crate::fsevents::{self, Where};
+use crate::look::Absent;
 use crate::secrets::Text;
 use crate::{autorun, checkouts, status, store, watched};
 
@@ -1573,38 +1574,50 @@ fn real(path: &Path, homes: &[&Path]) -> Result<Option<PathBuf>, String> {
     };
     // Nothing can be there now: no path, and no failure. Such a place is looked at again at every
     // look, so it is subscribed at the first one after it can be, and the full check reads it.
-    // A name longer than a file's name can be is one (`NAME_MAX`, `sys/syslimits.h`).
-    if path.components().any(|c| c.as_os_str().len() > 255) {
-        return Ok(None);
-    }
+    // What is not there is told as the reader tells it (`look::Absent`), so that a place the
+    // reader could not look at, as through a link in a loop or a folder whose name is longer
+    // than a file's can be, is never taken for one where nothing is.
     let mut missing = Vec::new();
     let mut existing = parent.to_path_buf();
     let mut out = loop {
         match crate::guarded::real(&existing, homes) {
             crate::guarded::Real::At(real) => break real,
             crate::guarded::Real::Guarded(_) => return Ok(None),
-            crate::guarded::Real::Failed(e) => match e.raw_os_error() {
-                // A folder that is not there yet: its own folder is watched. Looking at it
-                // without following it fails only where making it real failed.
-                Some(libc::ENOENT)
-                    if matches!(std::fs::symlink_metadata(&existing),
-                                Err(e) if e.kind() == std::io::ErrorKind::NotFound) =>
-                {
-                    // A walk that cannot stand on a name, as after a `..`, is nothing there.
-                    let Some(last) = existing.file_name() else {
-                        return Ok(None);
-                    };
-                    missing.push(last.to_os_string());
-                    existing.pop();
-                }
-                // A link that leads nowhere, a file on the way, a link in a loop.
-                Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP) => return Ok(None),
-                // Could not look, such as a folder that cannot be searched, a path longer than
-                // the system takes that may be there, or an i/o error.
-                _ => return Err(e.to_string()),
-            },
+            // Could not look, such as a folder that cannot be searched, a link in a loop, a path
+            // longer than the system takes that may be there, or an i/o error.
+            crate::guarded::Real::Failed(e) if Absent::on_the_way(&e).is_none() => {
+                return Err(e.to_string());
+            }
+            // A folder that is not there yet: its own folder is watched. Looking at it without
+            // following it fails only where making it real failed.
+            crate::guarded::Real::Failed(e)
+                if Absent::of(&e).is_some()
+                    && matches!(std::fs::symlink_metadata(&existing),
+                                Err(e) if Absent::of(&e).is_some()) =>
+            {
+                // A walk that cannot stand on a name, as after a `..`, is nothing there.
+                let Some(last) = existing.file_name() else {
+                    return Ok(None);
+                };
+                missing.push(last.to_os_string());
+                existing.pop();
+            }
+            // A link that leads nowhere, a file on the way.
+            crate::guarded::Real::Failed(_) => return Ok(None),
         }
     };
+    // Its own name in a folder that is there is looked at as the reader looks at it: one the
+    // system cannot take fails there too. A place in a folder that cannot be searched stays
+    // watched, since FSEvents watches it by its path, and a path FSEvents does not take is said
+    // with FSEvents's own reason (`derive`).
+    let place = out.join(name);
+    if missing.is_empty()
+        && fsevents::refuses(&place).is_none()
+        && let Err(e) = std::fs::symlink_metadata(&place)
+        && e.raw_os_error() == Some(libc::ENAMETOOLONG)
+    {
+        return Err(e.to_string());
+    }
     out.extend(missing.iter().rev());
     out.push(name);
     Ok(Some(out))
@@ -2531,6 +2544,9 @@ mod tests {
         assert!(made.success());
         let deep = dir.join(vec![name; 6].join("/")).join("hooks/pre-commit");
         assert!(real(&deep, &homes).is_err());
+        // A place whose own name is longer than a file's name can be, in a folder that is
+        // there, could not be looked at either.
+        assert!(real(&dir.join("real").join("l".repeat(256)), &homes).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

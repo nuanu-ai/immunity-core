@@ -316,14 +316,19 @@ fn baselines(conn: &Connection) -> rusqlite::Result<Baselines> {
 /// something.
 fn first_readings(conn: &Connection) -> rusqlite::Result<HashMap<(String, String), String>> {
     // The first reading of each that read something, looked up from where its readings
-    // begin, not found by going through every reading.
+    // begin, not found by going through every reading. One that never read anything, as the
+    // hooks of a worktree, is told by the index of what readings read before it is walked.
     let mut stmt = conn.prepare(&format!(
         "{}
          SELECT r.scope, r.kind,
-                (SELECT c.run_id FROM coverage c
-                 WHERE c.reader = r.reader AND c.scope = r.scope AND c.kind = r.kind
-                   AND c.completeness != 'none'
-                 ORDER BY c.id LIMIT 1)
+                CASE WHEN EXISTS (SELECT 1 FROM coverage f
+                                  WHERE f.reader = r.reader AND f.scope = r.scope
+                                    AND f.kind = r.kind AND f.completeness IN ('full', 'partial'))
+                THEN (SELECT c.run_id FROM coverage c
+                      WHERE c.reader = r.reader AND c.scope = r.scope AND c.kind = r.kind
+                        AND c.completeness != 'none'
+                      ORDER BY c.id LIMIT 1)
+                END
          FROM reading r WHERE r.reader IN (?1, ?2)",
         store::LATEST
     ))?;
@@ -1787,6 +1792,47 @@ mod tests {
     use super::*;
     use crate::events::{Arrival, Arrivals, Files, Level, RUNNING, Series, Tally};
     use crate::sigma::{ELASTIC, Rules};
+
+    #[test]
+    fn the_baseline_of_a_reading_begins_at_its_first_reading_that_read_something() {
+        // A reading that read nothing has no baseline yet; one that read part of what it looks
+        // at, or all of it, has one from then.
+        let dir = crate::common::Scratch::new("status-first-read");
+        let mut conn = store::open_or_make(&dir.join("store.db")).unwrap();
+        let tx = conn.transaction().unwrap();
+        store::put_entity(&tx, "machine:mac").unwrap();
+        let put = |run: &str, kind: &str, completeness: &str| {
+            let r = store::Reading {
+                reader: watched::READER,
+                scope: "machine:mac",
+                kind,
+                run_id: run,
+                at: 1,
+                observed_at: 1,
+            };
+            let (reason, gap) = match completeness {
+                "full" => (None, store::Gap::default()),
+                _ => (Some("not read"), store::Gap::of(store::Cause::Failed)),
+            };
+            tx.execute(
+                "INSERT OR IGNORE INTO coverage_kind (name) VALUES (?1)",
+                [kind],
+            )
+            .unwrap();
+            store::put_coverage(&tx, &r, completeness, reason, &gap).unwrap();
+        };
+        put("run-1", "a", "none");
+        put("run-2", "a", "partial");
+        put("run-3", "a", "full");
+        put("run-1", "b", "none");
+        put("run-2", "b", "partial");
+        put("run-1", "c", "none");
+        let first = first_readings(&tx).unwrap();
+        let of = |kind: &str| first.get(&("machine:mac".to_string(), kind.to_string()));
+        assert_eq!(of("a").map(String::as_str), Some("run-2"));
+        assert_eq!(of("b").map(String::as_str), Some("run-2"));
+        assert_eq!(of("c"), None);
+    }
 
     /// A rule of Elastic's set as the translation writes one, about `category`.
     fn rule(id: &str, category: &str, detection: &str) -> &'static str {
