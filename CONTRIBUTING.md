@@ -23,7 +23,7 @@ The Sigma rules in `rules/sigma/` are SigmaHQ's rules for macOS, copied byte for
 
 Open an issue first for a new reader, a new collector or a new dependency, so it can be weighed against the rules in AGENTS.md before code is written. Commit messages follow [Conventional Commits](https://www.conventionalcommits.org) and are in English.
 
-A change arrives as a pull request, and `./check` runs on it on a macOS runner. A pull request that changes `check` or anything under `.github/` is read by a maintainer before its result counts: a passing check on a change to the check itself shows nothing.
+A change arrives as a pull request, and `./check` runs on it on a macOS runner. The runner starts from a cache of cargo's downloads and the compiled dependencies that only a run on `main` saves; a pull request's run never writes it. A pull request that changes `check` or anything under `.github/` is read by a maintainer before its result counts: a passing check on a change to the check itself shows nothing.
 
 Contributions are under the [MIT licence](LICENSE) of the repository.
 

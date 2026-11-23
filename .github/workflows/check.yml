@@ -8,8 +8,10 @@
 #
 # A security tool's workflow is itself a target. So: pull_request, never pull_request_target,
 # so a pull request from a fork runs its own code with a read-only token and no secret; no
-# secret is used; the token may only read the repository; the one action is pinned by commit;
-# and no cache, so nothing a pull request writes is restored by a later run.
+# secret is used; the token may only read the repository; every action is pinned by commit;
+# and nothing a pull request writes is restored by a later run. The cache of what was compiled
+# is saved only by a run for a push to main, under an exact key with no fallback; a run for a
+# pull request restores it and never saves.
 name: check
 
 on:
@@ -40,10 +42,27 @@ jobs:
     timeout-minutes: 45
     env:
       PART: ${{ matrix.part }}
+      # Cargo's downloads, and the target folder. What target saves is the compiled
+      # dependencies; cargo rebuilds the package's own code when its fingerprints say it changed.
+      CACHED: |
+        ~/.cargo/registry/index
+        ~/.cargo/registry/cache
+        ~/.cargo/git/db
+        target
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # The key is exact: the image, the part, the lockfile and the toolchain. A change of
+      # dependencies or of the Rust release is a new key, and that run compiles from nothing.
+      # The part is its place in the matrix, so a change of the matrix's order is a new key too.
+      - name: Restore what main compiled
+        id: cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ env.CACHED }}
+          key: macos-26-part${{ strategy.job-index }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
       - name: Tools
         run: |
@@ -61,6 +80,14 @@ jobs:
       - name: ./check ${{ matrix.part }}
         # The part's words are separate arguments of ./check.
         run: ./check $PART
+
+      # Only a push to main saves, and only under a key not saved before.
+      - name: Save what main compiled
+        if: github.event_name == 'push' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ env.CACHED }}
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
   # The status check the branch protection of main requires. It runs even when a part failed
   # or was cancelled, and then fails: a skipped required check would count as passed.
