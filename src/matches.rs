@@ -141,6 +141,8 @@ struct Held {
     findings: BTreeMap<String, v1::FindingRef>,
     /// What arrives, as the latest reading stored it: not yet known before any.
     arrivals: Arrivals,
+    /// What the time the Mac was awake is counted from.
+    awake: events::Awake,
 }
 
 fn read(args: &MatchesArgs, now: i64) -> Result<v1::Matches, Failure> {
@@ -161,9 +163,11 @@ fn read_with(rules: &Rules, args: &MatchesArgs, now: i64) -> Result<v1::Matches,
         state: events::state_read(&tx).map_err(|e| unreadable(&e))?,
         findings: finding_refs(&tx, now).map_err(|e| unreadable(&e))?,
         arrivals: events::arrivals(&tx).map_err(|e| unreadable(&e))?,
+        awake: events::Awake::read(&tx, now).map_err(|e| unreadable(&e))?,
     };
     let after = args.after.as_ref();
-    let queue = events::queue(&args.system_root, after.map(|(_, p)| p), args.limit, now);
+    let after_place = after.map(|(_, p)| p);
+    let queue = events::queue(&args.system_root, after_place, args.limit, now, &held.awake);
     let mut answer = v1::Matches {
         format: FORMAT,
         answered_at: now,
