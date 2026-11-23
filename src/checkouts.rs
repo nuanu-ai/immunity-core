@@ -165,8 +165,8 @@ pub struct Checkout {
 /// What a walk found.
 pub struct Walk {
     pub checkouts: Vec<Checkout>,
-    /// Folders that could not be listed, named as checkouts are.
-    pub unlisted: Vec<String>,
+    /// Folders that could not be listed, named as checkouts are, each with why.
+    pub unlisted: Vec<(String, String)>,
     /// Folders macOS asks permission for that the walk did not enter (`guarded.rs`).
     pub guarded: Vec<PathBuf>,
     /// Folders on another file system than the walk's root, not gone down into, named as
@@ -223,28 +223,27 @@ pub fn rel(home: &Path, path: &Path) -> String {
     }
 }
 
-/// What one folder holds: the folders to descend into, every folder in it, and whether every
-/// entry could be read.
+/// What one folder holds: the folders to descend into, every folder in it, and what the system
+/// said of an entry that could not be read.
 struct Listed {
     descend: Vec<PathBuf>,
     folders: Vec<PathBuf>,
-    complete: bool,
+    missed: Option<String>,
 }
 
-/// The folders inside `dir`. `None` when the folder could not be listed at all.
-fn subfolders(dir: &Path, in_home: bool) -> Option<Listed> {
+/// The folders inside `dir`, or what the system said when the folder could not be listed.
+fn subfolders(dir: &Path, in_home: bool) -> Result<Listed, String> {
     let mut out = Vec::new();
     let mut folders = Vec::new();
-    let mut complete = true;
-    for entry in std::fs::read_dir(dir).ok()? {
-        let Ok(entry) = entry else {
-            complete = false;
-            continue;
-        };
+    let mut missed = None;
+    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
         // Symbolic links are not followed: they lead out of the tree or into a loop.
-        let Ok(file_type) = entry.file_type() else {
-            complete = false;
-            continue;
+        let (entry, file_type) = match entry.and_then(|e| e.file_type().map(|t| (e, t))) {
+            Ok(found) => found,
+            Err(e) => {
+                missed.get_or_insert(e.to_string());
+                continue;
+            }
         };
         if !file_type.is_dir() {
             continue;
@@ -259,12 +258,15 @@ fn subfolders(dir: &Path, in_home: bool) -> Option<Listed> {
         }
     }
     out.sort();
-    Some(Listed {
+    Ok(Listed {
         descend: out,
         folders,
-        complete,
+        missed,
     })
 }
+
+/// Why a folder whose device cannot be looked at is not walked.
+const NO_DEVICE: &str = "the file system it is on could not be told";
 
 /// Walks `root` to a fixed depth. The home folder, met from whatever root, is never taken for
 /// a checkout: a home folder under git is a store of settings, and taking it would hide every
@@ -282,7 +284,7 @@ pub fn walk(root: &Path, home: &Path) -> Walk {
     let mut stack = Vec::new();
     match base {
         Some(_) => stack.push((root.to_path_buf(), 0)),
-        None => unlisted.push(rel(home, root)),
+        None => unlisted.push((rel(home, root), NO_DEVICE.to_string())),
     }
     while let Some((dir, depth)) = stack.pop() {
         let top = dir == home;
@@ -296,14 +298,16 @@ pub fn walk(root: &Path, home: &Path) -> Walk {
         if depth == MAX_DEPTH {
             continue;
         }
-        let Some(found) = subfolders(&dir, top) else {
-            unlisted.push(rel(home, &dir));
-            continue;
+        let found = match subfolders(&dir, top) {
+            Ok(found) => found,
+            Err(why) => {
+                unlisted.push((rel(home, &dir), why));
+                continue;
+            }
         };
-        if found.complete {
-            listed.push(rel(home, &dir));
-        } else {
-            unlisted.push(rel(home, &dir));
+        match found.missed {
+            None => listed.push(rel(home, &dir)),
+            Some(why) => unlisted.push((rel(home, &dir), why)),
         }
         seen.extend(found.folders.iter().map(|f| rel(home, f)));
         for path in found.descend.into_iter().rev() {
@@ -313,7 +317,7 @@ pub fn walk(root: &Path, home: &Path) -> Walk {
                 continue;
             }
             match device(&path, false) {
-                None => unlisted.push(rel(home, &path)),
+                None => unlisted.push((rel(home, &path), NO_DEVICE.to_string())),
                 Some(d) if Some(d) != base => mounted.push(rel(home, &path)),
                 Some(_) => stack.push((path, depth + 1)),
             }
@@ -418,13 +422,14 @@ pub mod tests {
         file_systems(vec![(home.join("OrbStack"), None)]);
         let whole = walk(&home, &home);
         assert_eq!(found(&whole), ["dev/api"]);
-        assert_eq!(whole.unlisted, ["OrbStack"]);
+        let unlisted = |at: &str| [(at.to_string(), NO_DEVICE.to_string())];
+        assert_eq!(whole.unlisted, unlisted("OrbStack"));
         assert!(whole.mounted.is_empty());
         // The root's: nothing is walked blind.
         file_systems(vec![(home.clone(), None)]);
         let whole = walk(&home, &home);
         assert!(found(&whole).is_empty());
-        assert_eq!(whole.unlisted, ["."]);
+        assert_eq!(whole.unlisted, unlisted("."));
     }
 
     #[test]

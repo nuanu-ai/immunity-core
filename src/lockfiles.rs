@@ -12,6 +12,7 @@
 //! package of the same name are two components and never one. No registry name holds a space,
 //! so such a name can never equal one an advisory gives.
 
+use crate::baseline::Unit;
 use crate::checkouts::Checkout;
 use crate::store::Statement;
 use crate::store::{Cause, Gap, Lack};
@@ -237,11 +238,15 @@ enum Where {
     Linked,
 }
 
-/// What the walk of a checkout found: lockfiles relative to it, each with its kind and where.
+/// What the walk of a checkout found: lockfiles relative to it, each with its kind and where,
+/// and the folders it did not look through, relative to it with `/` after each.
 struct Walk {
     lockfiles: Vec<(String, &'static str, Where)>,
-    /// Whether every folder could be listed.
-    listed: bool,
+    /// Folders that could not be listed in full, each with the system's error.
+    unlisted: Vec<(String, String)>,
+    /// What the walk passes over by design: every entry of a folder it listed that it neither
+    /// goes into nor opens, and a folder a mark sets aside.
+    aside: Vec<String>,
     /// Whether folders were left that the look limit kept it from looking through.
     stopped: bool,
 }
@@ -264,7 +269,8 @@ fn cache_tag(name: &str, path: &Path) -> bool {
 fn walk(checkout: &Path, limit: usize) -> Walk {
     let mut out = Walk {
         lockfiles: Vec::new(),
-        listed: true,
+        unlisted: Vec::new(),
+        aside: Vec::new(),
         stopped: false,
     };
     let mut looked = 0;
@@ -284,41 +290,50 @@ fn walk(checkout: &Path, limit: usize) -> Walk {
             }
             looked += 1;
         }
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            out.listed = false;
-            continue;
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                out.unlisted.push((rel, e.to_string()));
+                continue;
+            }
         };
-        let (mut files, mut folders) = (Vec::new(), Vec::new());
+        let (mut files, mut folders, mut missed) = (Vec::new(), Vec::new(), None);
         let (mut environment, mut whole) = (false, not_own);
         for entry in entries {
-            let Ok(entry) = entry else {
-                out.listed = false;
-                continue;
+            let (entry, file_type) = match entry.and_then(|e| e.file_type().map(|t| (e, t))) {
+                Ok(found) => found,
+                Err(e) => {
+                    missed.get_or_insert(e.to_string());
+                    continue;
+                }
             };
             let name = entry.file_name().to_string_lossy().into_owned();
-            let Ok(file_type) = entry.file_type() else {
-                out.listed = false;
-                continue;
-            };
             environment |= file_type.is_file() && name == ENVIRONMENT_MARK;
             whole |= depth > 0
                 && (name == CHECKOUT_MARK
                     || (file_type.is_dir() && name == CONDA_MARK)
                     || (file_type.is_file() && cache_tag(&name, &entry.path())));
-            if file_type.is_dir() {
-                if !NEVER_ENTERED.contains(&name.as_str()) {
-                    folders.push((name, entry.path()));
-                }
-            } else if let Some(kind) = lockfile_kind(&name) {
-                if file_type.is_symlink() {
-                    files.push((name, kind, Where::Linked));
-                } else if file_type.is_file() {
-                    files.push((name, kind, at));
-                }
+            if file_type.is_dir() && !NEVER_ENTERED.contains(&name.as_str()) {
+                folders.push((name, entry.path()));
+                continue;
+            }
+            // A file is known by its name: nothing lies under it.
+            if file_type.is_file() {
+                files.extend(lockfile_kind(&name).map(|kind| (name, kind, at)));
+                continue;
+            }
+            // Neither gone into nor opened, whatever the reason: a folder never entered, a link
+            // of any kind, which is not followed, or an entry of another kind. What was known
+            // under it is kept (`Walk::aside`); a lockfile that is a link is also said.
+            out.aside.push(format!("{rel}{name}"));
+            if file_type.is_symlink() {
+                files.extend(lockfile_kind(&name).map(|kind| (name, kind, Where::Linked)));
             }
         }
+        out.unlisted.extend(missed.map(|e| (rel.clone(), e)));
         // The look for names does not look at what a mark says is not the project's.
         if at != Where::Opened && whole {
+            out.aside.push(rel);
             continue;
         }
         out.lockfiles.extend(
@@ -344,12 +359,19 @@ fn walk(checkout: &Path, limit: usize) -> Walk {
 
 /// What one walk of a checkout gives the indicators reader to look for strings in, relative
 /// to the checkout: the lockfiles of the kinds read here that are opened as text, those found
-/// and not opened, and whether every folder could be listed and the walk went to its end.
+/// and not opened, the folders it did not look through (`Walk`), and whether it went to its end.
 pub struct Texts {
     pub opened: Vec<String>,
     pub not_opened: Vec<String>,
-    pub listed: bool,
+    pub unlisted: Vec<(String, String)>,
+    pub aside: Vec<String>,
     pub stopped: bool,
+}
+
+/// Whether the file at `rel` in a checkout is one the walk of `read_as_text` looks for: a
+/// lockfile, by its name in any case. Where it lies decides only whether it is opened.
+pub fn looked_for_as_text(rel: &str) -> bool {
+    lockfile_kind(rel.rsplit('/').next().unwrap_or(rel)).is_some()
 }
 
 pub fn read_as_text(checkout: &Path) -> Texts {
@@ -361,7 +383,8 @@ pub fn read_as_text(checkout: &Path) -> Texts {
     Texts {
         opened: paths(opened),
         not_opened: paths(not_opened),
-        listed: walked.listed,
+        unlisted: walked.unlisted,
+        aside: walked.aside,
         stopped: walked.stopped,
     }
 }
@@ -375,7 +398,7 @@ pub fn read(checkout: &Checkout, id: &str) -> Option<Outcome> {
 /// `read`, with the look for names below the folders opened stopping after `limit` folders.
 fn read_within(checkout: &Checkout, id: &str, limit: usize) -> Option<Outcome> {
     let walked = walk(&checkout.path, limit);
-    if walked.lockfiles.is_empty() && walked.listed && !walked.stopped {
+    if walked.lockfiles.is_empty() && walked.unlisted.is_empty() && !walked.stopped {
         return None;
     }
     let prefix = if checkout.rel == "." {
@@ -481,27 +504,14 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize) -> Option<Outcome> {
         reasons.push(format!("{NOT_SUPPORTED_SAID}{}", names.join(", ")));
     }
     for (what, paths) in &not_opened {
-        let shown: Vec<&str> = paths.iter().take(3).map(String::as_str).collect();
-        let more = if paths.len() > shown.len() {
-            ", …"
-        } else {
-            ""
-        };
         let place = match *what {
             DEEPER => format!("deeper than {MAX_DEPTH} folders"),
             LINKED if paths.len() == 1 => "that is a link".to_string(),
             LINKED => "that are links".to_string(),
             _ => "in vendor or hidden folders".to_string(),
         };
-        reasons.push(format!(
-            "{NOT_OPENED_SAID}{} {place}: {}{more}",
-            if paths.len() == 1 {
-                "1 lockfile".to_string()
-            } else {
-                format!("{} lockfiles", paths.len())
-            },
-            shown.join(", ")
-        ));
+        let n = counted(paths.len(), "lockfile", "lockfiles");
+        reasons.push(format!("{NOT_OPENED_SAID}{n} {place}: {}", some_of(paths)));
     }
     if walked.stopped {
         reasons.push(format!(
@@ -516,31 +526,28 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize) -> Option<Outcome> {
     if !not_told.is_empty() {
         // Never a guess: an entry that is not known to be the package it names is left out,
         // and the reading is partial, so it never says that a package is not there.
-        let shown: Vec<&str> = not_told.iter().take(3).map(String::as_str).collect();
-        let more = if not_told.len() > shown.len() {
-            ", …"
-        } else {
-            ""
-        };
+        let n = counted(not_told.len(), "entry", "entries");
         reasons.push(format!(
-            "the package of {} cannot be told: {}{more}",
-            if not_told.len() == 1 {
-                "1 entry".to_string()
-            } else {
-                format!("{} entries", not_told.len())
-            },
-            shown.join(", ")
+            "the package of {n} cannot be told: {}",
+            some_of(&not_told)
         ));
     }
-    if !walked.listed {
-        reasons.push("a folder could not be listed".to_string());
+    if !walked.unlisted.is_empty() {
+        // Each folder with what the system said, so that a permission is told from another
+        // failure. `partial_for` takes this clause for every ecosystem.
+        let named: Vec<String> = (walked.unlisted.iter())
+            .map(|(rel, why)| format!("{} ({why})", Unit::whole(format!("{prefix}{rel}"))))
+            .collect();
+        let n = counted(named.len(), "folder", "folders");
+        reasons.push(format!("{n} could not be listed: {}", some_of(&named)));
     }
     // A lockfile that could not be read or a folder that could not be listed failed; a kind
     // of lockfile without a reader, a lockfile not opened where it is and folders not looked
     // through are no reader; an entry the lockfile does not say enough about is not given.
-    // The reading takes the worst.
+    // The reading takes the worst. Folders not looked through by design (`Walk::aside`) are
+    // limits of the reader, said in docs/reference.md.
     let mut causes = Vec::new();
-    if !not_parsed.is_empty() || !walked.listed {
+    if !not_parsed.is_empty() || !walked.unlisted.is_empty() {
         causes.push(Cause::Failed);
     }
     if !not_supported.is_empty() || !lacks.is_empty() || walked.stopped {
@@ -571,6 +578,17 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize) -> Option<Outcome> {
         statements,
         lockfiles,
     })
+}
+
+/// `n` things, as a reason counts them.
+fn counted(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
+}
+
+/// The first three of `items`, and "…" when there are more: a reason names some and counts all.
+fn some_of(items: &[String]) -> String {
+    let more = if items.len() > 3 { ", …" } else { "" };
+    format!("{}{more}", items[..items.len().min(3)].join(", "))
 }
 
 /// Where a component was first read, and each of its versions with where it was first read.
@@ -2685,6 +2703,13 @@ dependencies = [
         assert!(o.gap.lacks.is_empty());
         let read: Vec<&str> = o.lockfiles.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(read, ["dev/shop/Cargo.lock"]);
+        // Each is told to the indicators reader as a folder left aside, so that what was known
+        // in it is kept.
+        let aside = read_as_text(&dir.0).aside;
+        for folder in ["node_modules", "target", ".git", ".cache", ".conda"] {
+            let at = |a: &String| a.trim_end_matches('/') == folder;
+            assert!(aside.iter().any(at), "{folder} {aside:?}");
+        }
         let dir = Dir::new(
             "unsigned-tag",
             &[
@@ -2875,6 +2900,33 @@ dependencies = [
         // Without a lockfile where it opens them, such a project is still not one with none.
         std::fs::remove_file(dir.0.join("Cargo.lock")).unwrap();
         assert_eq!(within(2).unwrap().completeness, "partial");
+    }
+
+    #[test]
+    fn a_folder_that_could_not_be_listed_is_named_with_what_the_system_said_and_leaves_every_ecosystem_unknown()
+     {
+        // The status tells a folder this user may not open from another failure by the
+        // system's words, and the clause naming it is taken for every ecosystem.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = Dir::new("unlisted", &[("web/package-lock.json", NPM)]);
+        let web = dir.0.join("web");
+        std::fs::set_permissions(&web, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let (o, _) = dir.read();
+        let texts = read_as_text(&dir.0);
+        std::fs::set_permissions(&web, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            o.reason.as_deref(),
+            Some("1 folder could not be listed: dev/shop/web (Permission denied (os error 13))")
+        );
+        assert_eq!(o.gap.cause, Some(Cause::Failed));
+        assert_eq!(unknown_for(&o), [true, true]);
+        assert_eq!(
+            texts.unlisted,
+            [(
+                "web/".to_string(),
+                "Permission denied (os error 13)".to_string()
+            )]
+        );
     }
 
     #[test]

@@ -2476,7 +2476,7 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     let servers = args.servers_input.clone();
     read_servers(&mut run, servers.as_deref())?;
     stage(CheckStage::Projects);
-    let (walked, walk_failure) = read_checkouts(&mut run, args)?;
+    let (walked, walk_failure, not_told) = read_checkouts(&mut run, args)?;
     let from_agents = read_agent_folders(&mut run, args, agent_folders::LOOK_LIMIT)?;
     let any_checkouts = walked.is_some() || !from_agents.is_empty();
     // One checkout found by both readers is read once.
@@ -2502,7 +2502,13 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     read_other_autoruns(&mut run, &args.home, &found, walk_failure)?;
     stage(CheckStage::Software);
     let mut changed = read_integrity(&mut run, args)?;
-    changed.extend(read_indicators(&mut run, args, &found, walk_failure)?);
+    changed.extend(read_indicators(
+        &mut run,
+        args,
+        &found,
+        walk_failure,
+        &not_told,
+    )?);
     opened += findings::detect(run.tx, run.run_id, run.at, &changed)?;
     stage(CheckStage::Events);
     opened += read_events(&mut run, args)?;
@@ -2909,14 +2915,23 @@ fn unlisted_note(folders: &[String]) -> String {
     format!("Folders that could not be listed: {}.", shown.join(", "))
 }
 
-type CheckoutWalk = (Option<Vec<checkouts::Checkout>>, Option<&'static str>);
+/// What the walk for checkouts gives the readings over checkouts: the checkouts it found, a
+/// reason when it failed, and the checkouts the store holds that it could not look at, by
+/// their paths as ids name them.
+type CheckoutWalk = (
+    Option<Vec<checkouts::Checkout>>,
+    Option<&'static str>,
+    Vec<String>,
+);
 
 /// Which checkouts are on this machine, with a reason if the walk failed. When its root is
 /// not a folder its reading failed. A walk closes a checkout the store holds only where it
 /// looked: one looked at again under its root and not there (`Walk::look_again`). It leaves
 /// the checkouts outside its root as they were. The folder given is made real first
 /// (`checkouts::given`), and a walk of a folder outside the home folder meets the home by its
-/// real path.
+/// real path. Its completeness, cause and reason follow from what it read and did not
+/// (`look.rs`): the folders it listed and the checkouts it found are read, a folder it could
+/// not list is a unit not read, and what it did not look at that is no unit is said apart.
 fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Error>> {
     let start = checkouts::start(args.checkouts_root.as_deref(), &args.home);
     let root = &start.root;
@@ -2943,6 +2958,7 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
         return Ok((
             None,
             Some("the checkout walk could not open its root folder"),
+            Vec::new(),
         ));
     }
     run.readers += 1;
@@ -2983,7 +2999,7 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
     for rel in &kept {
         raw.push_str(&format!("kept, not looked into\t{rel}\n"));
     }
-    for folder in &walk.unlisted {
+    for (folder, _) in &walk.unlisted {
         raw.push_str(&format!("not listed\t{folder}\n"));
     }
     let raw_file = run.keep_raw(checkouts::READER, "checkouts.txt", raw.as_bytes())?;
@@ -3001,39 +3017,45 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
         })
         .collect();
     not_looked_into(run, checkouts::READER, &walk.guarded, &start.home)?;
-    let unlisted = (!walk.unlisted.is_empty())
-        .then(|| format!("could not be listed: {}", walk.unlisted.join(", ")));
-    let failure = unlisted
-        .as_ref()
-        .map(|_| "the checkout walk could not list some folders");
-    if unlisted.is_some() {
-        run.notes.push(unlisted_note(&walk.unlisted));
-    }
     // A folder that could not be listed or a known checkout that could not be looked at
     // failed; a walk limited to the folder given read what it was given, which does not hold
-    // the rest of the home folder, and a walk does not go into another file system. The worse
-    // is the reading's cause.
-    let mounted = (!walk.mounted.is_empty()).then(|| {
-        format!(
+    // the rest of the home folder, and a walk does not go into another file system. The worst
+    // is the reading's cause. The root, a folder, is there.
+    let mut look = look::Look::default();
+    look.present = 1;
+    for rel in walk
+        .listed
+        .iter()
+        .chain(walk.checkouts.iter().map(|c| &c.rel))
+    {
+        look.read(Unit::whole(rel));
+    }
+    for (folder, why) in &walk.unlisted {
+        look.not_looked_at(Unit::whole(folder), why.clone());
+    }
+    if args.checkouts_root.is_some() {
+        look.short(Cause::NotGiven, checkouts::ONLY_GIVEN.to_string());
+    }
+    if !walk.mounted.is_empty() {
+        let why = format!(
             "{}{}",
             checkouts::ANOTHER_FILE_SYSTEM,
             walk.mounted.join(", ")
-        )
+        );
+        look.short(Cause::NotGiven, why);
+    }
+    if !unknown.is_empty() {
+        let rels = unknown.join(", ");
+        let why = format!("known checkouts that could not be looked at, kept as they were: {rels}");
+        look.short(Cause::Failed, why);
+    }
+    let failure = (!walk.unlisted.is_empty()).then(|| {
+        let folders: Vec<String> = walk.unlisted.iter().map(|(f, _)| f.clone()).collect();
+        run.notes.push(unlisted_note(&folders));
+        "the checkout walk could not list some folders"
     });
-    let reasons: Vec<(String, Cause)> = args
-        .checkouts_root
-        .iter()
-        .map(|_| (checkouts::ONLY_GIVEN.to_string(), Cause::NotGiven))
-        .chain(mounted.map(|m| (m, Cause::NotGiven)))
-        .chain(unlisted.map(|u| (u, Cause::Failed)))
-        .chain((!unknown.is_empty()).then(|| {
-            let rels = unknown.join(", ");
-            let why =
-                format!("known checkouts that could not be looked at, kept as they were: {rels}");
-            (why, Cause::Failed)
-        }))
-        .collect();
-    let (completeness, reason, gap) = partial_when(&reasons);
+    let (completeness, reason) = look.completeness_noted(None);
+    let gap = Gap::when(look.cause());
     // Every checkout the store holds is in the statements or was looked for and is gone, so
     // the reading is compared whole, whatever its coverage says.
     let applied = Applied {
@@ -3054,7 +3076,7 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
         &walk.listed.iter().map(Unit::whole).collect::<Vec<_>>(),
         &walk.seen.iter().map(Unit::whole).collect::<Vec<_>>(),
     )?;
-    Ok((Some(walk.checkouts), failure))
+    Ok((Some(walk.checkouts), failure, unknown))
 }
 
 /// Checkouts in the folders agents worked in. The candidates are the working folders in the
@@ -3652,17 +3674,6 @@ fn read_lockfiles(
     Ok(())
 }
 
-/// A reading's completeness, reason and gap from why it is not whole, each why with its cause:
-/// partial with every why said and the worst cause, or full.
-fn partial_when(reasons: &[(String, Cause)]) -> (&'static str, Option<String>, Gap) {
-    let gap = Gap::when(Cause::worst(reasons.iter().map(|(_, c)| *c)));
-    let said: Vec<&str> = reasons.iter().map(|(r, _)| r.as_str()).collect();
-    match said.is_empty() {
-        true => ("full", None, gap),
-        false => ("partial", Some(said.join("; ")), gap),
-    }
-}
-
 /// How one reading is written: its coverage, and how its statements are compared with what is
 /// live. A reading of which entries are there is compared as a whole reading even when some of
 /// its units could not be read, since what it knew of those is made again (`kept`): what is
@@ -3751,6 +3762,14 @@ impl Visited {
         walk_failure
             .map(|why| (why, Cause::Failed))
             .or(omitted.then_some(("known checkouts were not looked into", Cause::NotGiven)))
+    }
+
+    /// The checkout a path as ids name it belongs to: the deepest one the store holds or the
+    /// reading looked into whose folder holds it.
+    fn owner(&self, path: &str) -> Option<&String> {
+        (self.held.iter().chain(&self.looked))
+            .filter(|rel| known::within(path, rel))
+            .max_by_key(|rel| rel.len())
     }
 
     /// Whether a file, by its path as ids name it, is in a checkout the reading did not look
@@ -4984,12 +5003,14 @@ fn read_other_autoruns(
 /// Reads the list of indicators and matches it. The list is the file given, else the one
 /// next to the store; neither there means not applicable, and nothing is written. A list
 /// that cannot be read fails and the one read before is matched. Returns the files that
-/// match an indicator they did not match before, for the rule.
+/// match an indicator they did not match before, for the rule. `not_told` are the checkouts
+/// the store holds that the walk could not look at.
 fn read_indicators(
     run: &mut Run,
     args: &Args,
     found: &[checkouts::Checkout],
     walk_failure: Option<&str>,
+    not_told: &[String],
 ) -> Result<Vec<findings::Observed>, Box<dyn Error>> {
     let path = args
         .indicators
@@ -5051,47 +5072,44 @@ fn read_indicators(
         }
     };
 
-    // What this run did not read that could hold a match: the places, as ids name them after
-    // `file:{machine}/`, each a file or a project with all under it; what the reading says of
-    // them; and why. One list keeps a match and says why the reading is not full.
-    struct Unread {
-        places: Vec<String>,
-        why: String,
-        cause: Cause,
-    }
     // What matches, as file id and indicator: hashes against watched files, the network
-    // kinds against the texts read in checkouts; and which texts were read.
+    // kinds against the texts read in checkouts; which texts were read; and what this run did
+    // not read that could hold a match (`look.rs`), each by its path as ids name it after
+    // `file:{machine}/`: a file that could not be read or looked at and a folder that could
+    // not be listed, each with why; lockfiles found and not opened, and a project whose look
+    // for lockfiles stopped at its limit, said together; and folders the look for lockfiles
+    // leaves out by design, said by nothing. The walk for checkouts that failed and known
+    // checkouts not looked into are no place.
     let mut matches = indicators::match_hashes(run.tx, &list)?;
-    let (mut read, mut failed, mut unread) = (BTreeSet::new(), Vec::new(), Vec::new());
+    let (mut read, mut look) = (BTreeSet::new(), look::Look::default());
     for c in found {
         let texts = lockfiles::read_as_text(&c.path);
         let in_project = |rel: &str| format!("{}/{rel}", c.rel);
+        for (folder, why) in texts.unlisted {
+            look.not_looked_at(Unit::whole(in_project(&folder)), why);
+        }
+        for folder in &texts.aside {
+            look.aside(Unit::whole(in_project(folder)));
+        }
         if !texts.not_opened.is_empty() {
             let n = things(texts.not_opened.len() as i64, "lockfile", "lockfiles");
-            unread.push(Unread {
-                places: texts.not_opened.iter().map(|rel| in_project(rel)).collect(),
-                why: format!("{n} found and not opened in {}", c.rel),
-                cause: Cause::NoReader,
-            });
-        }
-        let project = |why: &str, cause| Unread {
-            places: vec![c.rel.clone()],
-            why: format!("{why} in {}", c.rel),
-            cause,
-        };
-        if !texts.listed {
-            unread.push(project("a folder could not be listed", Cause::Failed));
+            let units = texts.not_opened.iter().map(|f| Unit::whole(in_project(f)));
+            let why = format!("{n} found and not opened in {}", c.rel);
+            look.short_of(units, Cause::NoReader, why);
         }
         if texts.stopped {
-            let why = "lockfiles were not looked for past the walk's limit";
-            unread.push(project(why, Cause::NoReader));
+            let why = format!(
+                "lockfiles were not looked for past the walk's limit in {}",
+                c.rel
+            );
+            look.short_of([Unit::whole(&c.rel)], Cause::NoReader, why);
         }
         let mut opened = texts.opened;
         use std::io::ErrorKind::{NotADirectory, NotFound};
         match std::fs::symlink_metadata(c.path.join(autorun::TASKS)) {
             Ok(_) => opened.push(autorun::TASKS.to_string()),
             Err(e) if matches!(e.kind(), NotFound | NotADirectory) => {}
-            Err(e) => failed.push((in_project(autorun::TASKS), e.to_string())),
+            Err(e) => look.not_looked_at(Unit::whole(in_project(autorun::TASKS)), e.to_string()),
         }
         for rel in opened {
             let shown = in_project(&rel);
@@ -5104,40 +5122,26 @@ fn read_indicators(
                     }
                     read.insert(file);
                 }
-                Err(why) => failed.push((shown, why.to_string())),
+                Err(why) => look.not_looked_at(Unit::whole(shown), why.to_string()),
             }
         }
     }
-    if !failed.is_empty() {
-        let said: Vec<String> = failed
-            .iter()
-            .map(|(f, why)| format!("{f} ({why})"))
-            .collect();
-        let why = format!("could not be read: {}", said.join("; "));
-        let places = failed.into_iter().map(|(f, _)| f).collect();
-        let cause = Cause::Failed;
-        unread.insert(0, Unread { places, why, cause });
+    if let Some(why) = walk_failure {
+        look.short(Cause::Failed, why.to_string());
     }
-    unread.extend(walk_failure.map(|why| Unread {
-        places: Vec::new(),
-        why: why.to_string(),
-        cause: Cause::Failed,
-    }));
+    // A known checkout the walk could not look at failed; one it did not look into, as one
+    // outside the folder it was given, was not given.
     let visited = Visited::of(run.tx, &machine, found)?;
-    let omitted: Vec<String> = visited.held.difference(&visited.looked).cloned().collect();
+    let (failed, omitted): (Vec<&String>, Vec<&String>) =
+        (visited.held.difference(&visited.looked)).partition(|rel| not_told.contains(*rel));
+    if !failed.is_empty() {
+        let held = things(failed.len() as i64, "known checkout", "known checkouts");
+        look.short(Cause::Failed, format!("{held} could not be looked at"));
+    }
     if !omitted.is_empty() {
-        let held = things(
-            omitted.len() as i64,
-            "known checkout was",
-            "known checkouts were",
-        );
-        let why = format!("{held} not looked into");
-        let cause = Cause::NotGiven;
-        unread.push(Unread {
-            places: omitted,
-            why,
-            cause,
-        });
+        let n = omitted.len() as i64;
+        let held = things(n, "known checkout was", "known checkouts were");
+        look.short(Cause::NotGiven, format!("{held} not looked into"));
     }
     let mut statements: Vec<Statement> = matches
         .iter()
@@ -5150,16 +5154,25 @@ fn read_indicators(
         .collect();
     // Each live match is decided by its own file. Its indicator off the list, it goes; a hash
     // match is this run's matching of the digests the store holds; a text read now decides
-    // its own. A text not read now is made again exactly when the list of what was not read
-    // names it or a place above it; otherwise the run looked where it was and found no text.
+    // its own. A text not read now is made again where this run did not look: a unit it did
+    // not read or left aside hides the file, whatever its spelling on a volume that ignores
+    // case; the checkout the file belongs to (`Visited::owner`) was not looked into; or the
+    // file is not one that checkout's reading looks for there. Otherwise that walk listed the
+    // folder where the file was, or a folder above it, in full and found no text: it goes.
     let on_list: BTreeMap<String, &indicators::Indicator> =
         list.matched.iter().map(|i| (i.literal(), i)).collect();
     let in_files = format!("file:{machine}/");
-    let named = |subject: &str| {
-        let path = subject.strip_prefix(&in_files).unwrap_or(subject);
-        unread.iter().flat_map(|u| &u.places).any(|place| {
-            (path.strip_prefix(place.as_str()))
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+    let kept = |subject: &str| {
+        subject.strip_prefix(&in_files).is_some_and(|path| {
+            look.hides_spelled(path)
+                || visited.owner(path).is_some_and(|owner| {
+                    let rel = (path.strip_prefix(owner.as_str()))
+                        .and_then(|rel| rel.strip_prefix('/'))
+                        .unwrap_or(path);
+                    !visited.looked.contains(owner)
+                        || !(rel.eq_ignore_ascii_case(autorun::TASKS)
+                            || lockfiles::looked_for_as_text(rel))
+                })
         })
     };
     let live: Vec<(String, String, String)> = run
@@ -5176,7 +5189,7 @@ fn read_indicators(
         let Some(i) = on_list.get(object) else {
             continue;
         };
-        if i.kind == indicators::SHA256 || read.contains(subject) || !named(subject) {
+        if i.kind == indicators::SHA256 || read.contains(subject) || !kept(subject) {
             continue;
         }
         statements.push(Statement {
@@ -5186,9 +5199,15 @@ fn read_indicators(
             source_ref: source_ref.clone(),
         });
     }
-    // Not full while anything that could hold a match was not read, each said as the list has it.
-    let reasons: Vec<(String, Cause)> = unread.iter().map(|u| (u.why.clone(), u.cause)).collect();
-    let (completeness, reason, gap) = partial_when(&reasons);
+    // Not full while anything that could hold a match was not read. Hashes are matched
+    // against every watched file whatever this run looked into, so it is partial, never none.
+    let (_, reason) = look.completeness_noted(None);
+    let gap = Gap::when(look.cause());
+    let completeness = if gap.cause.is_some() {
+        "partial"
+    } else {
+        "full"
+    };
     let applied = Applied {
         completeness,
         reason: reason.as_deref(),
