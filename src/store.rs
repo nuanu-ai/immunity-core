@@ -1510,8 +1510,8 @@ pub fn last_read(conn: &Connection, reader: &str, scope: &str) -> rusqlite::Resu
 }
 
 /// The last saved raw copy of this input, relative to the store's folder.
-pub fn last_raw(tx: &Transaction, reader: &str, input: &str) -> rusqlite::Result<Option<String>> {
-    tx.query_row(
+pub fn last_raw(conn: &Connection, reader: &str, input: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
         "SELECT path FROM raw_input WHERE reader = ?1 AND input = ?2",
         params![reader, input],
         |row| row.get(0),

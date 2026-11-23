@@ -103,12 +103,15 @@ pub struct Roots<'a> {
 }
 
 /// One thing read: its entity, its path as ids name it, its facts, and how its verdict was
-/// reached, for the raw copy.
+/// reached, for the raw copy. A thing whose only evidence is its digest keeps the list the digest
+/// is made over, so that a change can say which files moved (`compare`); a bundle has none, its
+/// evidence being its seal and signer.
 pub struct Thing {
     pub subject: String,
     pub shown: String,
     pub facts: Vec<(&'static str, String)>,
     pub how: String,
+    pub list: Option<Vec<u8>>,
 }
 
 /// One reading: a kind of thing on this machine.
@@ -407,15 +410,13 @@ fn app_support(
                 files += count;
                 let mut facts = vec![("located_on", machine.to_string())];
                 facts.extend(versions.into_iter().map(|v| ("has_version", v)));
-                facts.push((
-                    "has_digest",
-                    format!("stat:{}", crate::sha256::hex(&records)),
-                ));
+                facts.push(("has_digest", stat(&records)));
                 kind.things.push(Thing {
                     subject: format!("file:{machine}/{shown}"),
                     shown,
                     facts,
                     how: format!("{count} code files"),
+                    list: Some(records),
                 });
             }
         }
@@ -522,10 +523,21 @@ pub fn raw(kinds: &[Kind]) -> (String, Vec<Vec<usize>>) {
 }
 
 /// The digest of a tree: every entry but folders, in order of path, by metadata alone.
-pub fn digest(root: &Path) -> Result<String, String> {
+fn digest(root: &Path) -> Result<String, String> {
+    listing(root).map(|records| stat(&records))
+}
+
+/// The list a tree's digest is made over: for each entry but folders, in order of path, its path
+/// from the tree, a NUL, its change time and a newline.
+fn listing(root: &Path) -> Result<Vec<u8>, String> {
     let mut records = Vec::new();
     walk(root, b"", &mut records).map_err(|e| e.to_string())?;
-    Ok(format!("stat:{}", crate::sha256::hex(&records)))
+    Ok(records)
+}
+
+/// The digest of a list as `walk` or `walk_code` make it.
+fn stat(records: &[u8]) -> String {
+    format!("stat:{}", crate::sha256::hex(records))
 }
 
 fn walk(dir: &Path, rel: &[u8], out: &mut Vec<u8>) -> std::io::Result<()> {
@@ -875,6 +887,7 @@ fn bundles(conn: &Connection, roots: &Roots, machine: &str) -> rusqlite::Result<
             shown: p.found.shown,
             facts,
             how,
+            list: None,
         });
     }
     let mut note = format!("seal verified for {verified}");
@@ -933,13 +946,17 @@ fn kegs(roots: &Roots, machine: &str) -> Kind {
                 if !real_folder(&keg) {
                     continue;
                 }
-                match digest(&keg) {
+                match listing(&keg) {
                     Err(why) => kind.failed.push((shown, why)),
-                    Ok(d) => kind.things.push(Thing {
+                    Ok(list) => kind.things.push(Thing {
                         subject: format!("file:{machine}/{shown}"),
-                        facts: vec![("located_on", machine.to_string()), ("has_digest", d)],
+                        facts: vec![
+                            ("located_on", machine.to_string()),
+                            ("has_digest", stat(&list)),
+                        ],
                         shown,
                         how: String::new(),
+                        list: Some(list),
                     }),
                 }
             }
@@ -998,8 +1015,8 @@ fn npm(roots: &Roots, machine: &str) -> Kind {
         }
         for (name, path) in packages {
             let here = format!("{shown}/{name}");
-            let d = match digest(&path) {
-                Ok(d) => d,
+            let list = match listing(&path) {
+                Ok(list) => list,
                 Err(why) => {
                     kind.failed.push((here, why));
                     continue;
@@ -1024,12 +1041,13 @@ fn npm(roots: &Roots, machine: &str) -> Kind {
                     }
                 }
             }
-            facts.push(("has_digest", d));
+            facts.push(("has_digest", stat(&list)));
             kind.things.push(Thing {
                 subject: format!("component:{machine}/npm/{name}"),
                 shown: here,
                 facts,
                 how: String::new(),
+                list: Some(list),
             });
         }
     }
@@ -1083,6 +1101,172 @@ pub fn observed(
         });
     }
     Ok(out)
+}
+
+/// The name among the raw copies of a thing's list (`Thing::list`), and of what changed in it at
+/// its latest change (`Changes`): made from the thing's id by its SHA-256, so that any id is a
+/// safe file name.
+pub fn list_input(subject: &str) -> String {
+    format!("files/{}.txt", crate::sha256::hex(subject.as_bytes()))
+}
+
+pub fn changes_input(subject: &str) -> String {
+    format!("changes/{}.json", crate::sha256::hex(subject.as_bytes()))
+}
+
+/// The file of a raw copy of `input` under the store's folder, from its path as `raw_input`
+/// holds it: only of the shape `Run::keep_raw` writes, `raw/<one folder>/<input>`. Another
+/// program can write that table, so a path of any other shape, absolute or with `..`, is none.
+pub fn kept_file(folder: &Path, path: &str, input: &str) -> Option<PathBuf> {
+    let run = path
+        .strip_prefix("raw/")?
+        .strip_suffix(input)?
+        .strip_suffix('/')?;
+    let one = !run.is_empty() && !run.contains('/') && run != "." && run != "..";
+    one.then(|| folder.join(path))
+}
+
+/// The most a list kept before is read: a line for each of `MAX_FILES` files, of a path as long
+/// as macOS allows and its change time. A larger file is no list.
+pub const LIST_CAP: u64 = MAX_FILES as u64 * 1_100;
+/// The most of what changed that is read, and the longest name passed on, in bytes.
+const CHANGES_CAP: u64 = 64 << 10;
+const NAME_CAP: usize = 1_024;
+
+/// How many names of each kind of change are kept, in the list's order; the counts are exact.
+const NAMED: usize = 20;
+
+/// The files of one thing added, removed and changed between two of its lists, with the digests
+/// of both, so that it is told only of the change the journal holds between those two digests.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct Changes {
+    from: String,
+    to: String,
+    added: Named,
+    removed: Named,
+    changed: Named,
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct Named {
+    count: u64,
+    names: Vec<String>,
+}
+
+impl Named {
+    /// Counts a path, and keeps its name, from the thing's folder, while fewer than `NAMED` are.
+    fn push(&mut self, path: &[u8]) {
+        self.count += 1;
+        if self.names.len() < NAMED {
+            let name = path.strip_prefix(b"/").unwrap_or(path);
+            self.names.push(String::from_utf8_lossy(name).into_owned());
+        }
+    }
+}
+
+/// A list's records as path and change time; `None` when it is not a list `walk` makes. A path
+/// can hold a newline and never a NUL, and a change time holds neither, so each record ends at
+/// the first newline after its NUL.
+fn records(list: &[u8]) -> Option<Vec<(&[u8], &[u8])>> {
+    let mut out = Vec::new();
+    let mut rest = list;
+    while !rest.is_empty() {
+        let (path, after) = rest.split_at(rest.iter().position(|b| *b == 0)?);
+        let (time, after) = after[1..].split_at(after[1..].iter().position(|b| *b == b'\n')?);
+        out.push((path, time));
+        rest = &after[1..];
+    }
+    Some(out)
+}
+
+/// What changed from one list of a thing to the next: a path in the new list only is added, in
+/// the old only removed, in both with another change time changed. `None` when either is not a
+/// list, or when no file is told: what cannot be said is never said as nothing.
+pub fn compare(before: &[u8], now: &[u8]) -> Option<Changes> {
+    let (old, new) = (records(before)?, records(now)?);
+    let (was, is): (BTreeMap<_, _>, BTreeMap<_, _>) =
+        (old.iter().copied().collect(), new.iter().copied().collect());
+    let mut c = Changes {
+        from: stat(before),
+        to: stat(now),
+        added: Named::default(),
+        removed: Named::default(),
+        changed: Named::default(),
+    };
+    for (path, time) in &new {
+        match was.get(path) {
+            None => c.added.push(path),
+            Some(t) if t != time => c.changed.push(path),
+            Some(_) => {}
+        }
+    }
+    for (path, _) in old.iter().filter(|(path, _)| !is.contains_key(path)) {
+        c.removed.push(path);
+    }
+    (c.added.count + c.removed.count + c.changed.count > 0).then_some(c)
+}
+
+/// What files changed at the latest change of a finding's thing, from the raw copy the reading
+/// kept (`changes_input`): only when the latest journal entry the finding rests on is a change
+/// from the copy's old digest to its new one, so that the copy is of that very change. `None`
+/// otherwise, and the finding says nothing of files.
+pub fn files_changed(
+    conn: &Connection,
+    finding: &str,
+) -> rusqlite::Result<Option<crate::contract::v1::FilesChanged>> {
+    let change: Option<(String, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT j.subject, j.old_value, j.new_value FROM finding_basis b
+             JOIN journal j ON j.seq = b.journal
+             WHERE b.finding = ?1 ORDER BY j.seq DESC LIMIT 1",
+            [finding],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    let Some((subject, Some(from), Some(to))) = change else {
+        return Ok(None);
+    };
+    let input = changes_input(&subject);
+    let Some(path) = crate::store::last_raw(conn, READER, &input)? else {
+        return Ok(None);
+    };
+    // Raw copies are kept in the store's folder, as paths from it. What is read is bounded,
+    // whatever the file holds.
+    let folder = conn.path().map(Path::new).and_then(Path::parent);
+    let kept = folder
+        .and_then(|f| kept_file(f, &path, &input))
+        .and_then(|file| crate::autorun::read_capped_resolved(&file, CHANGES_CAP).ok())
+        .and_then(|bytes| serde_json::from_slice::<Changes>(&bytes).ok())
+        .filter(|c| c.from == from && c.to == to);
+    let told = |n: &Named| n.count >= n.names.len() as u64;
+    let kept = kept.filter(|c| {
+        let kinds = [&c.added, &c.removed, &c.changed];
+        kinds.iter().any(|n| n.count > 0) && kinds.iter().all(|n| told(n))
+    });
+    let names = |n: &Named| {
+        n.names
+            .iter()
+            .take(NAMED)
+            .map(|s| crate::known::whole(cut(s)))
+            .collect()
+    };
+    Ok(kept.map(|c| crate::contract::v1::FilesChanged {
+        added: c.added.count,
+        removed: c.removed.count,
+        changed: c.changed.count,
+        added_text: names(&c.added),
+        removed_text: names(&c.removed),
+        changed_text: names(&c.changed),
+    }))
+}
+
+/// A name cut to `NAME_CAP` bytes, at the end of a character.
+fn cut(name: &str) -> &str {
+    let mut end = name.len().min(NAME_CAP);
+    while !name.is_char_boundary(end) {
+        end -= 1;
+    }
+    &name[..end]
 }
 
 /// What the rules are told changed when a fact of an installed thing changed in place.
@@ -1306,7 +1490,42 @@ pub fn message(s: &Summary) -> crate::contract::v1::Integrity {
 
 #[cfg(test)]
 mod tests {
-    use super::bundle_version;
+    use super::{bundle_version, compare, kept_file};
+    use std::path::Path;
+
+    #[test]
+    fn a_kept_copy_is_a_file_only_at_a_path_of_the_shape_the_store_writes() {
+        // The table of raw copies is data another program can write: a path from it never
+        // reaches a file outside the store's folder of raw copies.
+        let (store, input) = (Path::new("/Users/example/store"), "files/ab.txt");
+        let file = kept_file(store, "raw/1795400000-000000001/files/ab.txt", input);
+        assert_eq!(
+            file,
+            Some(store.join("raw/1795400000-000000001/files/ab.txt"))
+        );
+        for path in [
+            "/Users/example/store/raw/1795400000-000000001/files/ab.txt",
+            "raw/../files/ab.txt",
+            "raw/./files/ab.txt",
+            "raw//files/ab.txt",
+            "raw/1795400000-000000001/../../files/ab.txt",
+            "other/1795400000-000000001/files/ab.txt",
+            "raw/1795400000-000000001/files/cd.txt",
+        ] {
+            assert_eq!(kept_file(store, path, input), None, "{path}");
+        }
+    }
+
+    #[test]
+    fn lists_that_tell_no_file_apart_are_never_told_as_no_file_changed() {
+        let list = b"/bin/tool\x001.5\n/lib/a\nb\x002.5\n";
+        assert!(compare(list, list).is_none());
+        assert!(compare(b"damaged", list).is_none());
+        // A name may hold a line break; it is still one file, unchanged here.
+        let c = compare(list, b"/bin/tool\x001.6\n/lib/a\nb\x002.5\n").unwrap();
+        assert_eq!(c.changed.names, ["bin/tool"]);
+        assert_eq!((c.added.count, c.removed.count), (0, 0));
+    }
 
     #[test]
     fn a_bundles_version_is_its_short_version_with_the_build_only_where_it_differs() {
