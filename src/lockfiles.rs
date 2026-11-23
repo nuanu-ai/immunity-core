@@ -86,19 +86,27 @@ const CACHE_MARK: &str = "CACHEDIR.TAG";
 const CACHE_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
 const CHECKOUT_MARK: &str = ".git";
 
-const SUPPORTED: [&str; 3] = ["package-lock.json", "pnpm-lock.yaml", "Cargo.lock"];
+/// `npm-shrinkwrap.json` is in the format of `package-lock.json`, as npm documents it.
+const SUPPORTED: [&str; 4] = [
+    "package-lock.json",
+    "npm-shrinkwrap.json",
+    "pnpm-lock.yaml",
+    "Cargo.lock",
+];
 /// Lockfiles this build has no reader for, by name, with the ecosystem whose packages each
 /// declares, as OSV names it. Data, from OSV-Scanner's list of supported lockfiles
 /// (google.github.io/osv-scanner, "Supported languages and lockfiles", read on 16 November
-/// 2026), with `go.sum` for Go, npm's own `npm-shrinkwrap.json`, Swift's `Package.resolved`, and
-/// CocoaPods' `Podfile.lock` and Nix's `flake.lock`, whose ecosystems OSV does not name. The
+/// 2026), with `go.sum` for Go, Swift's `Package.resolved`, CocoaPods' `Podfile.lock` and Nix's
+/// `flake.lock`, whose ecosystems OSV does not name, and Bun's binary `bun.lockb`, which Bun's
+/// documentation of its lockfile (bun.com/docs/install/lockfile) gives as the earlier form of
+/// `bun.lock`. The
 /// manifests that page lists beside the lockfiles (`go.mod`, `pom.xml`, `deps.json` and the
 /// like) are not lockfiles and are not here. A lockfile of a name on no list is not known to be
 /// one and cannot be said (docs/reference.md).
 const NOT_SUPPORTED: [(&str, Option<&str>); 25] = [
     ("yarn.lock", Some("npm")),
     ("bun.lock", Some("npm")),
-    ("npm-shrinkwrap.json", Some("npm")),
+    ("bun.lockb", Some("npm")),
     ("uv.lock", Some("PyPI")),
     ("poetry.lock", Some("PyPI")),
     ("Pipfile.lock", Some("PyPI")),
@@ -165,12 +173,11 @@ pub fn split_name(name: &str) -> (&str, Option<&'static str>) {
 }
 
 /// The ecosystem whose dependencies a kind of lockfile declares, by its name as `read` names
-/// it; `None` for one not known here.
+/// it, a version of its format with no reader as `<kind> version <n>`; `None` for one not known
+/// here.
 pub fn ecosystem_of(kind: &str) -> Option<&'static str> {
-    match kind {
-        "package-lock.json" | "pnpm-lock.yaml" => Some("npm"),
-        k if k.starts_with("package-lock.json version") => Some("npm"),
-        k if k.starts_with("pnpm-lock.yaml version") => Some("npm"),
+    match kind.split_once(" version ").map_or(kind, |(kind, _)| kind) {
+        "package-lock.json" | "npm-shrinkwrap.json" | "pnpm-lock.yaml" => Some("npm"),
         "Cargo.lock" => Some("crates.io"),
         _ => NOT_SUPPORTED
             .iter()
@@ -439,15 +446,21 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize) -> Option<Outcome> {
             continue;
         }
         let path = checkout.path.join(rel);
-        let text = std::fs::read(&path).ok();
-        lockfiles.push((source.clone(), text.as_ref().map_or(0, |t| t.len() as u64)));
+        // A kind with no reader is never opened: its size is the file's own, 0 when that cannot
+        // be had, as for a lockfile that could not be read.
         if !SUPPORTED.contains(&name) {
+            let size = std::fs::symlink_metadata(&path).map_or(0, |m| m.len());
+            lockfiles.push((source, size));
             not_supported.insert(name.to_string());
             continue;
         }
+        let text = std::fs::read(&path).ok();
+        lockfiles.push((source.clone(), text.as_ref().map_or(0, |t| t.len() as u64)));
         let parsed = match text.and_then(|t| String::from_utf8(t).ok()) {
             None => Parsed::Failed,
-            Some(t) if name == "package-lock.json" => npm(&t),
+            Some(t) if name == "package-lock.json" || name == "npm-shrinkwrap.json" => {
+                npm(&t, name)
+            }
             Some(t) if name == "pnpm-lock.yaml" => pnpm(&t),
             Some(t) => cargo(&t),
         };
@@ -621,20 +634,29 @@ enum Parsed {
 }
 
 /// npm's public registry. An entry is from it when it names no `resolved` address, as a
-/// bundled entry does, or names one here; anything else is not its package. A mirror counts
-/// as another registry.
+/// bundled entry does, or names one here. An address here is the package's own only as
+/// `registry_tarball` says; any other is not its package. A mirror counts as another registry.
 const NPM_REGISTRY: &str = "https://registry.npmjs.org/";
 
-/// `package-lock.json`, lockfile versions 2 and 3: the `packages` map. The root entry and
-/// workspace folders are the project itself and are skipped. Version 1 has no such map and no
-/// reader here; it is named as a kind of lockfile without one.
-fn npm(text: &str) -> Parsed {
+/// Whether `path`, the part of an address after `NPM_REGISTRY`, is the registry's file of the
+/// package `name` at `version`: exactly `<name>/-/<unscoped name>-<version>.tgz`, the unscoped
+/// name being `name` without its `@scope/`, with nothing after `.tgz`. Any other address names
+/// another package, another version or a file not known here.
+fn registry_tarball(path: &str, name: &str, version: &str) -> bool {
+    let unscoped = name.rsplit_once('/').map_or(name, |(_, n)| n);
+    path == format!("{name}/-/{unscoped}-{version}.tgz")
+}
+
+/// `package-lock.json` or `npm-shrinkwrap.json`, the `kind`, lockfile versions 2 and 3: the
+/// `packages` map. The root entry and workspace folders are the project itself and are skipped.
+/// Version 1 has no such map and no reader here; it is named as a kind of lockfile without one.
+fn npm(text: &str, kind: &str) -> Parsed {
     let Ok(lock) = serde_json::from_str::<serde_json::Value>(text) else {
         return Parsed::Failed;
     };
     match lock.get("lockfileVersion").and_then(|v| v.as_u64()) {
         Some(2 | 3) => {}
-        Some(n) => return Parsed::NoReader(format!("package-lock.json version {n}")),
+        Some(n) => return Parsed::NoReader(format!("{kind} version {n}")),
         None => return Parsed::Failed,
     }
     let Some(packages) = lock.get("packages").and_then(|p| p.as_object()) else {
@@ -654,7 +676,8 @@ fn npm(text: &str) -> Parsed {
 }
 
 /// One entry under `node_modules`, or `None` when the lockfile does not tell what it is: a
-/// name that is not a package's, no version, or a registry address of another package.
+/// name that is not a package's, no version, or a registry address that is not the file of the
+/// entry's name and `version` (`registry_tarball`).
 fn npm_entry(
     key: &str,
     installed_as: &str,
@@ -688,15 +711,6 @@ fn npm_entry(
         // whatever it is, it is not the public registry.
         Some(_) => Source::OtherRegistry,
     };
-    // The registry's address names the package, `<registry><name>/-/<file>`. One that names
-    // another package means the entry is not what its name says.
-    if let Some(path) = resolved
-        .filter(|_| source == Source::Registry)
-        .and_then(|r| r.strip_prefix(NPM_REGISTRY))
-        && path.split("/-/").next() != Some(name)
-    {
-        return None;
-    }
     let version = match text("version")? {
         Some("") => return None,
         Some(v) => Some(v.to_string()),
@@ -709,6 +723,17 @@ fn npm_entry(
             .map(str::to_string),
         None => return None,
     };
+    // A registry address that is not the file of this name and version means the entry is not
+    // what it says.
+    if let Some(path) = resolved
+        .filter(|_| source == Source::Registry)
+        .and_then(|r| r.strip_prefix(NPM_REGISTRY))
+        && !version
+            .as_deref()
+            .is_some_and(|v| registry_tarball(path, name, v))
+    {
+        return None;
+    }
     Some(Dep {
         at: At::Key(key.to_string()),
         name: name.to_string(),
@@ -862,8 +887,9 @@ fn pnpm_document(
 }
 
 /// One entry of `packages`, or `None` when the lockfile does not tell what it is: a name that is
-/// not a package's, no version, a name its key and its `name` field disagree on, no resolution,
-/// or a registry address of another package.
+/// not a package's, no version, a name or a version its key and its field disagree on, no resolution,
+/// or a registry address that is not the file of the entry's name and version
+/// (`registry_tarball`).
 fn pnpm_package(format: PnpmFormat, key: &str, entry: &serde_norway::Value) -> Option<Dep> {
     fn text<'a>(v: &'a serde_norway::Value, field: &str) -> Option<Option<&'a str>> {
         match v.get(field) {
@@ -880,10 +906,11 @@ fn pnpm_package(format: PnpmFormat, key: &str, entry: &serde_norway::Value) -> O
     if !npm_name(name) {
         return None;
     }
-    let version = match text(entry, "version")? {
-        Some("") => return None,
-        Some(v) => v,
-        None => key_version?,
+    let version = match (text(entry, "version")?, key_version) {
+        (Some(""), _) => return None,
+        (Some(field), Some(key)) if field != key => return None,
+        (Some(version), _) | (None, Some(version)) => version,
+        (None, None) => return None,
     };
     let resolution = entry.get("resolution")?;
     // A key that does not start with a slash, in 5.x and 6.0, names a host or a source.
@@ -911,8 +938,7 @@ fn pnpm_package(format: PnpmFormat, key: &str, entry: &serde_norway::Value) -> O
             Source::Git
         }
         (None, Some(t)) if t.starts_with(NPM_REGISTRY) => {
-            // The registry's address names the package, `<registry><name>/-/<file>`.
-            if t[NPM_REGISTRY.len()..].split("/-/").next() != Some(name) {
+            if !registry_tarball(&t[NPM_REGISTRY.len()..], name, version) {
                 return None;
             }
             Source::Registry
@@ -2155,6 +2181,197 @@ dependencies = [
             o.reason.as_deref(),
             Some("not supported yet: package-lock.json version 1")
         );
+    }
+
+    /// The reason of a reading that could not tell one entry, `<lockfile>#<key>`.
+    fn one_not_told(at: &str) -> Option<String> {
+        Some(format!(
+            "the package of 1 entry cannot be told: dev/shop/{at}"
+        ))
+    }
+
+    #[test]
+    fn an_npm_entry_is_the_registrys_only_when_its_address_names_its_package_and_version() {
+        // No false calm. npm fetches what `resolved` names: an honest `version` beside the
+        // address of another version's file, of another package's file in the right folder, or
+        // with more after `.tgz` would answer for a version that may not be installed. Such an
+        // entry is not told and the reading is partial. A scoped package's file carries its name
+        // without the scope, as `ink-6.4.6.tgz` in `NPM`.
+        let width = "string-width/-/string-width-5.1.2.tgz";
+        let ink = "@jrichman/ink/-/ink-6.4.6.tgz";
+        for (from, to, key) in [
+            (
+                width,
+                "string-width/-/string-width-5.0.0.tgz",
+                "string-width",
+            ),
+            (width, "string-width/-/strip-ansi-5.1.2.tgz", "string-width"),
+            (
+                width,
+                "string-width/-/string-width-5.1.2.tgz?v=5",
+                "string-width",
+            ),
+            (ink, "@jrichman/ink/-/ink-6.4.5.tgz", "ink"),
+        ] {
+            let dir = Dir::new(
+                "npm-address",
+                &[("package-lock.json", &NPM.replace(from, to))],
+            );
+            let (o, said) = dir.read();
+            let at = format!("package-lock.json#node_modules/{key}");
+            assert!(!said.iter().any(|s| s.ends_with(&at)), "{to}: {said:?}");
+            assert_eq!(o.reason, one_not_told(&at), "{to}");
+        }
+    }
+
+    #[test]
+    fn a_pnpm_entry_is_the_registrys_only_when_its_tarball_names_its_package_and_version() {
+        // As for npm: the registry's address of another version, of another package's file or
+        // with more after `.tgz` leaves the entry not told. The registry's own address of a
+        // scoped package, and of a package whose key carries a peer suffix, is read.
+        let ms = "  ms@2.1.3:\n    resolution: {integrity: sha512-FFFF}";
+        let tarball = |file: &str| {
+            format!(
+                "  ms@2.1.3:\n    resolution: {{integrity: sha512-FFFF, tarball: https://registry.npmjs.org/{file}}}"
+            )
+        };
+        for file in [
+            "ms/-/ms-2.0.0.tgz",
+            "ms/-/left-pad-2.1.3.tgz",
+            "ms/-/ms-2.1.3.tgz#ms-2.0.0",
+        ] {
+            let dir = Dir::new(
+                "pnpm-address",
+                &[("pnpm-lock.yaml", &PNPM_9.replace(ms, &tarball(file)))],
+            );
+            let (o, said) = dir.read();
+            assert!(
+                !said.iter().any(|s| s.contains("ms@2.1.3")),
+                "{file}: {said:?}"
+            );
+            assert_eq!(o.reason, one_not_told("pnpm-lock.yaml#ms@2.1.3"), "{file}");
+        }
+        for (text, from, to, read) in [
+            (
+                PNPM_9,
+                "  '@types/node@20.14.10':\n    resolution: {integrity: sha512-AAAA}",
+                "  '@types/node@20.14.10':\n    resolution: {integrity: sha512-AAAA, tarball: https://registry.npmjs.org/@types/node/-/node-20.14.10.tgz}",
+                "npm/@types/node|has_version|20.14.10|dev/shop/pnpm-lock.yaml#@types/node@20.14.10",
+            ),
+            (
+                PNPM_6,
+                "resolution: {integrity: sha512-GGGG}",
+                "resolution: {integrity: sha512-GGGG, tarball: https://registry.npmjs.org/react-dom/-/react-dom-18.3.1.tgz}",
+                "npm/react-dom|has_version|18.3.1|dev/shop/pnpm-lock.yaml#/react-dom@18.3.1(react@18.3.1)",
+            ),
+        ] {
+            let dir = Dir::new(
+                "pnpm-address-read",
+                &[("pnpm-lock.yaml", &text.replace(from, to))],
+            );
+            let (o, said) = dir.read();
+            assert!(said.contains(&read.to_string()), "{read}: {said:?}");
+            assert_eq!((o.completeness, o.reason), ("full", None), "{read}");
+        }
+    }
+
+    #[test]
+    fn an_npm_shrinkwrap_is_read_under_its_own_name_and_beside_a_package_lock_neither_hides_the_other()
+     {
+        // npm 11 and earlier install from `npm-shrinkwrap.json` when both are there, npm 12 from
+        // `package-lock.json`, and the folder does not say which npm runs: both are read, and a
+        // package of two versions in the two comes out at both.
+        let dir = Dir::new(
+            "shrinkwrap",
+            &[
+                ("npm-shrinkwrap.json", &NPM.replace("5.1.2", "5.1.3")),
+                ("package-lock.json", NPM),
+            ],
+        );
+        let (o, said) = dir.read();
+        for (version, file) in [
+            ("5.1.3", "npm-shrinkwrap.json"),
+            ("5.1.2", "package-lock.json"),
+        ] {
+            let fact = format!(
+                "npm/string-width|has_version|{version}|dev/shop/{file}#node_modules/string-width"
+            );
+            assert!(said.contains(&fact), "{fact}: {said:?}");
+        }
+        assert_eq!((o.completeness, o.reason), ("full", None));
+        assert_eq!(
+            read_as_text(&dir.0).opened,
+            ["npm-shrinkwrap.json", "package-lock.json"]
+        );
+    }
+
+    #[test]
+    fn an_npm_shrinkwrap_of_version_1_is_named_by_its_own_name_and_leaves_only_npm_unknown() {
+        let v1 = r#"{"name": "old", "lockfileVersion": 1, "requires": true,
+                     "dependencies": {"left-pad": {"version": "1.3.0"}}}"#;
+        let dir = Dir::new("shrinkwrap-v1", &[("npm-shrinkwrap.json", v1)]);
+        let (o, said) = dir.read();
+        assert!(said.is_empty());
+        assert_eq!(
+            lacks(&o),
+            [format!("{LOCKFILE_KIND} npm-shrinkwrap.json version 1")]
+        );
+        assert_eq!(
+            o.reason.as_deref(),
+            Some("not supported yet: npm-shrinkwrap.json version 1")
+        );
+        assert_eq!(unknown_for(&o), [true, false]);
+    }
+
+    #[test]
+    fn a_project_with_only_bun_s_binary_lockfile_is_never_one_with_no_lockfile() {
+        // Bun's binary `bun.lockb` has no reader: it is named, never opened as text, and leaves
+        // npm's packages of the project unknown and no other ecosystem's.
+        let dir = Dir::new("bun-lockb", &[("bun.lockb", "bun-lockfile-format-v0\n")]);
+        let (o, said) = dir.read();
+        assert!(said.is_empty());
+        assert_eq!(o.completeness, "partial");
+        assert_eq!(lacks(&o), [format!("{LOCKFILE_KIND} bun.lockb")]);
+        assert_eq!(unknown_for(&o), [true, false]);
+        let texts = read_as_text(&dir.0);
+        assert!(texts.opened.is_empty() && texts.not_opened.is_empty());
+    }
+
+    #[test]
+    fn a_lockfile_of_a_kind_with_no_reader_is_never_opened_and_is_listed_with_its_size() {
+        // Its size comes from the folder, so one this user may not open is still named as a
+        // kind with no reader and listed with its size.
+        use std::os::unix::fs::PermissionsExt;
+        let text = "bun-lockfile-format-v0\n";
+        let dir = Dir::new("lockb-closed", &[("bun.lockb", text)]);
+        let lockb = dir.0.join("bun.lockb");
+        std::fs::set_permissions(&lockb, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let (o, _) = dir.read();
+        std::fs::set_permissions(&lockb, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(lacks(&o), [format!("{LOCKFILE_KIND} bun.lockb")]);
+        assert_eq!(
+            o.lockfiles,
+            [("dev/shop/bun.lockb".to_string(), text.len() as u64)]
+        );
+    }
+
+    #[test]
+    fn a_pnpm_entry_whose_version_field_disagrees_with_its_key_is_never_read_as_either() {
+        // pnpm fetches by the key: a `version` field of another version would answer for a
+        // version that is not installed. The same version in both is read.
+        let ms = "  ms@2.1.3:\n    resolution: {integrity: sha512-FFFF}\n";
+        for (version, read) in [("9.9.9", false), ("2.1.3", true)] {
+            let text = PNPM_9.replace(ms, &format!("{ms}    version: {version}\n"));
+            let dir = Dir::new("pnpm-version-field", &[("pnpm-lock.yaml", &text)]);
+            let (o, said) = dir.read();
+            let fact = "npm/ms|has_version|2.1.3|dev/shop/pnpm-lock.yaml#ms@2.1.3".to_string();
+            assert_eq!(said.contains(&fact), read, "{version}: {said:?}");
+            assert!(!said.iter().any(|s| s.contains("9.9.9")), "{said:?}");
+            let reason = (!read)
+                .then(|| one_not_told("pnpm-lock.yaml#ms@2.1.3"))
+                .flatten();
+            assert_eq!(o.reason, reason, "{version}");
+        }
     }
 
     const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
