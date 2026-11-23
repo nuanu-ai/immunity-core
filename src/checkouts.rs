@@ -18,6 +18,7 @@
 
 use crate::agent_folders::still_there;
 use crate::guarded;
+use crate::look::Absent;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -33,10 +34,10 @@ pub const MOVED: &str = "is no longer a folder there, as when a link to a folder
 /// How the reading says which folders the walk did not go down into because they are on another
 /// file system than its root; they follow, named as checkouts are.
 pub const ANOTHER_FILE_SYSTEM: &str = "on another file system, not walked: ";
-/// How the reading says which checkouts the store holds have a link on their path (`Linked`);
-/// they follow, named as checkouts are.
+/// How the reading says which checkouts the store holds are there through a link on their path
+/// (`Linked`), not walked into; they follow, named as checkouts are.
 pub const UNDER_LINK: &str =
-    "known checkouts with a link on their path, not followed, kept as they were: ";
+    "known checkouts there through a link on their path, not walked into, kept as they were: ";
 
 /// The device of the file system `path` is on: of what it leads to when `follow`, as the
 /// walk's root is taken, since a home folder may be reached through a link; of `path` itself
@@ -68,9 +69,8 @@ pub fn moved(
         .filter_map(|id| id.strip_prefix(&prefix).map(str::to_string))
         .filter(|rel| {
             let path = start.home.join(rel);
-            path.strip_prefix(&start.root).is_ok_and(|under| {
-                matches!(look(&start.root, under, &start.home), Some(Again::Kept))
-            })
+            path.strip_prefix(&start.root)
+                .is_ok_and(|under| matches!(look(start, under), Some(Again::Kept)))
         })
         .collect())
 }
@@ -107,14 +107,14 @@ pub fn start(given: Option<&Path>, home: &Path) -> Start {
 }
 
 /// How a checkout the store holds, at `under` below the walk's `root`, is looked at again:
-/// as the walk goes, down real folders from `root`, taken as given, following no link and
-/// looking up nothing past one. First, as written, it may be in a folder macOS asks
-/// permission for under `home` that the walk was not given. Then, one part at a time, it is
-/// gone where a part is missing or a part above it is neither a folder nor a link, since that
-/// path cannot hold it. A link above it is not followed, so the checkout was not looked at
-/// (`Linked`); something other than a folder at its own place is it in another form, kept.
-/// `None` when every part is a folder.
-fn look(root: &Path, under: &Path, home: &Path) -> Option<Again> {
+/// as the walk goes, down real folders from `root`, taken as given. First, as written, it may
+/// be in a folder macOS asks permission for under `home` that the walk was not given. Then,
+/// one part at a time, it is gone where a part is missing or a part above it is neither a
+/// folder nor a link, since that path cannot hold it. At a link above it, it is looked at
+/// through the link (`through_link`); something other than a folder at its own place is it
+/// in another form, kept, and nothing past it is looked up. `None` when every part is a folder.
+fn look(start: &Start, under: &Path) -> Option<Again> {
+    let (root, home) = (&start.root, &start.home);
     if let Some(g) = guarded::folder_of(&root.join(under), home)
         && !root.starts_with(&g)
     {
@@ -127,13 +127,32 @@ fn look(root: &Path, under: &Path, home: &Path) -> Option<Again> {
         match std::fs::symlink_metadata(&at) {
             Ok(m) if m.is_dir() => {}
             Ok(_) if parts.peek().is_none() => return Some(Again::Kept),
-            Ok(m) if m.is_symlink() => return Some(Again::Linked),
+            Ok(m) if m.is_symlink() => return Some(through_link(start, &root.join(under))),
             Ok(_) => return Some(Again::Gone),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(Again::Gone),
             Err(_) => return Some(Again::NotTold),
         }
     }
     None
+}
+
+/// A known checkout at `path`, with a link above it, looked at through the link as a path
+/// from data is (`guarded::real`): no folder macOS asks permission for is entered, a walk
+/// pointed into one included, and one the link leads into is `Guarded`, nothing past it
+/// looked up. Its `.git` there is `Linked`; proof that nothing is there (`look::Absent`) is
+/// `Gone`; the disk not saying, a link loop among it, is `NotTold`.
+fn through_link(start: &Start, path: &Path) -> Again {
+    let homes = [start.home.as_path(), start.real_home.as_path()];
+    match guarded::real(path, &homes) {
+        guarded::Real::Guarded(g) => Again::Guarded(g),
+        guarded::Real::At(real) => match still_there(&real) {
+            Some(true) => Again::Linked,
+            Some(false) => Again::Gone,
+            None => Again::NotTold,
+        },
+        guarded::Real::Failed(e) if Absent::on_the_way(&e).is_some() => Again::Gone,
+        guarded::Real::Failed(_) => Again::NotTold,
+    }
 }
 
 const MAX_DEPTH: usize = 5;
@@ -193,7 +212,7 @@ impl Walk {
     /// as a volume that ignores case lets it, and that the walk met under the disk's name is
     /// gone: it is held under that name.
     pub fn look_again(&self, under: &Path, start: &Start) -> Again {
-        if let Some(again) = look(&start.root, under, &start.home) {
+        if let Some(again) = look(start, under) {
             return again;
         }
         let path = start.root.join(under);
@@ -216,8 +235,8 @@ pub enum Again {
     Kept,
     /// The disk could not say.
     NotTold,
-    /// A folder above it is now a link, which the walk does not follow: it was not looked at,
-    /// and what was known of it is kept.
+    /// A folder above it is now a link, and its `.git` is there through the link: the walk does
+    /// not go through links, so nothing in it was read, and what was known of it is kept.
     Linked,
     /// It is in this folder macOS asks permission for, which was not entered.
     Guarded(PathBuf),

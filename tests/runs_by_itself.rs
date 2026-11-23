@@ -847,7 +847,7 @@ fn a_known_project_in_a_folder_macos_protects_is_kept_and_the_folder_named_witho
     e.full();
     e.run_in(&e.home().join("Library/CloudStorage"));
     // One project moves into Documents, and a link takes the place of a folder on its way:
-    // the link is not followed, so the project is kept and named, and Documents not entered.
+    // nothing past the link is looked up, so the project is kept under Documents, not entered.
     let docs = e.home().join("Documents");
     std::fs::create_dir_all(&docs).unwrap();
     std::fs::rename(e.home().join("work"), docs.join("work")).unwrap();
@@ -856,10 +856,7 @@ fn a_known_project_in_a_folder_macos_protects_is_kept_and_the_folder_named_witho
     mode(&docs, 0o000);
     e.full();
     mode(&docs, 0o755);
-    assert_eq!(
-        e.coverage(CHECKOUTS_KIND),
-        format!("partial|{UNDER_LINK}work/app")
-    );
+    assert_eq!(e.coverage(CHECKOUTS_KIND), "full|");
     assert_eq!(
         e.rows(
             "SELECT completeness || '|' || reason FROM coverage WHERE reader = 'checkouts'
@@ -870,9 +867,9 @@ fn a_known_project_in_a_folder_macos_protects_is_kept_and_the_folder_named_witho
     assert!(projects_removed(&e).is_empty());
 }
 
-/// How the reading of checkouts names the known ones with a link on their path.
+/// How the reading of checkouts names the known ones there through a link on their path.
 const UNDER_LINK: &str =
-    "known checkouts with a link on their path, not followed, kept as they were: ";
+    "known checkouts there through a link on their path, not walked into, kept as they were: ";
 
 #[test]
 fn a_project_whose_folder_or_one_above_it_was_renamed_in_case_only_is_held_under_one_name() {
@@ -963,10 +960,14 @@ fn a_walk_whose_folder_is_not_one_writes_a_failed_reading_and_the_next_whole_wal
 /// `replaced` and a whole walk. The link points to a folder outside the home folder; to one
 /// in `~/Library/CloudStorage` named through another case of the home folder's own name,
 /// which macOS would not take for the protected folder; and, with `in_home`, to `~/Projects`,
-/// which the walk reads. There is a project with a package the store does not know. The
-/// protected folders' reading is unchanged by the walk, and nothing names the package but
-/// the project under `~/Projects`. Then `then` is called.
-fn after_a_link_took_the_place_of(replaced: &str, in_home: bool, then: impl Fn(&Estate)) {
+/// which the walk reads. There is a project with a package the store does not know. Nothing
+/// names the package but the project under `~/Projects`. Then `then` is called with the
+/// target and whether the protected folders' reading is unchanged by the walk.
+fn after_a_link_took_the_place_of(
+    replaced: &str,
+    in_home: bool,
+    then: impl Fn(&Estate, &str, bool),
+) {
     for target in ["elsewhere", "cloud", "home"]
         .iter()
         .take(2 + usize::from(in_home))
@@ -1000,7 +1001,7 @@ fn after_a_link_took_the_place_of(replaced: &str, in_home: bool, then: impl Fn(&
         std::fs::remove_dir_all(e.home().join(replaced)).unwrap();
         link(spelled.to_str().unwrap(), &e.home().join(replaced));
         e.full();
-        assert_eq!(guarded(), before, "{target}");
+        let unchanged = guarded() == before;
         let named = e.rows(
             "SELECT id FROM entity WHERE id LIKE '%planted%'
              UNION ALL SELECT subject FROM assertion WHERE subject || object LIKE '%planted%'
@@ -1012,22 +1013,26 @@ fn after_a_link_took_the_place_of(replaced: &str, in_home: bool, then: impl Fn(&
             "{target}: {named:?}"
         );
         assert_eq!(*target == "home", !named.is_empty(), "{target}");
-        then(&e);
+        then(&e, target, unchanged);
     }
 }
 
 #[test]
-fn a_known_project_under_a_folder_a_link_replaced_is_kept_and_named_as_not_looked_at() {
-    // The walk follows no link, so it did not look at the project: it may be reached through
-    // the link. Its hooks read before are not looked at again, and raise nothing.
-    after_a_link_took_the_place_of("dev", true, |e| {
+fn a_known_project_under_a_folder_a_link_replaced_is_kept_and_named_as_not_walked_into() {
+    // Looked at through the link, the project is there; the walk does not go through links,
+    // so it read nothing in it. Where the link leads into a folder macOS asks permission for,
+    // nothing past the link is looked up and that folder is named. Its hooks read before
+    // raise nothing.
+    after_a_link_took_the_place_of("dev", true, |e, target, unchanged| {
         assert_eq!(presence(e, "dev/shop"), "held");
         assert!(projects_removed(e).is_empty());
-        assert_eq!(
-            e.coverage(CHECKOUTS_KIND),
-            format!("partial|{UNDER_LINK}dev/shop")
-        );
-        assert_eq!(checkouts_cause(e), "not_given");
+        let (coverage, cause) = match target {
+            "cloud" => ("full|".to_string(), ""),
+            _ => (format!("partial|{UNDER_LINK}dev/shop"), "not_given"),
+        };
+        assert_eq!(e.coverage(CHECKOUTS_KIND), coverage, "{target}");
+        assert_eq!(checkouts_cause(e), cause, "{target}");
+        assert_eq!(unchanged, target != "cloud", "{target}");
         assert!(
             !e.found()
                 .iter()
@@ -1040,21 +1045,68 @@ fn a_known_project_under_a_folder_a_link_replaced_is_kept_and_named_as_not_looke
 
 #[test]
 fn a_known_project_whose_own_folder_a_link_replaced_is_kept_and_nothing_where_it_points_is_read() {
-    after_a_link_took_the_place_of("dev/shop", false, |e| {
+    after_a_link_took_the_place_of("dev/shop", false, |e, target, unchanged| {
         assert_eq!(presence(e, "dev/shop"), "held");
         assert!(projects_removed(e).is_empty());
         assert_eq!(e.coverage(CHECKOUTS_KIND), "full|");
+        assert!(unchanged, "{target}");
     });
+}
+
+#[test]
+fn a_known_project_behind_a_link_that_cannot_hold_it_is_gone_and_one_the_disk_cannot_tell_kept() {
+    // A link that leads nowhere, or to a folder where the project's folder has no `.git`: a
+    // look through it shows nothing there. A link loop, or a project folder that cannot be
+    // searched, shows nothing either way: the project is kept and the reading says so.
+    for case in ["nowhere", "no-git", "loop", "shut"] {
+        let e = Estate::new("link-cannot-hold");
+        e.checkout("dev/group/app");
+        e.full();
+        let group = e.home().join("dev/group");
+        std::fs::remove_dir_all(&group).unwrap();
+        let other = e.0.join("other");
+        match case {
+            "nowhere" => {}
+            "loop" => link(group.to_str().unwrap(), &other),
+            _ => std::fs::create_dir_all(other.join("app")).unwrap(),
+        }
+        if case == "shut" {
+            put(&other.join("app/.git/HEAD"), "ref: refs/heads/main\n");
+            mode(&other.join("app"), 0o000);
+        }
+        link(other.to_str().unwrap(), &group);
+        e.full();
+        if case == "shut" {
+            mode(&other.join("app"), 0o755);
+        }
+        let app = "checkout:machine:mac/dev/group/app".to_string();
+        match case {
+            "nowhere" | "no-git" => {
+                assert_eq!(projects_removed(&e), [app], "{case}");
+                assert_eq!(e.coverage(CHECKOUTS_KIND), "full|", "{case}");
+            }
+            _ => {
+                assert_eq!(projects_held(&e), [app], "{case}");
+                assert_eq!(
+                    e.coverage(CHECKOUTS_KIND),
+                    "partial|known checkouts that could not be looked at, kept as they were: \
+                     dev/group/app",
+                    "{case}"
+                );
+            }
+        }
+    }
 }
 
 #[test]
 fn a_known_project_under_a_link_stays_held_and_named_at_every_walk_and_goes_once_a_look_finds_it_gone()
  {
     // A folder above the project moved to another disk and a link took its place, as people
-    // do with `~/dev`, and an agent works there through the link. The walk follows no link, so
-    // run after run it neither closes the project nor says it read it. It goes once the link
-    // is gone, or once a folder in its place is listed without it. A walk pointed at a folder
-    // above the link looks the same way.
+    // do with `~/dev`, and an agent works there through the link. Looked at through the link,
+    // the project is there; the walk does not go through links, so run after run it neither
+    // closes the project nor says it read it. It goes once the link is gone, or once a folder
+    // in its place is listed without it. A walk pointed at a folder above the link looks the
+    // same way.
     for given in [false, true] {
         let e = Estate::new("under-link");
         let app = e.checkout("dev/group/app");

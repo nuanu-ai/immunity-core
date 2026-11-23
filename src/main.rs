@@ -3053,8 +3053,8 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
         let why = format!("known checkouts that could not be looked at, kept as they were: {rels}");
         look.short(Cause::Failed, why);
     }
-    // A link on a known checkout's path was not followed, as a folder on another file system
-    // is not walked: the walk did not look at it.
+    // A known checkout there through a link on its path was not walked into, as a folder on
+    // another file system is not: nothing in it was read.
     if !linked.is_empty() {
         let why = format!("{}{}", checkouts::UNDER_LINK, linked.join(", "));
         look.short(Cause::NotGiven, why);
