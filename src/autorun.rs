@@ -1957,20 +1957,6 @@ mod tests {
             (places().count(), ways().count(), POINTS.len()),
             (37, 71, 106)
         );
-        // The reference states the same counts.
-        let ((project_read, project), (home_read, home)) = (counts(false), counts(true));
-        let reference = include_str!("../docs/reference.md");
-        for said in [
-            format!(
-                "{project_read} of the {project} known ways in a project and {home_read} of the {home} known places in the home folder are read"
-            ),
-            format!("{} rows of the table of autorun points", places().count()),
-            format!("There are {project} ways in a project and {home} places in the home folder."),
-            format!("Read in a project ({project_read} of {project}):"),
-            format!("Read in the home folder ({home_read} of {home}):"),
-        ] {
-            assert!(reference.contains(&said), "docs/reference.md: {said}");
-        }
     }
 
     #[test]

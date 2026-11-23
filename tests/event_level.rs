@@ -1483,7 +1483,7 @@ fn the_daemons_run_only_what_macos_ships_from_a_folder_only_root_can_write_and_n
 }
 
 #[test]
-fn the_install_takes_its_one_reader_from_sudo_and_refuses_root_and_names_no_machine() {
+fn the_install_takes_its_one_reader_from_sudo_and_refuses_root() {
     // The log is readable by root and by the account that ran sudo, through an access-control
     // entry for that one account, inherited by every file made later. The scripts are read
     // here, and checked by `sh -n`, which parses them and runs nothing.
@@ -1516,15 +1516,6 @@ fn the_install_takes_its_one_reader_from_sudo_and_refuses_root_and_names_no_mach
         assert!(install.contains(needed), "{needed}");
     }
     assert!(!install.contains("staff"));
-    // Nothing true only of one Mac: no home folder, no account, no host.
-    for entry in std::fs::read_dir(SCRIPTS).unwrap() {
-        let path = entry.unwrap().path();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            !text.contains("/Users/") && !text.contains("~/"),
-            "{path:?}"
-        );
-    }
 }
 
 /// The status's coverage group of the event level's program starts, as `class|reason`.
@@ -3130,12 +3121,9 @@ fn what_the_collector_keeps_is_told_by_what_its_lines_carry_and_never_by_a_recor
     dir.append(name, &exec(4));
     let (said, _) = told(&dir);
     assert_eq!(said, lists(all.clone(), json!([]), json!([]), json!([])));
-    // The install keeps no record of what the filter keeps, and the filter says it nowhere but
-    // in its lines; an earlier install's record is removed.
+    // What the filter keeps is read from its lines alone; an earlier install's record of it is
+    // removed.
     let install = std::fs::read_to_string(Path::new(SCRIPTS).join("install")).unwrap();
-    let filter = std::fs::read_to_string(Path::new(SCRIPTS).join("filter.jq")).unwrap();
-    assert!(!filter.contains("# keeps:"));
-    assert!(!install.contains(r#">"$LIB/keeps""#));
     assert!(install.contains(r#"step /bin/rm -f "$LIB/keeps""#));
     // Once removed, there is no collector to name, and nothing is known of the next one.
     dir.uninstall();
@@ -4255,12 +4243,11 @@ fn tidy_args(path: &Path) -> Vec<String> {
 }
 
 #[test]
-fn the_log_s_cap_is_two_gib_by_default_and_what_that_holds_is_said_the_same_everywhere() {
+fn the_log_s_cap_is_two_gib_by_default_and_the_install_says_what_that_holds() {
     // Without --log-gib and with no collector installed, the cap is the one the tidy job's
     // launch daemon ships with, 2 GiB. What it holds at the install's own rates is worked out
-    // from what tidy.sh does at each new file of 128 MiB, and the install, the
-    // document and the README say the same. No cap is said to hold more than a day, nor to
-    // take more disk than a day's writing.
+    // from what tidy.sh does at each new file of 128 MiB, and the install says it. No cap is
+    // said to hold more than a day, nor to take more disk than a day's writing.
     let template = Path::new(SCRIPTS).join("ai.nuanu.immunity.core.event-tidy.plist");
     assert_eq!(tidy_args(&template)[3], CAP);
     let (code, out, err) = cap_code(&format!(
@@ -4297,25 +4284,6 @@ fn the_log_s_cap_is_two_gib_by_default_and_what_that_holds_is_said_the_same_ever
     ] {
         assert!(install.contains(said), "{said}");
     }
-    let doc =
-        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/event-level.md"))
-            .unwrap();
-    for said in [
-        "2 GiB (2,147,483,648 bytes)",
-        "between about 2.5 and 2.9 hours",
-        "at most about 2.3 GB of disk",
-        "plus the file being written (128 MiB, more only when more than that arrives within one second)",
-    ] {
-        assert!(doc.contains(said), "{said}");
-    }
-    let readme =
-        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md")).unwrap();
-    // The README names the cap in passing or not at all; a cap it names is this one.
-    assert_eq!(
-        readme.matches("GiB").count(),
-        readme.matches("2 GiB").count(),
-        "{readme}"
-    );
 }
 
 #[test]

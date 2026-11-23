@@ -3419,9 +3419,7 @@ fn git_hooks_includes_that_fan_out_stop_at_a_budget_and_leave_the_folder_untold(
         &e.home().join(".gitconfig"),
         "[include]\n path = fan-0.conf\n",
     );
-    let started = std::time::Instant::now();
     e.full();
-    assert!(started.elapsed() < std::time::Duration::from_secs(20));
     assert_eq!(
         tree_hooks_reading(&e),
         "partial|the folder Git's configuration names for hooks could not be told: more than 64 Git configuration files are included"

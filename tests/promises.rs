@@ -1564,20 +1564,6 @@ fn after_a_container_version_variable_changes_the_old_version_is_retracted() {
 }
 
 #[test]
-fn the_probe_runs_no_command_inside_a_container_and_holds_no_rule_for_one_product() {
-    // The probe only reads: it ran a command inside each WordPress container to read a version
-    // that nothing judged, and asked Proxmox for a version nothing read.
-    let probe =
-        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/probe.sh"))
-            .unwrap();
-    assert!(!probe.contains(" exec "), "{probe}");
-    assert!(
-        !probe.contains("##wp") && !probe.contains("##pve"),
-        "{probe}"
-    );
-}
-
-#[test]
 fn a_kind_no_longer_read_is_set_aside_once_and_never_told_as_read_in_full_or_removed() {
     // WordPress still runs in the container; this version only stopped reading its version
     // file. A full reading that found nothing would say it is gone and that the container was

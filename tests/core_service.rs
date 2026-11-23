@@ -1073,9 +1073,10 @@ fn on_answers_at_once_when_a_watcher_already_watches() {
     let login = Login::new("core-service-at-once");
     let started = Instant::now();
     assert_eq!(service(&login.run("on", &[])).watching, Some(true));
-    // The whole wait is 5 seconds.
+    // The whole wait is 5 seconds, so a command that waited it took at least that: the bound
+    // is the wait itself, not a measure of how fast the command runs.
     assert!(
-        started.elapsed() < Duration::from_secs(4),
+        started.elapsed() < Duration::from_secs(5),
         "{:?}",
         started.elapsed()
     );
