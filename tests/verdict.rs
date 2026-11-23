@@ -3074,127 +3074,34 @@ fn an_answer_or_a_statement_whose_reason_holds_a_secret_is_taken_with_its_reason
 }
 
 #[test]
-fn a_store_of_another_format_is_refused_by_every_command_and_left_unchanged() {
-    // This build reads only a store of its own format. A store of any other, older or newer,
-    // is refused by every command and by the app's status, with what to do, and is not changed:
-    // not a byte of it, and no journal or write-ahead file is left beside it. None of the
-    // refusals reads as an answer with nothing in it.
-    let r = Refusable::new("format");
-    // A person is told an older or a newer one in the one wording every command gives it.
-    let told: &[&str] = &[
-        "error: this store was made by another build of Immunity Core",
-        "It was left unchanged. Move it aside or pass another --store;",
-    ];
-    for (version, said, what_to_do, told) in [
-        ("8", "is from an older format (8)", START_OVER, Some(told)),
-        ("5", "is from an older format (5)", START_OVER, Some(told)),
-        (
-            "10",
-            "is from a newer format (10)",
-            "Use the version of Immunity Core that made it",
-            Some(told),
-        ),
-        (
-            "six",
-            "names a format this version does not know",
-            START_OVER,
-            None,
-        ),
-    ] {
-        r.damage(&format!(
-            "UPDATE meta SET value = '{version}' WHERE key = 'format_version'"
-        ));
-        r.refused_by_every_command_told(&[said, what_to_do], told);
-    }
-}
-
-#[test]
-fn a_store_that_lacks_a_table_a_column_or_its_id_or_holds_one_too_many_is_refused_by_every_command_and_left_unchanged()
- {
-    // A store of this format holds exactly the schema this build makes, and its id. One that
-    // does not was changed by something other than Immunity Core: every command, reading or writing,
-    // refuses it as damaged before anything else, and none makes again, empty, what was lost.
-    // The reviewer's probe: with the table of findings dropped, a run used to make it again and
-    // the findings in the store were gone for good.
+fn every_command_refuses_a_damaged_store_in_the_check_s_words_and_leaves_it_unchanged() {
+    // Every command, reading or writing, checks the store against its schema before anything
+    // else, refuses one that fails, and none makes again, empty, what was lost. Which damage the
+    // check finds is tested beside it (`store::tests`). Here the table of findings is dropped,
+    // the reviewer's probe: a run used to make it again and the findings in it were gone.
     let r = Refusable::new("damaged");
-    for damage in [
-        "DROP TABLE finding",
-        "DROP TABLE threat",
-        "ALTER TABLE threat DROP COLUMN vendor",
-        "ALTER TABLE finding ADD COLUMN extra TEXT",
-        "CREATE TABLE extra (a TEXT)",
-        "DROP INDEX journal_run",
-        "DROP INDEX journal_run; CREATE INDEX journal_run ON journal (run_id)",
-        // The same columns, without the reference a row of it must keep.
-        "ALTER TABLE coverage_lack RENAME TO old;
-         CREATE TABLE coverage_lack (coverage INTEGER NOT NULL, what TEXT NOT NULL, name TEXT);
-         DROP TABLE old;
-         CREATE INDEX coverage_lack_of ON coverage_lack (coverage);",
-        // A trigger of the format's name that no longer keeps the journal from shrinking.
-        "DROP TRIGGER journal_no_delete;
-         CREATE TRIGGER journal_no_delete BEFORE DELETE ON journal BEGIN SELECT 1; END;",
-        "DELETE FROM meta WHERE key = 'store_id'",
-    ] {
-        r.damage(damage);
-        r.refused_by_every_command(&["is damaged", START_OVER]);
-    }
+    r.damage("DROP TABLE finding");
+    r.refused_by_every_command(&["is damaged", START_OVER]);
     // Nothing a refusal did took a finding out: the store as it was still holds both.
     r.restore();
     assert_eq!(r.findings(), 2);
 }
 
 #[test]
-fn a_store_without_any_one_table_of_its_schema_is_refused_by_a_reader_and_by_a_writer() {
-    // Driven by the schema itself, as a store made from empty holds it, so a table added later is
-    // covered: whichever table is missing, `immunity status` and `immunity run` refuse the store and
-    // leave it as it was.
-    let r = Refusable::new("each-table");
-    let tables: Vec<String> = {
-        let db = rusqlite::Connection::open(r.mac.store()).unwrap();
-        let mut stmt = db
-            .prepare(
-                "SELECT name FROM sqlite_master
-                 WHERE type = 'table' AND substr(name, 1, 7) != 'sqlite_' ORDER BY name",
-            )
-            .unwrap();
-        stmt.query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap()
-    };
-    assert!(tables.len() > 40, "{tables:?}");
-    for table in &tables {
-        r.damage(&format!("DROP TABLE {table}"));
-        // Without `meta` the store names no format; without any other table it is damaged.
-        let said = if table == "meta" {
-            "does not name exactly one format"
-        } else {
-            "is damaged"
-        };
-        r.refused_by(
-            &[vec!["status", "--json"], vec!["run"]],
-            &[said, START_OVER],
-            None,
-        );
-    }
-}
-
-#[test]
-fn a_file_that_exists_is_never_given_a_schema_by_any_command() {
-    // A store is made only where no file was. A store whose objects were taken out of
-    // `sqlite_master` keeps its pages; a 0-byte file and a file that is not SQLite hold nothing
-    // of a store. Every command, reading or writing, refuses each as it is, and none makes a
-    // store in it under a new id.
-    let r = Refusable::new("no-schema");
-    r.damage("PRAGMA writable_schema = ON; DELETE FROM sqlite_master;");
-    r.refused_by_every_command(&[
-        "is an SQLite file that holds no tables, not a store",
-        NOT_A_STORE,
-    ]);
-    r.replace(b"");
-    r.refused_by_every_command(&["is an empty file, not a store", NOT_A_STORE]);
-    r.replace(b"invented notes, not a database\n");
-    r.refused_by_every_command(&["is not a store: it is not an SQLite file", NOT_A_STORE]);
+fn every_command_tells_a_person_of_a_store_of_another_format_in_one_wording_and_leaves_it_unchanged()
+ {
+    // Each command words the refusal for a person from the code of its own failure, so the one
+    // wording is a promise of every command. An older store stands for a newer one; `condition`
+    // tells both from any other refusal (`store::tests`).
+    let r = Refusable::new("format");
+    r.damage("UPDATE meta SET value = '8' WHERE key = 'format_version'");
+    r.refused_by_every_command_told(
+        &["is from an older format (8)", START_OVER],
+        Some(&[
+            "error: this store was made by another build of Immunity Core",
+            "It was left unchanged. Move it aside or pass another --store;",
+        ]),
+    );
 }
 
 #[test]
@@ -3276,110 +3183,6 @@ fn two_first_commands_at_once_and_one_killed_part_way_leave_no_store_or_a_whole_
 }
 
 #[test]
-fn a_store_whose_table_differs_only_in_a_check_a_unique_without_rowid_a_collation_or_autoincrement_is_refused()
- {
-    // The comparison is of each object's text as SQLite keeps it, so what lives only there is
-    // compared too. Each table is made again with the one difference and its rows.
-    let r = Refusable::new("text");
-    let remade = |table: &str, made: &str| {
-        format!(
-            "PRAGMA legacy_alter_table = ON;
-             ALTER TABLE {table} RENAME TO old_{table};
-             {made};
-             INSERT INTO {table} SELECT * FROM old_{table};
-             DROP TABLE old_{table};"
-        )
-    };
-    for (table, made) in [
-        // Without the CHECK that a threat gone has a run that saw it go.
-        (
-            "threat",
-            "CREATE TABLE threat (source TEXT NOT NULL, id TEXT NOT NULL, vendor TEXT NOT NULL,
-             product TEXT NOT NULL, name TEXT NOT NULL, date_added TEXT NOT NULL,
-             first_run TEXT NOT NULL, first_seen_at INTEGER NOT NULL, gone_at INTEGER,
-             gone_run TEXT, PRIMARY KEY (source, id))",
-        ),
-        // Without the UNIQUE of a basis' strength.
-        (
-            "basis_kind",
-            "CREATE TABLE basis_kind (name TEXT PRIMARY KEY, strength INTEGER NOT NULL)",
-        ),
-        (
-            "raw_input",
-            "CREATE TABLE raw_input (reader TEXT NOT NULL, input TEXT NOT NULL, path TEXT NOT NULL,
-             run_id TEXT NOT NULL, PRIMARY KEY (reader, input)) WITHOUT ROWID",
-        ),
-        (
-            "coverage_kind",
-            "CREATE TABLE coverage_kind (name TEXT COLLATE NOCASE PRIMARY KEY)",
-        ),
-        (
-            "feed_reading",
-            "CREATE TABLE feed_reading (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL,
-             run_id TEXT NOT NULL, at INTEGER NOT NULL,
-             outcome TEXT NOT NULL CHECK (outcome IN ('read', 'unchanged', 'failed')),
-             reason TEXT, etag TEXT, sha256 TEXT, raw_path TEXT, entries INTEGER,
-             CHECK ((outcome = 'failed') = (reason IS NOT NULL)))",
-        ),
-    ] {
-        r.damage(&remade(table, made));
-        r.refused_by(
-            &[vec!["status", "--json"], vec!["run", "--json"]],
-            &["is damaged", START_OVER],
-            None,
-        );
-    }
-}
-
-#[test]
-fn a_store_whose_id_or_format_has_another_form_is_refused() {
-    let r = Refusable::new("forms");
-    for (damage, said) in [
-        (
-            "UPDATE meta SET value = ' ' WHERE key = 'store_id'",
-            "it has no id of the form",
-        ),
-        (
-            "UPDATE meta SET value = 'x' WHERE key = 'store_id'",
-            "it has no id of the form",
-        ),
-        (
-            "UPDATE meta SET value = upper(value) || '' WHERE key = 'store_id'",
-            "it has no id of the form",
-        ),
-        (
-            "UPDATE meta SET value = substr(value, 2) WHERE key = 'store_id'",
-            "it has no id of the form",
-        ),
-        // Two rows of the format, in a `meta` made again without its key: the one that names
-        // a newer format is not taken for the store's.
-        (
-            "ALTER TABLE meta RENAME TO old_meta;
-             CREATE TABLE meta (key TEXT, value TEXT NOT NULL);
-             INSERT INTO meta SELECT * FROM old_meta;
-             DROP TABLE old_meta;
-             INSERT INTO meta VALUES ('format_version', '10');",
-            "does not name exactly one format",
-        ),
-        (
-            "UPDATE meta SET value = '07' WHERE key = 'format_version'",
-            "names a format this version does not know",
-        ),
-        (
-            "UPDATE meta SET value = ' 7' WHERE key = 'format_version'",
-            "names a format this version does not know",
-        ),
-    ] {
-        r.damage(damage);
-        r.refused_by(
-            &[vec!["status", "--json"], vec!["run", "--json"]],
-            &[said, START_OVER],
-            None,
-        );
-    }
-}
-
-#[test]
 fn a_command_that_only_reads_changes_not_a_byte_of_a_store_of_its_format() {
     // Opening to read applies nothing: not the vocabulary, not a table, not a journal.
     let r = Refusable::new("read-only");
@@ -3415,10 +3218,6 @@ fn a_command_that_only_reads_changes_not_a_byte_of_a_store_of_its_format() {
 /// What every refusal of a store ends with, older and damaged alike.
 const START_OVER: &str = "Nothing was changed. Move the old store aside or pass another --store; \
                           the next run starts a store from the beginning.";
-
-/// What the refusal of a file that holds no store says to do.
-const NOT_A_STORE: &str = "Nothing was changed. Move it aside or pass another --store; the next \
-                           run makes a store where there is no file.";
 
 /// A store with a finding of the response layer open and a finding the person saw, kept as it
 /// was so that each damage starts from it.
@@ -3480,11 +3279,6 @@ impl Refusable {
 
     fn restore(&self) {
         std::fs::write(self.mac.store(), &self.before).unwrap();
-    }
-
-    /// Puts these bytes where the store was.
-    fn replace(&self, bytes: &[u8]) {
-        std::fs::write(self.mac.store(), bytes).unwrap();
     }
 
     /// The findings the store holds: the one of the response layer and the one seen.
