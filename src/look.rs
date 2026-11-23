@@ -17,6 +17,8 @@
 //! - No longer read is not a reading. What an earlier run read and this build has no row for
 //!   is closed as retired by `retire_unread`: not shown as watched, never told as removed,
 //!   and said once by the next run's line, also when a watcher closed it (`lifecycle::set_aside`).
+//!   A match of the indicator list whose file no project a run looked into holds is closed the
+//!   same way, by `retire_facts`.
 //! - A time from the future proves nothing: `fresh`.
 //! - Not present on this Mac is not applicable: a full reading with a note. Present and
 //!   unreadable is a failed reading with its reason (`completeness`, `cause`).
@@ -356,8 +358,15 @@ pub fn retire_unread(tx: &Transaction, r: &Reading) -> rusqlite::Result<usize> {
         }
     }
     let mut closed = 0;
+    let why = format!("{}{NO_ROW}", crate::lifecycle::NO_LONGER_READ);
     for (scope, kind, subject) in &unclaimed {
-        closed += retire_facts(tx, r, scope, kind, subject)?;
+        let of = Reading {
+            reader,
+            scope,
+            kind,
+            ..*r
+        };
+        closed += retire_facts(tx, &of, subject, None, &why)?;
     }
     // The content read of a thing goes with the last kind that watched it.
     let gone: BTreeSet<&str> = unclaimed
@@ -366,7 +375,13 @@ pub fn retire_unread(tx: &Transaction, r: &Reading) -> rusqlite::Result<usize> {
         .filter(|subject| !watched.contains(subject))
         .collect();
     for subject in gone {
-        closed += retire_facts(tx, r, subject, watched::CONTENT, subject)?;
+        let of = Reading {
+            reader,
+            scope: subject,
+            kind: watched::CONTENT,
+            ..*r
+        };
+        closed += retire_facts(tx, &of, subject, None, &why)?;
     }
     for kind in kinds.iter().filter(|k| !written.contains(*k)) {
         let of_kind = Reading { kind, ..*r };
@@ -375,22 +390,24 @@ pub fn retire_unread(tx: &Transaction, r: &Reading) -> rusqlite::Result<usize> {
     Ok(closed)
 }
 
-/// Retracts the live facts of one thing in one reading, each with a journal entry `retired`.
-/// Returns how many were closed.
-fn retire_facts(
+/// Retracts the live facts of one thing in the reading `r`, those with `object` alone when one
+/// is given, each with a journal entry `retired` that says `why`: nothing looked at it, so it
+/// is never told as removed. Returns how many were closed.
+pub fn retire_facts(
     tx: &Transaction,
     r: &Reading,
-    scope: &str,
-    kind: &str,
     subject: &str,
+    object: Option<&str>,
+    why: &str,
 ) -> rusqlite::Result<usize> {
-    let why = format!("{}{NO_ROW}", crate::lifecycle::NO_LONGER_READ);
+    let (reader, scope, kind) = (r.reader, r.scope, r.kind);
     let facts: Vec<(i64, String, String)> = tx
         .prepare(
             "SELECT id, predicate, object FROM assertion
-             WHERE layer = 'live' AND reader = ?1 AND scope = ?2 AND kind = ?3 AND subject = ?4",
+             WHERE layer = 'live' AND reader = ?1 AND scope = ?2 AND kind = ?3 AND subject = ?4
+               AND (?5 IS NULL OR object = ?5)",
         )?
-        .query_map(params![watched::READER, scope, kind, subject], |row| {
+        .query_map(params![reader, scope, kind, subject, object], |row| {
             Ok((row.get(0)?, row.get(1)?, row.get(2)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -405,15 +422,7 @@ fn retire_facts(
                                   old_value, text)
              VALUES (?1, ?2, 'retired', ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
-                r.at,
-                r.run_id,
-                watched::READER,
-                scope,
-                kind,
-                subject,
-                predicate,
-                object,
-                why
+                r.at, r.run_id, reader, scope, kind, subject, predicate, object, why
             ],
         )?;
     }
