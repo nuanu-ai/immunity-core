@@ -30,6 +30,7 @@ Immunity Core has no numbered release yet. Entries go by the day a change reache
 
 ### Changed
 
+- For contributors: the check on GitHub keeps a cache of cargo's downloads and the compiled dependencies. Only a run for a push to `main` saves it, under a key made of the part, `Cargo.lock` and `rust-toolchain.toml`; a run for a pull request restores it and never saves.
 - A session file of Claude Code or Codex CLI that is a link is no longer followed: it is a session file that could not be read, and the reading of `agent-folders` is partial. A named pipe in its place no longer holds the reading. A line of a session longer than 64 MiB is counted as a line that could not be parsed, and the lines after it are read; until now it was held whole and parsed.
 - The project is now Immunity Core. Build package `immunity-core` to run `immunity`. The contract crate is `immunity-contract` 1.21.1 and the protobuf package is `immunity.v1`. Message format and field numbers stay at their previous values. The core's own rule set is named `immunity` and its redaction kinds begin with `immunity:`.
 - The service and collector use the `ai.nuanu.immunity.core` namespace. This build starts a fresh format 9 store. See [updating and removing](docs/reference.md#updating-and-removing) before updating a running installation.

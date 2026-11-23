@@ -8,8 +8,13 @@
 #
 # A security tool's workflow is itself a target. So: pull_request, never pull_request_target,
 # so a pull request from a fork runs its own code with a read-only token and no secret; no
-# secret is used; the token may only read the repository; the one action is pinned by commit;
-# and no cache, so nothing a pull request writes is restored by a later run.
+# secret is used; the token may only read the repository; every action is pinned by commit;
+# and nothing a pull request writes is restored by a run of main or of another pull request.
+# The cache of what was compiled is saved only by a run for a push to main, under an exact key
+# with no fallback; a run for a pull request restores it and never saves. A pull request runs
+# its own version of this file, so it can still save a cache, and by GitHub's rule on which ref
+# reads which cache (from memory) only later runs of that same pull request restore it.
+# scripts/lint.sh holds these rules and the save step's exact text.
 name: check
 
 on:
@@ -40,10 +45,38 @@ jobs:
     timeout-minutes: 45
     env:
       PART: ${{ matrix.part }}
+      # Cargo's downloads, and the target folder. What target saves is the compiled
+      # dependencies; cargo rebuilds the package's own code when its fingerprints say it changed.
+      CACHED: |
+        ~/.cargo/registry/index
+        ~/.cargo/registry/cache
+        ~/.cargo/git/db
+        target
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+
+      # The key is exact: the runner's label and the version of the image under it, the part,
+      # the lockfile and the toolchain. GitHub updates the image under one label, its Xcode and
+      # compiler with it, so what one image compiled is never restored under another. A change
+      # of dependencies or of the Rust release is a new key too, and that run compiles from
+      # nothing. ImageVersion is set by GitHub's hosted runners (from memory); the step fails
+      # when it is empty, so the key never leaves the image out.
+      - name: Key
+        id: key
+        run: |
+          [ -n "${ImageVersion-}" ] || { echo "ImageVersion is not set on this runner" >&2; exit 1; }
+          image=$(printf '%s' "$ImageVersion" | tr -c 'a-z0-9.' '-')
+          part=$(printf '%s' "$PART" | tr -c 'a-z0-9' '-')
+          echo "start=macos-26-$image-$part" >>"$GITHUB_OUTPUT"
+
+      - name: Restore what main compiled
+        id: cache
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ env.CACHED }}
+          key: ${{ steps.key.outputs.start }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}
 
       - name: Tools
         run: |
@@ -61,6 +94,14 @@ jobs:
       - name: ./check ${{ matrix.part }}
         # The part's words are separate arguments of ./check.
         run: ./check $PART
+
+      # Only a push to main saves, and only under a key not saved before.
+      - name: Save what main compiled
+        if: github.event_name == 'push' && steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ${{ env.CACHED }}
+          key: ${{ steps.cache.outputs.cache-primary-key }}
 
   # The status check the branch protection of main requires. It runs even when a part failed
   # or was cancelled, and then fails: a skipped required check would count as passed.

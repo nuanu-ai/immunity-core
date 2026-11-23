@@ -1890,74 +1890,115 @@ fn first_day(mac: &Mac, order: &str) -> Option<Watcher> {
     }
 }
 
-const FIRST_DAY: [&str; 5] = [
-    "watcher first",
-    "check first",
-    "both at once",
-    "watcher stopped and started again",
-    "watcher stopped before the check",
-];
-
-#[test]
-fn the_first_day_on_a_new_mac_finds_nothing_in_what_was_there_in_any_order_of_the_watcher_and_the_first_check()
- {
-    // The app starts its watcher and its first full check together, on a store that does not
-    // exist yet. What the Mac held before is the baseline, whichever writes first: one
-    // finding about each project's settings is what a new user would see at first launch.
-    for order in FIRST_DAY {
-        let mac = lived_in(&format!("day-one-{}", order.replace(' ', "-")));
-        let w = first_day(&mac, order);
-        assert!(found(&mac).is_empty(), "{order}: {:?}", found(&mac));
-        if let Some(w) = w {
-            assert!(w.stop().success());
-        }
+/// The app starts its watcher and its first full check together, on a store that does not
+/// exist yet. What the Mac held before is the baseline, whichever writes first: one finding
+/// about each project's settings is what a new user would see at first launch.
+fn first_day_finds_nothing_in_what_was_there(order: &str) {
+    let mac = lived_in(&format!("day-one-{}", order.replace(' ', "-")));
+    let w = first_day(&mac, order);
+    assert!(found(&mac).is_empty(), "{order}: {:?}", found(&mac));
+    if let Some(w) = w {
+        assert!(w.stop().success());
     }
 }
 
 #[test]
-fn after_the_first_check_what_appears_in_a_project_or_the_home_folder_is_found_in_every_order() {
-    // The first check is a baseline, not a pass for what comes after it.
-    for order in FIRST_DAY {
-        let mac = lived_in(&format!("day-one-later-{}", order.replace(' ', "-")));
-        if let Some(w) = first_day(&mac, order) {
-            assert!(w.stop().success());
-        }
-        mac.put("dev/api/.git/hooks/post-checkout", "#!/bin/sh\nsh .x\n");
-        mac.put("dev/api/.vscode/tasks.json", ON_OPEN);
-        mac.put(
-            "Library/LaunchAgents/com.invented.other.plist",
-            "<plist><dict/></plist>\n",
-        );
-        mac.put("dev/new/.git/HEAD", "ref: refs/heads/main\n");
-        mac.put(
-            "dev/new/package.json",
-            r#"{"scripts": {"preinstall": "node x.js"}}"#,
-        );
-        mac.app_run();
-        let rules: Vec<(String, String)> = found(&mac);
-        assert_eq!(
-            rules,
-            [
-                (
-                    "autorun.folder-open".to_string(),
-                    "~/dev/api/.vscode/tasks.json".to_string()
-                ),
-                (
-                    "autorun.package-install".to_string(),
-                    "~/dev/new/package.json#/scripts/preinstall".to_string()
-                ),
-                (
-                    "watched.autostart".to_string(),
-                    "~/Library/LaunchAgents/com.invented.other.plist".to_string()
-                ),
-                (
-                    "watched.git-hook".to_string(),
-                    "~/dev/api/.git/hooks/post-checkout".to_string()
-                ),
-            ],
-            "{order}"
-        );
+fn the_first_day_on_a_new_mac_finds_nothing_in_what_was_there_when_the_watcher_starts_first() {
+    first_day_finds_nothing_in_what_was_there("watcher first");
+}
+
+#[test]
+fn the_first_day_on_a_new_mac_finds_nothing_in_what_was_there_when_the_check_runs_first() {
+    first_day_finds_nothing_in_what_was_there("check first");
+}
+
+#[test]
+fn the_first_day_on_a_new_mac_finds_nothing_in_what_was_there_when_both_start_at_once() {
+    first_day_finds_nothing_in_what_was_there("both at once");
+}
+
+#[test]
+fn the_first_day_on_a_new_mac_finds_nothing_in_what_was_there_when_the_watcher_is_started_again() {
+    first_day_finds_nothing_in_what_was_there("watcher stopped and started again");
+}
+
+#[test]
+fn the_first_day_on_a_new_mac_finds_nothing_in_what_was_there_when_the_watcher_stops_before_the_check()
+ {
+    first_day_finds_nothing_in_what_was_there("watcher stopped before the check");
+}
+
+#[test]
+fn after_the_first_check_what_appears_in_a_project_or_the_home_folder_is_found_when_the_watcher_starts_first()
+ {
+    found_after_the_first_check("watcher first");
+}
+
+#[test]
+fn after_the_first_check_what_appears_in_a_project_or_the_home_folder_is_found_when_the_check_runs_first()
+ {
+    found_after_the_first_check("check first");
+}
+
+#[test]
+fn after_the_first_check_what_appears_in_a_project_or_the_home_folder_is_found_when_both_start_at_once()
+ {
+    found_after_the_first_check("both at once");
+}
+
+#[test]
+fn after_the_first_check_what_appears_in_a_project_or_the_home_folder_is_found_when_the_watcher_is_started_again()
+ {
+    found_after_the_first_check("watcher stopped and started again");
+}
+
+#[test]
+fn after_the_first_check_what_appears_in_a_project_or_the_home_folder_is_found_when_the_watcher_stops_before_the_check()
+ {
+    found_after_the_first_check("watcher stopped before the check");
+}
+
+/// The first check is a baseline, not a pass for what comes after it.
+fn found_after_the_first_check(order: &str) {
+    let mac = lived_in(&format!("day-one-later-{}", order.replace(' ', "-")));
+    if let Some(w) = first_day(&mac, order) {
+        assert!(w.stop().success());
     }
+    mac.put("dev/api/.git/hooks/post-checkout", "#!/bin/sh\nsh .x\n");
+    mac.put("dev/api/.vscode/tasks.json", ON_OPEN);
+    mac.put(
+        "Library/LaunchAgents/com.invented.other.plist",
+        "<plist><dict/></plist>\n",
+    );
+    mac.put("dev/new/.git/HEAD", "ref: refs/heads/main\n");
+    mac.put(
+        "dev/new/package.json",
+        r#"{"scripts": {"preinstall": "node x.js"}}"#,
+    );
+    mac.app_run();
+    let rules: Vec<(String, String)> = found(&mac);
+    assert_eq!(
+        rules,
+        [
+            (
+                "autorun.folder-open".to_string(),
+                "~/dev/api/.vscode/tasks.json".to_string()
+            ),
+            (
+                "autorun.package-install".to_string(),
+                "~/dev/new/package.json#/scripts/preinstall".to_string()
+            ),
+            (
+                "watched.autostart".to_string(),
+                "~/Library/LaunchAgents/com.invented.other.plist".to_string()
+            ),
+            (
+                "watched.git-hook".to_string(),
+                "~/dev/api/.git/hooks/post-checkout".to_string()
+            ),
+        ],
+        "{order}"
+    );
 }
 
 #[test]
