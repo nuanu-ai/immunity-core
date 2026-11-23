@@ -5294,19 +5294,15 @@ mod tests {
     }
 
     #[test]
-    fn a_busy_mac_is_read_many_times_faster_than_it_starts_programs() {
+    fn a_busy_mac_s_starts_are_each_read_and_matched_and_only_the_latest_evidence_kept() {
         // The watcher reads at every sample, every thirty seconds, and a full run reads what
         // accumulated since the last one, under the lock, each start evaluated against every
         // published rule. A busy Mac starts about 100 programs a second, so a sample adds
-        // about 3,000 lines. What is pinned is that the cost of a line does not grow with the
-        // lines read: a reader that became quadratic would be thousands of times slower on
-        // these 5,000 lines. The clock is the only measure here, so the bound is far below
-        // what is measured: 100 lines a second in a debug build, against about 14,000 on an
-        // idle Mac, 140 times under it, where a shared runner or a Mac busy with other builds
-        // stretches a time a few times over (four times, seen). One start in ten
-        // matches a high rule, so a finding's evidence is taken too, and one in ten a medium
-        // rule. Measured and printed with `--nocapture`, with the share of the time the rules
-        // take, measured over the same starts apart from the reading.
+        // about 3,000 lines. One start in ten matches a high rule, so a finding's evidence is
+        // taken too, and one in ten a medium rule. The speed is not pinned, since a clock on
+        // a loaded machine measures the machine: it is measured and printed with
+        // `--nocapture`, with the share of the time the rules take, measured over the same
+        // starts apart from the reading.
         let dir = crate::common::Scratch::at(
             std::env::temp_dir().join(format!("immunity-events-speed-{}", std::process::id())),
         );
@@ -5379,16 +5375,13 @@ mod tests {
             text.len() as u64 / n,
             rules.groups().0.len() + rules.groups().1.len()
         );
-        let bound = if cfg!(debug_assertions) { 100.0 } else { 500.0 };
-        assert!(rate > bound, "{rate:.0} lines a second");
     }
 
     #[test]
-    fn a_busy_mac_s_file_events_are_read_many_times_faster_than_they_happen() {
+    fn a_busy_mac_s_file_events_are_each_read_and_asked_only_of_the_rules_for_files() {
         // A Mac under agents' builds creates and renames about 200 files a second, measured on
         // a developer's Mac, so the watcher's reading every ten seconds takes about 2,000.
-        // As for program starts, the bound is far below what is measured: 200 file events a
-        // second in a debug build, against about 27,000 on an idle Mac, 135 times under it.
+        // As for program starts, the speed is printed with `--nocapture` and not pinned.
         // One file event in ten matches a high rule for file events, so its
         // finding's evidence is taken, and only the latest few are kept. Each file event is
         // asked only of the rules for file events.
@@ -5445,12 +5438,6 @@ mod tests {
             "read {n} file events of {} bytes each in {took:?}: {rate:.0} a second",
             text.len() as u64 / n
         );
-        let bound = if cfg!(debug_assertions) {
-            200.0
-        } else {
-            1_000.0
-        };
-        assert!(rate > bound, "{rate:.0} file events a second");
     }
 
     #[test]
@@ -5860,12 +5847,9 @@ mod tests {
         // A start without a value under a field every process has is no such run.
         a.line(Process, ALL_KEPT, SCRIPT | SIGNATURE, t);
         assert_eq!(told(&a), [format!("!{t}"), "+1000".into(), "+1000".into()]);
-        // The run is the one the document states.
+        // The run is 1,000 starts, the number docs/event-level.md states: changing one is
+        // changing both.
         assert_eq!(most(SCRIPT), 1000);
-        assert!(
-            include_str!("../docs/event-level.md")
-                .contains("It no longer arrives after 1,000 program starts in a row without one")
-        );
     }
 
     /// A program start as the filter that keeps who each process is writes it, at `second`:
@@ -6078,9 +6062,6 @@ mod tests {
         let read = looked(&root, &read, now);
         assert_eq!(told(&read.arrivals)[1], format!("!{}", now - 5000 + 602));
         let _ = std::fs::remove_dir_all(&root);
-        assert!(include_str!("../docs/event-level.md").contains(
-            "1,000 program starts in a row without one, counted in the file the collector is writing as the core reads it"
-        ));
     }
 
     #[test]

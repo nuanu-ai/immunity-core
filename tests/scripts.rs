@@ -9,10 +9,6 @@ use std::process::Command;
 
 const ROOT: &str = env!("CARGO_MANIFEST_DIR");
 
-fn read(rel: &str) -> String {
-    std::fs::read_to_string(Path::new(ROOT).join(rel)).unwrap()
-}
-
 /// A folder of invented tools, removed when the test ends.
 struct Tools(PathBuf);
 
@@ -50,6 +46,11 @@ impl Tools {
             "scripts/prerequisites.sh",
             "scripts/rust-path.sh",
             "scripts/cargo-built.sh",
+            // scripts/lint.sh and what it reads.
+            "scripts/lint.sh",
+            "scripts/probe.sh",
+            "scripts/event-level/install",
+            "Cargo.toml",
         ] {
             let destination = self.0.join(rel);
             std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
@@ -162,23 +163,6 @@ fn the_core_build_and_checks_use_cargos_external_artifact() {
 }
 
 #[test]
-fn the_tree_names_one_supported_macos_and_both_check_and_build_ask_for_it() {
-    // A colleague reads the version in the README and the build checks it: they must say the
-    // same.
-    for script in ["check", "build"] {
-        assert!(
-            read(script).contains("\n. ./scripts/prerequisites.sh\n"),
-            "{script}"
-        );
-    }
-    for doc in ["README.md", "CONTRIBUTING.md"] {
-        let text = read(doc);
-        assert!(text.contains("macOS 15 or later"), "{doc}");
-        assert!(!text.contains("macOS 14"), "{doc}");
-    }
-}
-
-#[test]
 fn the_two_halves_of_the_tests_hold_every_test_binary_exactly_once() {
     // The check on GitHub runs `./check tests 1/2` and `./check tests 2/2` side by side in
     // place of `cargo test`: a binary in neither half would never run there.
@@ -209,10 +193,7 @@ fn the_two_halves_of_the_tests_hold_every_test_binary_exactly_once() {
         .collect();
     expected.sort();
     assert_eq!(seen, expected);
-
-    // Unit tests of a library and its doc tests are not in either half.
-    assert!(!Path::new(ROOT).join("src/lib.rs").exists());
-    assert!(!read("Cargo.toml").contains("[lib]"));
+    // A library target's tests are in neither half: scripts/lint.sh refuses one.
 }
 
 #[test]

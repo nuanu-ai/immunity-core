@@ -2,9 +2,9 @@
 # All checks, in order: formatting, linter, then tests.
 #
 # With no argument it runs every part. A part can be asked for by name, and several in one
-# call: `lint` (formatting and linter), `tests` (all of cargo test) and `tests N/M` (share N
-# of M of the test binaries, as scripts/test-half.sh splits them). The check on GitHub runs
-# the parts side by side, so it runs what this file runs.
+# call: `lint` (formatting, linter and scripts/lint.sh), `tests` (all of cargo test) and
+# `tests N/M` (share N of M of the test binaries, as scripts/test-half.sh splits them). The
+# check on GitHub runs the parts side by side, so it runs what this file runs.
 set -e
 cd "$(dirname "$0")"
 . ./scripts/rust-path.sh
@@ -15,6 +15,8 @@ lint() {
   cargo fmt --check
   # The workspace: the core and the contract's crate with its example.
   cargo clippy --workspace --all-targets -- -D warnings
+  # The rules of CLAUDE.md that a grep holds.
+  scripts/lint.sh
 }
 
 [ $# -gt 0 ] || set -- lint tests

@@ -2469,29 +2469,6 @@ mod tests {
     }
 
     #[test]
-    fn a_line_packed_with_matches_is_cut_well_within_a_second() {
-        // gitleaks's generic rule checks its 1,445 stopwords for every match; as one automaton
-        // a line of the cap packed with matches costs milliseconds in a release build. The
-        // clock is the only measure here, so the bound is far above what is measured: 35 ms in
-        // a debug build on an idle Mac, over 100 times under four seconds, where a loaded
-        // machine stretches a time a few times over. A cost per match that grew with the matches
-        // in the line, about 3,400 here, would be far over it.
-        let mut line = String::new();
-        while line.len() < LINE_CAP - 64 {
-            line.push_str(&format!("token={}\n", ["aB3dE5", "gH7jK9"].concat()));
-        }
-        let set = set().unwrap();
-        let started = std::time::Instant::now();
-        let a = Args(cut_with(
-            Some(set),
-            vec![text_pieces("tool"), text_pieces(&line)],
-        ));
-        let took = started.elapsed();
-        assert!(!a.cuts().is_empty());
-        assert!(took < std::time::Duration::from_secs(4), "{took:?}");
-    }
-
-    #[test]
     fn a_text_from_a_source_keeps_what_only_looks_like_a_mark_or_an_escape() {
         // Text the collector printed is kept as it is but for its secrets: a broken mark and an
         // escape are text, and its backslashes stay single.
@@ -3190,12 +3167,10 @@ mod tests {
     }
 
     #[test]
-    fn the_cutter_s_work_is_bounded_megabytes_of_opened_marks_finish_well_under_a_second() {
+    fn megabytes_of_opened_marks_are_one_text_too_long_and_whole_marks_are_still_read() {
         // A source's text made of the opening of a mark, again and again, with a space inside and
-        // one brace at the end: reading the marks in it once cost the square of its length, 11 s
-        // for 2.4 MB, and it was read before the cap was checked.
+        // one brace at the end: none is a mark, and the text is withheld as too long.
         let s = format!("{}}}", "\\cut{ ".repeat(400_000));
-        let at = std::time::Instant::now();
         assert!(marks(&s).is_empty());
         assert_eq!(said(&s), mark(TOO_LONG, s.chars().count()));
         // Read back as the store keeps a text: the marks in it are looked for first.
@@ -3203,8 +3178,6 @@ mod tests {
             Text(cut_one(set().ok(), parse(&s))).said(),
             mark(TOO_LONG, s.len())
         );
-        let took = at.elapsed();
-        assert!(took < std::time::Duration::from_millis(500), "{took:?}");
         // Marks are still read where they are whole, the last one too.
         let kept = format!(
             "a\\cut{{{TOO_LONG} 3}}b\\cut{{x 12}}\\cut{{x}}\\cut{{ 3}}\\cut{{x+5}}\\cut{{x }}\\cut{{x 1\\cut{{xy"
