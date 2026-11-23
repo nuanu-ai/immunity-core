@@ -1324,6 +1324,21 @@ fn the_file_being_written_is_never_deleted_by_age_after_a_mac_slept_for_more_tha
 }
 
 #[test]
+fn a_log_file_whose_name_holds_a_space_is_deleted_by_age_without_a_word_in_the_error_file() {
+    // What tidy.sh prints goes to scripts.err, which Immunity Core reads as the scripts failing.
+    let dir = Dir::new("spaced");
+    let log = dir.0.join("log");
+    std::fs::create_dir_all(&log).unwrap();
+    let from = now_secs();
+    aged(&log, "exec-20261003T01 a.jsonl", 10, 30);
+    aged(&log, "exec-20261003T02.jsonl", 20, 1);
+    let out = tidy(&log, CAP);
+    assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
+    assert_eq!(files(&log), ["exec-20261003T02.jsonl", "removed"]);
+    assert_eq!(notes(&log, from), ["exec-20261003T01 a.jsonl 10 age"]);
+}
+
+#[test]
 fn over_the_cap_the_files_written_longest_ago_go_first_and_never_the_one_being_written() {
     // A Mac building at a hundred starts a second writes more in a day than the cap allows:
     // the files written longest ago are deleted first, each noted with `cap`, and the one

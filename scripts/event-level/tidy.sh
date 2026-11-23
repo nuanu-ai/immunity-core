@@ -71,26 +71,31 @@ remove() {
     echo "$now $1 $size $2" >>removed
 }
 
-# Oldest first by when each was last written, to the nanosecond; the last is the one being
-# written. The names hold no space, newline or pattern character, being the collector's own.
+# Oldest first by when each was last written, to the nanosecond; the last that is still there
+# is the one being written. The collector's names hold no space, newline or pattern character.
 files=$(/bin/ls -1tr -- exec-*.jsonl 2>/dev/null)
 set -f
 newest=
 for f in $files; do
-    newest=$f
+    [ -f "$f" ] && newest=$f
 done
-total=0
-kept=
-for f in $files; do
-    if [ "$f" != "$newest" ] && [ -n "$(/usr/bin/find "$f" -prune -mmin +1440)" ]; then
+set +f
+
+for f in exec-*.jsonl; do
+    [ -f "$f" ] && [ "$f" != "$newest" ] || continue
+    if [ -n "$(/usr/bin/find "$f" -prune -mmin +1440)" ]; then
         remove "$f" age
-        continue
     fi
+done
+
+files=$(/bin/ls -1tr -- exec-*.jsonl 2>/dev/null)
+set -f
+total=0
+for f in $files; do
     size=$(/usr/bin/stat -f %z "$f") || continue
     total=$((total + size))
-    kept="$kept $f"
 done
-for f in $kept; do
+for f in $files; do
     [ "$total" -gt "$cap" ] || break
     [ "$f" != "$newest" ] || break
     size=$(/usr/bin/stat -f %z "$f") || continue

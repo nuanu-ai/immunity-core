@@ -1101,7 +1101,9 @@ fn argmax() -> usize {
 /// to a pointer. No system function parses it; this is the layout Apple's `ps` reads, except
 /// that `ps` skips every zero byte after the path, so an empty first argument would read as
 /// padding there. An empty argument is a string of length zero. Exactly the count of strings
-/// after the padding are taken, and the environment is never read. No system function parses
+/// after the padding are taken, and the environment is never read. Only zero bytes are skipped
+/// as padding, and no further than that multiple, so on a kernel that pads less no argument
+/// loses its first bytes. No system function parses
 /// this area, so a later kernel could lay it out otherwise and shift every argument without a
 /// word: each reading first reads its own process's arguments through this code and checks them
 /// against the ones it was started with (`layout_known`), and takes no arguments when they
@@ -1111,7 +1113,10 @@ fn parse_procargs(b: &[u8]) -> Option<(String, Vec<String>)> {
     let rest = &b[4..];
     let end = rest.iter().position(|&c| c == 0)?;
     let exec = String::from_utf8_lossy(&rest[..end]).into_owned();
-    let mut rest = rest.get((end + 1).next_multiple_of(8)..)?;
+    let pad = (end + 1).next_multiple_of(8) - (end + 1);
+    let rest = &rest[end + 1..];
+    let zeros = rest.iter().take(pad).take_while(|&&c| c == 0).count();
+    let mut rest = &rest[zeros..];
     let mut args = Vec::new();
     for _ in 0..argc.max(0) {
         let end = rest.iter().position(|&c| c == 0)?;
@@ -1686,6 +1691,21 @@ mod tests {
         // A count larger than the strings there reads nothing.
         assert_eq!(read(4, &zsh(b"sh\0-c\0SECRET=1\0")), None);
         assert_eq!(parse_procargs(&[2, 0]), None);
+    }
+
+    #[test]
+    fn only_zero_bytes_are_skipped_after_the_path_so_no_argument_loses_its_first_bytes() {
+        let area = |argc: i32, rest: &[u8]| [&argc.to_ne_bytes()[..], rest].concat();
+        // Padded by three, short of eight: the first argument is read whole.
+        assert_eq!(
+            parse_procargs(&area(2, b"/bin/zsh\0\0\0\0sh\0-c\0SECRET=1\0")),
+            Some(("/bin/zsh".to_string(), strings(&["sh", "-c"])))
+        );
+        // No arguments and nothing after the path: none, as the count says.
+        assert_eq!(
+            parse_procargs(&area(0, b"/bin/zsh\0")),
+            Some(("/bin/zsh".to_string(), Vec::new()))
+        );
     }
 
     #[test]
