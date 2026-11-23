@@ -216,7 +216,7 @@ impl Matched {
         }
         let all = self.all_compared();
         let mut said = format!(
-            "matched against the package-lock.json, pnpm-lock.yaml and Cargo.lock of {}, {} compared in full: {known} in {}",
+            "matched against the package-lock.json, npm-shrinkwrap.json, pnpm-lock.yaml and Cargo.lock of {}, {} compared in full: {known} in {}",
             found.projects(),
             grouped(self.compared),
             if all {
