@@ -753,19 +753,21 @@ fn npm_entry(
     })
 }
 
-/// A package name as npm allows it, in the part that matters here: not empty, no blank or
-/// control character, and a slash only in `@scope/name`.
+/// A package name as npm allows it: what `encodeURIComponent` leaves unchanged, so that a
+/// registry that decodes an address serves the package the text names. ASCII letters, digits
+/// and `-_.!~*'()`, with one slash only in `@scope/name`. A name with no scope does not start
+/// with `.` or `_`; a scope and the name after it may (`@_sh/widget` is a package), and neither
+/// is `.` or `..`, which an address would take for a folder. The rule is npm's
+/// `validate-npm-package-name` as remembered, not read again for this.
 fn npm_name(name: &str) -> bool {
-    let plain = |s: &str| !s.is_empty() && !s.chars().any(|c| c.is_whitespace() || c.is_control());
+    let part = |s: &str| {
+        !matches!(s, "" | "." | "..")
+            && s.bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&c))
+    };
     match name.split_once('/') {
-        None => plain(name),
-        Some((scope, rest)) => {
-            scope.len() > 1
-                && scope.starts_with('@')
-                && plain(scope)
-                && plain(rest)
-                && !rest.contains('/')
-        }
+        None => part(name) && !name.starts_with(['.', '_']),
+        Some((scope, rest)) => scope.strip_prefix('@').is_some_and(part) && part(rest),
     }
 }
 
@@ -1065,7 +1067,11 @@ const YARN_VERSIONS: [&str; 6] = ["4", "5", "6", "8", "9", "10"];
 /// `yarn.lock`. A file with a comment `yarn lockfile v<N>`, as Yarn 1 writes it, is in Yarn 1's
 /// grammar (`yarn1`): version 1 is read by `yarn1`, any other is a kind with no reader. Without
 /// one it is Yarn 2 and later's, which is YAML: every entry by its `resolution`, which is what
-/// Yarn fetches, never by its key.
+/// Yarn fetches, never by its key. Yarn 1 needs no header and takes `key: value`, so a text
+/// with no version comment that Yarn 1's grammar also accepts may be installed by Yarn 1 as other
+/// packages, and which Yarn reads it is not in the file: it fails the reading. A file Yarn 2 and
+/// later write is not in Yarn 1's grammar, as `cacheKey: 10c0` is a number then a key without a
+/// value.
 ///
 /// Yarn reads every scalar as text; a value `serde_norway` reads as a number or a boolean where
 /// text is expected leaves the entry not told, never converted. A key given twice in one mapping
@@ -1089,6 +1095,9 @@ fn yarn(text: &str) -> Parsed {
     let Ok(Value::Mapping(lock)) = serde_norway::from_str::<Value>(text) else {
         return Parsed::Failed;
     };
+    if crate::yarn1::parse(text).is_ok() {
+        return Parsed::Failed;
+    }
     let version = match lock.get("__metadata").and_then(|m| m.get("version")) {
         Some(Value::String(v)) => v.clone(),
         Some(Value::Number(n)) => n.to_string(),
@@ -1224,8 +1233,8 @@ fn yarn1(entries: &[crate::yarn1::Entry]) -> Parsed {
 /// Yarn fetches a locked entry from `resolved` as written and checks nothing, so the entry is the
 /// public registry's only when `resolved`, without its `#` fragment, is the registry's file of
 /// the entry's name and `version` (`registry_tarball`). The name is the `name` field, else the
-/// name all its keys give, which ends at the first `@` after its first character, as Yarn's
-/// `normalizePattern` reads a key. An entry with no `resolved` is resolved again by Yarn and is
+/// package all its keys ask for (`asks_for`); a key's name ends at the first `@` after its first
+/// character, as Yarn's `normalizePattern` reads a key. An entry with no `resolved` is resolved again by Yarn and is
 /// told only when every key names a `file:` or `link:` range, a path.
 fn yarn1_entry(keys: &[String], fields: &[crate::yarn1::Entry]) -> Option<Dep> {
     let text = |name: &str| match fields.iter().find(|f| f.keys.iter().any(|k| k == name)) {
@@ -1241,11 +1250,22 @@ fn yarn1_entry(keys: &[String], fields: &[crate::yarn1::Entry]) -> Option<Dep> {
             None => (key, ""),
         }
     }
+    // The package a key asks for: the one its range names when the range is an alias,
+    // `npm:<name>@<range>`, else the key's own name. Yarn 1 groups the keys that resolve to one
+    // package and writes `name` only for the first of them when its name differs; so a group may
+    // mix an alias with plain keys and carry no `name` (the lead's reading of Yarn's
+    // `__tests__/lockfile.js`, lines 106 to 219; the alias form is from memory).
+    fn asks_for(key: &str) -> &str {
+        let (name, range) = split(key);
+        range
+            .strip_prefix("npm:")
+            .map_or(name, |real| split(real).0)
+    }
     let name = match text("name")? {
         Some(name) => name,
         None => {
-            let name = split(keys.first()?).0;
-            if keys.iter().any(|k| split(k).0 != name) {
+            let name = asks_for(keys.first()?);
+            if keys.iter().any(|k| asks_for(k) != name) {
                 return None;
             }
             name
@@ -2575,6 +2595,16 @@ dependencies = [
         let at = "package-lock.json#node_modules/string-width";
         assert!(!said.iter().any(|s| s.ends_with(at)), "{said:?}");
         assert_eq!(reason, one_not_told(at));
+        // A name a registry decodes to another one: `x%2Dy` is served as `x-y`.
+        let text = NPM.replace(
+            "    \"node_modules/string-width\": {",
+            "    \"node_modules/x%2Dy\": {\n      \"version\": \"1.0.0\",\n      \"resolved\": \"https://registry.npmjs.org/x%2Dy/-/x%2Dy-1.0.0.tgz\"\n    },\n    \"node_modules/string-width\": {",
+        );
+        assert_ne!(text, NPM);
+        let (said, reason) = read_one("npm-encoded", "package-lock.json", &text);
+        let at = "package-lock.json#node_modules/x%2Dy";
+        assert!(!said.iter().any(|s| s.ends_with(at)), "{said:?}");
+        assert_eq!(reason, one_not_told(at));
     }
 
     #[test]
@@ -3043,6 +3073,8 @@ __metadata:
         // the two readings would differ, so the file is not read. So is anything else that is
         // not one YAML mapping with Yarn's `__metadata`.
         let width = "\"string-width@npm:^5.1.2\":\n  version: 5.1.2\n  resolution: \"string-width@npm:5.1.2\"\n";
+        // A file as Yarn 2 and later write it is not in Yarn 1's grammar, so it is read.
+        assert!(crate::yarn1::parse(YARN).is_err());
         for (tag, text) in [
             ("twice", format!("{YARN}\n{width}")),
             (
@@ -3062,6 +3094,12 @@ __metadata:
             ("v1-pointer", format!("{YARN1}x@^1 \"string-width@^5.1.2\"\n")),
             ("v1-number", format!("{YARN1}x@^1 5\n")),
             ("v1-long", format!("# yarn lockfile v{}\n", "1".repeat(40))),
+            // No header, and both grammars read it: Yarn 1 would install `widget`, Yarn 2 and
+            // later `gadget`, and the file does not say which Yarn reads it.
+            (
+                "both-grammars",
+                "\"__metadata\":\n  version: 8\nwidget@^1:\n  version: \"1.0.0\"\n  resolved: \"https://registry.npmjs.org/widget/-/widget-1.0.0.tgz\"\n  resolution: \"gadget@npm:1.0.0\"\n".to_string(),
+            ),
         ] {
             let (said, reason) = read_one(tag, "yarn.lock", &text);
             assert!(said.is_empty(), "{tag}: {said:?}");
@@ -3213,26 +3251,33 @@ string-width@^5.0.0, string-width@^5.1.2:
         // beside an address of another package or version is not the registry's package.
         let width = "string-width@^5.0.0, string-width@^5.1.2";
         let file = "string-width/-/string-width-5.1.2.tgz";
-        let cjs = "string-width-cjs@npm:string-width@^4.2.0";
         let (lib, lib_key) = ("private-lib@^2.0.0:\n", "private-lib@^2.0.0");
         let link = "\"linked-dir@link:./vendor/linked-dir\"";
         for (from, to, key) in [
             (file, "evil-width/-/evil-width-5.1.2.tgz", width),
             (file, "string-width/-/string-width-5.1.1.tgz", width),
             ("  version \"5.1.2\"\n", "", width),
+            // A name a registry decodes to another one.
+            (
+                "string-width@^5.0.0, string-width@^5.1.2:\n  version \"5.1.2\"\n  resolved \"https://registry.yarnpkg.com/string-width/-/string-width-5.1.2.tgz",
+                "x%2Dy@^5.0.0, x%2Dy@^5.1.2:\n  version \"5.1.2\"\n  resolved \"https://registry.yarnpkg.com/x%2Dy/-/x%2Dy-5.1.2.tgz",
+                "x%2Dy@^5.0.0, x%2Dy@^5.1.2",
+            ),
             // Dot segments in the version: the address names another package's file.
             (
                 "version \"5.1.2\"\n  resolved \"https://registry.yarnpkg.com/string-width/-/string-width-5.1.2.tgz",
                 "version \"5.1.2/../../../other/-/other-2.0.0\"\n  resolved \"https://registry.yarnpkg.com/string-width/-/string-width-5.1.2/../../../other/-/other-2.0.0.tgz",
                 width,
             ),
-            ("  name string-width\n", "", cjs),
             // Where the address alone would tell: a `version` or a `name` that is not text, or
             // not a package's, and keys of two packages.
             ("version \"2.0.0\"", "version 5", lib_key),
             ("version \"2.0.0\"", "version \"\"", lib_key),
             (lib, "private-lib@^2.0.0:\n  name true\n", lib_key),
             (lib, "private-lib@^2.0.0:\n  name \"a b\"\n", lib_key),
+            (lib, "private-lib@^2.0.0:\n  name \".x\"\n", lib_key),
+            (lib, "private-lib@^2.0.0:\n  name \"_x\"\n", lib_key),
+            (lib, "private-lib@^2.0.0:\n  name \"@x%2Dy/z\"\n", lib_key),
             (
                 lib,
                 "other-lib@^2.0.0, private-lib@^2.0.0:\n",
@@ -3271,6 +3316,71 @@ string-width@^5.0.0, string-width@^5.1.2:
         );
         assert!(said.contains(&fact), "{said:?}");
         assert_eq!(reason, one_not_told("yarn.lock#dev-tool@^1.0.0"));
+    }
+
+    #[test]
+    fn a_package_name_is_what_npm_allows_and_never_one_an_address_would_read_another_way() {
+        // A name goes into a registry address as text. One a registry would decode, or take for
+        // a folder, names another file; an honest name is never refused for its first character
+        // inside a scope.
+        for name in [
+            "widget",
+            "@scope/widget",
+            "@_sh/widget",
+            "@scope/_widget",
+            "a.b-c_d~e",
+        ] {
+            assert!(super::npm_name(name), "{name}");
+        }
+        for name in [
+            "",
+            ".",
+            "..",
+            ".x",
+            "_x",
+            "x%2Dy",
+            "x y",
+            "x/y",
+            "@/x",
+            "@scope/",
+            "@scope/..",
+            "@../x",
+            "@scope/a/b",
+            "x?y",
+            "x#y",
+            "x@y",
+        ] {
+            assert!(!super::npm_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_yarn_1_alias_is_the_package_its_range_or_name_field_names_when_resolved_is_its_file() {
+        // Yarn 1 groups the keys that resolve to one package and writes `name` only for the
+        // first when its name differs, so a group of a plain key and an alias has none. The
+        // package is the one the alias names, and still only as `resolved` names its file.
+        let file = "  version \"1.0.0\"\n  resolved \"https://registry.npmjs.org/widget/-/widget-1.0.0.tgz#0123456789abcdef\"\n";
+        let header = "# yarn lockfile v1\n\n\n";
+        for (key, extra) in [
+            ("widget@^1, \"zcopy@npm:widget@^1\"", ""),
+            ("\"zcopy@npm:widget@^1\"", ""),
+            ("\"zcopy@^1\"", "  name widget\n"),
+        ] {
+            let text = format!("{header}{key}:\n{extra}{file}");
+            let (said, reason) = read_one("yarn1-alias", "yarn.lock", &text);
+            let at = key.replace('"', "");
+            let fact = format!("npm/widget|has_version|1.0.0|dev/shop/yarn.lock#{at}");
+            assert_eq!(said.get(1), Some(&fact), "{key}: {said:?}");
+            assert_eq!(reason, None, "{key}");
+        }
+        // An alias whose `resolved` is another package's file is not told.
+        let text = format!(
+            "{header}\"zcopy@npm:widget@^1\":\n{}",
+            file.replace("widget/-/widget", "gadget/-/gadget")
+        );
+        let (said, reason) = read_one("yarn1-alias-other", "yarn.lock", &text);
+        assert!(said.is_empty(), "{said:?}");
+        assert_eq!(reason, one_not_told("yarn.lock#zcopy@npm:widget@^1"));
     }
 
     #[test]

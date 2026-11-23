@@ -15,6 +15,9 @@
 //!   line's spaces as indentation and a comment runs on to the next line feed;
 //! - a lone surrogate in a quoted string's escapes, which `JSON.parse` takes and `serde_json`
 //!   does not;
+//! - a comment holding the words `yarn lockfile v` in any shape but `yarn lockfile v<digits>`
+//!   between ASCII spaces and tabs, since JavaScript's `trim`, which Yarn uses, and Rust's take
+//!   different characters, and a version Yarn sees could be missed;
 //! - a top-level key whose value is not a block, which Yarn takes as a pointer to another key:
 //!   refused one layer up, where the tree becomes entries (`lockfiles::yarn1`).
 //!
@@ -131,16 +134,26 @@ fn tokens(text: &str) -> Result<(Tokens, Option<String>), String> {
                     .position(|&c| c == b'\n')
                     .map_or(b.len(), |p| i + p);
                 let raw = &text[i + 1..end];
-                if raw.strip_suffix('\r').unwrap_or(raw).contains('\r') {
+                // A `\r` only right before the `\n` that ends the comment.
+                let body = match raw.strip_suffix('\r') {
+                    Some(body) if end < b.len() => body,
+                    _ => raw,
+                };
+                if body.contains('\r') {
                     return Err(format!(
                         "line {line}: a carriage return not followed by a line feed"
                     ));
                 }
-                let comment = raw.trim();
-                if let Some(n) = comment.strip_prefix("yarn lockfile v")
-                    && !n.is_empty()
-                    && n.bytes().all(|c| c.is_ascii_digit())
-                {
+                // JavaScript's `trim` and Rust's take different characters, so neither is
+                // copied: only ASCII spaces and tabs, and the words in exactly Yarn's shape.
+                let comment = body.trim_matches([' ', '\t']);
+                if comment.contains("yarn lockfile v") {
+                    let n = comment.strip_prefix("yarn lockfile v").unwrap_or_default();
+                    if n.is_empty() || !n.bytes().all(|c| c.is_ascii_digit()) {
+                        return Err(format!(
+                            "line {line}: a comment naming a lockfile version in another shape"
+                        ));
+                    }
                     version = Some(n.to_string());
                     if n != "1" {
                         return Ok((out, version));
@@ -497,6 +510,33 @@ mod tests {
                 "# a\r  b\nx \"1\"\n",
                 Err("carriage return"),
             ),
+            (
+                "cr ending the text",
+                "x \"1\"\n# note\r",
+                Err("carriage return"),
+            ),
+            // The words in any other shape: Yarn's `trim` may still see a version in them.
+            (
+                "bom after a version",
+                "# yarn lockfile v2\u{feff}\n",
+                Err("another shape"),
+            ),
+            (
+                "nel after a version",
+                "# yarn lockfile v2\u{85}\n",
+                Err("another shape"),
+            ),
+            (
+                "words before",
+                "# see yarn lockfile v1\n",
+                Err("another shape"),
+            ),
+            (
+                "words after",
+                "# yarn lockfile v1 beta\n",
+                Err("another shape"),
+            ),
+            ("no digits", "# yarn lockfile v\n", Err("another shape")),
             ("odd", "a:\n   x \"1\"\n", Err("odd number")),
             ("tab", "a:\n\tx \"1\"\n", Err("does not read here")),
             ("unclosed", "a \"x\n", Err("not JSON")),
@@ -512,8 +552,7 @@ mod tests {
             ("# yarn lockfile v2\n{{{\n".to_string(), Some("2")),
             (format!("{plain}#  yarn lockfile v10 \n["), Some("10")),
             (plain.to_string(), None),
-            (format!("# yarn lockfile v\n{plain}"), None),
-            (format!("# yarn lockfile v1 beta\n{plain}"), None),
+            ("#\tyarn lockfile v2\t\r\n{{{".to_string(), Some("2")),
         ] {
             let read = parse(&text).unwrap();
             assert_eq!(read.version.as_deref(), version, "{text}");
