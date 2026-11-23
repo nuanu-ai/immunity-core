@@ -1067,9 +1067,9 @@ const YARN_VERSIONS: [&str; 6] = ["4", "5", "6", "8", "9", "10"];
 /// `yarn.lock`. A file with a comment `yarn lockfile v<N>`, as Yarn 1 writes it, is in Yarn 1's
 /// grammar (`yarn1`): version 1 is read by `yarn1`, any other is a kind with no reader. Without
 /// one it is Yarn 2 and later's, which is YAML: every entry by its `resolution`, which is what
-/// Yarn fetches, never by its key. Yarn 1 reads any YAML, as its own grammar or after it, and
-/// fetches a locked entry from its `resolved` address, a field Yarn 2 and later never write: an
-/// entry holding one may be installed by Yarn 1 as another package, so it fails the reading.
+/// Yarn fetches, never by its key. The comment decides the format, as Yarn 2 and later also take
+/// a file with it for Yarn 1's; what Yarn 1 would install from a file in the other format is not
+/// judged.
 ///
 /// Yarn reads every scalar as text; a value `serde_norway` reads as a number or a boolean where
 /// text is expected leaves the entry not told, never converted. A key given twice in one mapping
@@ -1110,14 +1110,6 @@ fn yarn(text: &str) -> Parsed {
         };
         if key == "__metadata" {
             continue;
-        }
-        // A key that is not plain text may be `resolved` to Yarn 1's YAML reader, as js-yaml
-        // makes the key `[resolved]` the text `resolved` (from memory of js-yaml).
-        let plain_keys = entry
-            .as_mapping()
-            .is_none_or(|m| m.keys().all(|k| matches!(k, Value::String(_))));
-        if !plain_keys || entry.get("resolved").is_some() {
-            return Parsed::Failed;
         }
         match yarn_entry(key, entry) {
             Some(Some(dep)) => out.push(dep),
@@ -3082,8 +3074,6 @@ __metadata:
         // the two readings would differ, so the file is not read. So is anything else that is
         // not one YAML mapping with Yarn's `__metadata`.
         let width = "\"string-width@npm:^5.1.2\":\n  version: 5.1.2\n  resolution: \"string-width@npm:5.1.2\"\n";
-        let both = "\"__metadata\":\n  version: 8\nwidget@^1:\n  version: \"1.0.0\"\n  resolved: \"https://registry.npmjs.org/widget/-/widget-1.0.0.tgz\"\n  resolution: \"gadget@npm:1.0.0\"\n";
-        let resolved = "  resolution: \"string-width@npm:5.1.2\"\n  resolved: \"https://registry.npmjs.org/string-width/-/string-width-5.1.2.tgz\"";
         for (tag, text) in [
             ("twice", format!("{YARN}\n{width}")),
             (
@@ -3103,35 +3093,6 @@ __metadata:
             ("v1-pointer", format!("{YARN1}x@^1 \"string-width@^5.1.2\"\n")),
             ("v1-number", format!("{YARN1}x@^1 5\n")),
             ("v1-long", format!("# yarn lockfile v{}\n", "1".repeat(40))),
-            // A `resolved` address, which Yarn 2 and later never write and Yarn 1 fetches, read
-            // as YAML or not: Yarn 1 would install `widget` where Yarn 2 and later fetch `gadget`.
-            ("both-grammars", both.to_string()),
-            ("yaml-only", format!("{both}# note\r# tail\n")),
-            (
-                "resolved",
-                YARN.replace("  resolution: \"string-width@npm:5.1.2\"", resolved),
-            ),
-            (
-                "tagged-resolved",
-                YARN.replace(
-                    "  resolution: \"string-width@npm:5.1.2\"",
-                    &resolved.replace("  resolved:", "  !!str resolved:"),
-                ),
-            ),
-            (
-                "sequence-key",
-                YARN.replace(
-                    "  resolution: \"string-width@npm:5.1.2\"",
-                    &resolved.replace("  resolved:", "  ? [resolved]\n  :"),
-                ),
-            ),
-            (
-                "tagged-key",
-                YARN.replace(
-                    "  resolution: \"string-width@npm:5.1.2\"",
-                    &resolved.replace("  resolved:", "  !foo resolved:"),
-                ),
-            ),
         ] {
             let (said, reason) = read_one(tag, "yarn.lock", &text);
             assert!(said.is_empty(), "{tag}: {said:?}");
