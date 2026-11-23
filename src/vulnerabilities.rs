@@ -540,6 +540,36 @@ pub struct Matched {
     /// Per component of the registry: its affecting records of each kind, with the versions
     /// they affect.
     pub affected: BTreeMap<String, Vec<(String, String, Vec<String>)>>,
+    /// The checkouts and ecosystems whose lockfiles this run read in full (`lockfiles_for`).
+    read: HashSet<(String, &'static str)>,
+    /// The components those lockfiles hold for which this run has an answer `unknown` or data
+    /// that is not current.
+    untold: HashSet<String>,
+}
+
+impl Matched {
+    /// Whether this run tells for certain what affects the component `about` names, so that a
+    /// finding about it that the run did not hold again is over: its checkout is gone, or its
+    /// checkout's lockfiles of its ecosystem were read in full in this run and either no longer
+    /// hold the package, or hold it and every answer for it is known, on current data.
+    pub fn known(&self, conn: &Connection, about: &str) -> rusqlite::Result<bool> {
+        // The checkout whose lockfiles the reader read the component in, kept after it went. A
+        // thing the store holds no such fact of has no checkout, so nothing is known of it.
+        let (checkout, gone): (String, bool) = conn
+            .query_row(
+                "SELECT scope, scope IN (SELECT id FROM gone_entity) FROM assertion
+                 WHERE subject = ?1 AND reader = ?2 LIMIT 1",
+                params![about, crate::lockfiles::READER],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?
+            .unwrap_or_default();
+        let read = about
+            .strip_prefix(&format!("component:{checkout}/"))
+            .and_then(|rest| rest.split_once('/'))
+            .is_some_and(|(eco, _)| self.read.iter().any(|(c, e)| *c == checkout && *e == eco));
+        Ok(gone || (read && !self.untold.contains(about)))
+    }
 }
 
 /// Matches every package the checkouts' lockfiles hold against the data, writes the answers
@@ -553,12 +583,8 @@ pub fn match_all(tx: &Transaction, run_id: &str, at: i64) -> rusqlite::Result<Ma
     tx.execute("DELETE FROM vulnerability_place", [])?;
     let mut places: HashMap<(String, &'static str), (&'static str, Option<String>)> =
         HashMap::new();
+    let mut read = HashSet::new();
     for (scope, completeness, reason, reading_run, lacks) in &readings {
-        // A checkout with no lockfile has no place: it is one counted item (`unread_places`),
-        // never a place of every ecosystem that would read as compared.
-        if reason.as_deref() == Some(crate::lockfiles::NONE_FOUND_NOTE) {
-            continue;
-        }
         for f in &fresh {
             let eco = f.feed.ecosystem;
             let (lockfiles, why) = lockfiles_for(
@@ -569,6 +595,14 @@ pub fn match_all(tx: &Transaction, run_id: &str, at: i64) -> rusqlite::Result<Ma
                 run_id,
                 eco,
             );
+            if lockfiles == "full" {
+                read.insert((scope.clone(), eco));
+            }
+            // A checkout with no lockfile has no place: it is one counted item
+            // (`unread_places`), never a place of every ecosystem that would read as compared.
+            if reason.as_deref() == Some(crate::lockfiles::NONE_FOUND_NOTE) {
+                continue;
+            }
             tx.execute(
                 "INSERT INTO vulnerability_place (checkout, ecosystem, lockfiles, lockfiles_why,
                      feed, feed_why, reading, read_at, run_id, at)
@@ -654,10 +688,23 @@ pub fn match_all(tx: &Transaction, run_id: &str, at: i64) -> rusqlite::Result<Ma
     write_answers(tx, &computed, run_id, at)?;
     link_catalogue(tx)?;
 
+    let component =
+        |checkout: &str, eco: &str, package: &str| format!("component:{checkout}/{eco}/{package}");
+    let untold: HashSet<String> = packages
+        .keys()
+        .filter(|(_, eco, _)| fresh_of(eco).is_none_or(|f| f.not_current.is_some()))
+        .map(|(checkout, eco, package)| component(checkout, eco, package))
+        .chain(
+            computed
+                .iter()
+                .filter(|c| c.answer == "unknown")
+                .map(|c| component(&c.checkout, c.ecosystem, &c.package)),
+        )
+        .collect();
+
     // What the findings rest on: affected registry components, by record kind.
     let mut affected: BTreeMap<String, Vec<(String, String, Vec<String>)>> = BTreeMap::new();
     for c in computed.iter().filter(|c| c.answer == "affected") {
-        let component = format!("component:{}/{}/{}", c.checkout, c.ecosystem, c.package);
         let kind = c.kind.clone();
         let versions: Vec<String> = c
             .entries
@@ -668,11 +715,15 @@ pub fn match_all(tx: &Transaction, run_id: &str, at: i64) -> rusqlite::Result<Ma
             .filter_map(|e| e["version"].as_str().map(str::to_string))
             .collect();
         affected
-            .entry(component)
+            .entry(component(&c.checkout, c.ecosystem, &c.package))
             .or_default()
             .push((c.advisory.clone(), kind, versions));
     }
-    Ok(Matched { affected })
+    Ok(Matched {
+        affected,
+        read,
+        untold,
+    })
 }
 
 /// The answer for one advisory and one package in one checkout.
@@ -2286,6 +2337,20 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_thing_the_store_holds_no_fact_of_is_never_known_so_its_finding_is_never_cleared() {
+        let dir = crate::common::Scratch::new("known-nothing");
+        let conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
+        let checkout = "checkout:machine:mac/dev/shop";
+        let matched = Matched {
+            affected: BTreeMap::new(),
+            read: HashSet::from([(checkout.to_string(), "npm")]),
+            untold: HashSet::new(),
+        };
+        let about = format!("component:{checkout}/npm/left-pad");
+        assert!(!matched.known(&conn, &about).unwrap());
+    }
 
     fn v(s: &str) -> Version {
         version(s).unwrap_or_else(|| panic!("{s}"))

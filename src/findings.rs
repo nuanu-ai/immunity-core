@@ -704,13 +704,16 @@ fn exploited_vulnerability() -> Rule {
 }
 
 /// Holds a rule that finds a state for what a run found now: each thing in `now` has a finding
-/// that stands, raised when none does, with the journal entries it rests on; each finding of
-/// the rule about a thing no longer in `now` is cleared. A finding the owner answered stays
-/// answered while the thing stays. Returns how many findings were opened.
+/// that stands, raised when none does, with the journal entries it rests on. A finding of the
+/// rule about a thing not in `now` is cleared only when the run knows the thing's state
+/// (`known`), so the state is over; one the run cannot tell about is left exactly as it was,
+/// with its answer and its occurrence. A finding the owner answered stays answered while the
+/// thing stays. Returns how many findings were opened.
 pub fn hold(
     tx: &Transaction,
     rule: &str,
     now: &[(String, Vec<i64>)],
+    known: &dyn Fn(&str) -> rusqlite::Result<bool>,
     run_id: &str,
     at: i64,
 ) -> rusqlite::Result<usize> {
@@ -790,7 +793,7 @@ pub fn hold(
         .query_map([rule], |r| Ok((r.get(0)?, r.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     for (id, about) in standing {
-        if now.iter().any(|(a, _)| *a == about) {
+        if now.iter().any(|(a, _)| *a == about) || !known(&about)? {
             continue;
         }
         tx.execute("UPDATE finding SET state = 'cleared' WHERE id = ?1", [&id])?;
