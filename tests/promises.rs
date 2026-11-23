@@ -1136,8 +1136,8 @@ fn unsupported_lockfile_gives_partial_coverage_naming_it_and_supported_ones_are_
         ),
         [
             "checkout:machine:mac/dev/tools|full||",
-            "checkout:machine:mac/dev/work/broken|partial|not supported yet: yarn.lock; could not be read: package-lock.json|failed",
-            "checkout:machine:mac/dev/work/shop|partial|not supported yet: yarn.lock|no_reader",
+            "checkout:machine:mac/dev/work/broken|partial|not supported yet: yarn.lock version 1; could not be read: package-lock.json|failed",
+            "checkout:machine:mac/dev/work/shop|partial|not supported yet: yarn.lock version 1|no_reader",
         ]
     );
     let id = "component:checkout:machine:mac/dev/work/shop";
@@ -10340,7 +10340,7 @@ fn unknown_is_never_given_as_zero_or_full() {
         serde_json::json!([
             {"what": "git hooks of a checkout whose .git is a file", "what_text": null,
              "where_count": 1},
-            {"what": "lockfile kind", "what_text": "yarn.lock", "where_count": 1},
+            {"what": "lockfile kind", "what_text": "yarn.lock version 1", "where_count": 1},
         ])
     );
     assert_eq!(c["failed"], 1, "{c:#}");
@@ -10496,7 +10496,7 @@ fn a_lockfile_of_a_kind_without_a_reader_is_named_as_such_by_status_and_the_repo
     );
     assert_eq!(
         item["examples_text"],
-        serde_json::json!(["uv.lock", "yarn.lock"])
+        serde_json::json!(["uv.lock", "yarn.lock version 1"])
     );
     // The names are data beside the words, never inside a sentence.
     for words in [&item["title"], &item["meaning"], &item["advice"]] {
@@ -10515,7 +10515,7 @@ fn a_lockfile_of_a_kind_without_a_reader_is_named_as_such_by_status_and_the_repo
         r["no_reader_for"]["items"],
         serde_json::json!([
             {"what": "lockfile kind", "what_text": "uv.lock", "where_count": 2},
-            {"what": "lockfile kind", "what_text": "yarn.lock", "where_count": 2},
+            {"what": "lockfile kind", "what_text": "yarn.lock version 1", "where_count": 2},
         ])
     );
     let c = &r["coverage"];
@@ -10534,12 +10534,14 @@ fn a_lockfile_of_a_kind_without_a_reader_is_named_as_such_by_status_and_the_repo
     let (code, printed, _) = status_out(&store, &["--coverage"]);
     assert_eq!(code, Some(0));
     let row = |which: &str| {
-        printed
-            .lines()
-            .any(|l| l.split_whitespace().collect::<Vec<_>>() == ["lockfile", "kind", which, "2"])
+        printed.lines().any(|l| {
+            l.split_whitespace().collect::<Vec<_>>().join(" ") == format!("lockfile kind {which} 2")
+        })
     };
     assert!(
-        printed.contains("\n  No reader in this build for\n") && row("uv.lock") && row("yarn.lock"),
+        printed.contains("\n  No reader in this build for\n")
+            && row("uv.lock")
+            && row("yarn.lock version 1"),
         "{printed}"
     );
     // The pages list what is read: what this version has no reader for is the status's to say.
@@ -10562,14 +10564,14 @@ fn a_lockfile_of_a_kind_without_a_reader_is_named_as_such_by_status_and_the_repo
     immunity_home(&store, &brew, &absent);
     assert_eq!(
         status_json(&store)["no_reader_for"]["items"],
-        serde_json::json!([{"what": "lockfile kind", "what_text": "yarn.lock", "where_count": 2}])
+        serde_json::json!([{"what": "lockfile kind", "what_text": "yarn.lock version 1", "where_count": 2}])
     );
     // Nor in a checkout that is gone.
     std::fs::remove_dir_all(root.join("work/blog")).unwrap();
     immunity_home(&store, &brew, &absent);
     assert_eq!(
         status_json(&store)["no_reader_for"]["items"],
-        serde_json::json!([{"what": "lockfile kind", "what_text": "yarn.lock", "where_count": 1}])
+        serde_json::json!([{"what": "lockfile kind", "what_text": "yarn.lock version 1", "where_count": 1}])
     );
 }
 
