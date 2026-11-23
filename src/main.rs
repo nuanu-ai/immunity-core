@@ -4751,21 +4751,41 @@ fn read_integrity(run: &mut Run, args: &Args) -> Result<Vec<findings::Observed>,
 
 /// Keeps each thing's list of files as a raw copy of its own, written again only when it moved,
 /// and when it moved from a list kept before, what changed between the two: a finding of the
-/// change reads it (`integrity::files_changed`).
+/// change reads it (`integrity::files_changed`). Only the latest of each is kept.
 fn keep_lists(run: &Run, kinds: &[integrity::Kind]) -> Result<(), Box<dyn Error>> {
     for t in kinds.iter().flat_map(|k| &k.things) {
         let Some(list) = &t.list else { continue };
         let input = integrity::list_input(&t.subject);
-        let before = store::last_raw(run.tx, integrity::READER, &input)?
+        let kept = store::last_raw(run.tx, integrity::READER, &input)?;
+        let before = kept
+            .as_ref()
             .and_then(|path| std::fs::read(run.home.join(path)).ok());
+        // Most lists do not move between checks: this spares `keep_raw` reading each again.
         if before.as_ref() == Some(list) {
             continue;
         }
-        run.keep_raw(integrity::READER, &input, list)?;
+        replace_raw(run, &input, kept, list)?;
         if let Some(changes) = before.and_then(|b| integrity::compare(&b, list)) {
             let input = integrity::changes_input(&t.subject);
-            run.keep_raw(integrity::READER, &input, &serde_json::to_vec(&changes)?)?;
+            let kept = store::last_raw(run.tx, integrity::READER, &input)?;
+            replace_raw(run, &input, kept, &serde_json::to_vec(&changes)?)?;
         }
+    }
+    Ok(())
+}
+
+/// Keeps a raw copy of an input of the integrity reader that no assertion points at, and then
+/// removes the copy kept before, `kept`, once the new one is written and its row set. A copy
+/// left as it was, equal to the new bytes, stays; a removal that fails is ignored.
+fn replace_raw(
+    run: &Run,
+    input: &str,
+    kept: Option<String>,
+    bytes: &[u8],
+) -> Result<(), Box<dyn Error>> {
+    let path = run.keep_raw(integrity::READER, input, bytes)?;
+    if let Some(old) = kept.filter(|old| *old != path) {
+        let _ = std::fs::remove_file(run.home.join(old));
     }
     Ok(())
 }

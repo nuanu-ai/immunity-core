@@ -1456,3 +1456,36 @@ fn a_file_name_with_an_escape_sequence_or_a_line_break_is_shown_as_data_and_brea
         assert!(line.starts_with("    Added "), "{line:?}\n{text}");
     }
 }
+
+#[test]
+fn a_folder_of_code_that_changed_three_times_leaves_one_list_and_one_changes_file() {
+    // An app that updates code in its folder every day must not leave a list a day for ever.
+    let e = Estate::new("bounded");
+    bundle(&e.app(), "1.0");
+    let js = e
+        .home()
+        .join("Library/Application Support/Tiny/1.0/main.js");
+    put(&js, "a\n");
+    e.run();
+    for step in ["b\n", "c\n", "d\n"] {
+        append(&js, step);
+        e.run();
+    }
+    let mut kept = Vec::new();
+    let mut dirs = vec![e.0.join("raw")];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if let Some(input) = path.parent().and_then(|p| p.file_name()) {
+                kept.push(input.to_string_lossy().into_owned());
+            }
+        }
+    }
+    kept.retain(|input| input == "files" || input == "changes");
+    kept.sort();
+    assert_eq!(kept, ["changes", "files"]);
+    let told = &e.changed(APP_CODE).0["files"]["changed_text"];
+    assert_eq!(told[0], "1.0/main.js");
+}
