@@ -163,7 +163,7 @@ fn read_with(rules: &Rules, args: &MatchesArgs, now: i64) -> Result<v1::Matches,
         state: events::state_read(&tx).map_err(|e| unreadable(&e))?,
         findings: finding_refs(&tx, now).map_err(|e| unreadable(&e))?,
         arrivals: events::arrivals(&tx).map_err(|e| unreadable(&e))?,
-        awake: events::Awake::read(&tx, now).map_err(|e| unreadable(&e))?,
+        awake: events::Awake::read(&tx).map_err(|e| unreadable(&e))?,
     };
     let after = args.after.as_ref();
     let after_place = after.map(|(_, p)| p);
