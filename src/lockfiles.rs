@@ -1067,11 +1067,9 @@ const YARN_VERSIONS: [&str; 6] = ["4", "5", "6", "8", "9", "10"];
 /// `yarn.lock`. A file with a comment `yarn lockfile v<N>`, as Yarn 1 writes it, is in Yarn 1's
 /// grammar (`yarn1`): version 1 is read by `yarn1`, any other is a kind with no reader. Without
 /// one it is Yarn 2 and later's, which is YAML: every entry by its `resolution`, which is what
-/// Yarn fetches, never by its key. Yarn 1 needs no header and takes `key: value`, so a text
-/// with no version comment that Yarn 1's grammar also accepts may be installed by Yarn 1 as other
-/// packages, and which Yarn reads it is not in the file: it fails the reading. A file Yarn 2 and
-/// later write is not in Yarn 1's grammar, as `cacheKey: 10c0` is a number then a key without a
-/// value.
+/// Yarn fetches, never by its key. Yarn 1 reads any YAML, as its own grammar or after it, and
+/// fetches a locked entry from its `resolved` address, a field Yarn 2 and later never write: an
+/// entry holding one may be installed by Yarn 1 as another package, so it fails the reading.
 ///
 /// Yarn reads every scalar as text; a value `serde_norway` reads as a number or a boolean where
 /// text is expected leaves the entry not told, never converted. A key given twice in one mapping
@@ -1095,9 +1093,6 @@ fn yarn(text: &str) -> Parsed {
     let Ok(Value::Mapping(lock)) = serde_norway::from_str::<Value>(text) else {
         return Parsed::Failed;
     };
-    if crate::yarn1::parse(text).is_ok() {
-        return Parsed::Failed;
-    }
     let version = match lock.get("__metadata").and_then(|m| m.get("version")) {
         Some(Value::String(v)) => v.clone(),
         Some(Value::Number(n)) => n.to_string(),
@@ -1115,6 +1110,14 @@ fn yarn(text: &str) -> Parsed {
         };
         if key == "__metadata" {
             continue;
+        }
+        // A key that is not plain text may be `resolved` to Yarn 1's YAML reader, as js-yaml
+        // makes the key `[resolved]` the text `resolved` (from memory of js-yaml).
+        let plain_keys = entry
+            .as_mapping()
+            .is_none_or(|m| m.keys().all(|k| matches!(k, Value::String(_))));
+        if !plain_keys || entry.get("resolved").is_some() {
+            return Parsed::Failed;
         }
         match yarn_entry(key, entry) {
             Some(Some(dep)) => out.push(dep),
@@ -1143,6 +1146,10 @@ fn yarn_entry(key: &str, entry: &serde_norway::Value) -> Option<Option<Dep>> {
     let stated = text("version")?;
     let at = resolution.get(1..)?.find('@')? + 1;
     let (name, reference) = (&resolution[..at], &resolution[at + 1..]);
+    // The project itself, whatever it is named.
+    if reference.starts_with("workspace:") {
+        return Some(None);
+    }
     if !npm_name(name) {
         return None;
     }
@@ -1173,7 +1180,6 @@ fn yarn_entry(key: &str, entry: &serde_norway::Value) -> Option<Option<Dep>> {
         (source, version)
     } else {
         let source = match reference {
-            r if r.starts_with("workspace:") => return Some(None),
             r if ["file:", "portal:", "link:", "exec:"]
                 .iter()
                 .any(|p| r.starts_with(p)) =>
@@ -1373,12 +1379,15 @@ fn bun_row(key: &str, row: &serde_json::Value) -> Option<Option<Dep>> {
     let first = row.first()?.as_str()?;
     let at = first.get(1..)?.find('@')? + 1;
     let (name, resolution) = (&first[..at], &first[at + 1..]);
+    // The project itself, whatever it is named.
+    if resolution.starts_with("workspace:") || resolution.starts_with("root:") {
+        return Some(None);
+    }
     if !npm_name(name) {
         return None;
     }
     let mut version = None;
     let source = match resolution {
-        r if r.starts_with("workspace:") || r.starts_with("root:") => return Some(None),
         r if r.starts_with("file:") || r.starts_with("link:") => Source::Path,
         r if GIT.iter().any(|p| r.starts_with(p)) => Source::Git,
         r if WEB.iter().any(|p| r.starts_with(p)) => Source::OtherRegistry,
@@ -3073,8 +3082,8 @@ __metadata:
         // the two readings would differ, so the file is not read. So is anything else that is
         // not one YAML mapping with Yarn's `__metadata`.
         let width = "\"string-width@npm:^5.1.2\":\n  version: 5.1.2\n  resolution: \"string-width@npm:5.1.2\"\n";
-        // A file as Yarn 2 and later write it is not in Yarn 1's grammar, so it is read.
-        assert!(crate::yarn1::parse(YARN).is_err());
+        let both = "\"__metadata\":\n  version: 8\nwidget@^1:\n  version: \"1.0.0\"\n  resolved: \"https://registry.npmjs.org/widget/-/widget-1.0.0.tgz\"\n  resolution: \"gadget@npm:1.0.0\"\n";
+        let resolved = "  resolution: \"string-width@npm:5.1.2\"\n  resolved: \"https://registry.npmjs.org/string-width/-/string-width-5.1.2.tgz\"";
         for (tag, text) in [
             ("twice", format!("{YARN}\n{width}")),
             (
@@ -3094,11 +3103,34 @@ __metadata:
             ("v1-pointer", format!("{YARN1}x@^1 \"string-width@^5.1.2\"\n")),
             ("v1-number", format!("{YARN1}x@^1 5\n")),
             ("v1-long", format!("# yarn lockfile v{}\n", "1".repeat(40))),
-            // No header, and both grammars read it: Yarn 1 would install `widget`, Yarn 2 and
-            // later `gadget`, and the file does not say which Yarn reads it.
+            // A `resolved` address, which Yarn 2 and later never write and Yarn 1 fetches, read
+            // as YAML or not: Yarn 1 would install `widget` where Yarn 2 and later fetch `gadget`.
+            ("both-grammars", both.to_string()),
+            ("yaml-only", format!("{both}# note\r# tail\n")),
             (
-                "both-grammars",
-                "\"__metadata\":\n  version: 8\nwidget@^1:\n  version: \"1.0.0\"\n  resolved: \"https://registry.npmjs.org/widget/-/widget-1.0.0.tgz\"\n  resolution: \"gadget@npm:1.0.0\"\n".to_string(),
+                "resolved",
+                YARN.replace("  resolution: \"string-width@npm:5.1.2\"", resolved),
+            ),
+            (
+                "tagged-resolved",
+                YARN.replace(
+                    "  resolution: \"string-width@npm:5.1.2\"",
+                    &resolved.replace("  resolved:", "  !!str resolved:"),
+                ),
+            ),
+            (
+                "sequence-key",
+                YARN.replace(
+                    "  resolution: \"string-width@npm:5.1.2\"",
+                    &resolved.replace("  resolved:", "  ? [resolved]\n  :"),
+                ),
+            ),
+            (
+                "tagged-key",
+                YARN.replace(
+                    "  resolution: \"string-width@npm:5.1.2\"",
+                    &resolved.replace("  resolved:", "  !foo resolved:"),
+                ),
             ),
         ] {
             let (said, reason) = read_one(tag, "yarn.lock", &text);
@@ -3351,6 +3383,33 @@ string-width@^5.0.0, string-width@^5.1.2:
             "x@y",
         ] {
             assert!(!super::npm_name(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_project_itself_is_skipped_whatever_it_is_named() {
+        // A workspace or root is no package to judge: a name npm would not publish leaves
+        // nothing not told.
+        for (tag, file, text) in [
+            (
+                "yarn-ws",
+                "yarn.lock",
+                YARN.replace("@shop/ui@workspace", "_widget@workspace"),
+            ),
+            (
+                "bun-ws",
+                "bun.lock",
+                BUN.replace("\"@shop/ui@workspace", "\"_widget@workspace"),
+            ),
+            (
+                "bun-root",
+                "bun.lock",
+                BUN.replace("\"shop@root:", "\"_shop@root:"),
+            ),
+        ] {
+            assert_ne!(text, if file == "bun.lock" { BUN } else { YARN }, "{tag}");
+            let (_, reason) = read_one(tag, file, &text);
+            assert_eq!(reason, None, "{tag}");
         }
     }
 
