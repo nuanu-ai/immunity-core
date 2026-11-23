@@ -2,13 +2,15 @@
 //! readings of them, kept here once. Both readers of the table (`autorun::POINTS`), the watched
 //! places reader (`watched.rs`) and the reader of parts (`autorun.rs`), record what they found
 //! through `Look`, and the store compares and retracts through it (`read_watched` in
-//! `main.rs`):
+//! `main.rs`). The search for projects (`read_checkouts`) and the matching of indicators
+//! against the texts of projects (`read_indicators`) say what they did not read through it too:
 //!
 //! - Not read is not absent. A unit is read in full only by `absent`, which takes proof that
 //!   its path is not there, or by `read`, `read_part`; a unit that could not be read is
 //!   recorded with why (`unread`, `not_looked_at`, `not_into`). What was known of a unit is
 //!   retracted only where `retracts` allows it: a unit read in full covers it, and no unit not
-//!   read hides it.
+//!   read hides it. Units said together (`short_of`) and units left out by design (`aside`)
+//!   hide what is in them too; only the first make the reading short.
 //! - Losing sight is a change. Every unit that is there and was not read carries its reason,
 //!   and `not_read` hands each one to the store, which judges it as `baseline.rs` says and
 //!   never carries it as unchanged.
@@ -77,6 +79,10 @@ pub struct Look {
     /// checkouts not looked into, the folder Git's configuration names for hooks when it
     /// could not be told, hooks kept where this build does not read them.
     short: Vec<(Cause, String)>,
+    /// Units not read that are no unit of `unread`: those a `short` says together, by a count
+    /// or by the project that holds them, and those left out by design, which no reason says
+    /// and which leave the reading full. What was known of each is kept.
+    hidden: Vec<Unit>,
     /// The units read in full, by their paths as ids name them: a file looked at, found or
     /// absent, and a folder listed or found absent (`baseline.rs`).
     read: Vec<Unit>,
@@ -132,6 +138,18 @@ impl Look {
         self.short.push((cause, why));
     }
 
+    /// Units not read, said together by `why` with its cause.
+    pub fn short_of(&mut self, units: impl IntoIterator<Item = Unit>, cause: Cause, why: String) {
+        self.hidden.extend(units);
+        self.short(cause, why);
+    }
+
+    /// A unit the reader leaves out by design: what was known of it is kept, and the reading is
+    /// not short for it.
+    pub fn aside(&mut self, unit: Unit) {
+        self.hidden.push(unit);
+    }
+
     /// Whether the reading did not read something that is no unit of it.
     pub fn is_short(&self) -> bool {
         !self.short.is_empty()
@@ -169,7 +187,20 @@ impl Look {
 
     /// Whether a unit this reading did not read hides `unit`: what was known of it is kept.
     pub fn hides(&self, unit: &Unit) -> bool {
-        self.unread.iter().any(|u| u.unit.hides(unit))
+        self.hiding().any(|u| u.hides(unit))
+    }
+
+    /// `hides`, for the unit at `path`, with paths compared as a Mac's volumes compare names
+    /// (`spelling::key`): on a volume that ignores case, a file met under another spelling of
+    /// its name is the same file.
+    pub fn hides_spelled(&self, path: &str) -> bool {
+        let spelled = |u: &Unit| Unit::part(crate::spelling::key(&u.path), u.part.clone());
+        let at = spelled(&Unit::whole(path));
+        self.hiding().any(|u| spelled(u).hides(&at))
+    }
+
+    fn hiding(&self) -> impl Iterator<Item = &Unit> {
+        self.unread.iter().map(|u| &u.unit).chain(&self.hidden)
     }
 
     /// Whether this reading may retract what was known of a unit: whenever no unit it did not
@@ -680,6 +711,27 @@ mod tests {
         looked.look.short(Cause::NotGiven, missed.to_string());
         let said = format!("{both}; {whole}; {missed}");
         assert_eq!(looked.coverage(mcp), ("partial", Some(said)));
+    }
+
+    #[test]
+    fn units_said_together_or_left_out_by_design_keep_what_was_known_and_only_the_said_ones_make_a_reading_short()
+     {
+        let inside = Unit::whole("dev/a/vendor/cache/package-lock.json");
+        let mut aside = Look::default();
+        aside.aside(Unit::whole("dev/a/vendor/cache"));
+        assert!(aside.hides(&inside) && aside.hides_spelled("dev/a/Vendor/Cache/x"));
+        assert_eq!(
+            (aside.cause(), aside.completeness_noted(None).1),
+            (None, None)
+        );
+        let mut said = Look::default();
+        let why = "1 lockfile found and not opened in dev/a".to_string();
+        said.short_of([inside.clone()], Cause::NoReader, why.clone());
+        assert!(said.hides(&inside) && !said.hides(&Unit::whole("dev/a/package-lock.json")));
+        assert_eq!(
+            (said.cause(), said.completeness_noted(None).1),
+            (Some(Cause::NoReader), Some(why))
+        );
     }
 
     #[test]

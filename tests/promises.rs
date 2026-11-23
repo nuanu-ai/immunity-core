@@ -1382,7 +1382,7 @@ fn folder_that_cannot_be_listed_gives_a_partial_checkouts_reading_naming_it_and_
              WHERE kind = 'checkouts under the home folder' ORDER BY id DESC LIMIT 1"
         ),
         [
-            "partial|could not be listed: dev/archive; known checkouts that could not be looked at, kept as they were: dev/archive/app|failed"
+            "partial|could not be read: dev/archive (Permission denied (os error 13)); known checkouts that could not be looked at, kept as they were: dev/archive/app|failed"
         ]
     );
     assert!(rows(&store, "SELECT 1 FROM assertion WHERE layer = 'retracted'").is_empty());
