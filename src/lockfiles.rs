@@ -1142,7 +1142,11 @@ snapshots:
         // were.
         use std::os::unix::fs::PermissionsExt;
         let text = "bun-lockfile-format-v0\n";
-        for (file, kind) in [("bun.lockb", "bun.lockb"), ("pdm.lock", "pdm.lock")] {
+        for (file, kind) in [
+            ("bun.lockb", "bun.lockb"),
+            ("pdm.lock", "pdm.lock"),
+            ("requirements.txt", "requirements.txt"),
+        ] {
             let dir = Dir::new("kind-closed", &[("Cargo.lock", CARGO), (file, text)]);
             let path = dir.0.join(file);
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -1208,6 +1212,7 @@ snapshots:
             ("Cargo.lock", CARGO, "crates.io"),
             ("uv.lock", &super::uv::tests::sample(), "PyPI"),
             ("pylock.toml", &super::pylock::tests::sample(), "PyPI"),
+            ("Pipfile.lock", super::pipfile::tests::PIPFILE, "PyPI"),
             ("poetry.lock", &super::poetry::tests::lock(), "PyPI"),
         ] {
             let (said, reason) = read_one("own-reader", kind, sample);
@@ -1615,13 +1620,12 @@ __metadata:
 
     #[test]
     fn a_lockfile_of_an_ecosystem_with_no_reader_is_named_as_a_kind_wherever_it_is() {
-        // `Pipfile.lock`, `Gemfile.lock` and the rest of the published list are lockfiles: one
+        // `go.sum`, `Gemfile.lock` and the rest of the published list are lockfiles: one
         // beside a `Cargo.lock` is a kind with no reader, by name, whether at the root, deep or
         // set aside. It leaves its own ecosystem unknown and no other: a deep `go.sum` makes
         // Go partial and not npm, and a name of no ecosystem a record can be about leaves none.
         for (tag, path, eco) in [
             ("go-deep", "a/b/c/d/e/go.sum", Some("Go")),
-            ("pipfile", "Pipfile.lock", Some("PyPI")),
             ("gemfile", "api/Gemfile.lock", Some("RubyGems")),
             (
                 "composer-deep",
