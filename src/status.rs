@@ -1460,7 +1460,7 @@ fn feed_message(s: &crate::osv::State, run_id: &str) -> crate::contract::v1::Fee
         records: s.good_at.map(|_| n(s.records)),
         malicious_records: s.good_at.map(|_| n(s.malicious)),
         withdrawn_records: s.good_at.map(|_| n(s.withdrawn)),
-        matched: crate::vulnerabilities::has_reader(s.feed.ecosystem),
+        matched: crate::lockfiles::has_reader(s.feed.ecosystem),
         ..Default::default()
     };
     match &s.latest {

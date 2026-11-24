@@ -488,7 +488,8 @@ fn held_packages(conn: &Connection) -> rusqlite::Result<Packages> {
                 continue;
             };
             // No component of an ecosystem with no feed exists: every ecosystem a lockfile is
-            // read for has one (`every_ecosystem_a_lockfile_is_read_for_has_a_feed`).
+            // read for has one, which a test in `lockfiles` holds
+            // (`every_ecosystem_a_lockfile_is_read_for_has_a_feed`).
             let Some(eco) = FEEDS.iter().map(|f| f.ecosystem).find(|e| *e == eco) else {
                 continue;
             };
@@ -1045,13 +1046,6 @@ impl Affecting {
     }
 }
 
-/// Whether this build reads some kind of lockfile of `ecosystem`, so that a feed of it has
-/// packages to be matched against.
-pub fn has_reader(ecosystem: &str) -> bool {
-    (crate::lockfiles::SUPPORTED.iter())
-        .any(|k| crate::lockfiles::ecosystem_of(k) == Some(ecosystem))
-}
-
 /// The ecosystems whose lockfile packages the latest check compared with current data, in
 /// the order of `FEEDS`. Through the records linked to it, this is all of the catalogue that
 /// is compared with the estate: an ecosystem counts only where some checkout's lockfiles were
@@ -1534,7 +1528,7 @@ fn totals_of(conn: &Connection, now: i64, t: &Totals) -> rusqlite::Result<v1::Vu
             .map(|f| v1::FeedFreshness {
                 source: f.feed.source.to_string(),
                 ecosystem: f.feed.ecosystem.to_string(),
-                matched: has_reader(f.feed.ecosystem),
+                matched: crate::lockfiles::has_reader(f.feed.ecosystem),
                 read_at: f.reading.map(|r| r.1),
                 current: f.not_current.is_none(),
                 not_current_why: f.not_current.clone(),
@@ -2358,19 +2352,6 @@ mod tests {
     }
 
     use super::*;
-
-    #[test]
-    fn every_ecosystem_a_lockfile_is_read_for_has_a_feed() {
-        // Packages read and never compared would read as compared: no place, no lack and no
-        // answer would say otherwise. So a reader comes only with data for its ecosystem.
-        for kind in crate::lockfiles::SUPPORTED {
-            let ecosystem = crate::lockfiles::ecosystem_of(kind);
-            assert!(
-                ecosystem.is_some_and(|e| FEEDS.iter().any(|f| f.ecosystem == e)),
-                "{kind}: {ecosystem:?}"
-            );
-        }
-    }
 
     #[test]
     fn a_thing_the_store_holds_no_fact_of_is_never_known_so_its_finding_is_never_cleared() {
