@@ -69,15 +69,24 @@ pub(super) fn pypi_file(address: &str, name: &str, version: &str) -> bool {
 }
 
 /// Whether `file` is the name of a file of the project `name`, normalised, at `version`, in
-/// canonical form. A wheel is `{distribution}-{version}(-{build tag})?-{python tag}-{abi
-/// tag}-{platform tag}.whl` ("Binary distribution format"), its build tag starting with a digit;
-/// a source distribution is `{name}-{version}.tar.gz` ("Source distribution format"), or
-/// `.zip` as older ones are, split at its last `-`, since a canonical version holds none.
+/// canonical form. It checks both itself: a version not canonical is never a match, and a name
+/// not normalised never equals the normalised name of a file's distribution. A wheel is
+/// `{distribution}-{version}(-{build tag})?-{python tag}-{abi tag}-{platform tag}.whl` ("Binary
+/// distribution format"), no part empty, its build tag starting with a digit; a source
+/// distribution is `{name}-{version}.tar.gz` ("Source distribution format"), or `.zip` as older
+/// ones are, split at its last `-`, since a canonical version holds none.
 /// Versions are compared as text: `1.0` is not `1.0.0` here, which only leaves an entry not told.
 pub(super) fn pypi_file_name(file: &str, name: &str, version: &str) -> bool {
     let named = |distribution: &str| pypi_name(distribution).as_deref() == Some(name);
+    if !canonical_version(version) {
+        return false;
+    }
     if let Some(stem) = file.strip_suffix(".whl") {
-        return match stem.split('-').collect::<Vec<_>>()[..] {
+        let parts: Vec<&str> = stem.split('-').collect();
+        if parts.contains(&"") {
+            return false;
+        }
+        return match parts[..] {
             [distribution, v, _, _, _] => named(distribution) && v.to_ascii_lowercase() == version,
             [distribution, v, build, _, _, _] => {
                 build.starts_with(|c: char| c.is_ascii_digit())
@@ -90,8 +99,17 @@ pub(super) fn pypi_file_name(file: &str, name: &str, version: &str) -> bool {
     let Some(stem) = (file.strip_suffix(".tar.gz")).or_else(|| file.strip_suffix(".zip")) else {
         return false;
     };
-    stem.rsplit_once('-')
-        .is_some_and(|(distribution, v)| v == version && named(distribution))
+    // A segment of the name after its first that begins as a version does (a digit, or `v` or
+    // `V` and a digit) lets the file name be read as another project at another version, as
+    // `widget-1.0-2.zip` is `widget-1-0` at `2` and `widget` at `1.0-2`, so such a name is not
+    // told; this only ever leaves an entry not told.
+    let versionlike = |segment: &str| {
+        let rest = segment.strip_prefix(['v', 'V']).unwrap_or(segment);
+        rest.starts_with(|c: char| c.is_ascii_digit())
+    };
+    stem.rsplit_once('-').is_some_and(|(distribution, v)| {
+        v == version && named(distribution) && !distribution.split('-').skip(1).any(versionlike)
+    })
 }
 
 #[cfg(test)]
@@ -257,6 +275,42 @@ mod tests {
             ("widget-1.2.0.tar.bz2", "widget", "1.2.0"),
             ("widget-1.2.0.egg", "widget", "1.2.0"),
             ("widget1.2.0.tar.gz", "widget", "1.2.0"),
+        ] {
+            assert!(
+                !pypi_file_name(file, name, version),
+                "{file} {name} {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_name_proves_a_project_and_version_only_when_it_has_one_reading() {
+        // Each sample that passes beside its nearest that must not: a wheel with an empty
+        // part, a call with a version not canonical or a name not normalised, and an sdist
+        // whose name could be split into another project at another version.
+        for (file, name, version) in [
+            ("widget-1.0-py3-none-any.whl", "widget", "1.0"),
+            ("widget-1.0.tar.gz", "widget", "1.0"),
+            ("my_widget-1.0-py3-none-any.whl", "my-widget", "1.0"),
+            ("python-dateutil-2.8.2.tar.gz", "python-dateutil", "2.8.2"),
+            ("3d-widget-1.0.tar.gz", "3d-widget", "1.0"),
+            ("widget-vx-2.tar.gz", "widget-vx", "2"),
+        ] {
+            assert!(
+                pypi_file_name(file, name, version),
+                "{file} {name} {version}"
+            );
+        }
+        for (file, name, version) in [
+            ("widget-1.0---.whl", "widget", "1.0"),
+            ("widget--py3-none-any.whl", "widget", ""),
+            ("widget--py3-none-any.whl", "widget", "1.0"),
+            ("widget-.tar.gz", "widget", ""),
+            ("widget-1.0+local.tar.gz", "widget", "1.0+local"),
+            ("my_widget-1.0-py3-none-any.whl", "My_Widget", "1.0"),
+            ("widget-1.0-2.zip", "widget-1-0", "2"),
+            ("widget-v1-2.tar.gz", "widget-v1", "2"),
+            ("widget-V1-2.tar.gz", "widget-v1", "2"),
         ] {
             assert!(
                 !pypi_file_name(file, name, version),
