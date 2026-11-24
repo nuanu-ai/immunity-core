@@ -408,61 +408,116 @@ pub(super) fn text_version(
     }
 }
 
-/// Whether the array `files` of a `poetry.lock` or `pdm.lock` entry lists only PyPI's files of
-/// the project `name`, normalised, at `version`: at least one, each a table with a string `file`
-/// that `pypi_file_name` takes or, as PDM writes with static URLs, a string `url` that
-/// `pypi_file` takes, never both. Anything else is not known to be PyPI's.
-pub(super) fn pypi_files(files: Option<&toml::de::DeValue>, name: &str, version: &str) -> bool {
-    let Some(files) = files.and_then(|f| f.as_array()) else {
-        return false;
-    };
-    !files.is_empty()
-        && files.iter().all(|row| {
-            let text = |key: &str| row.get_ref().get(key).map(|v| v.get_ref().as_str());
-            match (text("file"), text("url")) {
-                (Some(Some(file)), None) => pypi_file_name(file, name, version),
-                (None, Some(Some(url))) => pypi_file(url, name, version),
-                _ => false,
+/// What the array `files` of a `poetry.lock` or `pdm.lock` entry lists: rows of a string `file`,
+/// a file's name, or, as PDM writes them with the strategy `static_urls`, rows of a string
+/// `url`, a file's address.
+#[derive(Debug, PartialEq)]
+pub(super) enum Files {
+    /// Every row a file's name, `true` when each is PyPI's file of the project at the version
+    /// (`pypi_file_name`).
+    Names(bool),
+    /// Every row an address, `true` when each is PyPI's file of the project at the version
+    /// (`pypi_file`).
+    Addresses(bool),
+}
+
+/// What the array `files` lists for the project `name`, normalised, at `version`; `None` for no
+/// row, rows of both kinds, a row with both keys or neither, or a value of another type.
+pub(super) fn pypi_files(
+    files: Option<&toml::de::DeValue>,
+    name: &str,
+    version: &str,
+) -> Option<Files> {
+    let (mut names, mut addresses, mut pypi) = (0, 0, true);
+    for row in files?.as_array()?.iter() {
+        let text = |key: &str| row.get_ref().get(key).map(|v| v.get_ref().as_str());
+        match (text("file"), text("url")) {
+            (Some(Some(file)), None) => {
+                names += 1;
+                pypi = pypi && pypi_file_name(file, name, version);
             }
-        })
+            (None, Some(Some(url))) => {
+                addresses += 1;
+                pypi = pypi && pypi_file(url, name, version);
+            }
+            _ => return None,
+        }
+    }
+    match (names, addresses) {
+        (0, 0) => None,
+        (_, 0) => Some(Files::Names(pypi)),
+        (0, _) => Some(Files::Addresses(pypi)),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod toml_lock_tests {
-    use super::pypi_files;
+    use super::{Files, pypi_files};
 
     #[test]
-    fn an_entry_s_files_are_pypi_s_only_when_each_row_names_one_of_its_files_in_one_way() {
+    fn an_entry_s_files_are_told_only_when_every_row_names_a_file_in_the_same_one_way() {
         let at = "https://files.pythonhosted.org/packages/3a/1b/0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab";
         let rows = |rows: &str| {
             let text = format!("files = [{rows}]");
             let table = toml::de::DeTable::parse(&text).unwrap().into_inner();
             pypi_files(table.get("files").map(|f| f.get_ref()), "widget", "1.2.0")
         };
-        let wheel = "file = \"widget-1.2.0-py3-none-any.whl\"";
-        let sdist = format!("url = \"{at}/widget-1.2.0.tar.gz\"");
-        assert!(rows(&format!("{{{wheel}}}, {{{sdist}}}")));
-        for (case, text) in [
-            ("no row", String::new()),
+        let wheel = "{file = \"widget-1.2.0-py3-none-any.whl\"}";
+        let sdist = "{file = \"widget-1.2.0.tar.gz\"}";
+        let at_wheel = format!("{{url = \"{at}/widget-1.2.0-py3-none-any.whl\"}}");
+        let at_sdist = format!("{{url = \"{at}/widget-1.2.0.tar.gz\"}}");
+        let elsewhere = "{url = \"https://example.invalid/widget-1.2.0.tar.gz\"}";
+        let other = "{file = \"widget-1.2.1.tar.gz\"}";
+        let both =
+            format!("{{file = \"widget-1.2.0.tar.gz\", url = \"{at}/widget-1.2.0.tar.gz\"}}");
+        for (case, text, told) in [
             (
-                "a row of another version",
-                "{file = \"widget-1.2.1.tar.gz\"}".to_string(),
+                "names of PyPI's",
+                format!("{wheel}, {sdist}"),
+                Some(Files::Names(true)),
             ),
             (
-                "one row of two",
-                format!("{{{wheel}}}, {{file = \"gadget-1.2.0.tar.gz\"}}"),
+                "a name of another version",
+                format!("{wheel}, {other}"),
+                Some(Files::Names(false)),
+            ),
+            (
+                "addresses of PyPI's",
+                format!("{at_wheel}, {at_sdist}"),
+                Some(Files::Addresses(true)),
             ),
             (
                 "an address elsewhere",
-                "{url = \"https://example.invalid/widget-1.2.0.tar.gz\"}".to_string(),
+                format!("{at_wheel}, {elsewhere}"),
+                Some(Files::Addresses(false)),
             ),
-            ("both keys", format!("{{{wheel}, {sdist}}}")),
-            ("neither key", "{hash = \"sha256:00\"}".to_string()),
-            ("a file not a string", "{file = 1}".to_string()),
-            ("a row not a table", "\"widget-1.2.0.tar.gz\"".to_string()),
+            ("no row", String::new(), None),
+            (
+                "a name and an address",
+                format!("{wheel}, {at_sdist}"),
+                None,
+            ),
+            ("both keys in a row", both, None),
+            ("neither key", "{hash = \"sha256:00\"}".to_string(), None),
+            (
+                "a name and a row of neither",
+                format!("{wheel}, {{hash = \"sha256:00\"}}"),
+                None,
+            ),
+            (
+                "a file not a string",
+                format!("{wheel}, {{file = 1}}"),
+                None,
+            ),
+            (
+                "a row not a table",
+                "\"widget-1.2.0.tar.gz\"".to_string(),
+                None,
+            ),
         ] {
-            assert!(!rows(&text), "{case}");
+            assert_eq!(rows(&text), told, "{case}");
         }
-        assert!(!pypi_files(None, "widget", "1.2.0"));
+        assert_eq!(pypi_files(None, "widget", "1.2.0"), None);
     }
 }

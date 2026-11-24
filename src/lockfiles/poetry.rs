@@ -1,6 +1,6 @@
 //! The reader of `poetry.lock`.
 
-use super::pypi::{pypi_files, pypi_name, text_version, toml_lock};
+use super::pypi::{Files, pypi_files, pypi_name, text_version, toml_lock};
 use super::{Parsed, Source};
 
 pub(super) const READ: Option<super::Reader> = Some(|text, _| poetry(text));
@@ -12,8 +12,8 @@ pub(super) const READ: Option<super::Reader> = Some(|text, _| poetry(text));
 /// registry; `git` is git; `file` and `directory` are a path. So a package with no source was
 /// taken from PyPI when the file was written. Poetry installs it from the index the project
 /// configures, taken here to be PyPI, and checks each file against its hash in `files`. It is
-/// PyPI's when its files are all PyPI's files of its name and version (`pypi_files`). A file
-/// that is not TOML, no `lock-version` as a string, a `package` that is not an array of tables,
+/// PyPI's when its files are all names of PyPI's files of its name and version (`pypi_files`).
+/// A file that is not TOML, no `lock-version` as a string, a `package` that is not an array of tables,
 /// and a package whose name or version is not a string or whose source is not a table fail the
 /// reading, as they fail Poetry. Another `lock-version` is a kind with no reader. Left not told:
 /// a name that is not valid, a source of another type or none, and a package with no source
@@ -29,7 +29,10 @@ fn poetry(text: &str) -> Parsed {
         let name = pypi_name(name);
         let source = match package.get("source").map(|s| s.get_ref()) {
             None => (name.as_deref())
-                .filter(|name| pypi_files(package.get("files").map(|f| f.get_ref()), name, version))
+                .filter(|name| {
+                    let files = package.get("files").map(|f| f.get_ref());
+                    pypi_files(files, name, version) == Some(Files::Names(true))
+                })
                 .map(|_| Source::Registry),
             Some(source) => match source
                 .as_table()?
