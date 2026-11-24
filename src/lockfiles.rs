@@ -23,7 +23,14 @@ mod bun;
 mod cargo;
 mod commit;
 mod npm;
+mod pdm;
+mod pipfile;
 mod pnpm;
+mod poetry;
+mod pylock;
+mod pypi;
+mod requirements;
+mod uv;
 mod yarn;
 
 use bun::bun;
@@ -48,6 +55,9 @@ pub const DEEPER: &str = "lockfile below the folders read";
 /// What this build reads of a lockfile in a folder it sets aside, `vendor` or a hidden one: its
 /// kind, by name. The lockfile is there and was not opened.
 pub const SET_ASIDE: &str = "lockfile in a folder set aside";
+/// What this build reads of a lockfile with entries whose package cannot be told: its kind, by
+/// name. The lockfile was read, and those entries were left out.
+pub const NOT_TOLD: &str = "lockfile entries whose package cannot be told";
 /// Folders past `LOOK_LIMIT` that the walk did not look through: what they hold is not known.
 pub const NOT_LOOKED: &str = "folders not looked through for lockfiles";
 /// What this build reads of a lockfile that is a symbolic link: its kind, by name. Links are not
@@ -100,16 +110,47 @@ const CACHE_MARK: &str = "CACHEDIR.TAG";
 const CACHE_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
 const CHECKOUT_MARK: &str = ".git";
 
+/// How a lockfile is read: from its text and its kind's name, which `npm` needs to tell
+/// `package-lock.json` from `npm-shrinkwrap.json` and the other readers leave unused.
+type Reader = fn(&str, &str) -> Parsed;
+
+/// The kinds of lockfile this build knows a reader's place for: a kind's name, the ecosystem
+/// whose packages it declares, as OSV names it, and its reader, `None` until one is written. A
+/// kind whose reader is `None` is named as having no reader and never opened, as a kind of
+/// `NOT_SUPPORTED` is. A kind is read only by the reader of its own row.
 /// `npm-shrinkwrap.json` is in the format of `package-lock.json`, as npm documents it.
 /// `yarn.lock` is read in the formats of Yarn 1 and of Yarn 2 and later.
-const SUPPORTED: [&str; 6] = [
-    "package-lock.json",
-    "npm-shrinkwrap.json",
-    "pnpm-lock.yaml",
-    "yarn.lock",
-    "bun.lock",
-    "Cargo.lock",
+const FORMATS: [(&str, &str, Option<Reader>); 12] = [
+    ("package-lock.json", "npm", Some(npm)),
+    ("npm-shrinkwrap.json", "npm", Some(npm)),
+    ("pnpm-lock.yaml", "npm", Some(|text, _| pnpm(text))),
+    ("yarn.lock", "npm", Some(|text, _| yarn(text))),
+    ("bun.lock", "npm", Some(|text, _| bun(text))),
+    ("Cargo.lock", "crates.io", Some(|text, _| cargo(text))),
+    ("uv.lock", "PyPI", uv::READ),
+    ("poetry.lock", "PyPI", poetry::READ),
+    ("pdm.lock", "PyPI", pdm::READ),
+    ("pylock.toml", "PyPI", pylock::READ),
+    ("Pipfile.lock", "PyPI", pipfile::READ),
+    ("requirements.txt", "PyPI", requirements::READ),
 ];
+/// Kinds a file is also named by in a pattern: the prefix, one or more characters none of
+/// which is `.`, and the suffix, ignoring case. PEP 751 names a named lock `pylock.<name>.toml`,
+/// `^pylock\.([^.]+)\.toml$` (packaging.python.org, "pylock.toml specification").
+const PATTERNS: [(&str, &str, &str); 1] = [("pylock.", ".toml", "pylock.toml")];
+
+/// The reader of a kind of lockfile, by the kind's name; `None` for a kind with none.
+fn reader_of(kind: &str) -> Option<Reader> {
+    FORMATS.iter().find(|(k, ..)| *k == kind).and_then(|f| f.2)
+}
+
+/// Whether this build reads some kind of lockfile of an ecosystem, as OSV names it.
+// No caller yet: the change that first asks it of an ecosystem removes this line.
+#[allow(dead_code)]
+pub fn has_reader(ecosystem: &str) -> bool {
+    (FORMATS.iter()).any(|(_, of, read)| *of == ecosystem && read.is_some())
+}
+
 /// Lockfiles this build has no reader for, by name, with the ecosystem whose packages each
 /// declares, as OSV names it. Data, from OSV-Scanner's list of supported lockfiles
 /// (google.github.io/osv-scanner, "Supported languages and lockfiles", read on 16 November
@@ -120,14 +161,8 @@ const SUPPORTED: [&str; 6] = [
 /// manifests that page lists beside the lockfiles (`go.mod`, `pom.xml`, `deps.json` and the
 /// like) are not lockfiles and are not here. A lockfile of a name on no list is not known to be
 /// one and cannot be said (docs/reference.md).
-const NOT_SUPPORTED: [(&str, Option<&str>); 23] = [
+const NOT_SUPPORTED: [(&str, Option<&str>); 17] = [
     ("bun.lockb", Some("npm")),
-    ("uv.lock", Some("PyPI")),
-    ("poetry.lock", Some("PyPI")),
-    ("Pipfile.lock", Some("PyPI")),
-    ("pdm.lock", Some("PyPI")),
-    ("pylock.toml", Some("PyPI")),
-    ("requirements.txt", Some("PyPI")),
     ("composer.lock", Some("Packagist")),
     ("go.sum", Some("Go")),
     ("Package.resolved", Some("SwiftURL")),
@@ -191,27 +226,20 @@ pub fn split_name(name: &str) -> (&str, Option<&'static str>) {
 /// it, a version of its format with no reader as `<kind> version <n>`; `None` for one not known
 /// here.
 pub fn ecosystem_of(kind: &str) -> Option<&'static str> {
-    match kind.split_once(" version ").map_or(kind, |(kind, _)| kind) {
-        "package-lock.json"
-        | "npm-shrinkwrap.json"
-        | "pnpm-lock.yaml"
-        | "yarn.lock"
-        | "bun.lock" => Some("npm"),
-        "Cargo.lock" => Some("crates.io"),
-        _ => NOT_SUPPORTED
-            .iter()
-            .find(|(name, _)| *name == kind)
-            .and_then(|(_, ecosystem)| *ecosystem),
-    }
+    let kind = kind.split_once(" version ").map_or(kind, |(kind, _)| kind);
+    (FORMATS.iter().map(|(name, of, _)| (*name, Some(*of))))
+        .chain(NOT_SUPPORTED)
+        .find(|(name, _)| *name == kind)
+        .and_then(|(_, ecosystem)| ecosystem)
 }
 
 /// Whether a partial reading leaves the dependencies of one ecosystem in part unknown. What the
 /// reading names it did not read, `lacks` by their names (a kind with no reader, a lockfile not
-/// opened), leaves the ecosystem of each name unknown and no other: a name of no ecosystem a
-/// record can be about, such as `flake.lock`, leaves none. A lack with no name, folders not
-/// looked through, counts for every ecosystem. The reason's clauses for the lacks are only words
-/// for a person. The reason decides the rest: a lockfile of that ecosystem not parsed, an entry
-/// not told, a folder not listed. A clause this does not recognise counts for every ecosystem,
+/// opened, a kind with entries not told), leaves the ecosystem of each name unknown and no
+/// other: a name of no ecosystem a record can be about, such as `flake.lock`, leaves none. A
+/// lack with no name, folders not looked through, counts for every ecosystem. The reason's
+/// clauses for the lacks are only words for a person. The reason decides the rest: a lockfile
+/// of that ecosystem not parsed, a folder not listed. A clause this does not recognise counts for every ecosystem,
 /// so that nothing reads as fully known that is not.
 pub fn partial_for(reason: &str, lacks: &[Option<String>], ecosystem: &str) -> bool {
     let of_it = |name: &str| ecosystem_of(name) == Some(ecosystem);
@@ -222,6 +250,8 @@ pub fn partial_for(reason: &str, lacks: &[Option<String>], ecosystem: &str) -> b
             } else if let Some(names) = clause.strip_prefix("could not be read: ") {
                 names.split(", ").any(of_it)
             } else if clause.starts_with("the package of ") {
+                // Entries not told are decided by their lack (`NOT_TOLD`). The clause counts for
+                // npm only for a reading written before that lack was recorded.
                 ecosystem == "npm"
             } else {
                 true
@@ -242,13 +272,20 @@ pub struct Outcome {
 
 /// The kind of lockfile a file's name says, as this build names the kind; `None` for a name of
 /// no lockfile. Names are matched ignoring case: macOS volumes ignore case by default, so
-/// `Package-Lock.json` is the same file to its tool.
+/// `Package-Lock.json` is the same file to its tool. A name of no kind is matched against
+/// `PATTERNS`, ignoring case too.
 fn lockfile_kind(name: &str) -> Option<&'static str> {
-    SUPPORTED
-        .iter()
-        .copied()
-        .chain(NOT_SUPPORTED.iter().map(|(n, _)| *n))
+    let lower = name.to_ascii_lowercase();
+    let in_pattern = |(prefix, suffix, _): &&(&str, &str, &str)| {
+        let middle = lower
+            .strip_prefix(prefix)
+            .and_then(|r| r.strip_suffix(suffix));
+        middle.is_some_and(|middle| !middle.is_empty() && !middle.contains('.'))
+    };
+    (FORMATS.iter().map(|(kind, ..)| *kind))
+        .chain(NOT_SUPPORTED.iter().map(|(kind, _)| *kind))
         .find(|kind| kind.eq_ignore_ascii_case(name))
+        .or_else(|| PATTERNS.iter().find(in_pattern).map(|(.., kind)| *kind))
 }
 
 /// Where the walk found a lockfile.
@@ -403,7 +440,7 @@ pub fn looked_for_as_text(rel: &str) -> bool {
 pub fn read_as_text(checkout: &Path) -> Texts {
     let walked = walk(checkout, LOOK_LIMIT);
     let (opened, not_opened) = (walked.lockfiles.into_iter())
-        .filter(|(_, kind, _)| SUPPORTED.contains(kind))
+        .filter(|(_, kind, _)| reader_of(kind).is_some())
         .partition::<Vec<_>, _>(|(_, _, at)| *at == Where::Opened);
     let paths = |found: Vec<(String, &str, Where)>| found.into_iter().map(|(p, ..)| p).collect();
     Texts {
@@ -434,8 +471,9 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize) -> Option<Outcome> {
     };
     let mut not_supported: BTreeSet<String> = BTreeSet::new();
     let mut not_parsed: BTreeSet<&str> = BTreeSet::new();
-    // Entries whose package cannot be told, as `<lockfile>#<key>`.
+    // Entries whose package cannot be told, as `<lockfile>#<key>`, and the kinds they are of.
     let mut not_told: Vec<String> = Vec::new();
+    let mut not_told_kinds: BTreeSet<&str> = BTreeSet::new();
     // Lockfiles of a kind read here that were not opened, by where, and their kinds.
     let mut not_opened: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
     let mut lacks: BTreeSet<(&'static str, &str)> = BTreeSet::new();
@@ -456,7 +494,7 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize) -> Option<Outcome> {
             Where::Linked => Some(LINKED),
         };
         if let Some(what) = unopened {
-            if SUPPORTED.contains(&name) {
+            if reader_of(name).is_some() {
                 not_opened.entry(what).or_default().push(source);
                 lacks.insert((what, name));
             } else {
@@ -467,26 +505,23 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize) -> Option<Outcome> {
         let path = checkout.path.join(rel);
         // A kind with no reader is never opened: its size is the file's own, 0 when that cannot
         // be had, as for a lockfile that could not be read.
-        if !SUPPORTED.contains(&name) {
+        let Some(reader) = reader_of(name) else {
             let size = std::fs::symlink_metadata(&path).map_or(0, |m| m.len());
             lockfiles.push((source, size));
             not_supported.insert(name.to_string());
             continue;
-        }
+        };
         let text = std::fs::read(&path).ok();
         lockfiles.push((source.clone(), text.as_ref().map_or(0, |t| t.len() as u64)));
         let parsed = match text.and_then(|t| String::from_utf8(t).ok()) {
             None => Parsed::Failed,
-            Some(t) if name == "package-lock.json" || name == "npm-shrinkwrap.json" => {
-                npm(&t, name)
-            }
-            Some(t) if name == "pnpm-lock.yaml" => pnpm(&t),
-            Some(t) if name == "yarn.lock" => yarn(&t),
-            Some(t) if name == "bun.lock" => bun(&t),
-            Some(t) => cargo(&t),
+            Some(t) => reader(&t, name),
         };
         let (ecosystem, found) = match parsed {
             Parsed::Deps(ecosystem, found, unknown) => {
+                if !unknown.is_empty() {
+                    not_told_kinds.insert(name);
+                }
                 not_told.extend(unknown.iter().map(|key| format!("{source}#{key}")));
                 (ecosystem, found)
             }
@@ -598,6 +633,7 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize) -> Option<Outcome> {
             .iter()
             .map(|name| Lack::new(LOCKFILE_KIND, Some(name)))
             .chain(lacks.iter().map(|(what, name)| Lack::new(what, Some(name))))
+            .chain((not_told_kinds.iter()).map(|name| Lack::new(NOT_TOLD, Some(name))))
             .chain(walked.stopped.then(|| Lack::new(NOT_LOOKED, None)))
             .collect(),
     };
@@ -708,8 +744,8 @@ fn version_shape(v: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CACHE_SIGNATURE, Checkout, DEEPER, LINKED, LOCKFILE_KIND, NOT_LOOKED, SET_ASIDE,
-        ecosystem_of, partial_for, read, read_as_text, read_within,
+        CACHE_SIGNATURE, Checkout, DEEPER, LINKED, LOCKFILE_KIND, NOT_LOOKED, NOT_TOLD, SET_ASIDE,
+        ecosystem_of, has_reader, lockfile_kind, partial_for, read, read_as_text, read_within,
     };
 
     fn file_name(path: &str) -> &str {
@@ -1117,19 +1153,115 @@ snapshots:
     #[test]
     fn a_lockfile_of_a_kind_with_no_reader_is_never_opened_and_is_listed_with_its_size() {
         // Its size comes from the folder, so one this user may not open is still named as a
-        // kind with no reader and listed with its size.
+        // kind with no reader, never as a failed reading, and listed with its size. The six
+        // Python kinds have a row with no reader yet, and a named `pylock.<name>.toml` is a
+        // `pylock.toml`: each leaves PyPI unknown, and npm and crates.io as they were.
         use std::os::unix::fs::PermissionsExt;
         let text = "bun-lockfile-format-v0\n";
-        let dir = Dir::new("lockb-closed", &[("bun.lockb", text)]);
-        let lockb = dir.0.join("bun.lockb");
-        std::fs::set_permissions(&lockb, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let (o, _) = dir.read();
-        std::fs::set_permissions(&lockb, std::fs::Permissions::from_mode(0o644)).unwrap();
-        assert_eq!(lacks(&o), [format!("{LOCKFILE_KIND} bun.lockb")]);
-        assert_eq!(
-            o.lockfiles,
-            [("dev/shop/bun.lockb".to_string(), text.len() as u64)]
+        for (file, kind) in [
+            ("bun.lockb", "bun.lockb"),
+            ("uv.lock", "uv.lock"),
+            ("poetry.lock", "poetry.lock"),
+            ("pdm.lock", "pdm.lock"),
+            ("pylock.toml", "pylock.toml"),
+            ("pylock.dev.toml", "pylock.toml"),
+            ("Pipfile.lock", "Pipfile.lock"),
+            ("requirements.txt", "requirements.txt"),
+        ] {
+            let dir = Dir::new("kind-closed", &[("Cargo.lock", CARGO), (file, text)]);
+            let path = dir.0.join(file);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let (o, _) = dir.read();
+            let texts = read_as_text(&dir.0);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(lacks(&o), [format!("{LOCKFILE_KIND} {kind}")], "{file}");
+            assert_eq!(o.gap.cause, Some(Cause::NoReader), "{file}");
+            let reason = format!("not supported yet: {kind}");
+            assert_eq!(o.reason.as_deref(), Some(reason.as_str()), "{file}");
+            let size = text.len() as u64;
+            assert!(o.lockfiles.contains(&(format!("dev/shop/{file}"), size)));
+            assert_eq!(unknown_for(&o), [kind == "bun.lockb", false], "{file}");
+            let names: Vec<Option<String>> = o.gap.lacks.iter().map(|l| l.name.clone()).collect();
+            let python = partial_for(&reason, &names, "PyPI");
+            assert_eq!(python, kind != "bun.lockb", "{file}");
+            assert_eq!(texts.opened, ["Cargo.lock"], "{file}");
+            assert!(texts.not_opened.is_empty(), "{file}");
+        }
+    }
+
+    #[test]
+    fn an_entry_not_told_leaves_the_ecosystem_of_its_kind_unknown_and_no_other() {
+        // No false calm. The reading names the kind with entries not told in a lack of its own:
+        // npm is left in part unknown and crates.io beside it is not, and a kind of any other
+        // ecosystem leaves that ecosystem unknown by its lack alone, with no clause counted.
+        let text = NPM.replace(
+            "registry.npmjs.org/string-width/-/string-width-5.1.2.tgz",
+            "registry.npmjs.org/widget/-/widget-5.1.2.tgz",
         );
+        let dir = Dir::new(
+            "not-told",
+            &[("Cargo.lock", CARGO), ("package-lock.json", &text)],
+        );
+        let (o, _) = dir.read();
+        let at = "package-lock.json#node_modules/string-width";
+        assert_eq!(o.reason, one_not_told(at));
+        assert_eq!(o.gap.cause, Some(Cause::NotGiven));
+        assert_eq!(lacks(&o), [format!("{NOT_TOLD} package-lock.json")]);
+        assert_eq!(unknown_for(&o), [true, false]);
+        // The lack beside a reason whose only clause decides nothing.
+        let (uv, words) = (
+            [Some("uv.lock".to_string())],
+            "not supported yet: flake.lock",
+        );
+        assert!(partial_for(words, &uv, "PyPI"));
+        assert!(!partial_for(words, &uv, "npm") && !partial_for(words, &uv, "crates.io"));
+        // A reading written before the lack was recorded still leaves npm unknown by its words.
+        let said = one_not_told(at).unwrap();
+        assert!(partial_for(&said, &[], "npm") && !partial_for(&said, &[], "crates.io"));
+    }
+
+    #[test]
+    fn every_kind_with_a_reader_is_read_by_its_own_reader() {
+        // A kind is read only by the reader of its row: a sample of each format named as its
+        // kind is read in full, and an ecosystem has a reader only where a row of it has one.
+        for (kind, sample, ecosystem) in [
+            ("package-lock.json", NPM, "npm"),
+            ("npm-shrinkwrap.json", NPM, "npm"),
+            ("pnpm-lock.yaml", PNPM_9, "npm"),
+            ("yarn.lock", YARN, "npm"),
+            ("bun.lock", BUN, "npm"),
+            ("Cargo.lock", CARGO, "crates.io"),
+        ] {
+            let (said, reason) = read_one("own-reader", kind, sample);
+            assert_eq!(reason, None, "{kind}");
+            let of_it = format!("{ecosystem}/");
+            assert!(said.iter().any(|s| s.starts_with(&of_it)), "{kind}");
+        }
+        assert!(has_reader("npm") && has_reader("crates.io"));
+        assert!(!has_reader("PyPI") && !has_reader("RubyGems"));
+    }
+
+    #[test]
+    fn a_named_pylock_is_a_pylock_toml_and_no_other_name_is() {
+        // PEP 751: `pylock.toml`, or `pylock.<name>.toml` with a name holding no dot.
+        for name in [
+            "pylock.toml",
+            "pylock.dev.toml",
+            "PyLock.Dev.TOML",
+            "pylock.a-b_c.toml",
+        ] {
+            assert_eq!(lockfile_kind(name), Some("pylock.toml"), "{name}");
+        }
+        for name in [
+            "pylock..toml",
+            "pylock.a.b.toml",
+            "xpylock.dev.toml",
+            "pylock.dev.toml.bak",
+            "pylock.dev.tom",
+            "pylock-dev.toml",
+        ] {
+            assert_eq!(lockfile_kind(name), None, "{name}");
+        }
     }
 
     /// A `yarn.lock` of Yarn 4 (`__metadata.version` 8) with every kind of resolution the
