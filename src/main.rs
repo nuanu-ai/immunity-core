@@ -195,10 +195,11 @@ struct Args {
     tailscale: Option<PathBuf>,
     /// A saved copy of the threat catalogue to read instead of fetching it.
     threats_input: Option<PathBuf>,
-    /// Saved archives of the vulnerability data to read instead of fetching them: crates.io's
-    /// and npm's.
+    /// Saved archives of the vulnerability data to read instead of fetching them: crates.io's,
+    /// npm's and PyPI's.
     osv_crates_input: Option<PathBuf>,
     osv_npm_input: Option<PathBuf>,
+    osv_pypi_input: Option<PathBuf>,
     /// The curl to fetch the catalogue and the vulnerability data with instead of the system's.
     curl: Option<PathBuf>,
     /// The folder that `/Library` and `/etc` are resolved under for watched places: `/`
@@ -277,11 +278,12 @@ fn parse_args(
             let (mut servers_input, mut checkouts_root, mut tailscale) = (None, None, None);
             let (mut sessions_root, mut threats_input, mut curl) = (None, None, None);
             let (mut system_root, mut indicators) = (None, None);
-            let (mut osv_crates_input, mut osv_npm_input) = (None, None);
+            let (mut osv_crates_input, mut osv_npm_input, mut osv_pypi_input) = (None, None, None);
             options.read(it, |arg, it| {
                 match arg.as_str() {
                     "--osv-crates-input" => osv_crates_input = Some(value(it, &arg)?.into()),
                     "--osv-npm-input" => osv_npm_input = Some(value(it, &arg)?.into()),
+                    "--osv-pypi-input" => osv_pypi_input = Some(value(it, &arg)?.into()),
                     "--tailscale" => tailscale = Some(value(it, &arg)?.into()),
                     "--machine-name" => machine = Some(value(it, &arg)?),
                     "--brew" => brew = Some(value(it, &arg)?.into()),
@@ -313,6 +315,7 @@ fn parse_args(
                 threats_input,
                 osv_crates_input,
                 osv_npm_input,
+                osv_pypi_input,
                 curl,
                 system_root: system_root.unwrap_or_else(|| PathBuf::from("/")),
                 indicators,
@@ -5364,8 +5367,11 @@ fn get_feeds(
     let curl = args.curl.as_deref().unwrap_or(Path::new(threats::CURL));
     // One input for each feed, in the order of `FEEDS`: a feed added without its input does
     // not compile, where `zip` would leave it unasked and say nothing.
-    let inputs: [&Option<PathBuf>; osv::FEEDS.len()] =
-        [&args.osv_crates_input, &args.osv_npm_input];
+    let inputs: [&Option<PathBuf>; osv::FEEDS.len()] = [
+        &args.osv_crates_input,
+        &args.osv_npm_input,
+        &args.osv_pypi_input,
+    ];
     let mut got = Vec::new();
     for (feed, input) in osv::FEEDS.iter().zip(inputs) {
         got.push(osv::get(conn, feed, input.as_deref(), curl, home, now)?);
@@ -5474,7 +5480,7 @@ fn feed_clause(s: &osv::State, run_id: &str) -> String {
         return format!("{ecosystem} never read");
     };
     let since = view::utc_or(s.changed_at.or(s.good_at), "an unknown time");
-    match outcome.as_str() {
+    let said = match outcome.as_str() {
         "failed" => {
             // What the download said: cut on its own, as every source's text in the run's line.
             let reason = secrets::said(reason.as_deref().unwrap_or_default());
@@ -5512,7 +5518,9 @@ fn feed_clause(s: &osv::State, run_id: &str) -> String {
             }
             None => format!("{ecosystem}: {held}"),
         },
-    }
+    };
+    let matched = lockfiles::has_reader(ecosystem);
+    format!("{said}{}", osv::not_compared(ecosystem, matched))
 }
 
 /// One sentence about the threat catalogue for the report line. What its entries are
@@ -5887,6 +5895,7 @@ mod tests {
             threats_input: None,
             osv_crates_input: None,
             osv_npm_input: None,
+            osv_pypi_input: None,
             curl: None,
             system_root: dir.join("no-system"),
             indicators: None,
@@ -5942,6 +5951,7 @@ mod tests {
             threats_input: None,
             osv_crates_input: None,
             osv_npm_input: None,
+            osv_pypi_input: None,
             curl: None,
             system_root: dir.join("no-system"),
             indicators: None,
@@ -6005,6 +6015,7 @@ mod tests {
             threats_input: None,
             osv_crates_input: None,
             osv_npm_input: None,
+            osv_pypi_input: None,
             curl: None,
             system_root: dir.join("no-system"),
             indicators: None,

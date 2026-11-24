@@ -154,6 +154,7 @@ impl Dir {
             .arg(self.0.join("brew.json"))
             .args(["--tailscale", "absent", "--threats-input", "absent"])
             .args(["--osv-crates-input", "absent", "--osv-npm-input", "absent"])
+            .args(["--osv-pypi-input", "absent"])
             .arg("--system-root")
             .arg(self.root())
             .arg("--servers-input")

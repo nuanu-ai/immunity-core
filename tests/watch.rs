@@ -116,6 +116,8 @@ impl Mac {
             .arg(&absent)
             .arg("--osv-npm-input")
             .arg(&absent)
+            .arg("--osv-pypi-input")
+            .arg(&absent)
             .arg("--system-root")
             .arg(self.sys());
         cmd

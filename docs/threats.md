@@ -2,7 +2,7 @@
 
 A threat is knowledge from outside: a vulnerability, or an indicator from an incident report. This page is the contract for how Immunity Core takes threats in, matches them against what it found on the Mac, and answers. It covers what is built and names what is planned.
 
-Built: CISA's catalogue of exploited vulnerabilities, fetched whole at every check; OSV's vulnerability data for npm and crates.io, matched against the projects' lockfiles with four answers; a list of indicators matched against part of what Immunity Core reads. Planned: matching installed software, Homebrew, servers' packages and other ecosystems, and the four answers for indicators. Until then the status says that no vulnerability is matched against those, so whether one affects them is unknown, and lists it among the limits of this version.
+Built: CISA's catalogue of exploited vulnerabilities, fetched whole at every check; OSV's vulnerability data for npm and crates.io, matched against the projects' lockfiles with four answers; OSV's data for PyPI, downloaded and not yet compared with anything; a list of indicators matched against part of what Immunity Core reads. Planned: matching installed software, Homebrew, servers' packages and other ecosystems, and the four answers for indicators. Until then the status says that no vulnerability is matched against those, so whether one affects them is unknown, and lists it among the limits of this version.
 
 ## Where rules and data come from
 
@@ -12,7 +12,7 @@ Built: CISA's catalogue of exploited vulnerabilities, fetched whole at every che
 | [Elastic detection rules](https://github.com/elastic/detection-rules) | 66 of its 185 detection rules for macOS (60 over process starts, 6 over file events) at commit `032ac5e`, each translated into Sigma by a program, not edited by hand, and checked against Elasticsearch's documented meaning on invented events; the other 119 are listed with the reason | Elastic License 2.0, see [`rules/elastic/NOTICE`](../rules/elastic/NOTICE) | Compiled into the program |
 | [Elastic protections artifacts](https://github.com/elastic/protections-artifacts) | 57 of its 278 behaviour rules for macOS (54 over process starts, 3 over file events) at commit `a87715d`, translated and checked the same way; they state no level, and the action each takes upstream, stopping a process, is not taken; the other 221 are listed with the reason | Elastic License 2.0, see [`rules/elastic-behaviour/NOTICE`](../rules/elastic-behaviour/NOTICE) | Compiled into the program |
 | [MITRE ATT&CK](https://attack.mitre.org) | The techniques for macOS and the 13 tactics of Enterprise ATT&CK, from release 20.1 | MITRE's ATT&CK licence, see [`rules/attack/NOTICE`](../rules/attack/NOTICE) | Compiled into the program |
-| [OSV](https://osv.dev) | Vulnerability and malicious package records for npm and crates.io, from sources such as the GitHub Advisory Database, RustSec and OpenSSF Malicious Packages | Each record keeps its source's licence; Immunity Core names the source beside every record it shows | Downloaded: crates.io at every check, npm once a day |
+| [OSV](https://osv.dev) | Vulnerability and malicious package records for npm, crates.io and PyPI, from sources such as the GitHub Advisory Database, RustSec, the Python Packaging Advisory Database and OpenSSF Malicious Packages | Each record keeps its source's licence; Immunity Core names the source beside every record it shows | Downloaded: crates.io at every check, npm and PyPI once a day |
 | [CISA KEV](https://www.cisa.gov/known-exploited-vulnerabilities-catalog) | The catalogue of vulnerabilities known to be exploited | CC0 | Downloaded at every check |
 
 Test data copied from other projects carries its own notice beside it, in `tests/osv/NOTICE` and `tests/semver/NOTICE`.
@@ -24,8 +24,9 @@ These are the only requests Immunity Core makes. What is asked never depends on 
 | Source | Address | When | Size cap | Time limit |
 |---|---|---|---|---|
 | CISA KEV | `https://www.cisa.gov/sites/default/files/feeds/known_exploited_vulnerabilities.json` | every check | 8 MiB | 300 s |
-| OSV, crates.io | `https://osv-vulnerabilities.storage.googleapis.com/crates.io/all.zip` | every check | 64 MiB | 300 s |
+| OSV, crates.io | `https://osv-vulnerabilities.storage.googleapis.com/crates.io/all.zip` | every check | 64 MiB | 120 s |
 | OSV, npm | `https://osv-vulnerabilities.storage.googleapis.com/npm/all.zip` | when its last good reading is over 24 hours old | 512 MiB | 900 s |
+| OSV, PyPI | `https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip` | when its last good reading is over 24 hours old | 128 MiB | 180 s |
 
 Each goes through the system's curl, with the ETag the source last sent when there is one:
 
@@ -36,9 +37,11 @@ Each goes through the system's curl, with the ETag the source last sent when the
   <address>
 ```
 
-`--disable` keeps `~/.curlrc` out. A redirect is not followed. "Not modified" is believed only in answer to Immunity Core's own ETag. The body is held to the cap after decompression too. npm's archive is about 220 MB, 93% of it reports of malicious packages.
+`--disable` keeps `~/.curlrc` out. A redirect is not followed. "Not modified" is believed only in answer to Immunity Core's own ETag. The body is held to the cap after decompression too. npm's archive is about 220 MB, 93% of it reports of malicious packages. PyPI's was 38.3 MB on 24 November 2026.
 
-The feeds are fetched before the store is locked for the check, under a lock of their own, so a long download holds up no watcher's reading and no status. A second check stops at that lock and writes nothing. The time limits above are per request. [Background checks](core-service.md) have a separate 30-minute limit for the whole check. For tests and offline use, `--threats-input <file>`, `--osv-crates-input <file>` and `--osv-npm-input <file>` read saved copies, and `--curl <path>` runs another curl.
+The feeds are fetched before the store is locked for the check, under a lock of their own, so a long download holds up no watcher's reading and no status. A second check stops at that lock and writes nothing. The time limits above are per request. [Background checks](core-service.md) have a separate 30-minute limit for the whole check: the four limits add up to 1,500 s, and with a watcher's reading waited out for up to 60 s they leave 240 s for the check's readers. For tests and offline use, `--threats-input <file>`, `--osv-crates-input <file>`, `--osv-npm-input <file>` and `--osv-pypi-input <file>` read saved copies, and `--curl <path>` runs another curl.
+
+PyPI's data is downloaded and not yet compared with anything, because no Python lockfile is read. An ecosystem is matched when this build has a feed for it and reads some kind of lockfile of it. Only a matched ecosystem has places, answers and counts, and only it is named where the status, the run's line or the pages say what packages were compared. A feed of an ecosystem that is not matched is downloaded, read, counted and shown as a feed, and nothing else: `matched` is false on it in `vulnerability_data.feeds`, and so is `vulnerability_data.matched`, which is true only when every feed's ecosystem is matched. Its data not being current is not an item of the status, since no answer rests on it, and a download of it that failed is said on the line of downloads. Its reading counts as current for 26 hours, as npm's does. PyPI's names are kept as a record gives them and in the form PEP 503 compares them, lower case with each run of `-`, `_` and `.` one `-`.
 
 ## Feed content is untrusted
 
@@ -88,7 +91,7 @@ Matching is by mechanism, never by product. A matcher works for a kind of identi
 - Findings. A malicious package or an exploited vulnerability is a finding; every other match is an "affects me" answer in a list and raises nothing. `lockfiles.malicious-package` (T1195.001, critical, high) is for a package a malicious record names: a `MAL-` id or CWE-506. `lockfiles.malicious-name-removed` (T1195.001, high, low) is for when every such record names only npm's placeholder version `0.0.1-security`. `lockfiles.exploited-vulnerability` (no technique, critical, medium) is for a record linked to the catalogue. A package with both raises only the malicious finding. These findings are about a state: each stays while the dependency matches, and a check clears it only when it shows the state is over. That is when the checkout is gone, or when the checkout's lockfiles of that ecosystem were read in full in that check and no longer hold the package, or hold it and no answer for it is `unknown` and the data is current. When the check cannot tell, because a lockfile was not read in full, the data is not current or failed to load, or an answer is `unknown`, the finding stays as it was, with the person's answer.
 - Commands. `immunity vulnerabilities [--json]` lists the "affects me" answers, malicious and exploited first, then by the source's label, at most 200 with the total. `immunity vulnerability <id> [--json]` gives the answer for one record id or CVE id in every checkout whose lockfiles were read. An id the data does not hold is said to be unknown, never "not affected".
 - Status. `immunity status --json` has a part `vulnerabilities` beside what needs a look, never counted in it. Its numbers count distinct records: `affected_records`, `affected_packages`, `affected_projects`, `affected_records_by_label`. The app's panel leaves them out; they are in the report.
-- Sources. Wherever a record's text is shown, its source is named with the record's id: the GitHub Advisory Database, RustSec, OpenSSF's Malicious Packages.
+- Sources. Wherever a record's text is shown, its source is named with the record's id: the GitHub Advisory Database, RustSec, OpenSSF's Malicious Packages, the Python Packaging Advisory Database.
 
 ### Planned, in this order
 
