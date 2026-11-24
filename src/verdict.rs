@@ -207,6 +207,9 @@ pub fn listed(
         args,
         |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
+    if total == 0 {
+        return Ok((0, 0, Vec::new()));
+    }
     let list = conn
         .prepare(&format!(
             "SELECT {COLUMNS} FROM verdict WHERE {cond}
@@ -250,6 +253,9 @@ pub struct Summary {
 
 /// Gives each finding what it carries of the verdicts (`Summary`).
 pub fn attach(conn: &Connection, found: &mut [Found]) -> rusqlite::Result<()> {
+    if found.is_empty() {
+        return Ok(());
+    }
     let rank = |column: &str, scale: &[&str]| {
         let whens: String = scale
             .iter()
@@ -292,26 +298,34 @@ pub fn attach(conn: &Connection, found: &mut [Found]) -> rusqlite::Result<()> {
             _ => None,
         };
     }
-    for v in conn
-        .prepare(&format!("SELECT {COLUMNS} FROM verdict WHERE raised"))?
-        .query_map([], row)?
-    {
-        let v = v?;
-        if let Some(s) = v.finding.as_ref().and_then(|f| of_finding.get_mut(f)) {
-            s.opening = Some(v);
+    if !of_finding.is_empty() {
+        for v in conn
+            .prepare(&format!("SELECT {COLUMNS} FROM verdict WHERE raised"))?
+            .query_map([], row)?
+        {
+            let v = v?;
+            if let Some(s) = v.finding.as_ref().and_then(|f| of_finding.get_mut(f)) {
+                s.opening = Some(v);
+            }
         }
     }
     // The `verdict.suspicious` finding that stands for a rule and a thing: its latest occurrence,
-    // open or marked expected.
-    let standing: BTreeMap<(String, String), String> = conn
-        .prepare(
-            "SELECT substr(f.rule, length(?1) + 1), f.about, f.id FROM finding f
-             WHERE f.rule LIKE ?1 || '%' AND f.state IN ('open', 'expected')
-               AND NOT EXISTS (SELECT 1 FROM finding g WHERE g.rule = f.rule
-                               AND g.about = f.about AND g.occurrence > f.occurrence)",
-        )?
-        .query_map([PREFIX], |r| Ok(((r.get(0)?, r.get(1)?), r.get(2)?)))?
-        .collect::<rusqlite::Result<_>>()?;
+    // open or marked expected (`state_at` only turns `expected` into `open`, so checking `found`
+    // in memory matches the raw `state IN ('open', 'expected')` condition without scanning the
+    // table again).
+    let standing: BTreeMap<(&str, &str), String> = found
+        .iter()
+        .filter(|f| !f.superseded && (f.state == "open" || f.state == "expected"))
+        .filter_map(|f| {
+            f.rule
+                .strip_prefix(PREFIX)
+                .map(|subject| ((subject, f.about.as_str()), f.id.clone()))
+        })
+        .collect();
+    let standing: BTreeMap<(String, String), String> = standing
+        .into_iter()
+        .map(|((r, a), id)| ((r.to_string(), a.to_string()), id))
+        .collect();
     for f in found.iter_mut() {
         f.verdicts = if f.rule.starts_with(PREFIX) {
             of_finding.remove(&f.id)

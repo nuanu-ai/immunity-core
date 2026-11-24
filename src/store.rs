@@ -1476,13 +1476,63 @@ pub fn checkouts(conn: &Connection) -> rusqlite::Result<i64> {
 }
 
 pub fn totals(tx: &Connection, run_id: &str) -> rusqlite::Result<Totals> {
-    let all = |sql: &str| tx.query_row(sql, [], |row| row.get::<_, i64>(0));
     let one = |sql: &str| tx.query_row(sql, [run_id], |row| row.get::<_, i64>(0));
+    let mut checkouts: HashSet<String> = HashSet::new();
+    let mut components: HashSet<String> = HashSet::new();
+    let mut named_machines: BTreeSet<String> = BTreeSet::new();
+    let mut same_as: Vec<(String, String)> = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT subject, predicate, object FROM assertion
+             WHERE layer = 'live'
+               AND (predicate IN ('located_on', 'part_of', 'same_as')
+                    OR subject LIKE 'machine:%' OR object LIKE 'machine:%')",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let subject = r.get_ref(0)?.as_str()?;
+            let predicate = r.get_ref(1)?.as_str()?;
+            let object = r.get_ref(2)?.as_str()?;
+            match predicate {
+                "located_on" if subject.starts_with("checkout:") => {
+                    checkouts.insert(subject.to_string());
+                }
+                "part_of" => {
+                    components.insert(subject.to_string());
+                }
+                "same_as" => {
+                    same_as.push((subject.to_string(), object.to_string()));
+                }
+                _ => {}
+            }
+            if subject.starts_with("machine:") {
+                named_machines.insert(subject.to_string());
+            }
+            if object.starts_with("machine:") {
+                named_machines.insert(object.to_string());
+            }
+        }
+    }
+    let entities: BTreeSet<String> = tx
+        .prepare("SELECT id FROM entity WHERE type = 'machine'")?
+        .query_map([], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    {
+        let mut stmt = tx.prepare(&format!("{LATEST} SELECT DISTINCT scope FROM reading"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let scope = r.get_ref(0)?.as_str()?;
+            if scope.starts_with("machine:") {
+                named_machines.insert(scope.to_string());
+            }
+        }
+    }
+    let known: BTreeSet<String> = entities.intersection(&named_machines).cloned().collect();
+    let machines = resolver::groups(known, &same_as).len() as i64;
     Ok(Totals {
-        machines: machine_groups(tx)?.len() as i64,
-        checkouts: checkouts(tx)?,
-        components: all("SELECT COUNT(DISTINCT subject) FROM assertion
-             WHERE layer = 'live' AND predicate = 'part_of'")?,
+        machines,
+        checkouts: checkouts.len() as i64,
+        components: components.len() as i64,
         // A partial reading that never made an assertion has nothing that could be removed.
         partial: one("SELECT COUNT(*) FROM coverage c
              WHERE run_id = ?1 AND completeness = 'partial'
@@ -1547,14 +1597,15 @@ pub fn machine_groups(conn: &Connection) -> rusqlite::Result<Vec<Vec<String>>> {
 /// Machine entities known only as another user's device: the reader that says so is the
 /// only one that names them, besides the resolver, and nothing was ever read on them.
 pub fn other_users_devices(conn: &Connection) -> rusqlite::Result<BTreeSet<String>> {
-    conn.prepare(
-        "SELECT DISTINCT a.subject FROM assertion a
+    conn.prepare(&format!(
+        "{LATEST}
+         SELECT DISTINCT a.subject FROM assertion a
          WHERE a.layer = 'live' AND a.predicate = 'relation_to_owner' AND a.object = ?1
            AND NOT EXISTS (SELECT 1 FROM assertion o
-                           WHERE o.layer = 'live' AND o.subject = a.subject
+                           WHERE +o.layer = 'live' AND o.subject = a.subject
                              AND o.reader NOT IN (a.reader, ?2))
-           AND NOT EXISTS (SELECT 1 FROM coverage c WHERE c.scope = a.subject)",
-    )?
+           AND a.subject NOT IN (SELECT DISTINCT scope FROM reading)"
+    ))?
     .query_map(params![crate::tailnet::OTHER_USER, resolver::READER], |r| {
         r.get(0)
     })?

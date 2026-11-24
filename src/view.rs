@@ -1736,11 +1736,12 @@ fn changes(conn: &Connection, out: &mut String) -> Out {
     let mut kinds_stmt = conn.prepare(
         "SELECT DISTINCT kind FROM coverage WHERE run_id = ?1 AND kind != ?2 ORDER BY kind",
     )?;
+    let base = crate::status::baselines(conn)?;
     for (i, run) in runs.iter().enumerate() {
         let (run_id, at, finished, report) = (&run.run_id, &run.at, &run.finished, &run.report);
         // Counted as the report and `immunity status` count them: what was read for the first
         // time is the baseline, shown as such and never as added.
-        let (since, first, events) = crate::status::run_changes(conn, run_id)?;
+        let (since, first, events) = crate::status::run_changes_with(conn, run_id, &base)?;
         let not_full: Vec<(String, String, String, Option<String>, bool)> = not_full_stmt
             .query_map([run_id], |r| {
                 Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))

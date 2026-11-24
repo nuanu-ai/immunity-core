@@ -257,6 +257,10 @@ fn no_reader_for(conn: &Connection) -> rusqlite::Result<Vec<NoReader>> {
 /// The run calls this inside its transaction before it finishes; `immunity status` calls it on
 /// the latest finished run.
 pub fn summary(conn: &Connection, run: RunMark, home: &Path) -> Res<Summary> {
+    summary_at(conn, run, home, crate::now_secs())
+}
+
+fn summary_at(conn: &Connection, run: RunMark, home: &Path, now: i64) -> Res<Summary> {
     let base = baselines(conn)?;
     let changes = file_changes(conn, &base)?;
     let machine = this_machine(conn, &run.id)?;
@@ -276,7 +280,7 @@ pub fn summary(conn: &Connection, run: RunMark, home: &Path) -> Res<Summary> {
         no_reader_for: no_reader_for(conn)?,
         integrity: crate::integrity::summary(conn, &run.id)?,
         feeds: crate::osv::states(conn)?,
-        vulnerabilities: crate::vulnerabilities::totals(conn, crate::now_secs())?,
+        vulnerabilities: crate::vulnerabilities::totals(conn, now)?,
         changes,
         run,
     })
@@ -298,7 +302,7 @@ fn this_machine(conn: &Connection, run_id: &str) -> rusqlite::Result<String> {
 const BASELINED: [&str; 2] = [watched::READER, crate::integrity::READER];
 
 /// Which differences the journal holds are a baseline, journaled and counted as nothing new.
-struct Baselines {
+pub(crate) struct Baselines {
     /// For each reading of a reader in `BASELINED`, the run whose reading of it first read
     /// something. The two readers' kinds differ, so scope and kind name one reading.
     first: HashMap<(String, String), String>,
@@ -306,7 +310,7 @@ struct Baselines {
 
 /// The baselines of the journal: a reading's events are the baseline when it was the first of
 /// its scope and kind to read something.
-fn baselines(conn: &Connection) -> rusqlite::Result<Baselines> {
+pub(crate) fn baselines(conn: &Connection) -> rusqlite::Result<Baselines> {
     Ok(Baselines {
         first: first_readings(conn)?,
     })
@@ -455,11 +459,12 @@ pub struct RunEvent {
 
 /// What one run journaled, counted as the report and `immunity status` count it, and how many
 /// things it read for the first time and took as their baseline.
-pub fn run_changes(
+pub(crate) fn run_changes_with(
     conn: &Connection,
     run_id: &str,
+    base: &Baselines,
 ) -> rusqlite::Result<(Since, usize, Vec<RunEvent>)> {
-    let mut events = journaled(conn, Some(run_id), None, &baselines(conn)?)?;
+    let mut events = journaled(conn, Some(run_id), None, base)?;
     // The store's first run, as the report calls it: everything it found is the baseline.
     let first_run: bool = conn.query_row(
         "SELECT NOT EXISTS (SELECT 1 FROM journal WHERE entry = 'run_finished' AND run_id != ?1
@@ -711,11 +716,16 @@ pub struct State {
     pub not_covered: Vec<crate::covered::Uncovered>,
     /// The event level as its latest reading left it; `None` before any reading of it.
     pub event_level: Option<crate::events::Level>,
+    found: Vec<findings::Found>,
+    packages: Option<crate::finding_answer::Packages>,
 }
 
 pub fn state(conn: &Connection, home: &Path, now: i64) -> Res<State> {
-    let summary = match latest_finished(conn)? {
-        Some(run) => Some(summary(conn, run, home)?),
+    let finished = latest_finished(conn)?;
+    let finished_at = finished.as_ref().and_then(|r| r.finished_at);
+    let finished_started = finished.as_ref().map(|r| r.started_at);
+    let summary = match finished {
+        Some(run) => Some(summary_at(conn, run, home, now)?),
         None => None,
     };
     let mut files = BTreeMap::new();
@@ -727,16 +737,18 @@ pub fn state(conn: &Connection, home: &Path, now: i64) -> Res<State> {
         let (kind, n): (String, i64) = row?;
         files.insert(kind, n);
     }
-    let (coverage, problems, needs) = looked(conn, now)?;
-    // Watched live while a watcher runs and its latest reading, sample and look at what to
-    // watch did not fail. A failed reading of the event level stands for program starts
-    // alone, which are then not claimed as seen.
+    let coverage = view::latest_coverage(conn)?;
+    let problems = problems(conn, &coverage)?;
+    let (found, packages) = findings::all_with_packages(conn, now)?;
+    let needs = findings::needs_from(&found);
+    let answered = findings::answered_from(&found);
     let failed = crate::watch::failures(conn, home)?;
     let live = crate::watch::watching_live(home) && crate::watch::live_with(&failed);
     let events_failed = failed.iter().find(|f| f.what == crate::watch::EVENTS);
     let full_check_failed = failed.iter().any(|f| f.what == crate::watch::FULL_CHECK);
-    let mut this_mac = crate::covered::this_mac(conn, &coverage, live)?;
-    let mut event_level = crate::events::level(conn, now)?;
+    let mut this_mac =
+        crate::covered::this_mac_with(conn, &coverage, live, Some(finished_at), Some(&files))?;
+    let mut event_level = crate::events::level_with_check(conn, now, Some(finished_started))?;
     if let Some(failure) = events_failed
         && let Some(level) = &mut event_level
         && level.state == crate::events::RUNNING
@@ -745,16 +757,6 @@ pub fn state(conn: &Connection, home: &Path, now: i64) -> Res<State> {
         level.read_at = failure.at;
         level.reason = Some(failure.detail.clone());
     }
-    // A collector that is installed and records nothing (refused, failing or silent), or that
-    // runs and lost part of what it was to record (a gap in its numbering, a restart it cannot
-    // account for, lines it could not read, log files the cap or the tidy job deleted before
-    // they were read), leaves a place of this Mac read in part, as a reading that failed does:
-    // never the calm of a Mac watched whole. A loss holds it until a full check that read this
-    // Mac after the loss was read has finished, which read again what the unseen moment could
-    // have left; the day's caveats and `rules.judged` still say the loss. Such coverage names
-    // the cause `not_given`, which the test of a failed reading does not count, so it is said
-    // here. Lines it could not read are a failed reading, which holds it for the day. Not
-    // installed is a limit the person can lift, and `not_covered` says it.
     if this_mac.state == "watched"
         && (events_failed.is_some()
             || full_check_failed
@@ -770,7 +772,6 @@ pub fn state(conn: &Connection, home: &Path, now: i64) -> Res<State> {
     {
         this_mac.state = "watched_in_part";
     }
-    // Program starts are watched only while the level records them.
     if let Some(l) = event_level
         .as_ref()
         .filter(|l| l.state == crate::events::RUNNING)
@@ -780,8 +781,23 @@ pub fn state(conn: &Connection, home: &Path, now: i64) -> Res<State> {
             .push((crate::covered::EVENTS, l.last_day.starts, "events"));
     }
     this_mac.failed = failed;
-    let not_covered =
-        crate::covered::not_covered(conn, &coverage, &problems, catalogue(conn)?.as_ref())?;
+    let cat_owned;
+    let cat_ref = match &summary {
+        Some(s) => s.catalogue.as_ref(),
+        None => {
+            cat_owned = catalogue(conn)?;
+            cat_owned.as_ref()
+        }
+    };
+    let not_covered = crate::covered::not_covered_with(
+        conn,
+        &coverage,
+        &problems,
+        cat_ref,
+        Some(event_level.as_ref()),
+        summary.as_ref().map(|s| &s.vulnerabilities),
+        Some(finished_started),
+    )?;
     Ok(State {
         last: latest_run(conn)?,
         summary,
@@ -790,21 +806,14 @@ pub fn state(conn: &Connection, home: &Path, now: i64) -> Res<State> {
         files,
         presence_only: watched::presence_only_by_kind(conn)?,
         needs,
-        answered: findings::answered(conn, now)?,
+        answered,
         standing: crate::owner::standing(conn)?,
         this_mac,
         not_covered,
         event_level,
+        found,
+        packages,
     })
-}
-
-/// The latest readings, their problems and what needs a look at `now`: what `needs_a_look`
-/// serves.
-fn looked(conn: &Connection, now: i64) -> Res<(Vec<Latest>, Problems, findings::Needs)> {
-    let coverage = view::latest_coverage(conn)?;
-    let problems = problems(conn, &coverage)?;
-    let needs = findings::needs(conn, now)?;
-    Ok((coverage, problems, needs))
 }
 
 /// What needs a look at `now`, as `immunity status --json` counts it; `immunity watch` gives its total
@@ -815,11 +824,13 @@ pub fn needs(conn: &Connection, now: i64) -> Res<findings::Needs> {
 
 /// Text from a source as a field's value: hidden characters as the terminal shows them,
 /// and at most `TEXT_CAP` characters.
+#[cfg(test)]
 pub fn text(s: &str) -> Value {
     Value::String(text_string(s))
 }
 
 /// The same as a string, for the contract's `_text` fields.
+#[cfg(test)]
 pub fn text_string(s: &str) -> String {
     capped(view::shown(s))
 }
@@ -831,6 +842,7 @@ pub fn said_text(s: &str) -> Value {
 }
 
 /// Text already shown, cut to `TEXT_CAP` characters.
+#[cfg(test)]
 pub fn capped(shown: String) -> String {
     if shown.chars().count() <= TEXT_CAP {
         return shown;
@@ -1056,10 +1068,12 @@ pub fn message(
                 matched: feeds.iter().all(|f| f.matched),
                 feeds,
             });
-            out.vulnerabilities = crate::vulnerabilities::totals_message(conn, now)?;
-            if out.vulnerabilities.is_none() {
-                absent("vulnerabilities", crate::vulnerabilities::NEVER_MATCHED);
-            }
+            out.vulnerabilities = Some(crate::vulnerabilities::totals_of_with(
+                conn,
+                now,
+                &s.vulnerabilities,
+                Some(&st.coverage),
+            )?);
             match &s.integrity {
                 Some(i) => out.integrity = Some(crate::integrity::message(i)),
                 None => absent("integrity", "installed software has never been read"),
@@ -1097,18 +1111,19 @@ pub fn message(
     } else {
         out.coverage = Some(coverage_message(&st.problems));
     }
-    // Every finding, so that a finding named from another (a verdict's) is given by reference.
-    let found = findings::all(conn, now)?;
+    let found = &st.found;
     let items: Vec<findings::Item> = found.iter().map(findings::item).collect();
     let refs = crate::finding_answer::refs(&items);
-    let packages = crate::finding_answer::packages(conn)?;
+    let owned_packages;
+    let packages = match &st.packages {
+        Some(p) => p,
+        None => {
+            owned_packages = crate::finding_answer::Packages::for_items(conn, &items, None)?;
+            &owned_packages
+        }
+    };
     let store_id = out.store_id.clone();
     let all = &st.needs.items;
-    // The cut is taken per source, in the one order, urgent first: up to `NEEDS_SHOWN` of
-    // the core's findings and up to as many of the response layer's, so that neither source
-    // can push the other's findings out of the list. Within a source the order puts urgent
-    // findings first, so its cut never drops an urgent finding while it keeps one that is
-    // not; `urgent_total` says how many urgent ones there are over both.
     let mut taken = [0; 2];
     let mut kept: Vec<&findings::Item> = Vec::new();
     for i in all {
@@ -1126,7 +1141,7 @@ pub fn message(
                 i,
                 store_id.as_deref(),
                 &refs,
-                &packages,
+                packages,
             )),
             meaning: i.words.meaning.to_string(),
             advice: i.words.advice.to_string(),
@@ -1134,7 +1149,7 @@ pub fn message(
             technique_text: i.technique.map(whole),
             change: i.change.as_deref().map(crate::finding_answer::change_of),
             evidence: match f {
-                Some(f) => crate::finding_answer::evidence(conn, f)?
+                Some(f) => crate::finding_answer::evidence_with(conn, f, Some(packages))?
                     .map(|body| v1::Evidence { body: Some(body) }),
                 None => None,
             },
@@ -1144,7 +1159,7 @@ pub fn message(
         items: shown,
         total: n(all.len()),
         urgent_total: n(all.iter().filter(|i| i.urgent()).count()),
-        by_rule: by_rule(all),
+        by_rule: crate::finding_answer::by_rule(all),
     });
     let outside: Vec<&findings::Item> = st
         .answered
@@ -1156,7 +1171,7 @@ pub fn message(
         items: outside
             .iter()
             .take(NEEDS_SHOWN)
-            .map(|i| crate::finding_answer::listed(i, store_id.as_deref(), &refs, &packages))
+            .map(|i| crate::finding_answer::listed(i, store_id.as_deref(), &refs, packages))
             .collect(),
     });
     out.statements_outside_app = Some(crate::owner::outside_app(&st.standing, NEEDS_SHOWN));
@@ -1172,72 +1187,6 @@ fn mark(r: &RunMark) -> crate::contract::v1::CheckMark {
         started_at: r.started_at,
         finished_at: r.finished_at,
     }
-}
-
-/// The findings that need a look, counted by rule over all of them: urgent ones first, then the
-/// most severe, a severity not known taken as the most severe as `findings::order` takes it,
-/// then the most findings, then by rule.
-fn by_rule(all: &[findings::Item]) -> Vec<crate::contract::v1::RuleCount> {
-    use crate::contract::{v1, value_of};
-    // The rank of a severity, `None` above every level.
-    let rank = |s: Option<&str>| {
-        s.map_or(findings::SEVERITIES.len(), |s| {
-            findings::SEVERITIES
-                .iter()
-                .position(|x| *x == s)
-                .unwrap_or(findings::SEVERITIES.len())
-        })
-    };
-    struct Group<'a> {
-        first: &'a findings::Item,
-        /// The short title the group is shown by: its findings' own, or, when they differ, the
-        /// rule's general one. Only the response layer's findings carry two sets of words under
-        /// one rule (`verdict::words`), and a count of both must not say what holds for one.
-        short: &'static str,
-        worst: Option<&'static str>,
-        count: usize,
-        urgent: usize,
-    }
-    let mut groups: Vec<Group> = Vec::new();
-    for i in all {
-        match groups.iter_mut().find(|g| g.first.rule == i.rule) {
-            Some(g) => {
-                if i.words.short != g.short {
-                    g.short = crate::verdict::WORDS.short;
-                }
-                if rank(i.severity) > rank(g.worst) {
-                    g.worst = i.severity;
-                }
-                g.count += 1;
-                g.urgent += usize::from(i.urgent());
-            }
-            None => groups.push(Group {
-                first: i,
-                short: i.words.short,
-                worst: i.severity,
-                count: 1,
-                urgent: usize::from(i.urgent()),
-            }),
-        }
-    }
-    groups.sort_by(|a, b| {
-        (b.urgent > 0)
-            .cmp(&(a.urgent > 0))
-            .then_with(|| rank(b.worst).cmp(&rank(a.worst)))
-            .then_with(|| b.count.cmp(&a.count))
-            .then_with(|| a.first.rule.cmp(&b.first.rule))
-    });
-    groups
-        .iter()
-        .map(|g| v1::RuleCount {
-            rule: g.first.rule.clone(),
-            short_title: g.short.to_string(),
-            rule_title_text: crate::finding_answer::rule_title(&g.first.rule),
-            severity: g.worst.map(value_of::<v1::Level>),
-            count: n(g.count),
-            urgent: n(g.urgent),
-        })
-        .collect()
 }
 
 /// `this_mac`, with whether what the status says is fresh: the latest full check finished

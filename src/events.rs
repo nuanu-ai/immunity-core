@@ -2574,6 +2574,7 @@ pub fn read(
         "DELETE FROM rule_match WHERE hour < ?1",
         [(now - KEEP_MATCHES) / HOUR],
     )?;
+    let mut day_tally: Option<Tally> = None;
     let (completeness, reason, cause): (&str, Option<String>, Option<Cause>) = match &found {
         Found::NotInstalled => (
             "none",
@@ -2581,7 +2582,12 @@ pub fn read(
             Some(Cause::NotGiven),
         ),
         Found::Failed(why) => ("none", Some(why.clone()), Some(Cause::Failed)),
-        Found::Read(log) => covered(log.state, &tally_since(tx, Since::At(now - DAY))?),
+        Found::Read(log) => {
+            let t = tally_since(tx, now - DAY)?;
+            let cov = covered(log.state, &t);
+            day_tally = Some(t);
+            cov
+        }
     };
     tx.execute(
         "DELETE FROM coverage WHERE reader = ?1 AND scope = ?2 AND kind = ?3",
@@ -2611,11 +2617,12 @@ pub fn read(
     if let Found::Read(log) = &found
         && log.state == RUNNING
     {
-        let (completeness, reason, cause) = files_covered(
-            &log.collects,
-            &tally_since(tx, Since::At(now - DAY))?,
-            &file_tally_since(tx, Since::At(now - DAY))?,
-        );
+        let tally = match day_tally {
+            Some(t) => t,
+            None => tally_since(tx, now - DAY)?,
+        };
+        let (completeness, reason, cause) =
+            files_covered(&log.collects, &tally, &file_tally_since(tx, now - DAY)?);
         crate::store::put_coverage(
             tx,
             &Reading {
@@ -2786,108 +2793,6 @@ pub fn raised_first<T>(mut newest_first: Vec<T>) -> Vec<T> {
     let raised = usize::from(newest_first.len() > EVIDENCE);
     newest_first.rotate_right(raised);
     newest_first
-}
-
-/// What a finding from a published rule carries beside its words, each in its own field: the
-/// rule as it describes itself, its authors among them, as the Detection Rule License asks of
-/// a message made from a match; the kind of event it is about, `events`; how many events it
-/// counts since it was raised; the latest of them, newest first, after the one that raised it
-/// when that one is no longer among them (`raised_first`); and where the rule's set
-/// comes from, with its licence, each by its address or identifier and by its name in words.
-/// Text from the rule or from an event is only in `_text` fields.
-pub fn finding_detail(
-    conn: &Connection,
-    finding: &str,
-    file: &'static str,
-    meta: &Meta,
-    kind: crate::sigma::Kind,
-) -> rusqlite::Result<Value> {
-    let mut v = crate::sigma::Match { file, meta, kind }.json();
-    v["licence"] = json!(meta.source.licence);
-    v["licence_name"] = json!(meta.source.licence_name);
-    // Here `source` is where the set comes from, its repository, as the contract's
-    // `PublishedRuleMatched.source` has it since version 1.0.0; the set's machine name is the
-    // prefix of `name`, and `set` and `source_name` give it in words.
-    v["source"] = json!(meta.source.url);
-    v["source_name"] = json!(meta.source.set);
-    let evidence = match kind {
-        crate::sigma::Kind::Process => evidence(conn, finding)?,
-        crate::sigma::Kind::File => file_evidence(conn, finding)?,
-    };
-    v["matches"] = json!(counted(conn, finding)?);
-    v["evidence"] = json!(raised_first(evidence));
-    Ok(v)
-}
-
-/// The file events a finding from a published rule keeps, newest first: the file, a rename's
-/// source, and the program, under ECS's names, with `action` the event's own fixed name.
-fn file_evidence(conn: &Connection, finding: &str) -> rusqlite::Result<Vec<Value>> {
-    let text = |s: Option<String>| s.as_deref().map(crate::status::text);
-    conn.prepare(
-        "SELECT timestamp, action, path, source, executable
-         FROM rule_file_evidence WHERE finding = ?1 ORDER BY rowid DESC",
-    )?
-    .query_map([finding], |r| {
-        let action: String = r.get(1)?;
-        Ok(json!({
-            "timestamp_text": crate::status::text(&r.get::<_, String>(0)?),
-            "action": FILE_KINDS.iter().find(|k| **k == action),
-            "file_text": crate::status::text(&r.get::<_, String>(2)?),
-            "source_text": text(r.get(3)?),
-            "executable_text": crate::status::text(&r.get::<_, String>(4)?),
-        }))
-    })?
-    .collect()
-}
-
-/// How many events a finding from a published rule counts.
-fn counted(conn: &Connection, finding: &str) -> rusqlite::Result<i64> {
-    Ok(conn
-        .query_row(
-            "SELECT matches FROM rule_finding WHERE finding = ?1",
-            [finding],
-            |r| r.get(0),
-        )
-        .optional()?
-        .unwrap_or(0))
-}
-
-/// The starts a finding from a published rule keeps, newest first, under ECS's names. The
-/// arguments are cut again, so a set newer than the one that kept them applies, before they
-/// are escaped and capped; `cuts` lists what was cut, since a mark in this JSON's text can be
-/// forged.
-fn evidence(conn: &Connection, finding: &str) -> rusqlite::Result<Vec<Value>> {
-    let text = |s: Option<String>| s.as_deref().map(crate::status::text);
-    conn.prepare(
-        "SELECT timestamp, executable, args, parent_executable, working_directory, pid,
-                parent_pid, user_id, signing_id, team_id, platform_binary
-         FROM rule_evidence WHERE finding = ?1 ORDER BY rowid DESC",
-    )?
-    .query_map([finding], |r| {
-        let args: Vec<String> = serde_json::from_str(&r.get::<_, String>(2)?).unwrap_or_default();
-        let args = crate::secrets::Args::stored(&args);
-        Ok(json!({
-            "timestamp_text": crate::status::text(&r.get::<_, String>(0)?),
-            "executable_text": crate::status::text(&r.get::<_, String>(1)?),
-            "args_text": args
-                .shown(crate::view::shown)
-                .into_iter()
-                .map(crate::status::capped)
-                .collect::<Vec<_>>(),
-            "cuts": args.cuts().iter().map(|c| json!({
-                "argument": c.argument, "kind": c.kind, "length": c.length,
-            })).collect::<Vec<_>>(),
-            "parent_executable_text": text(r.get(3)?),
-            "working_directory_text": text(r.get(4)?),
-            "pid": r.get::<_, i64>(5)?,
-            "parent_pid": r.get::<_, Option<i64>>(6)?,
-            "user_id": r.get::<_, Option<i64>>(7)?,
-            "signing_id_text": text(r.get(8)?),
-            "team_id_text": text(r.get(9)?),
-            "platform_binary": r.get::<_, Option<bool>>(10)?,
-        }))
-    })?
-    .collect()
 }
 
 /// What a replay of the log on disk found. Nothing is read from the store or written to it.
@@ -3901,17 +3806,20 @@ pub struct Series {
 }
 
 /// Program starts read hour by hour over the day before `now`, see `Series`.
+#[cfg(test)]
 pub fn starts_by_hour(conn: &Connection, now: i64) -> rusqlite::Result<Series> {
     series(conn, now, HOUR, HOURS, now - DAY)
 }
 
 /// Program starts read minute by minute over the hour before `now`, see `Series`: the readings
 /// less than an hour old, which are the last hour's by the hour.
+#[cfg(test)]
 pub fn starts_by_minute(conn: &Connection, now: i64) -> rusqlite::Result<Series> {
     series(conn, now, MINUTE, MINUTES, now - HOUR + 1)
 }
 
 /// Program starts read since `from`, in `n` steps of `step` seconds ending at `now`.
+#[cfg(test)]
 fn series(conn: &Connection, now: i64, step: i64, n: usize, from: i64) -> rusqlite::Result<Series> {
     let mut counts = vec![0; n];
     let last = n as i64 - 1;
@@ -3934,6 +3842,15 @@ fn series(conn: &Connection, now: i64, step: i64, n: usize, from: i64) -> rusqli
 
 /// The level, or `None` before any reading of it.
 pub fn level(conn: &Connection, now: i64) -> rusqlite::Result<Option<Level>> {
+    level_with_check(conn, now, None)
+}
+
+/// `level`, using `check_started_at` when the caller has already read `status::latest_finished`.
+pub fn level_with_check(
+    conn: &Connection,
+    now: i64,
+    check_started_at: Option<Option<i64>>,
+) -> rusqlite::Result<Option<Level>> {
     let row = conn
         .query_row(
             "SELECT state, read_at, written, said_by, said, reason, version
@@ -3955,14 +3872,21 @@ pub fn level(conn: &Connection, now: i64) -> rusqlite::Result<Option<Level>> {
         return Ok(None);
     };
     // The latest full check's own reading counts as since it, and every one after it.
-    let check = crate::status::latest_finished(conn)?.map_or(0, |r| r.started_at);
+    let check = match check_started_at {
+        Some(started) => started.unwrap_or(0),
+        None => crate::status::latest_finished(conn)?.map_or(0, |r| r.started_at),
+    };
     let (collected, why) = collected(conn)?;
+    let (file_since_check, file_last_day) = file_tallies(conn, check, now - DAY)?;
     let files = Files {
         collected,
         why,
-        since_check: file_tally_since(conn, Since::Check(check))?,
-        last_day: file_tally_since(conn, Since::At(now - DAY))?,
+        since_check: file_since_check,
+        last_day: file_last_day,
     };
+    let (since_check, last_day, starts_by_hour, starts_by_minute) =
+        event_count_summary(conn, check, now)?;
+    let (matches_last_day, matches_last_week) = matches_windows(conn, now)?;
     Ok(Some(Level {
         files,
         arrivals: arrivals(conn)?,
@@ -3974,13 +3898,152 @@ pub fn level(conn: &Connection, now: i64) -> rusqlite::Result<Option<Level>> {
         said: said.map(|s| crate::secrets::Kept::Said.read(&s)),
         reason,
         version,
-        since_check: tally_since(conn, Since::Check(check))?,
-        last_day: tally_since(conn, Since::At(now - DAY))?,
-        matches_last_day: matches_since(conn, now - DAY)?,
-        matches_last_week: matches_since(conn, now - KEEP_MATCHES)?,
-        starts_by_hour: starts_by_hour(conn, now)?,
-        starts_by_minute: starts_by_minute(conn, now)?,
+        since_check,
+        last_day,
+        matches_last_day,
+        matches_last_week,
+        starts_by_hour,
+        starts_by_minute,
     }))
+}
+
+/// One pass over `event_count` (in `rowid` order) for both spans and both series.
+fn event_count_summary(
+    conn: &Connection,
+    check: i64,
+    now: i64,
+) -> rusqlite::Result<(Tally, Tally, Series, Series)> {
+    let day_from = now - DAY;
+    let minute_series_from = now - HOUR + 1;
+    let mut total = Tally::default();
+    let mut since_check = Tally::default();
+    let mut last_day = Tally::default();
+    let mut found_check = false;
+    let mut by_hour = vec![0i64; HOURS];
+    let mut by_minute = vec![0i64; MINUTES];
+    let last_hour = HOURS as i64 - 1;
+    let last_minute = MINUTES as i64 - 1;
+    let add = |dst: &mut Tally, src: &Tally| {
+        dst.starts += src.starts;
+        dst.lost += src.lost;
+        dst.unknown_gaps += src.unknown_gaps;
+        dst.unreadable += src.unreadable;
+        dst.other += src.other;
+        dst.removed_cap += src.removed_cap;
+        dst.removed_unread += src.removed_unread;
+    };
+    let mut stmt = conn.prepare(
+        "SELECT at, starts, lost, unknown_gaps, unreadable, other, removed_cap, removed_unread
+         FROM event_count ORDER BY rowid",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let at: i64 = r.get(0)?;
+        let row = Tally {
+            starts: r.get(1)?,
+            lost: r.get(2)?,
+            unknown_gaps: r.get(3)?,
+            unreadable: r.get(4)?,
+            other: r.get(5)?,
+            removed_cap: r.get(6)?,
+            removed_unread: r.get(7)?,
+        };
+        if !found_check && at == check {
+            found_check = true;
+        }
+        add(&mut total, &row);
+        if found_check {
+            add(&mut since_check, &row);
+        }
+        if at >= day_from {
+            add(&mut last_day, &row);
+            let ago = ((now - at) / HOUR).clamp(0, last_hour);
+            by_hour[(last_hour - ago) as usize] += row.starts;
+        }
+        if at >= minute_series_from {
+            let ago = ((now - at) / MINUTE).clamp(0, last_minute);
+            by_minute[(last_minute - ago) as usize] += row.starts;
+        }
+    }
+    Ok((
+        if found_check { since_check } else { total },
+        last_day,
+        Series {
+            ends_at: now,
+            step: HOUR,
+            counts: by_hour,
+        },
+        Series {
+            ends_at: now,
+            step: MINUTE,
+            counts: by_minute,
+        },
+    ))
+}
+
+/// One pass over `event_file_count` (in `rowid` order) for both spans.
+fn file_tallies(
+    conn: &Connection,
+    check: i64,
+    day_from: i64,
+) -> rusqlite::Result<(FileTally, FileTally)> {
+    let mut total = FileTally::default();
+    let mut since_check = FileTally::default();
+    let mut last_day = FileTally::default();
+    let mut found_check = false;
+    let add = |dst: &mut FileTally, src: &FileTally| {
+        dst.files += src.files;
+        dst.lost += src.lost;
+        dst.unknown_gaps += src.unknown_gaps;
+        dst.unreadable += src.unreadable;
+    };
+    let mut stmt = conn.prepare(
+        "SELECT at, files, lost, unknown_gaps, unreadable FROM event_file_count ORDER BY rowid",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let at: i64 = r.get(0)?;
+        let row = FileTally {
+            files: r.get(1)?,
+            lost: r.get(2)?,
+            unknown_gaps: r.get(3)?,
+            unreadable: r.get(4)?,
+        };
+        if !found_check && at == check {
+            found_check = true;
+        }
+        add(&mut total, &row);
+        if found_check {
+            add(&mut since_check, &row);
+        }
+        if at >= day_from {
+            add(&mut last_day, &row);
+        }
+    }
+    Ok((if found_check { since_check } else { total }, last_day))
+}
+
+/// How many program starts matched each rule in the last day and in the last week, in one scan.
+fn matches_windows(
+    conn: &Connection,
+    now: i64,
+) -> rusqlite::Result<(BTreeMap<String, i64>, BTreeMap<String, i64>)> {
+    let day_hour = (now - DAY) / HOUR;
+    let week_hour = (now - KEEP_MATCHES) / HOUR;
+    let mut day = BTreeMap::new();
+    let mut week = BTreeMap::new();
+    let mut stmt = conn.prepare("SELECT rule, hour, matches FROM rule_match WHERE hour >= ?1")?;
+    let mut rows = stmt.query([week_hour])?;
+    while let Some(r) = rows.next()? {
+        let rule: String = r.get(0)?;
+        let hour: i64 = r.get(1)?;
+        let count: i64 = r.get(2)?;
+        *week.entry(rule.clone()).or_default() += count;
+        if hour >= day_hour {
+            *day.entry(rule).or_default() += count;
+        }
+    }
+    Ok((day, week))
 }
 
 /// The cap of the log, as the latest reading left it.
@@ -4006,52 +4069,15 @@ pub fn cap_words(bytes: u64) -> String {
     }
 }
 
-/// How many program starts matched each rule in readings from the hour that holds `from` on.
-fn matches_since(conn: &Connection, from: i64) -> rusqlite::Result<BTreeMap<String, i64>> {
-    conn.prepare("SELECT rule, SUM(matches) FROM rule_match WHERE hour >= ?1 GROUP BY rule")?
-        .query_map([from / HOUR], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect()
-}
-
-/// Which readings a span counts.
-#[derive(Clone, Copy)]
-enum Since {
-    /// Those stamped at or after a time: the last day.
-    At(i64),
-    /// Those the store received from a full check's own reading on, which is stamped with the
-    /// check's start, the time given. They are told by the order of the rows, which a clock set
-    /// back cannot rewind: a reading stamped before the check's start that came after it counts.
-    /// The earliest row with that stamp is taken, so one stamped alike earlier only counts more.
-    /// Every row kept when none has it: no full check has finished, it did not read the log, or
-    /// its row was deleted. The rows' order survives `VACUUM`, which copies them in order.
-    Check(i64),
-}
-
-impl Since {
-    /// The condition on the rows of `table`, with its one parameter.
-    fn rows(self, table: &str) -> (String, i64) {
-        match self {
-            Since::At(from) => ("at >= ?1".to_string(), from),
-            Since::Check(start) => (
-                format!("rowid >= COALESCE((SELECT MIN(rowid) FROM {table} WHERE at = ?1), 0)"),
-                start,
-            ),
-        }
-    }
-}
-
-/// The counts of every reading `since` counts.
-fn tally_since(conn: &Connection, since: Since) -> rusqlite::Result<Tally> {
-    let (rows, at) = since.rows("event_count");
+/// The counts of every reading stamped at or after `from`.
+fn tally_since(conn: &Connection, from: i64) -> rusqlite::Result<Tally> {
     conn.query_row(
-        &format!(
-            "SELECT COALESCE(SUM(starts), 0), COALESCE(SUM(lost), 0),
-                    COALESCE(SUM(unknown_gaps), 0), COALESCE(SUM(unreadable), 0),
-                    COALESCE(SUM(other), 0), COALESCE(SUM(removed_cap), 0),
-                    COALESCE(SUM(removed_unread), 0)
-             FROM event_count WHERE {rows}"
-        ),
-        [at],
+        "SELECT COALESCE(SUM(starts), 0), COALESCE(SUM(lost), 0),
+                COALESCE(SUM(unknown_gaps), 0), COALESCE(SUM(unreadable), 0),
+                COALESCE(SUM(other), 0), COALESCE(SUM(removed_cap), 0),
+                COALESCE(SUM(removed_unread), 0)
+         FROM event_count WHERE at >= ?1",
+        [from],
         |r| {
             Ok(Tally {
                 starts: r.get(0)?,
@@ -4066,16 +4092,13 @@ fn tally_since(conn: &Connection, since: Since) -> rusqlite::Result<Tally> {
     )
 }
 
-/// The counts of file events of every reading `since` counts.
-fn file_tally_since(conn: &Connection, since: Since) -> rusqlite::Result<FileTally> {
-    let (rows, at) = since.rows("event_file_count");
+/// The counts of file events of every reading stamped at or after `from`.
+fn file_tally_since(conn: &Connection, from: i64) -> rusqlite::Result<FileTally> {
     conn.query_row(
-        &format!(
-            "SELECT COALESCE(SUM(files), 0), COALESCE(SUM(lost), 0),
-                    COALESCE(SUM(unknown_gaps), 0), COALESCE(SUM(unreadable), 0)
-             FROM event_file_count WHERE {rows}"
-        ),
-        [at],
+        "SELECT COALESCE(SUM(files), 0), COALESCE(SUM(lost), 0),
+                COALESCE(SUM(unknown_gaps), 0), COALESCE(SUM(unreadable), 0)
+         FROM event_file_count WHERE at >= ?1",
+        [from],
         |r| {
             Ok(FileTally {
                 files: r.get(0)?,
@@ -5954,7 +5977,7 @@ mod tests {
         assert_eq!(h.counts.len(), HOURS);
         assert_eq!(
             h.counts.iter().sum::<i64>(),
-            tally_since(&conn, Since::At(now - DAY)).unwrap().starts
+            tally_since(&conn, now - DAY).unwrap().starts
         );
         assert_eq!((h.counts[0], h.counts[1]), (8, 3));
         assert_eq!((h.counts[21], h.counts[22], h.counts[23]), (11, 0, 11));

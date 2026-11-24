@@ -1345,29 +1345,36 @@ fn affecting_in(
     condition: &str,
     values: &[&dyn rusqlite::ToSql],
 ) -> rusqlite::Result<Vec<Affecting>> {
+    // Preload linked (source, advisory) once instead of scanning `vulnerability_linked`
+    // (whose PK starts with `cve`) for every affected row.
+    let linked: HashSet<(String, String)> = conn
+        .prepare("SELECT DISTINCT source, advisory FROM vulnerability_linked")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
     let mut list: Vec<Affecting> = conn
         .prepare(&format!(
             "SELECT v.checkout, v.ecosystem, v.package, v.source, v.advisory, v.modified,
                     a.kind, a.severity, a.summary, a.aliases, v.entries, v.fixed, v.read_at,
-                    v.since_at,
-                    EXISTS (SELECT 1 FROM vulnerability_linked l
-                            WHERE l.source = v.source AND l.advisory = v.advisory)
+                    v.since_at
              FROM {table} v
              JOIN advisory a ON a.source = v.source AND a.id = v.advisory
              WHERE v.answer = 'affected' AND {condition}"
         ))?
         .query_map(values, |r| {
+            let source: String = r.get(3)?;
+            let advisory: String = r.get(4)?;
             let kind: String = r.get(6)?;
             let severity: Option<String> = r.get(7)?;
             let aliases: String = r.get(9)?;
             let entries: String = r.get(10)?;
             let fixed: String = r.get(11)?;
+            let exploited = linked.contains(&(source.clone(), advisory.clone()));
             Ok(Affecting {
                 checkout: r.get(0)?,
                 ecosystem: r.get(1)?,
                 package: r.get(2)?,
-                source: r.get(3)?,
-                advisory: r.get(4)?,
+                source,
+                advisory,
                 modified: r.get(5)?,
                 label: label_of(&kind, severity.as_deref()),
                 kind,
@@ -1377,7 +1384,7 @@ fn affecting_in(
                 fixed: serde_json::from_str(&fixed).unwrap_or_default(),
                 read_at: r.get(12)?,
                 since_at: r.get(13)?,
-                exploited: r.get(14)?,
+                exploited,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -1593,13 +1600,22 @@ fn judged_now<'a>(answer: &'a str, reason: &'a str, stale: bool) -> (&'a str, &'
 /// The totals as they stand at `now`: the answers the last check wrote, with "not affected"
 /// counted as "don't know" where its data is not current at `now`.
 pub fn totals(conn: &Connection, now: i64) -> rusqlite::Result<Totals> {
+    let places: Vec<(String, String, String, String)> = conn
+        .prepare("SELECT checkout, ecosystem, lockfiles, feed FROM vulnerability_place")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let catalogue_compared: Vec<&'static str> = FEEDS
+        .iter()
+        .filter(|feed| {
+            places
+                .iter()
+                .any(|(_, e, l, f)| e == feed.ecosystem && f == "current" && l != "not_read")
+        })
+        .map(|feed| feed.ecosystem)
+        .collect();
     let mut t = Totals {
-        matched: conn.query_row(
-            "SELECT EXISTS (SELECT 1 FROM vulnerability_place)",
-            [],
-            |r| r.get(0),
-        )?,
-        catalogue_compared: catalogue_compared(conn)?,
+        matched: !places.is_empty(),
+        catalogue_compared,
         ..Totals::default()
     };
     let stale = stale_at(conn, now)?;
@@ -1611,44 +1627,75 @@ pub fn totals(conn: &Connection, now: i64) -> rusqlite::Result<Totals> {
     // What cannot be told of each project, as every answer gives it.
     let unread = unread_places(conn)?;
     let untold: HashSet<String> = unread.iter().map(|p| p.0.clone()).collect();
-    let mut counts: Vec<(String, String, i64)> = Vec::new();
-    let rows: Vec<(String, String, String, String, i64)> = conn
-        .prepare(
-            "SELECT checkout, answer, reason, source, COUNT(*) FROM vulnerability_answer
-             GROUP BY checkout, answer, reason, source",
-        )?
-        .query_map([], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    for (checkout, answer, reason, source, n) in &rows {
-        let (answer, reason) = judged_now(answer, reason, stale.contains_key(source.as_str()));
-        let (answer, reason) = untold_now(answer, reason, untold.contains(checkout));
-        match counts
-            .iter_mut()
-            .find(|(a, r, _)| a == answer && r == reason)
-        {
-            Some(c) => c.2 += n,
-            None => counts.push((answer.to_string(), reason.to_string(), *n)),
-        }
-    }
-    for (answer, _, n) in &counts {
-        let n = *n as usize;
-        match answer.as_str() {
-            "affected" => t.affected += n,
-            "unknown" => t.unknown += n,
-            _ => t.not_affected += n,
-        }
-    }
+    let rank_of = |reason: &str| {
+        REASONS
+            .iter()
+            .position(|r| *r == reason)
+            .unwrap_or(REASONS.len())
+    };
+    let mut counts: HashMap<(String, String), usize> = HashMap::new();
+    let mut first: BTreeMap<(String, String, String), usize> = BTreeMap::new();
     let mut labels: BTreeMap<&'static str, usize> = BTreeMap::new();
     let mut records: BTreeMap<(String, String), &'static str> = BTreeMap::new();
     let mut packages: BTreeSet<(String, String)> = BTreeSet::new();
     let mut projects: BTreeSet<String> = BTreeSet::new();
-    for a in affecting(conn)? {
-        *labels.entry(a.label).or_default() += 1;
-        records.insert((a.source, a.advisory), a.label);
-        packages.insert((a.ecosystem, a.package));
-        projects.insert(a.checkout);
+    // One pass over `vulnerability_answer` instead of three, joining `advisory` only for
+    // `affected` rows without parsing JSON columns that `totals` does not use.
+    {
+        let mut stmt = conn.prepare(
+            "SELECT v.checkout, v.ecosystem, v.package, v.source, v.advisory,
+                    v.answer, v.reason, a.kind, a.severity
+             FROM vulnerability_answer v
+             LEFT JOIN advisory a
+               ON v.answer = 'affected' AND a.source = v.source AND a.id = v.advisory",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let checkout = r.get_ref(0)?.as_str()?;
+            let ecosystem = r.get_ref(1)?.as_str()?;
+            let package = r.get_ref(2)?.as_str()?;
+            let source = r.get_ref(3)?.as_str()?;
+            let advisory = r.get_ref(4)?.as_str()?;
+            let raw_answer = r.get_ref(5)?.as_str()?;
+            let raw_reason = r.get_ref(6)?.as_str()?;
+            let (answer, reason) = judged_now(raw_answer, raw_reason, stale.contains_key(source));
+            let (answer, reason) = untold_now(answer, reason, untold.contains(checkout));
+            match answer {
+                "affected" => t.affected += 1,
+                "unknown" => {
+                    t.unknown += 1;
+                    *counts
+                        .entry((answer.to_string(), reason.to_string()))
+                        .or_default() += 1;
+                }
+                _ => t.not_affected += 1,
+            }
+            if raw_answer == "affected" {
+                // `affecting` joins `advisory` with INNER JOIN; skip if absent.
+                if let rusqlite::types::ValueRef::Text(kind_bytes) = r.get_ref(7)? {
+                    let kind = std::str::from_utf8(kind_bytes).unwrap_or_default();
+                    let severity = match r.get_ref(8)? {
+                        rusqlite::types::ValueRef::Text(b) => std::str::from_utf8(b).ok(),
+                        _ => None,
+                    };
+                    let label = label_of(kind, severity);
+                    *labels.entry(label).or_default() += 1;
+                    records.insert((source.to_string(), advisory.to_string()), label);
+                    packages.insert((ecosystem.to_string(), package.to_string()));
+                    projects.insert(checkout.to_string());
+                }
+            } else if answer == "unknown" {
+                let rank = rank_of(reason);
+                let slot = first
+                    .entry((
+                        checkout.to_string(),
+                        ecosystem.to_string(),
+                        package.to_string(),
+                    ))
+                    .or_insert(rank);
+                *slot = (*slot).min(rank);
+            }
+        }
     }
     let in_order = |of: &BTreeMap<&'static str, usize>| -> Vec<(&'static str, usize)> {
         LABELS
@@ -1663,81 +1710,37 @@ pub fn totals(conn: &Connection, now: i64) -> rusqlite::Result<Totals> {
     }
     t.records_by_label = in_order(&record_labels);
     (t.records, t.packages, t.projects) = (records.len(), packages.len(), projects.len());
-    // A package counts once, under the first reason of its "don't know" answers.
-    let unknown: Vec<(String, String, String, String)> = conn
-        .prepare(
-            "SELECT checkout, ecosystem, package, answer, reason, source FROM vulnerability_answer
-             WHERE answer != 'affected'",
-        )?
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .into_iter()
-        .filter_map(|(c, e, p, answer, reason, source)| {
-            let (answer, reason) =
-                judged_now(&answer, &reason, stale.contains_key(source.as_str()));
-            let (answer, reason) = untold_now(answer, reason, untold.contains(&c));
-            (answer == "unknown").then(|| (c, e, p, reason.to_string()))
-        })
-        .collect();
-    let rank_of = |reason: &str| {
-        REASONS
-            .iter()
-            .position(|r| *r == reason)
-            .unwrap_or(REASONS.len())
-    };
-    let mut first: BTreeMap<(String, String, String), usize> = BTreeMap::new();
-    for (c, e, p, reason) in unknown {
-        let rank = rank_of(&reason);
-        let slot = first.entry((c, e, p)).or_insert(rank);
-        *slot = (*slot).min(rank);
-    }
     // Data that is not current, or was never read, may lack the record that names a package,
     // so every package of such a place is "don't know" with the feed's reason. One that no
     // record held names has no answer of its own and is one more "don't know" answer here,
     // standing for the records the data lacks.
-    let stale_places: HashSet<(String, String)> = conn
-        .prepare("SELECT checkout, ecosystem, feed FROM vulnerability_place")?
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .into_iter()
-        .filter(|(_, e, feed)| feed == "not_current" || stale_eco.contains(e.as_str()))
-        .map(|(c, e, _)| (c, e))
+    let stale_places: HashSet<(&str, &str)> = places
+        .iter()
+        .filter(|(_, e, _, feed)| feed == "not_current" || stale_eco.contains(e.as_str()))
+        .map(|(c, e, _, _)| (c.as_str(), e.as_str()))
         .collect();
     let mut unanswered = 0;
-    for (c, e, p) in held_packages(conn)?.into_keys() {
-        if !stale_places.contains(&(c.clone(), e.to_string())) {
-            continue;
-        }
-        if let std::collections::btree_map::Entry::Vacant(slot) = first.entry((c, e.to_string(), p))
-        {
-            slot.insert(rank_of(FEED_NOT_READ));
-            unanswered += 1;
+    if !stale_places.is_empty() {
+        for (c, e, p) in held_packages(conn)?.into_keys() {
+            if !stale_places.contains(&(c.as_str(), e)) {
+                continue;
+            }
+            if let std::collections::btree_map::Entry::Vacant(slot) =
+                first.entry((c, e.to_string(), p))
+            {
+                slot.insert(rank_of(FEED_NOT_READ));
+                unanswered += 1;
+            }
         }
     }
     t.unknown += unanswered;
     t.by_reason = REASONS
         .iter()
         .map(|code| {
-            let mut n: usize = counts
-                .iter()
-                .filter(|(a, r, _)| a == "unknown" && r == code)
-                .map(|(_, _, n)| *n as usize)
-                .sum();
+            let mut n = counts
+                .get(&("unknown".to_string(), (*code).to_string()))
+                .copied()
+                .unwrap_or(0);
             if *code == FEED_NOT_READ {
                 n += unanswered;
             }
@@ -1761,25 +1764,14 @@ pub fn totals(conn: &Connection, now: i64) -> rusqlite::Result<Totals> {
     // at the check and now, it has no place not wholly read, and none of its packages is
     // "don't know", whatever the reason: one such package and it was not compared in full.
     let untold_package: HashSet<&str> = t.unknown_packages.iter().map(|u| u.0.as_str()).collect();
-    let mut compared: BTreeMap<String, bool> = BTreeMap::new();
-    for (c, e, lockfiles, feed) in conn
-        .prepare("SELECT checkout, ecosystem, lockfiles, feed FROM vulnerability_place")?
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-    {
+    let mut compared: BTreeMap<&str, bool> = BTreeMap::new();
+    for (c, e, lockfiles, feed) in &places {
         let whole = lockfiles == "full" && feed == "current" && !stale_eco.contains(e.as_str());
-        *compared.entry(c).or_insert(false) |= whole;
+        *compared.entry(c.as_str()).or_insert(false) |= whole;
     }
     t.projects_compared = compared
         .into_iter()
-        .filter(|(c, whole)| *whole && !untold.contains(c) && !untold_package.contains(c.as_str()))
+        .filter(|(c, whole)| *whole && !untold.contains(*c) && !untold_package.contains(*c))
         .count();
     t.unread_places = unread;
     t.informational = conn.query_row(
@@ -1872,23 +1864,18 @@ pub fn at_shown(at: &str) -> String {
     }
 }
 
-/// The totals as the contract gives them, with each feed and whether it is current now: the
-/// status's part about known vulnerabilities, and the totals of `immunity vulnerabilities`.
-/// Absent when matching never ran on this store: nothing was counted, so nothing reads as 0.
-pub fn totals_message(
-    conn: &Connection,
-    now: i64,
-) -> rusqlite::Result<Option<v1::VulnerabilityTotals>> {
-    // Matching runs in every check that finishes.
-    if crate::status::latest_finished(conn)?.is_none() {
-        return Ok(None);
-    }
-    let t = totals(conn, now)?;
-    totals_of(conn, now, &t).map(Some)
-}
-
 /// The totals `t` as the contract gives them.
 fn totals_of(conn: &Connection, now: i64, t: &Totals) -> rusqlite::Result<v1::VulnerabilityTotals> {
+    totals_of_with(conn, now, t, None)
+}
+
+/// The totals `t` as the contract gives them, reusing already-read `latest` coverage when given.
+pub fn totals_of_with(
+    conn: &Connection,
+    now: i64,
+    t: &Totals,
+    latest: Option<&[crate::view::Latest]>,
+) -> rusqlite::Result<v1::VulnerabilityTotals> {
     let n = |x: usize| x as u64;
     let by = |list: &[(&'static str, usize)]| -> Vec<v1::Count> {
         list.iter()
@@ -1898,6 +1885,14 @@ fn totals_of(conn: &Connection, now: i64, t: &Totals) -> rusqlite::Result<v1::Vu
             })
             .collect()
     };
+    let projects_found = match latest {
+        Some(latest) => {
+            let this = crate::covered::this_machine(conn)?;
+            crate::covered::projects_found(latest, this.as_deref())
+        }
+        None => projects_found(conn)?,
+    };
+    let (without_lockfile, not_read) = project_counts(&t.unread_places);
     Ok(v1::VulnerabilityTotals {
         affected: n(t.affected),
         unknown: n(t.unknown),
@@ -1925,10 +1920,10 @@ fn totals_of(conn: &Connection, now: i64, t: &Totals) -> rusqlite::Result<v1::Vu
             .collect(),
         informational_records: n(t.informational),
         places_not_read: n(t.unread_places.iter().filter(|p| p.2 != NONE_FOUND).count()),
-        projects_not_read: n(project_counts(&t.unread_places).1),
-        projects_without_lockfile: n(project_counts(&t.unread_places).0),
+        projects_not_read: n(not_read),
+        projects_without_lockfile: n(without_lockfile),
         projects_compared: n(t.projects_compared),
-        projects_found: Some(projects_found(conn)?),
+        projects_found: Some(projects_found),
     })
 }
 

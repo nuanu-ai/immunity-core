@@ -176,17 +176,55 @@ fn read_through(
         (awake, store::id(&tx).map_err(|e| unreadable(&e))?)
     };
     let queue = log(&awake);
-    let conn = store::open_read_only(&args.store).map_err(Failure::Store)?;
-    let tx = conn.unchecked_transaction().map_err(|e| unreadable(&e))?;
-    if store::id(&tx).map_err(|e| unreadable(&e))? != id {
-        let why = "the store was replaced while the event log was read; ask again";
-        return Err(Failure::Store(Outcome::new(Code::Moved, why)));
-    }
-    let held = Held {
-        read_to: events::read_up_to(&tx).map_err(|e| unreadable(&e))?,
-        state: events::state_read(&tx).map_err(|e| unreadable(&e))?,
-        findings: finding_refs(&tx, now).map_err(|e| unreadable(&e))?,
-        arrivals: events::arrivals(&tx).map_err(|e| unreadable(&e))?,
+    let has_hits = matches!(&queue, Queue::Read(s) if !s.hits.is_empty());
+    let (held, hit_meta) = {
+        let conn = store::open_read_only(&args.store).map_err(Failure::Store)?;
+        let tx = conn.unchecked_transaction().map_err(|e| unreadable(&e))?;
+        if store::id(&tx).map_err(|e| unreadable(&e))? != id {
+            let why = "the store was replaced while the event log was read; ask again";
+            return Err(Failure::Store(Outcome::new(Code::Moved, why)));
+        }
+        let held = Held {
+            read_to: if has_hits {
+                events::read_up_to(&tx).map_err(|e| unreadable(&e))?
+            } else {
+                BTreeMap::new()
+            },
+            state: events::state_read(&tx).map_err(|e| unreadable(&e))?,
+            findings: if has_hits {
+                finding_refs(&tx, now).map_err(|e| unreadable(&e))?
+            } else {
+                BTreeMap::new()
+            },
+            arrivals: events::arrivals(&tx).map_err(|e| unreadable(&e))?,
+        };
+        // Finish all store queries before releasing the SHARED lock, so CPU-heavy secret cutting
+        // on matched command lines runs outside any SQLite transaction.
+        let mut hit_meta = Vec::new();
+        if let Queue::Read(s) = &queue {
+            for hit in &s.hits {
+                let position = hit.at.to_string();
+                let mut per_rule = Vec::with_capacity(hit.matched.len());
+                for (_, meta) in &hit.matched {
+                    let (raised, mut findings) =
+                        raised(&tx, &held, hit, meta).map_err(|e| unreadable(&e))?;
+                    let said = verdict::listed(
+                        &tx,
+                        "position = ?1 AND rule = ?2",
+                        &[&position, &meta.name],
+                    )
+                    .map_err(|e| unreadable(&e))?;
+                    if let Some(f) = said.2.iter().rev().find_map(|v| v.finding.as_ref())
+                        && let Some(r) = held.findings.get(f)
+                    {
+                        findings.push(r.clone());
+                    }
+                    per_rule.push((raised, findings, said));
+                }
+                hit_meta.push((position, per_rule));
+            }
+        }
+        (held, hit_meta)
     };
     let after = args.after.as_ref();
     let mut answer = v1::Matches {
@@ -221,25 +259,18 @@ fn read_through(
         Queue::Read(s) => {
             let mut collector = collector(&s, &held.arrivals);
             status_state(&mut collector);
-            for hit in &s.hits {
+            for (hit, (position, per_rule)) in s.hits.iter().zip(hit_meta) {
                 let event = event(&hit.event);
-                for (file, meta) in &hit.matched {
-                    let (raised, mut findings) =
-                        raised(&tx, &held, hit, meta).map_err(|e| unreadable(&e))?;
-                    let position = hit.at.to_string();
-                    // The response layer's verdicts about the match, read by the match; the
-                    // finding its latest suspicious one went to is named after the core's.
-                    let said = verdict::listed(
-                        &tx,
-                        "position = ?1 AND rule = ?2",
-                        &[&position, &meta.name],
-                    )
-                    .map_err(|e| unreadable(&e))?;
-                    if let Some(f) = said.2.iter().rev().find_map(|v| v.finding.as_ref())
-                        && let Some(r) = held.findings.get(f)
-                    {
-                        findings.push(r.clone());
-                    }
+                let last_idx = hit.matched.len().saturating_sub(1);
+                let mut event = Some(event);
+                for (idx, ((file, meta), (raised, findings, said))) in
+                    hit.matched.iter().zip(per_rule).enumerate()
+                {
+                    let ev = if idx == last_idx {
+                        event.take()
+                    } else {
+                        event.clone()
+                    };
                     answer.matches.push(v1::RuleMatch {
                         verdicts: verdict::verdicts(
                             said,
@@ -247,9 +278,9 @@ fn read_through(
                             &held.findings,
                             None,
                         ),
-                        position,
+                        position: position.clone(),
                         rule: Some(rule(file, meta)),
-                        event: Some(event.clone()),
+                        event: ev,
                         raised: raised as i32,
                         findings,
                     });

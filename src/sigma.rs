@@ -20,6 +20,7 @@
 //!
 //! Nothing is stored and nothing is printed here.
 
+#[cfg(test)]
 use serde_json::{Value as Json, json};
 use serde_norway::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -1049,9 +1050,11 @@ impl Loaded {
 pub struct Match<'a> {
     pub file: &'static str,
     pub meta: &'a Meta,
+    #[cfg(test)]
     pub kind: Kind,
 }
 
+#[cfg(test)]
 impl Match<'_> {
     /// What a message made from this match carries, the rule's authors included as the
     /// Detection Rule License asks.
@@ -1161,7 +1164,7 @@ impl Rules {
     }
 
     /// The rules marked in `hit`, in the order they are shipped.
-    fn matched(&self, kind: Kind, hit: &[bool]) -> Vec<Match<'_>> {
+    fn matched(&self, _kind: Kind, hit: &[bool]) -> Vec<Match<'_>> {
         self.rules
             .iter()
             .zip(hit)
@@ -1170,7 +1173,8 @@ impl Rules {
                 Some(Match {
                     file: l.file,
                     meta: l.meta.as_ref()?,
-                    kind,
+                    #[cfg(test)]
+                    kind: _kind,
                 })
             })
             .collect()

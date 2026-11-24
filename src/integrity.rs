@@ -38,7 +38,7 @@ use crate::codesign;
 use crate::look::{Look, NOT_HERE, Said};
 use crate::store::{Gap, Statement};
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::os::unix::ffi::OsStrExt;
@@ -1343,21 +1343,6 @@ pub fn summary(conn: &Connection, run_id: &str) -> rusqlite::Result<Option<Summa
     if !crate::store::read_any(conn, READER)? {
         return Ok(None);
     }
-    let count = |sql: &str, kind: &str| -> rusqlite::Result<i64> {
-        conn.query_row(sql, params![READER, kind], |r| r.get(0))
-    };
-    let live = "SELECT COUNT(DISTINCT subject) FROM assertion
-                WHERE layer = 'live' AND reader = ?1 AND kind = ?2 AND predicate = 'has_digest'";
-    let mut signers = BTreeMap::new();
-    let mut stmt = conn.prepare(
-        "SELECT object FROM assertion WHERE layer = 'live' AND reader = ?1 AND kind = ?2
-           AND predicate = 'signed_by'",
-    )?;
-    for row in stmt.query_map(params![READER, BUNDLES], |r| r.get::<_, String>(0))? {
-        let signer = row?;
-        let class = signer.split(',').next().unwrap_or_default().to_string();
-        *signers.entry(class).or_default() += 1;
-    }
     let first_run: Option<String> = conn
         .query_row(
             "SELECT run_id FROM coverage WHERE reader = ?1 AND kind = ?2
@@ -1366,23 +1351,67 @@ pub fn summary(conn: &Connection, run_id: &str) -> rusqlite::Result<Option<Summa
             |r| r.get(0),
         )
         .optional()?;
-    let not_verifying = |since: Option<&str>| -> rusqlite::Result<i64> {
-        conn.query_row(
-            "SELECT COUNT(DISTINCT subject) FROM assertion
-             WHERE layer = 'live' AND reader = ?1 AND kind = ?2 AND predicate = 'has_seal'
-               AND object != ?3 AND (?4 IS NULL OR run_id = ?4)",
-            params![READER, BUNDLES, codesign::VERIFIES, since],
-            |r| r.get(0),
-        )
-    };
-    let verified: i64 = conn.query_row(
-        "SELECT COUNT(DISTINCT subject) FROM assertion
-         WHERE layer = 'live' AND reader = ?1 AND kind = ?2 AND run_id = ?3
-           AND predicate IN ('has_digest', 'has_version', 'has_seal')",
-        params![READER, BUNDLES, run_id],
-        |r| r.get(0),
-    )?;
-    let bundles = count(live, BUNDLES)?;
+    let mut signers: BTreeMap<String, i64> = BTreeMap::new();
+    let mut bundles_set: HashSet<String> = HashSet::new();
+    let mut kegs_set: HashSet<String> = HashSet::new();
+    let mut packages_set: HashSet<String> = HashSet::new();
+    let mut app_folders_set: HashSet<String> = HashSet::new();
+    let mut not_verifying_set: HashSet<String> = HashSet::new();
+    let mut not_verifying_first_set: HashSet<String> = HashSet::new();
+    let mut verified_set: HashSet<String> = HashSet::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT kind, predicate, subject, object, run_id FROM assertion
+             WHERE layer = 'live' AND reader = ?1",
+        )?;
+        let mut rows = stmt.query([READER])?;
+        while let Some(r) = rows.next()? {
+            let kind = r.get_ref(0)?.as_str()?;
+            let predicate = r.get_ref(1)?.as_str()?;
+            let subject = r.get_ref(2)?.as_str()?;
+            let object = r.get_ref(3)?.as_str()?;
+            let row_run = r.get_ref(4)?.as_str()?;
+            if predicate == "has_digest" {
+                match kind {
+                    BUNDLES => {
+                        bundles_set.insert(subject.to_string());
+                    }
+                    KEGS => {
+                        kegs_set.insert(subject.to_string());
+                    }
+                    NPM => {
+                        packages_set.insert(subject.to_string());
+                    }
+                    APP_SUPPORT => {
+                        app_folders_set.insert(subject.to_string());
+                    }
+                    _ => {}
+                }
+            }
+            if kind == BUNDLES {
+                match predicate {
+                    "signed_by" => {
+                        let class = object.split(',').next().unwrap_or_default().to_string();
+                        *signers.entry(class).or_default() += 1;
+                    }
+                    "has_seal" if object != codesign::VERIFIES => {
+                        not_verifying_set.insert(subject.to_string());
+                        if first_run.as_deref() == Some(row_run) {
+                            not_verifying_first_set.insert(subject.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+                if row_run == run_id
+                    && matches!(predicate, "has_digest" | "has_version" | "has_seal")
+                {
+                    verified_set.insert(subject.to_string());
+                }
+            }
+        }
+    }
+    let bundles = bundles_set.len() as i64;
+    let verified = verified_set.len() as i64;
     let mut readings = Vec::new();
     let mut stmt = conn.prepare(
         "SELECT kind, completeness, reason FROM coverage WHERE reader = ?1 AND run_id = ?2
@@ -1401,16 +1430,13 @@ pub fn summary(conn: &Connection, run_id: &str) -> rusqlite::Result<Option<Summa
         )?,
         bundles,
         signers,
-        not_verifying: not_verifying(None)?,
-        not_verifying_since_first: match &first_run {
-            Some(first) => not_verifying(Some(first))?,
-            None => 0,
-        },
+        not_verifying: not_verifying_set.len() as i64,
+        not_verifying_since_first: not_verifying_first_set.len() as i64,
         verified,
         carried: bundles - verified,
-        kegs: count(live, KEGS)?,
-        packages: count(live, NPM)?,
-        app_folders: count(live, APP_SUPPORT)?,
+        kegs: kegs_set.len() as i64,
+        packages: packages_set.len() as i64,
+        app_folders: app_folders_set.len() as i64,
         changed_in_place: changed_in_place(conn, run_id)?
             .iter()
             .map(|(_, subject, _, _)| subject)

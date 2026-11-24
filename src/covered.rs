@@ -200,9 +200,18 @@ fn earlier_probe(r: &Latest) -> bool {
 /// Is this Mac watched, and how: from the latest readings, `live` and when a watcher last
 /// read. `not_checked` before any reading of this Mac; `watched_in_part` when a reading of its
 /// own places failed, that is, they are there and could not be read; else `watched`.
-pub fn this_mac(conn: &Connection, latest: &[Latest], live: bool) -> rusqlite::Result<ThisMac> {
+pub fn this_mac_with(
+    conn: &Connection,
+    latest: &[Latest],
+    live: bool,
+    checked_at: Option<Option<i64>>,
+    files: Option<&BTreeMap<String, i64>>,
+) -> rusqlite::Result<ThisMac> {
     let this = this_machine(conn)?;
-    let checked_at = status::latest_finished(conn)?.and_then(|r| r.finished_at);
+    let checked_at = match checked_at {
+        Some(at) => at,
+        None => status::latest_finished(conn)?.and_then(|r| r.finished_at),
+    };
     let live_read_at = crate::watch::last_read(conn)?;
     let Some(this) = this else {
         return Ok(ThisMac {
@@ -225,11 +234,18 @@ pub fn this_mac(conn: &Connection, latest: &[Latest], live: bool) -> rusqlite::R
             .query_map([reader], |r| Ok((r.get(0)?, r.get(1)?)))?
             .collect()
     };
-    let files = counts(
-        "SELECT object, COUNT(DISTINCT subject) FROM assertion
-         WHERE layer = 'live' AND reader = ?1 AND predicate = 'watched_as' GROUP BY object",
-        watched::READER,
-    )?;
+    let owned_files;
+    let files = match files {
+        Some(f) => f,
+        None => {
+            owned_files = counts(
+                "SELECT object, COUNT(DISTINCT subject) FROM assertion
+                 WHERE layer = 'live' AND reader = ?1 AND predicate = 'watched_as' GROUP BY object",
+                watched::READER,
+            )?;
+            &owned_files
+        }
+    };
     let installed = counts(
         "SELECT kind, COUNT(DISTINCT subject) FROM assertion
          WHERE layer = 'live' AND reader = ?1 AND predicate = 'has_digest' GROUP BY kind",
@@ -239,15 +255,17 @@ pub fn this_mac(conn: &Connection, latest: &[Latest], live: bool) -> rusqlite::R
     // full run, reads only the watched places, which every reading of this Mac reads.
     let installed_read = mine.iter().any(|r| r.reader == integrity::READER);
     // Packages of the projects on this Mac, once their lockfiles have been read.
-    let in_checkout = format!("checkout:{this}/%");
+    let from = format!("checkout:{this}/");
+    let to = format!("checkout:{this}0");
     let dependencies: Option<i64> = if latest
         .iter()
         .any(|r| r.reader == crate::lockfiles::READER && r.scope.starts_with("checkout:"))
     {
         Some(conn.query_row(
             "SELECT COUNT(DISTINCT subject) FROM assertion
-             WHERE layer = 'live' AND reader = ?1 AND predicate = 'part_of' AND scope LIKE ?2",
-            params![crate::lockfiles::READER, in_checkout],
+             WHERE layer = 'live' AND reader = ?1 AND scope >= ?2 AND scope < ?3
+               AND predicate = 'part_of'",
+            params![crate::lockfiles::READER, from, to],
             |r| r.get(0),
         )?)
     } else {
@@ -973,11 +991,14 @@ fn with_reason(place: String, reason: Option<&str>) -> Example {
 
 /// What the program does not cover, one item per cause, in the order of `CAUSES`: what the
 /// owner can fix first.
-pub fn not_covered(
+pub fn not_covered_with(
     conn: &Connection,
     latest: &[Latest],
     p: &Problems,
     catalogue: Option<&Catalogue>,
+    event_level: Option<Option<&crate::events::Level>>,
+    vuln_totals: Option<&crate::vulnerabilities::Totals>,
+    latest_run_started: Option<Option<i64>>,
 ) -> rusqlite::Result<Vec<Uncovered>> {
     let mac = findings::This::of(conn, this_machine(conn)?)?;
     let this = mac.as_ref().map(|m| m.id.as_str());
@@ -1054,7 +1075,15 @@ pub fn not_covered(
     // The event level, as its latest reading left it: not installed, or installed and not
     // recording, each with its own words. A reading of it that failed is among the readings
     // that failed above.
-    if let Some(l) = crate::events::level(conn, crate::now_secs())? {
+    let owned_level;
+    let level_ref = match event_level {
+        Some(l) => l,
+        None => {
+            owned_level = crate::events::level(conn, crate::now_secs())?;
+            owned_level.as_ref()
+        }
+    };
+    if let Some(l) = level_ref {
         let cause = match l.state.as_str() {
             crate::events::NOT_INSTALLED => Some(&EVENTS_OFF),
             crate::events::REFUSED => Some(&EVENTS_REFUSED),
@@ -1292,11 +1321,15 @@ pub fn not_covered(
     // not, and why not, matched feed by matched feed (`vulnerabilities::matched_feeds`): why its
     // latest download failed, else why what it holds is not current. A feed of an ecosystem not
     // matched has its failure on the line of downloads alone.
-    if let Some(run) = status::latest_finished(conn)?
-        && let Some(since) = crate::vulnerabilities::stale(conn, run.started_at)?
+    let run_started = match latest_run_started {
+        Some(started) => started,
+        None => status::latest_finished(conn)?.map(|r| r.started_at),
+    };
+    if let Some(started_at) = run_started
+        && let Some(since) = crate::vulnerabilities::stale(conn, started_at)?
     {
         let (mut reasons, mut failures, mut yours) = (Vec::new(), Vec::new(), false);
-        for f in crate::vulnerabilities::matched_freshness(conn, run.started_at)? {
+        for f in crate::vulnerabilities::matched_freshness(conn, started_at)? {
             let Some(not_current) = f.not_current else {
                 continue;
             };
@@ -1329,7 +1362,14 @@ pub fn not_covered(
     // Packages whose answer is "don't know", one count, with each reason and its count. The
     // data not being current is the item above, and here it is the reason for the packages
     // it leaves untold.
-    let t = crate::vulnerabilities::totals(conn, crate::now_secs())?;
+    let owned_totals;
+    let t = match vuln_totals {
+        Some(t) => t,
+        None => {
+            owned_totals = crate::vulnerabilities::totals(conn, crate::now_secs())?;
+            &owned_totals
+        }
+    };
     if t.packages_unknown > 0 {
         out.push(Uncovered {
             reasons: t

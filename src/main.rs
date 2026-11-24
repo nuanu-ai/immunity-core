@@ -2513,7 +2513,15 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     let problems = status::problems(&tx, &latest)?;
     let needs = findings::needs(&tx, at)?;
     // What is not covered is one clause, never a count of things to look at.
-    let not_covered = covered::not_covered(&tx, &latest, &problems, summary.catalogue.as_ref())?;
+    let not_covered = covered::not_covered_with(
+        &tx,
+        &latest,
+        &problems,
+        summary.catalogue.as_ref(),
+        None,
+        Some(&summary.vulnerabilities),
+        Some(Some(summary.run.started_at)),
+    )?;
     let mut said = needs_sentence(needs.items.len(), opened);
     if let Some(clause) = covered::clause(&not_covered) {
         said.push(' ');

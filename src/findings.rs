@@ -1128,9 +1128,6 @@ pub struct Found {
     /// What it is about, in the program's words, where no name from the Mac says it: for the
     /// item of places read for the first time, those places counted by kind.
     pub thing: Option<String>,
-    /// For a published rule's finding, the rule, its count and its evidence, as
-    /// `events::finding_detail` gives them.
-    pub detail: Option<Value>,
     /// What it carries of the response layer's verdicts (`verdict::attach`).
     pub verdicts: Option<crate::verdict::Summary>,
     /// Its latest occurrence is a place that could not be read, and nothing it rests on is a
@@ -1163,117 +1160,120 @@ fn state_at(state: String, until: Option<i64>, again: bool, now: i64) -> String 
 
 /// Every finding, newest first.
 pub fn all(conn: &Connection, now: i64) -> rusqlite::Result<Vec<Found>> {
-    let this = This::of(conn, this_machine(conn)?)?;
+    all_with_packages(conn, now).map(|(found, _)| found)
+}
+
+/// Every finding, newest first, together with any vulnerability data already loaded for
+/// `lockfiles.*` findings so callers do not query those tables a second time.
+pub fn all_with_packages(
+    conn: &Connection,
+    now: i64,
+) -> rusqlite::Result<(Vec<Found>, Option<crate::finding_answer::Packages>)> {
+    let this = this_with_name(conn)?;
     let mut affecting: Option<Vec<crate::vulnerabilities::Affecting>> = None;
     let mut kept: Option<std::collections::BTreeMap<String, crate::vulnerabilities::Kept>> = None;
-    conn.prepare(&format!(
-        "SELECT id, rule, about, state, change, first_seen_at, first_seen_run, last_seen_at,
-                last_seen_run, answered_at, reason, until_at,
-                (SELECT object FROM assertion a WHERE a.subject = f.about
-                   AND a.predicate = 'installed_at' ORDER BY a.id DESC LIMIT 1),
-                (SELECT j.new_value FROM finding_basis b JOIN journal j ON j.seq = b.journal
-                 WHERE b.finding = f.id
-                   AND ((j.entry IN ('added', 'changed', 'sampled')
-                         AND j.predicate = CASE f.rule WHEN 'integrity.app-seal' THEN 'has_seal'
-                                                       WHEN 'integrity.app-signer' THEN 'signed_by'
-                                                       WHEN 'indicator.match' THEN 'matches_indicator'
-                                                       END)
-                        OR (f.change = 'not read' AND j.entry = 'not_read'))
-                 ORDER BY j.seq DESC LIMIT 1),
-                via,
-                EXISTS (SELECT 1 FROM finding g WHERE g.rule = f.rule AND g.about = f.about
-                          AND g.occurrence > f.occurrence),
-                f.change = 'not read'
-                  AND NOT EXISTS (SELECT 1 FROM finding_basis b JOIN journal j ON j.seq = b.journal
-                                  WHERE b.finding = f.id AND j.entry != 'not_read'),
-                {}
-         FROM finding f ORDER BY last_seen_at DESC, id",
-        again()
-    ))?
-    .query_map([], |r| {
-        let (state, answered_at, until, last): (String, Option<i64>, Option<i64>, i64) =
-            (r.get(3)?, r.get(9)?, r.get(11)?, r.get(7)?);
-        let again = r.get::<_, Option<bool>>(17)?.unwrap_or(false);
-        let about: String = r.get(2)?;
-        // Where it is installed, as the reader wrote it: under the home folder when it does
-        // not start at the root.
-        let installed: Option<String> = r.get(12)?;
-        Ok(Found {
-            id: r.get(0)?,
-            rule: r.get(1)?,
-            place: match installed {
-                Some(path) if path.starts_with('/') => path,
-                Some(path) => format!("~/{path}"),
-                None => place(&about, this.as_ref()),
-            },
-            about,
-            state: state_at(state, until, again, now),
-            change: r.get(4)?,
-            first_seen: (r.get(5)?, r.get(6)?),
-            last_seen: (last, r.get(8)?),
-            answered_at,
-            reason: r
-                .get::<_, Option<String>>(10)?
-                .map(|s| crate::secrets::Kept::AnswerReason.read(&s)),
-            until,
-            became: r.get(13)?,
-            thing: None,
-            via: r.get(14)?,
-            superseded: r.get(15)?,
-            in_force: false,
-            detail: None,
-            verdicts: None,
-            unread_only: r.get::<_, Option<bool>>(16)?.unwrap_or(false),
-        })
-    })?
-    .map(|f| {
-        f.and_then(|mut f| {
-            f.in_force = in_force(&f, now);
-            // The item of places read for the first time names them, from what it rests on, and
-            // is about them, counted: the machine is where they are.
-            if f.rule == FIRST_READ_RULE {
-                let read = first_read_basis(conn, &f.id)?;
-                f.became = Some(first_read_places(&read, this.as_ref()));
-                f.thing = Some(first_read_thing(&read));
-            }
-            // A finding about a dependency says where its lockfile lines are and what records
-            // it rests on, from the answers that stand now, or from what it kept when it was
-            // cleared or its package left. They are read once for all such findings, not once
-            // for each.
-            if f.rule.starts_with("lockfiles.") {
-                let kept = kept.get_or_insert_with(|| {
-                    crate::vulnerabilities::kept(conn).unwrap_or_default()
-                });
-                let list = match kept.get(&f.id) {
-                    Some(k) => &k.was,
-                    None => affecting.get_or_insert_with(|| {
-                        crate::vulnerabilities::affecting(conn).unwrap_or_default()
-                    }),
-                };
-                if let Some((place, value)) = crate::vulnerabilities::finding_detail(list, &f.about)
-                {
-                    f.place = place;
-                    f.became = Some(value);
+    let mut found = conn
+        .prepare(&format!(
+            "SELECT id, rule, about, state, change, first_seen_at, first_seen_run, last_seen_at,
+                    last_seen_run, answered_at, reason, until_at,
+                    (SELECT object FROM assertion a WHERE a.subject = f.about
+                       AND a.predicate = 'installed_at' ORDER BY a.id DESC LIMIT 1),
+                    (SELECT j.new_value FROM finding_basis b JOIN journal j ON j.seq = b.journal
+                     WHERE b.finding = f.id
+                       AND ((j.entry IN ('added', 'changed', 'sampled')
+                             AND j.predicate = CASE f.rule WHEN 'integrity.app-seal' THEN 'has_seal'
+                                                           WHEN 'integrity.app-signer' THEN 'signed_by'
+                                                           WHEN 'indicator.match' THEN 'matches_indicator'
+                                                           END)
+                            OR (f.change = 'not read' AND j.entry = 'not_read'))
+                     ORDER BY j.seq DESC LIMIT 1),
+                    via,
+                    EXISTS (SELECT 1 FROM finding g WHERE g.rule = f.rule AND g.about = f.about
+                              AND g.occurrence > f.occurrence),
+                    f.change = 'not read'
+                      AND NOT EXISTS (SELECT 1 FROM finding_basis b JOIN journal j ON j.seq = b.journal
+                                      WHERE b.finding = f.id AND j.entry != 'not_read'),
+                    {}
+             FROM finding f ORDER BY last_seen_at DESC, id",
+            again()
+        ))?
+        .query_map([], |r| {
+            let (state, answered_at, until, last): (String, Option<i64>, Option<i64>, i64) =
+                (r.get(3)?, r.get(9)?, r.get(11)?, r.get(7)?);
+            let again = r.get::<_, Option<bool>>(17)?.unwrap_or(false);
+            let about: String = r.get(2)?;
+            // Where it is installed, as the reader wrote it: under the home folder when it does
+            // not start at the root.
+            let installed: Option<String> = r.get(12)?;
+            Ok(Found {
+                id: r.get(0)?,
+                rule: r.get(1)?,
+                place: match installed {
+                    Some(path) if path.starts_with('/') => path,
+                    Some(path) => format!("~/{path}"),
+                    None => place(&about, this.as_ref()),
+                },
+                about,
+                state: state_at(state, until, again, now),
+                change: r.get(4)?,
+                first_seen: (r.get(5)?, r.get(6)?),
+                last_seen: (last, r.get(8)?),
+                answered_at,
+                reason: r
+                    .get::<_, Option<String>>(10)?
+                    .map(|s| crate::secrets::Kept::AnswerReason.read(&s)),
+                until,
+                became: r.get(13)?,
+                thing: None,
+                via: r.get(14)?,
+                superseded: r.get(15)?,
+                in_force: false,
+                verdicts: None,
+                unread_only: r.get::<_, Option<bool>>(16)?.unwrap_or(false),
+            })
+        })?
+        .map(|f| {
+            f.and_then(|mut f| {
+                f.in_force = in_force(&f, now);
+                // The item of places read for the first time names them, from what it rests on, and
+                // is about them, counted: the machine is where they are.
+                if f.rule == FIRST_READ_RULE {
+                    let read = first_read_basis(conn, &f.id)?;
+                    f.became = Some(first_read_places(&read, this.as_ref()));
+                    f.thing = Some(first_read_thing(&read));
                 }
-            }
-            // A published rule's finding carries the rule and the events it matched.
-            if let Some(l) = published(&f.rule)
-                && let Some(meta) = &l.meta
-                && let Some(kind) = l.kind
-            {
-                f.detail = Some(crate::events::finding_detail(
-                    conn, &f.id, l.file, meta, kind,
-                )?);
-            }
-            Ok(f)
+                // A finding about a dependency says where its lockfile lines are and what records
+                // it rests on, from the answers that stand now, or from what it kept when it was
+                // cleared or its package left. They are read once for all such findings, not once
+                // for each.
+                if f.rule.starts_with("lockfiles.") {
+                    let kept = kept.get_or_insert_with(|| {
+                        crate::vulnerabilities::kept(conn).unwrap_or_default()
+                    });
+                    let list = match kept.get(&f.id) {
+                        Some(k) => &k.was,
+                        None => affecting.get_or_insert_with(|| {
+                            crate::vulnerabilities::affecting(conn).unwrap_or_default()
+                        }),
+                    };
+                    if let Some((place, value)) =
+                        crate::vulnerabilities::finding_detail(list, &f.about)
+                    {
+                        f.place = place;
+                        f.became = Some(value);
+                    }
+                }
+                Ok(f)
+            })
         })
-    })
-    .collect::<rusqlite::Result<Vec<Found>>>()
-    .and_then(|mut found| {
-        crate::verdict::attach(conn, &mut found)?;
-        judged_as_read(&mut found);
-        Ok(found)
-    })
+        .collect::<rusqlite::Result<Vec<Found>>>()?;
+    crate::verdict::attach(conn, &mut found)?;
+    judged_as_read(&mut found);
+    let packages = match (affecting, kept) {
+        (Some(a), Some(k)) => Some(crate::finding_answer::Packages::from_parts(a, k)),
+        _ => None,
+    };
+    Ok((found, packages))
 }
 
 /// Marks each `verdict.suspicious` finding `unread_only` when the finding its verdicts judged is:
@@ -1684,14 +1684,13 @@ fn in_force(f: &Found, now: i64) -> bool {
 }
 
 /// Every finding whose answer is in force now, whoever gave it, the latest answer first.
-pub fn answered(conn: &Connection, now: i64) -> rusqlite::Result<Vec<Item>> {
-    let found = all(conn, now)?;
+pub fn answered_from(found: &[Found]) -> Vec<Item> {
     let mut items: Vec<Item> = found.iter().filter(|f| f.in_force).map(item).collect();
     items.sort_by(|a, b| {
         let at = |i: &Item| i.answer.as_ref().map(|a| a.at);
         at(b).cmp(&at(a)).then_with(|| a.id.cmp(&b.id))
     });
-    Ok(items)
+    items
 }
 
 #[derive(Debug)]
@@ -1801,14 +1800,23 @@ pub struct Answered {
     pub in_force: bool,
 }
 
-/// The machine the latest run ran on: the scope of its resolver reading.
-fn this_machine(conn: &Connection) -> rusqlite::Result<Option<String>> {
-    conn.query_row(
-        "SELECT scope FROM coverage WHERE reader = ?1 ORDER BY id DESC LIMIT 1",
-        [crate::resolver::READER],
-        |r| r.get(0),
-    )
-    .optional()
+/// This Mac as a place names it: from the store's own record in `meta` first (O(1)), falling
+/// back to the latest resolver reading for stores without it.
+fn this_with_name(conn: &Connection) -> rusqlite::Result<Option<This>> {
+    if let Some((id, name)) = crate::store::held_mac(conn)? {
+        return Ok(Some(This {
+            id,
+            name: Some(name),
+        }));
+    }
+    let id: Option<String> = conn
+        .query_row(
+            "SELECT scope FROM coverage WHERE reader = ?1 ORDER BY id DESC LIMIT 1",
+            [crate::resolver::READER],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(id.map(|id| This { id, name: None }))
 }
 
 /// This Mac as a place names it: its id in the store, and its name now where the store
@@ -1879,6 +1887,12 @@ pub fn place(id: &str, this: Option<&This>) -> String {
 /// The shipped published rule a finding's rule names, `sigma:<id>` or `elastic:<id>`; `None`
 /// for any other rule and for a rule this build no longer ships.
 pub fn published(rule: &str) -> Option<&'static crate::sigma::Loaded> {
+    if !crate::sigma::SOURCES.iter().any(|s| {
+        rule.strip_prefix(s.name)
+            .is_some_and(|r| r.starts_with(':'))
+    }) {
+        return None;
+    }
     crate::sigma::Rules::shipped().by_name(rule)
 }
 
@@ -2217,13 +2231,18 @@ pub struct Needs {
 /// The open findings. What the program does not cover is not among them: it is apart, in
 /// `covered.rs`, and never something to look at.
 pub fn needs(conn: &Connection, now: i64) -> rusqlite::Result<Needs> {
-    let mut items: Vec<Item> = all(conn, now)?
+    Ok(needs_from(&all(conn, now)?))
+}
+
+/// The same from findings already read (`all`).
+pub fn needs_from(found: &[Found]) -> Needs {
+    let mut items: Vec<Item> = found
         .iter()
         .filter(|f| f.state == "open")
         .map(item)
         .collect();
     order(&mut items);
-    Ok(Needs { items })
+    Needs { items }
 }
 
 /// The order of everything that needs a look, and of findings: urgent first, then the most
@@ -2401,7 +2420,6 @@ mod tests {
             place: "invented".into(),
             became: None,
             thing: None,
-            detail: None,
             verdicts: None,
             unread_only: false,
         };
@@ -2447,7 +2465,6 @@ mod tests {
             place: "invented".into(),
             became: None,
             thing: None,
-            detail: None,
             verdicts: None,
             unread_only: false,
         };
@@ -2487,7 +2504,6 @@ mod tests {
             place: "invented".into(),
             became: None,
             thing: None,
-            detail: None,
             verdicts: Some(crate::verdict::Summary {
                 levels: Some((3, 2)),
                 ..Default::default()
@@ -2541,7 +2557,6 @@ mod tests {
             place: "invented".into(),
             became: None,
             thing: None,
-            detail: None,
             verdicts: None,
             unread_only,
         };

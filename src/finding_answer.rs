@@ -22,12 +22,12 @@ const FORMAT: u32 = 1;
 
 /// Every finding the store holds, in every state, the most severe first.
 pub fn list(conn: &Connection, now: i64) -> rusqlite::Result<v1::Findings> {
-    let found = findings::all(conn, now)?;
+    let (found, loaded_packages) = findings::all_with_packages(conn, now)?;
     let mut items: Vec<Item> = found.iter().map(findings::item).collect();
     findings::order(&mut items);
     let store_id = Some(store::id(conn)?);
     let refs = refs(&items);
-    let packages = packages(conn)?;
+    let packages = Packages::for_items(conn, &items, loaded_packages)?;
     Ok(v1::Findings {
         format: FORMAT,
         answered_at: now,
@@ -54,11 +54,11 @@ pub fn one(
     pair: bool,
     now: i64,
 ) -> rusqlite::Result<Result<v1::Finding, Refused>> {
-    let found = findings::all(conn, now)?;
-    let mut one = of(conn, &found, id, now)?;
+    let (found, loaded_packages) = findings::all_with_packages(conn, now)?;
+    let items: Vec<Item> = found.iter().map(findings::item).collect();
+    let refs = refs(&items);
+    let mut one = of_with(conn, &found, &refs, loaded_packages.as_ref(), id, now)?;
     if let Some(f) = one.as_mut() {
-        let items: Vec<Item> = found.iter().map(findings::item).collect();
-        let refs = refs(&items);
         f.answered_together = with.iter().filter_map(|w| refs.get(*w).cloned()).collect();
         f.answered_with = f.answered_together.first().cloned().filter(|_| pair);
     }
@@ -76,6 +76,19 @@ pub fn one(
 pub fn of(
     conn: &Connection,
     found: &[Found],
+    id: &str,
+    now: i64,
+) -> rusqlite::Result<Option<v1::Finding>> {
+    let items: Vec<Item> = found.iter().map(findings::item).collect();
+    let refs = refs(&items);
+    of_with(conn, found, &refs, None, id, now)
+}
+
+fn of_with(
+    conn: &Connection,
+    found: &[Found],
+    refs: &BTreeMap<String, v1::FindingRef>,
+    packages: Option<&Packages>,
     id: &str,
     now: i64,
 ) -> rusqlite::Result<Option<v1::Finding>> {
@@ -99,12 +112,10 @@ pub fn of(
         })
         .collect();
     let store_id = Some(store::id(conn)?);
-    let items: Vec<Item> = found.iter().map(findings::item).collect();
-    let refs = refs(&items);
     let verdicts = verdict::verdicts(
         verdict::of_finding(conn, id, &f.rule)?,
         store_id.as_deref(),
-        &refs,
+        refs,
         i.verdicts.as_ref().and_then(|s| s.standing.as_ref()),
     );
     Ok(Some(v1::Finding {
@@ -128,7 +139,7 @@ pub fn of(
         first_seen_at: f.first_seen.0,
         last_seen_at: f.last_seen.0,
         answer: i.answer.as_ref().map(answer),
-        evidence: evidence(conn, f)?.map(|body| v1::Evidence { body: Some(body) }),
+        evidence: evidence_with(conn, f, packages)?.map(|body| v1::Evidence { body: Some(body) }),
         rests_on,
         answers_note: findings::ANSWERS_NOTE.to_string(),
         thing: i.thing.clone(),
@@ -151,6 +162,35 @@ pub struct Packages(
     Vec<vulnerabilities::Affecting>,
     BTreeMap<String, vulnerabilities::Kept>,
 );
+
+impl Packages {
+    pub fn empty() -> Packages {
+        Packages(Vec::new(), BTreeMap::new())
+    }
+
+    pub fn from_parts(
+        affecting: Vec<vulnerabilities::Affecting>,
+        kept: BTreeMap<String, vulnerabilities::Kept>,
+    ) -> Packages {
+        Packages(affecting, kept)
+    }
+
+    /// Loads package answers only when `items` contains a finding about a component, reusing
+    /// any already loaded during `findings::all_with_packages`.
+    pub fn for_items(
+        conn: &Connection,
+        items: &[Item],
+        loaded: Option<Packages>,
+    ) -> rusqlite::Result<Packages> {
+        if !items.iter().any(|i| i.about.starts_with("component:")) {
+            return Ok(Packages::empty());
+        }
+        match loaded {
+            Some(p) => Ok(p),
+            None => packages(conn),
+        }
+    }
+}
 
 pub fn packages(conn: &Connection) -> rusqlite::Result<Packages> {
     Ok(Packages(
@@ -191,6 +231,70 @@ pub fn rule_title(rule: &str) -> Option<String> {
     findings::published(rule)
         .and_then(|l| l.meta.as_ref())
         .map(|m| whole(&m.title))
+}
+
+/// The findings that need a look, counted by rule over all of them: urgent ones first, then the
+/// most severe, a severity not known taken as the most severe as `findings::order` takes it,
+/// then the most findings, then by rule.
+pub fn by_rule(all: &[Item]) -> Vec<v1::RuleCount> {
+    let rank = |s: Option<&str>| {
+        s.map_or(findings::SEVERITIES.len(), |s| {
+            findings::SEVERITIES
+                .iter()
+                .position(|x| *x == s)
+                .unwrap_or(findings::SEVERITIES.len())
+        })
+    };
+    struct Group<'a> {
+        first: &'a Item,
+        /// The short title the group is shown by: its findings' own, or, when they differ, the
+        /// rule's general one. Only the response layer's findings carry two sets of words under
+        /// one rule (`verdict::words`), and a count of both must not say what holds for one.
+        short: &'static str,
+        worst: Option<&'static str>,
+        count: usize,
+        urgent: usize,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    for i in all {
+        match groups.iter_mut().find(|g| g.first.rule == i.rule) {
+            Some(g) => {
+                if i.words.short != g.short {
+                    g.short = crate::verdict::WORDS.short;
+                }
+                if rank(i.severity) > rank(g.worst) {
+                    g.worst = i.severity;
+                }
+                g.count += 1;
+                g.urgent += usize::from(i.urgent());
+            }
+            None => groups.push(Group {
+                first: i,
+                short: i.words.short,
+                worst: i.severity,
+                count: 1,
+                urgent: usize::from(i.urgent()),
+            }),
+        }
+    }
+    groups.sort_by(|a, b| {
+        (b.urgent > 0)
+            .cmp(&(a.urgent > 0))
+            .then_with(|| rank(b.worst).cmp(&rank(a.worst)))
+            .then_with(|| b.count.cmp(&a.count))
+            .then_with(|| a.first.rule.cmp(&b.first.rule))
+    });
+    groups
+        .iter()
+        .map(|g| v1::RuleCount {
+            rule: g.first.rule.clone(),
+            short_title: g.short.to_string(),
+            rule_title_text: rule_title(&g.first.rule),
+            severity: g.worst.map(value_of::<v1::Level>),
+            count: g.count as u64,
+            urgent: g.urgent as u64,
+        })
+        .collect()
 }
 
 pub fn listed(
@@ -250,8 +354,12 @@ fn answer(a: &findings::Answered) -> v1::Answer {
 }
 
 /// What a finding rests on, by the kind of its rule; `None` for a kind this build does not
-/// shape.
-pub fn evidence(conn: &Connection, f: &Found) -> rusqlite::Result<Option<v1::evidence::Body>> {
+/// shape. Reuses already-loaded vulnerability answers when `packages` is given.
+pub fn evidence_with(
+    conn: &Connection,
+    f: &Found,
+    packages: Option<&Packages>,
+) -> rusqlite::Result<Option<v1::evidence::Body>> {
     use v1::evidence::Body;
     if let Some(l) = findings::published(&f.rule) {
         let (Some(meta), Some(kind)) = (&l.meta, l.kind) else {
@@ -292,17 +400,25 @@ pub fn evidence(conn: &Connection, f: &Found) -> rusqlite::Result<Option<v1::evi
                 indicators_text: became(),
             }),
             Some("processes") => Body::DetachedProcess(detached(conn, &f.id)?),
-            Some("lockfiles") => {
-                Body::VulnerablePackage(match vulnerabilities::kept(conn)?.remove(&f.id) {
+            Some("lockfiles") => Body::VulnerablePackage(match packages {
+                Some(p) => match p.1.get(&f.id) {
+                    Some(k) => v1::VulnerablePackage {
+                        no_longer_found: Some(value_of::<v1::NoLongerFound>(&k.why)),
+                        no_longer_found_at: Some(k.at),
+                        ..package_in_slice(conn, &k.was, &f.about)?
+                    },
+                    None => package_in_slice(conn, &p.0, &f.about)?,
+                },
+                None => match vulnerabilities::kept(conn)?.remove(&f.id) {
                     // What it was about when it was cleared or its package left, and why.
                     Some(k) => v1::VulnerablePackage {
                         no_longer_found: Some(value_of::<v1::NoLongerFound>(&k.why)),
                         no_longer_found_at: Some(k.at),
-                        ..package_in(conn, k.was, &f.about)?
+                        ..package_in_slice(conn, &k.was, &f.about)?
                     },
                     None => package(conn, &f.about)?,
-                })
-            }
+                },
+            }),
             _ => return Ok(None),
         },
     ))
@@ -451,17 +567,17 @@ fn detached(conn: &Connection, finding: &str) -> rusqlite::Result<v1::DetachedPr
 /// (`vulnerabilities::finding_detail`): every record that affects it, and every release it
 /// affects with where it is declared.
 pub fn package(conn: &Connection, about: &str) -> rusqlite::Result<v1::VulnerablePackage> {
-    package_in(conn, vulnerabilities::affecting(conn)?, about)
+    package_in_slice(conn, &vulnerabilities::affecting(conn)?, about)
 }
 
 /// The same from the answers in `list`.
-fn package_in(
+fn package_in_slice(
     conn: &Connection,
-    list: Vec<vulnerabilities::Affecting>,
+    list: &[vulnerabilities::Affecting],
     about: &str,
 ) -> rusqlite::Result<v1::VulnerablePackage> {
-    let mine: Vec<vulnerabilities::Affecting> =
-        list.into_iter().filter(|a| a.is_about(about)).collect();
+    let mine: Vec<&vulnerabilities::Affecting> =
+        list.iter().filter(|a| a.is_about(about)).collect();
     let mut out = v1::VulnerablePackage::default();
     let Some(first) = mine.first() else {
         return Ok(out);

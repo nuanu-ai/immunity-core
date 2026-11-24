@@ -42,8 +42,9 @@ type Said = (Option<String>, Option<String>);
 /// What the tailnet alone says of each machine no other trace names and nothing was read
 /// on: whose it is and its system, where it says.
 fn tailnet_only(conn: &Connection) -> rusqlite::Result<BTreeMap<String, Said>> {
-    conn.prepare(
-        "SELECT a.subject,
+    conn.prepare(&format!(
+        "{}
+         SELECT a.subject,
                 (SELECT r.object FROM assertion r WHERE r.layer = 'live' AND r.reader = ?1
                    AND r.subject = a.subject AND r.predicate = 'relation_to_owner' LIMIT 1),
                 (SELECT p.object FROM assertion p WHERE p.layer = 'live' AND p.reader = ?1
@@ -51,10 +52,11 @@ fn tailnet_only(conn: &Connection) -> rusqlite::Result<BTreeMap<String, Said>> {
          FROM (SELECT DISTINCT subject FROM assertion
                WHERE layer = 'live' AND reader = ?1) a
          WHERE NOT EXISTS (SELECT 1 FROM assertion o
-                           WHERE o.layer = 'live' AND o.subject = a.subject
+                           WHERE +o.layer = 'live' AND o.subject = a.subject
                              AND o.reader NOT IN (?1, ?2))
-           AND NOT EXISTS (SELECT 1 FROM coverage c WHERE c.scope = a.subject)",
-    )?
+           AND a.subject NOT IN (SELECT DISTINCT scope FROM reading)",
+        store::LATEST
+    ))?
     .query_map([tailnet::READER, resolver::READER], |r| {
         Ok((r.get(0)?, (r.get(1)?, r.get(2)?)))
     })?
