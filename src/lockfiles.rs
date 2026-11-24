@@ -119,7 +119,8 @@ type Reader = fn(&str, &str) -> Parsed;
 /// kind whose reader is `None` is named as having no reader and never opened, as a kind of
 /// `NOT_SUPPORTED` is. A kind is read only by the reader of its own row.
 /// `npm-shrinkwrap.json` is in the format of `package-lock.json`, as npm documents it.
-/// `yarn.lock` is read in the formats of Yarn 1 and of Yarn 2 and later.
+/// `yarn.lock` is read in the formats of Yarn 1 and of Yarn 2 and later. A row gets a reader
+/// only with a feed for its ecosystem in `osv::FEEDS` (a test below holds it).
 const FORMATS: [(&str, &str, Option<Reader>); 12] = [
     ("package-lock.json", "npm", Some(npm)),
     ("npm-shrinkwrap.json", "npm", Some(npm)),
@@ -144,9 +145,8 @@ fn reader_of(kind: &str) -> Option<Reader> {
     FORMATS.iter().find(|(k, ..)| *k == kind).and_then(|f| f.2)
 }
 
-/// Whether this build reads some kind of lockfile of an ecosystem, as OSV names it.
-// No caller yet: the change that first asks it of an ecosystem removes this line.
-#[allow(dead_code)]
+/// Whether this build reads some kind of lockfile of an ecosystem, as OSV names it, so that a
+/// feed of it has packages to be matched against.
 pub fn has_reader(ecosystem: &str) -> bool {
     (FORMATS.iter()).any(|(_, of, read)| *of == ecosystem && read.is_some())
 }
@@ -744,8 +744,9 @@ fn version_shape(v: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CACHE_SIGNATURE, Checkout, DEEPER, LINKED, LOCKFILE_KIND, NOT_LOOKED, NOT_TOLD, SET_ASIDE,
-        ecosystem_of, has_reader, lockfile_kind, partial_for, read, read_as_text, read_within,
+        CACHE_SIGNATURE, Checkout, DEEPER, FORMATS, LINKED, LOCKFILE_KIND, NOT_LOOKED, NOT_TOLD,
+        SET_ASIDE, ecosystem_of, has_reader, lockfile_kind, partial_for, read, read_as_text,
+        read_within,
     };
 
     fn file_name(path: &str) -> &str {
@@ -1239,6 +1240,16 @@ snapshots:
         }
         assert!(has_reader("npm") && has_reader("crates.io"));
         assert!(!has_reader("PyPI") && !has_reader("RubyGems"));
+    }
+
+    #[test]
+    fn every_ecosystem_a_lockfile_is_read_for_has_a_feed() {
+        // Packages read and never compared would read as compared: no place, no lack and no
+        // answer would say otherwise. So a reader comes only with data for its ecosystem.
+        for (kind, ecosystem, reader) in FORMATS {
+            let fed = crate::osv::FEEDS.iter().any(|f| f.ecosystem == ecosystem);
+            assert!(reader.is_none() || fed, "{kind}: {ecosystem}");
+        }
     }
 
     #[test]

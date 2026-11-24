@@ -5362,7 +5362,10 @@ fn get_feeds(
     now: i64,
 ) -> Result<Vec<osv::Got>, Box<dyn Error>> {
     let curl = args.curl.as_deref().unwrap_or(Path::new(threats::CURL));
-    let inputs = [&args.osv_crates_input, &args.osv_npm_input];
+    // One input for each feed, in the order of `FEEDS`: a feed added without its input does
+    // not compile, where `zip` would leave it unasked and say nothing.
+    let inputs: [&Option<PathBuf>; osv::FEEDS.len()] =
+        [&args.osv_crates_input, &args.osv_npm_input];
     let mut got = Vec::new();
     for (feed, input) in osv::FEEDS.iter().zip(inputs) {
         got.push(osv::get(conn, feed, input.as_deref(), curl, home, now)?);
