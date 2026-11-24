@@ -102,7 +102,7 @@ const CHECKOUT_MARK: &str = ".git";
 
 /// `npm-shrinkwrap.json` is in the format of `package-lock.json`, as npm documents it.
 /// `yarn.lock` is read in the formats of Yarn 1 and of Yarn 2 and later.
-const SUPPORTED: [&str; 6] = [
+pub(crate) const SUPPORTED: [&str; 6] = [
     "package-lock.json",
     "npm-shrinkwrap.json",
     "pnpm-lock.yaml",

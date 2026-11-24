@@ -487,6 +487,8 @@ fn held_packages(conn: &Connection) -> rusqlite::Result<Packages> {
             let Some((eco, name)) = rest.split_once('/') else {
                 continue;
             };
+            // A package of an ecosystem with no feed has nothing to be compared with: its place
+            // is one not read, `no_matcher` (`unmatched_places`).
             let Some(eco) = FEEDS.iter().map(|f| f.ecosystem).find(|e| *e == eco) else {
                 continue;
             };
@@ -1043,6 +1045,13 @@ impl Affecting {
     }
 }
 
+/// Whether this build reads some kind of lockfile of `ecosystem`, so that a feed of it has
+/// packages to be matched against.
+pub fn has_reader(ecosystem: &str) -> bool {
+    (crate::lockfiles::SUPPORTED.iter())
+        .any(|k| crate::lockfiles::ecosystem_of(k) == Some(ecosystem))
+}
+
 /// The ecosystems whose lockfile packages the latest check compared with current data, in
 /// the order of `FEEDS`. Through the records linked to it, this is all of the catalogue that
 /// is compared with the estate: an ecosystem counts only where some checkout's lockfiles were
@@ -1525,7 +1534,7 @@ fn totals_of(conn: &Connection, now: i64, t: &Totals) -> rusqlite::Result<v1::Vu
             .map(|f| v1::FeedFreshness {
                 source: f.feed.source.to_string(),
                 ecosystem: f.feed.ecosystem.to_string(),
-                matched: true,
+                matched: has_reader(f.feed.ecosystem),
                 read_at: f.reading.map(|r| r.1),
                 current: f.not_current.is_none(),
                 not_current_why: f.not_current.clone(),
@@ -1610,23 +1619,30 @@ pub const NOT_READ: &str = "not_read";
 /// project, built here alone, so the list, the totals and the answer for one record, held or
 /// not, say the same. A place is a project's lockfiles of one ecosystem, read in part or not in
 /// the latest check (`vulnerability_place`), of a kind this version has no reader for
-/// (`no_reader_places`), a project in which the latest check found no lockfile at all, and one
-/// the reading of lockfiles did not open in the latest check, which no other table holds. The
-/// last two stand for every ecosystem, `any`. What they declare is not known, so none is ever
-/// "not affected".
+/// (`no_reader_places`), with packages read and not matched (`unmatched_places`), a project in
+/// which the latest check found no lockfile at all, and one the reading of lockfiles did not
+/// open in the latest check, which no other table holds. The last two stand for every
+/// ecosystem, `any`. What they declare is not known, so none is ever "not affected".
 pub fn unread_places(conn: &Connection) -> rusqlite::Result<Vec<UnreadPlace>> {
-    let mut out: Vec<UnreadPlace> = conn
+    let rows: Vec<UnreadPlace> = conn
         .prepare(
             "SELECT checkout, ecosystem, lockfiles, lockfiles_why FROM vulnerability_place
-             WHERE lockfiles != 'full' ORDER BY checkout, ecosystem",
+             ORDER BY checkout, ecosystem",
         )?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
         .collect::<rusqlite::Result<_>>()?;
+    // The places the latest matching judged. Any other place the latest reading of lockfiles
+    // found is not read, whatever feeds this build has: the store may have been written by a
+    // build with other feeds.
+    let rowed: HashSet<(String, String)> =
+        rows.iter().map(|p| (p.0.clone(), p.1.clone())).collect();
+    let mut out: Vec<UnreadPlace> = rows.into_iter().filter(|p| p.2 != "full").collect();
     out.extend(
-        no_reader_places(conn)?
+        no_reader_places(conn, &rowed)?
             .into_iter()
             .map(|(c, e, names)| (c, e, NO_READER.to_string(), Some(no_reader_said(&names)))),
     );
+    out.extend(unmatched_places(conn, &rowed)?);
     // Each project the store holds, with its latest reading of lockfiles, if any: none found
     // only where that reading opened it in the latest check and found nothing; not read where
     // no reading opened it then.
@@ -1721,14 +1737,18 @@ fn untold(places: &[UnreadPlace]) -> BTreeMap<String, String> {
 }
 
 /// The places whose lockfiles are of a kind this version has no reader for, in an ecosystem no
-/// data is matched for, as checkout, ecosystem and the kinds by name, from each checkout's
+/// data was matched for, as checkout, ecosystem and the kinds by name, from each checkout's
 /// latest reading of lockfiles. Such a project was compared with nothing there, though every
-/// lockfile it has of a matched ecosystem was read. A kind of a matched ecosystem, such as
-/// `bun.lockb`, is not here: its place is `partial` (`vulnerability_place`). Nor is a kind of no
-/// ecosystem a record can be about. The store keeps only the ecosystem of a record's own feed,
-/// so a place of any other OSV ecosystem stands, through `untold`, between the project and
-/// every record, which may name that ecosystem too.
-fn no_reader_places(conn: &Connection) -> rusqlite::Result<Vec<(String, String, String)>> {
+/// lockfile it has of a matched ecosystem was read. A kind whose place the latest matching
+/// judged (`rowed`), such as `bun.lockb` for npm, is not here: that place is `partial`
+/// (`vulnerability_place`). Nor is a kind of no ecosystem a record can be about. The store
+/// keeps only the ecosystem of a record's own feed, so a place of any other OSV ecosystem
+/// stands, through `untold`, between the project and every record, which may name that
+/// ecosystem too.
+fn no_reader_places(
+    conn: &Connection,
+    rowed: &HashSet<(String, String)>,
+) -> rusqlite::Result<Vec<(String, String, String)>> {
     let rows: Vec<(String, String)> = conn
         .prepare(
             "SELECT c.scope, l.name FROM coverage c JOIN coverage_lack l ON l.coverage = c.id
@@ -1750,17 +1770,62 @@ fn no_reader_places(conn: &Connection) -> rusqlite::Result<Vec<(String, String, 
         let Some(ecosystem) = crate::lockfiles::ecosystem_of(&name) else {
             continue;
         };
-        if FEEDS.iter().any(|f| f.ecosystem == ecosystem) {
-            continue;
+        let place = (checkout, ecosystem.to_string());
+        if !rowed.contains(&place) {
+            places.entry(place).or_default().push(name);
         }
-        places
-            .entry((checkout, ecosystem.to_string()))
-            .or_default()
-            .push(name);
     }
     Ok(places
         .into_iter()
         .map(|((c, e), names)| (c, e, names.join(", ")))
+        .collect())
+}
+
+/// The places whose packages the reading of lockfiles holds and the latest matching did not
+/// judge (`rowed`): `no_matcher` where this build fetches no data for the ecosystem, `not_read`
+/// where it does and no check since compared them. A project with no reading of lockfiles is
+/// one place for every ecosystem, `any` (`unread_places`), and is not here.
+fn unmatched_places(
+    conn: &Connection,
+    rowed: &HashSet<(String, String)>,
+) -> rusqlite::Result<Vec<UnreadPlace>> {
+    let mut places: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT subject, scope FROM assertion
+         WHERE layer = 'live' AND reader = ?1 AND predicate = 'part_of'
+           AND scope NOT IN (SELECT id FROM gone_entity)
+           AND scope IN (SELECT scope FROM coverage WHERE reader = ?1)",
+    )?;
+    for row in stmt.query_map([crate::lockfiles::READER], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })? {
+        let (subject, scope) = row?;
+        let Some((eco, _)) = (subject.strip_prefix(&format!("component:{scope}/")))
+            .and_then(|rest| rest.split_once('/'))
+        else {
+            continue;
+        };
+        let place = (scope.clone(), eco.to_string());
+        if !rowed.contains(&place) {
+            places.insert(place);
+        }
+    }
+    Ok(places
+        .into_iter()
+        .map(|(c, e)| {
+            let (lockfiles, why) = if FEEDS.iter().any(|f| f.ecosystem == e) {
+                (
+                    NOT_READ,
+                    format!("its {e} packages were not compared in the latest check"),
+                )
+            } else {
+                (
+                    NO_MATCHER,
+                    format!("this version reads no vulnerability data for {e}"),
+                )
+            };
+            (c, e, lockfiles.to_string(), Some(why))
+        })
         .collect())
 }
 
@@ -1996,16 +2061,24 @@ pub fn one(conn: Option<&Connection>, id: &str, now: i64) -> rusqlite::Result<v1
             p.openvex = None;
         }
     };
-    // A place no row of `vulnerability_place` holds: lockfiles of a kind with no reader, or a
-    // project not opened. A project with no lockfile has no row: it is counted, not answered.
-    let unrowed = |places: &mut Vec<v1::PlaceAnswer>, ecosystem: Option<&str>| {
+    // A place no row of `vulnerability_place` holds: lockfiles of a kind with no reader,
+    // packages not matched, or a project not opened. A project with no lockfile has no row: it
+    // is counted, not answered.
+    let unrowed = |answers: &mut Vec<v1::PlaceAnswer>, ecosystem: Option<&str>| {
         for (checkout, eco, lockfiles, why) in &unread {
-            if lockfiles == NO_READER || (lockfiles == NOT_READ && eco == ANY_ECOSYSTEM) {
-                places.push(v1::PlaceAnswer {
+            let rowed = places.iter().any(|p| p.0 == *checkout && p.1 == *eco);
+            if lockfiles != NONE_FOUND && !rowed {
+                // Said of its own ecosystem, a place with no matcher says so; said for a
+                // record's, it is a place of that project not read.
+                let reason = match (lockfiles.as_str(), ecosystem) {
+                    (NO_MATCHER, None) => NO_MATCHER,
+                    _ => PLACE_NOT_READ,
+                };
+                answers.push(v1::PlaceAnswer {
                     project_text: place_of(checkout),
                     ecosystem: ecosystem.map_or(eco.clone(), str::to_string),
                     answer: Some(answer("unknown")),
-                    reason: Some(PLACE_NOT_READ.to_string()),
+                    reason: Some(reason.to_string()),
                     detail_text: untold.get(checkout).or(why.as_ref()).map(|w| whole(w)),
                     ..Default::default()
                 });
@@ -2228,10 +2301,16 @@ fn no_record_said(answers: &[v1::PlaceAnswer], found: crate::covered::Found) -> 
     // Each project for which it cannot be told, with every reason of its answers.
     let mut unknown: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
     for a in answers.iter().filter(|a| a.answer != Some(not_affected)) {
+        // Packages read and not matched are told with the lockfiles not all read: such a
+        // project is one of those (`untold`).
+        let reason = match a.reason.as_deref().unwrap_or_default() {
+            NO_MATCHER => PLACE_NOT_READ,
+            r => r,
+        };
         unknown
             .entry(a.project_text.as_str())
             .or_default()
-            .insert(a.reason.as_deref().unwrap_or_default());
+            .insert(reason);
     }
     if unknown.is_empty() {
         let of = match found {

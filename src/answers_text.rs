@@ -837,6 +837,7 @@ fn unread_said(p: &v1::UnreadPlace) -> String {
         "partial" => "some lockfiles not read",
         "not_read" => "lockfiles not read",
         "no_reader" => "lockfiles of a kind this version does not read",
+        "no_matcher" => "packages read and not compared",
         "none_found" => return "no lockfile this version reads".to_string(),
         other => return other.replace('_', " "),
     };
@@ -2976,6 +2977,29 @@ mod tests {
         }
         assert!(!text.contains("~/dev/p5"), "{text}");
         assert_eq!(calm_in(&text), Vec::<&str>::new(), "{text}");
+    }
+
+    #[test]
+    fn a_place_whose_packages_no_data_is_read_for_says_they_were_read_and_why() {
+        let m = v1::Vulnerabilities {
+            totals: Some(v1::VulnerabilityTotals {
+                projects_not_read: 1,
+                ..Default::default()
+            }),
+            unread: Some(v1::UnreadPlaces {
+                items: vec![v1::UnreadPlace {
+                    project_text: "~/dev/shop".to_string(),
+                    ecosystem: "PyPI".to_string(),
+                    lockfiles: "no_matcher".to_string(),
+                    why_text: Some("this version reads no vulnerability data for PyPI".to_string()),
+                }],
+                total: 1,
+            }),
+            ..Default::default()
+        };
+        let text = vulnerabilities(&m, &Screen::pipe());
+        let said = "~/dev/shop  PyPI  packages read and not compared: this version reads no vulnerability data for PyPI\n";
+        assert!(text.contains(said), "{text}");
     }
 
     #[test]

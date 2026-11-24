@@ -1046,9 +1046,11 @@ pub fn message(
                 None => absent("watched", "watched places have never been read"),
             }
             out.threats = Some(threats_message(s.catalogue.as_ref()));
+            let feeds: Vec<v1::FeedState> =
+                s.feeds.iter().map(|f| feed_message(f, &s.run.id)).collect();
             out.vulnerability_data = Some(v1::VulnerabilityData {
-                matched: true,
-                feeds: s.feeds.iter().map(|f| feed_message(f, &s.run.id)).collect(),
+                matched: feeds.iter().all(|f| f.matched),
+                feeds,
             });
             out.vulnerabilities = crate::vulnerabilities::totals_message(conn, now)?;
             if out.vulnerabilities.is_none() {
@@ -1458,7 +1460,7 @@ fn feed_message(s: &crate::osv::State, run_id: &str) -> crate::contract::v1::Fee
         records: s.good_at.map(|_| n(s.records)),
         malicious_records: s.good_at.map(|_| n(s.malicious)),
         withdrawn_records: s.good_at.map(|_| n(s.withdrawn)),
-        matched: true,
+        matched: crate::vulnerabilities::has_reader(s.feed.ecosystem),
         ..Default::default()
     };
     match &s.latest {
@@ -1966,5 +1968,29 @@ mod tests {
             (&r["watching_rules"], &r["not_watching"]),
             (&json!(0), &json!([]))
         );
+    }
+
+    #[test]
+    fn a_feed_is_said_matched_only_when_some_kind_of_lockfile_of_its_ecosystem_is_read() {
+        // No feed of this build lacks a reader, so one of an invented ecosystem stands for it.
+        static INVENTED: crate::osv::Feed = crate::osv::Feed {
+            source: "osv-invented",
+            ecosystem: "Invented",
+            ..crate::osv::FEEDS[0]
+        };
+        let state = |feed| crate::osv::State {
+            feed,
+            latest: None,
+            good_at: None,
+            changed_at: None,
+            records: 0,
+            malicious: 0,
+            withdrawn: 0,
+            counts: None,
+        };
+        let matched: Vec<bool> = (crate::osv::FEEDS.iter().chain([&INVENTED]))
+            .map(|f| feed_message(&state(f), "r1").matched)
+            .collect();
+        assert_eq!(matched, [true, true, false]);
     }
 }

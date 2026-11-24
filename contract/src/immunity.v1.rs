@@ -2480,10 +2480,12 @@ pub struct UnreadPlace {
     /// `partial`, some of them read; `not_read`, with the ecosystem `any` for a project the
     /// reading of lockfiles did not open; `no_reader`, lockfiles of a kind this version has no
     /// reader for, such as `go.sum`, in an ecosystem no data is matched for, so the project was
-    /// compared with nothing there; or `none_found`, the project was opened and no lockfile this
-    /// version knows of was found in it, with the ecosystem `any`. A project with any such place
-    /// is never answered "does not affect" for any record, since the store does not keep every
-    /// ecosystem a record names. One with `none_found` is counted, never answered for a record.
+    /// compared with nothing there; `no_matcher`, packages read of an ecosystem this version
+    /// fetches no vulnerability data for, since 1.26.1; or `none_found`, the project was opened and
+    /// no lockfile this version knows of was found in it, with the ecosystem `any`. A project with
+    /// any such place is never answered "does not affect" for any record, since the store does not
+    /// keep every ecosystem a record names. One with `none_found` is counted, never answered for a
+    /// record.
     #[prost(string, tag = "3")]
     pub lockfiles: ::prost::alloc::string::String,
     /// Why, as the reading of lockfiles gave it, or for `no_reader` the kinds by name. Whole.
@@ -2790,7 +2792,8 @@ pub struct PlaceAnswer {
     /// `known`, or `no_signs` for an id no record names.
     #[prost(string, optional, tag = "5")]
     pub certainty: ::core::option::Option<::prost::alloc::string::String>,
-    /// Why it cannot be told, the core's word, and what was said. Whole.
+    /// Why it cannot be told, the core's word, such as `place_not_read`, or `no_matcher` for a
+    /// place of `unread` with that word, since 1.26.1; and what was said. Whole.
     #[prost(string, optional, tag = "6")]
     pub reason: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag = "7")]
