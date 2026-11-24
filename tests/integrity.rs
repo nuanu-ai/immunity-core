@@ -1216,7 +1216,7 @@ fn package_managers_this_version_does_not_read_are_named_by_kind_as_a_limit_and_
     let names = "\"MacPorts\"; \"Nix\"; \"pkgsrc\"; \"conda\"; \"npm packages installed globally under nvm\"";
     let section = said
         .split("\n\n")
-        .find(|s| s.trim_start().starts_with("Not judged on this Mac\n"))
+        .find(|s| s.trim_start().starts_with("Limits of this version here\n"))
         .unwrap_or_else(|| panic!("{said}"));
     let lines: Vec<&str> = section.lines().collect();
     assert!(
@@ -1233,24 +1233,14 @@ fn package_managers_this_version_does_not_read_are_named_by_kind_as_a_limit_and_
         1,
         "{said}"
     );
-    // The status itself names them among what is not judged, and its next step is the command
-    // that says more.
+    // A limit of this version: the status itself leaves them out.
     let status = Command::new(env!("CARGO_BIN_EXE_immunity"))
         .args(["status", "--store"])
         .arg(e.store())
         .output()
         .unwrap();
     let status = String::from_utf8(status.stdout).unwrap();
-    assert!(
-        status
-            .lines()
-            .any(|l| l.trim_start().starts_with("Not judged")
-                && l.contains("MacPorts, Nix, pkgsrc, conda"))
-            && status
-                .lines()
-                .any(|l| l == "→ immunity status --coverage   what was read and what was not"),
-        "{status}"
-    );
+    assert!(!status.contains("MacPorts"), "{status}");
     // An agent finds each one by name among what this build has no reader for.
     let out = Command::new(env!("CARGO_BIN_EXE_immunity"))
         .args(["status", "--json", "--store"])

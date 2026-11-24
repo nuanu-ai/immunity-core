@@ -514,8 +514,9 @@ fn a_way_not_read_with_two_names_is_named_as_two_names_in_the_report_and_the_sta
         .output()
         .unwrap();
     assert!(out.status.success());
+    // A way not read is a limit, which the run's text leaves to `--coverage`.
     let report = String::from_utf8(out.stdout).unwrap();
-    assert!(report.contains(".env, .gemini/.env"), "{report}");
+    assert!(!report.contains(".gemini/.env"), "{report}");
     let status = e.status();
     let u = status["not_covered"]
         .as_array()

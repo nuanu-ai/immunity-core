@@ -1045,7 +1045,7 @@ fn a_place_left_unsubscribed_is_not_watched_live_until_a_later_subscription_take
     let text = within(mac.immunity().args(["status", "--store"]).arg(mac.store()));
     let text = String::from_utf8(text.stdout).unwrap();
     assert!(
-        text.contains("subscription to some watched places failed, so it does not watch live"),
+        text.contains("\n  ! The watcher's latest subscription to some watched places failed "),
         "{text}"
     );
     let page = mac.view();
@@ -2391,7 +2391,11 @@ fn a_failed_reading_or_sample_is_not_watched_live_with_its_reason_until_the_next
     );
     let text = within(mac.immunity().args(["status", "--store"]).arg(mac.store()));
     let text = String::from_utf8(text.stdout).unwrap();
-    assert!(text.contains("so it does not watch live"), "{text}");
+    assert!(
+        text.contains("\n  ! The watcher's latest reading of the watched places failed ")
+            && !text.contains("No watcher runs"),
+        "{text}"
+    );
     closed(0o755).unwrap();
     mac.put(".zshrc", "two\n");
     w.until("read", |v| count(v, "changed") == 1);
@@ -2733,8 +2737,8 @@ fn the_job_s_watcher_leaves_when_its_core_is_replaced_and_the_status_says_it_is_
     let text = within(mac.immunity().args(["status", "--store"]).arg(mac.store()));
     let text = String::from_utf8(text.stdout).unwrap();
     assert!(
-        text.contains("the watcher is restarting on a new core")
-            && !text.contains("a watcher runs, but"),
+        text.contains("\n  ! The watcher is restarting on a new core")
+            && !text.contains("No watcher runs"),
         "{text}"
     );
 
@@ -2843,8 +2847,8 @@ fn a_failure_the_store_did_not_take_is_not_calm_and_live_comes_back_when_the_rea
         .unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(
-        text.contains("write to the store failed, so it does not watch live")
-            && !text.contains("a watcher runs now;"),
+        text.contains("\n  ! The watcher's latest write to the store failed ")
+            && !text.contains("Watching live"),
         "{text}"
     );
     let pages = mac.view();
@@ -3097,8 +3101,8 @@ fn a_quiet_mac_needs_no_look_whatever_is_not_covered_and_a_planted_change_does()
     assert!(out.status.success());
     let line = String::from_utf8_lossy(&out.stdout);
     assert!(
-        line.starts_with("✗ 1 thing needs a look, none urgent · 1 new in this check")
-            && line.contains("\n  New\n    medium  Program set to start by itself changed  1\n"),
+        line.starts_with("● 1 thing needs a look · 1 new in this check   took ")
+            && line.contains("\n  medium  Program set to start by itself changed"),
         "{line}"
     );
     assert_eq!(answered(&mac.status()).0, 1);
@@ -3681,18 +3685,17 @@ fn a_sample_that_opens_a_finding_says_so_in_one_line_and_a_quiet_sample_says_not
 fn a_folder_macos_asks_permission_for_does_not_lengthen_the_report_of_a_quiet_mac() {
     // Every Mac with a Documents folder had its report end in "1 reading read nothing ...
     // changes unknown where nothing was read": a folder not looked into is not a reading
-    // that read nothing, and it is said under what is not covered.
+    // that read nothing, and it is said under what is not covered, never as a fault.
     let mac = Mac::new("guarded-quiet");
     mac.put("Documents/notes.txt", "x\n");
     mac.run();
     let out = mac.run_cmd().output().unwrap();
     let line = String::from_utf8_lossy(&out.stdout);
-    let changed = line
-        .lines()
-        .find_map(|l| l.strip_prefix("  Changed "))
-        .map(str::trim_start);
-    assert_eq!(changed, Some("nothing since the last check"), "{line}");
-    assert!(!line.contains("read nothing"), "{line}");
+    assert!(line.starts_with("✓ Nothing needs a look"), "{line}");
+    assert!(
+        !line.contains("read nothing") && !line.contains("Documents"),
+        "{line}"
+    );
     let r = mac.status().clone();
     assert_eq!(r["last_finished_run"]["readings"]["failed"], 0, "{r:#}");
     assert!(
