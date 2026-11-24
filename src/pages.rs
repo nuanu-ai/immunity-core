@@ -184,28 +184,22 @@ fn state(
         .iter()
         .filter(|n| n.section == "needs_a_look")
         .collect();
-    let needs = r.needs_a_look.as_ref().filter(|_| not_computed.is_empty());
     // Things as the rows show them, a pair one thing: the band says what the table draws.
     let shown = shown(&rows_of(st));
-    let total = needs.map(|_| (shown.now + shown.look) as u64);
+    let total = (shown.now + shown.look) as u64;
     let urgent = shown.now as u64;
-    let fresh = r.this_mac.as_ref().is_some_and(|t| t.fresh);
     // Why the headline cannot say more, in the program's own words, set beside the name.
     let mut why: Vec<String> = not_computed.iter().map(|n| esc(&n.reason)).collect();
-    let (glyph, headline) = match total {
+    // The glyph and the words by the status's own headline: calm only when it is calm.
+    use v1::Headline as H;
+    let (glyph, headline) = match H::try_from(r.headline) {
         // Red only for urgent ones; orange for things to look at, none urgent.
-        Some(n) if n > 0 && urgent > 0 => (GLYPH_NOW, esc(&needs_you(urgent, n))),
-        Some(n) if n > 0 => (GLYPH_LOOK, esc(&needs_you(urgent, n))),
-        _ if m.state == "not_checked" && m.checked_at.is_none() => {
+        Ok(H::NeedsALook) if urgent > 0 => (GLYPH_NOW, esc(&needs_you(urgent, total))),
+        Ok(H::NeedsALook) => (GLYPH_LOOK, esc(&needs_you(urgent, total))),
+        Ok(H::NotChecked) if m.state == "not_checked" => {
             (GLYPH_UNKNOWN, "Nothing has been checked yet.".to_string())
         }
-        None => {
-            if why.is_empty() {
-                why.push("what needs a look is not known yet".to_string());
-            }
-            (GLYPH_UNKNOWN, "I can't tell".to_string())
-        }
-        Some(_) if !fresh => {
+        Ok(H::NotChecked | H::Stale) => {
             if let Some(reason) = r.this_mac.as_ref().and_then(|t| t.stale_reason.as_deref()) {
                 why.push(esc(reason));
             }
@@ -217,16 +211,17 @@ fn state(
                 },
             )
         }
-        Some(_) => match m.state {
-            "watched" if m.live && m.failed.is_empty() => {
-                (GLYPH_CALM, "Nothing needs you".to_string())
+        Ok(H::Calm) => (GLYPH_CALM, "Nothing needs you".to_string()),
+        Ok(H::InPart) => (GLYPH_PART, "Nothing needs you".to_string()),
+        _ => {
+            if why.is_empty() {
+                why.push(match r.needs_a_look {
+                    None => "what needs a look is not known yet".to_string(),
+                    Some(_) => "whether this Mac is watched is not known".to_string(),
+                });
             }
-            "watched" | "watched_in_part" => (GLYPH_PART, "Nothing needs you".to_string()),
-            _ => {
-                why.push("whether this Mac is watched is not known".to_string());
-                (GLYPH_UNKNOWN, "I can't tell".to_string())
-            }
-        },
+            (GLYPH_UNKNOWN, "I can't tell".to_string())
+        }
     };
     let mut parts: Vec<String> = Vec::new();
     // Its name now, which can differ from the one in its id.
@@ -2886,31 +2881,48 @@ pub fn technical() -> String {
 mod tests {
     use super::*;
 
+    /// The band's glyph is the status's headline: the calm disc only for `calm`, the ring for
+    /// `in_part`, the clock for `stale`, and the question mark for a headline not known. The line
+    /// under it says how this Mac is watched, whatever the headline.
     #[test]
-    fn a_fresh_report_is_calm_only_while_live_readings_are_working() {
+    fn a_page_draws_the_calm_disc_only_for_a_calm_headline() {
         let dir = crate::common::Scratch::new("report-live");
         let conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
         let now = 1_000_001;
         let mut st = crate::status::state(&conn, &dir, now).unwrap();
         st.this_mac.state = "watched";
         st.this_mac.checked_at = Some(now - 1);
-        let r = v1::Status {
-            this_mac: Some(v1::ThisMac {
-                fresh: true,
+        let band = |st: &crate::status::State, headline: v1::Headline| {
+            let r = v1::Status {
+                this_mac: Some(v1::ThisMac {
+                    fresh: true,
+                    ..Default::default()
+                }),
+                needs_a_look: Some(v1::NeedsALook::default()),
+                headline: headline as i32,
                 ..Default::default()
-            }),
-            needs_a_look: Some(v1::NeedsALook::default()),
-            ..Default::default()
-        };
-        let band = |st: &crate::status::State| {
+            };
             let mut out = String::new();
             state(&conn, &mut out, st, &r, now).unwrap();
             out
         };
-        let stopped = band(&st);
-        assert!(stopped.contains(GLYPH_PART) && stopped.contains("live watching is off"));
+        for (headline, glyph) in [
+            (v1::Headline::Calm, GLYPH_CALM),
+            (v1::Headline::InPart, GLYPH_PART),
+            (v1::Headline::Stale, GLYPH_STALE),
+            (v1::Headline::Unknown, GLYPH_UNKNOWN),
+            (v1::Headline::Unspecified, GLYPH_UNKNOWN),
+        ] {
+            let drawn = band(&st, headline);
+            assert!(drawn.contains(glyph), "{headline:?}: {drawn}");
+            assert!(
+                headline == v1::Headline::Calm || !drawn.contains(GLYPH_CALM),
+                "{headline:?}: {drawn}"
+            );
+        }
+        let stopped = band(&st, v1::Headline::InPart);
+        assert!(stopped.contains("live watching is off"), "{stopped}");
         st.this_mac.live = true;
-        assert!(band(&st).contains(GLYPH_CALM));
         for (what, words) in [
             (crate::watch::FULL_CHECK, "full check"),
             (crate::watch::EVENTS, "reading of program starts"),
@@ -2920,8 +2932,7 @@ mod tests {
                 at: now,
                 detail: "invented refusal".to_string(),
             }];
-            let failed = band(&st);
-            assert!(failed.contains(GLYPH_PART), "{failed}");
+            let failed = band(&st, v1::Headline::InPart);
             assert!(failed.contains("watched live"), "{failed}");
             assert!(
                 failed.contains(&format!("latest {words} failed")),

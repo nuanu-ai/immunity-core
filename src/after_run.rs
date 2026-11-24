@@ -6,7 +6,7 @@
 //! `immunity run` answers with the status the check left, read back from the store (`Status`), so
 //! its text is made from that message too: what it raised is told by the findings first seen
 //! since the check began, and whether it may say "nothing needs a look" is decided by the
-//! status's own rule (`overview::failing`), never by a second one. After the lines that are the
+//! status's own headline (`Status.headline`), never by a second rule. After the lines that are the
 //! run's own (what changed, what was read), it says what the status says of the same store after
 //! its headline, from the status's own function (`overview::context`), so a run is never calmer
 //! than `immunity status`.
@@ -722,6 +722,12 @@ mod tests {
     use super::*;
     use crate::screen::visible;
 
+    /// The text of a run's status made by hand, with the headline `status::message` would give
+    /// it, computed from the message as it stands.
+    fn run(s: &v1::Status, screen: &Screen) -> String {
+        super::run(&crate::headline::headed(s.clone()), screen)
+    }
+
     const NOW: i64 = 1_794_807_960;
     const STARTED: i64 = NOW - 40;
 
@@ -1015,6 +1021,7 @@ mod tests {
                 Screen::terminal(80, false),
                 Screen::terminal(40, false),
             ] {
+                let s = &crate::headline::headed(s.clone());
                 let ran = run(s, &screen);
                 let status_text = overview::status(s, &screen, false);
                 let said = context_lines(&ran);
@@ -1047,6 +1054,7 @@ mod tests {
     fn a_run_reads_calm_only_when_the_status_s_own_rule_allows_it() {
         let mut calm = status();
         calm.needs_a_look = Some(v1::NeedsALook::default());
+        calm.this_mac.as_mut().unwrap().live = true;
         let text = run(&calm, &Screen::pipe());
         assert!(
             text.starts_with("✓ Nothing needs a look   took 12 s\n"),
@@ -1078,7 +1086,11 @@ mod tests {
             ..Default::default()
         });
         let text = run(&download, &Screen::pipe());
-        let status_text = overview::status(&download, &Screen::pipe(), false);
+        let status_text = overview::status(
+            &crate::headline::headed(download.clone()),
+            &Screen::pipe(),
+            false,
+        );
         assert_eq!(
             text.starts_with('✓'),
             status_text.starts_with('✓'),
@@ -1301,6 +1313,7 @@ mod tests {
         );
         let mut calm = s.clone();
         calm.needs_a_look = Some(v1::NeedsALook::default());
+        calm.this_mac.as_mut().unwrap().live = true;
         let text = run(&calm, &Screen::pipe());
         assert!(
             text.starts_with("✓ Nothing needs a look · the first check of this Mac"),

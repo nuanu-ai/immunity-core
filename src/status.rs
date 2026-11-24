@@ -956,7 +956,7 @@ pub fn message(
             &crate::covered::ThisMac::unchecked(false),
             now,
         ));
-        return Ok(out);
+        return Ok(crate::headline::headed(out));
     };
     let mut not_computed = Vec::new();
     let mut absent = |section: &str, reason: &str| {
@@ -998,7 +998,11 @@ pub fn message(
     }
     out.not_covered = st.not_covered.iter().map(uncovered_message).collect();
     match &st.last {
-        Some(l) => out.last_run = Some(mark(l)),
+        Some(l) => {
+            out.last_run = Some(mark(l));
+            // A check that has committed its end still holds its lock while it tidies the store.
+            out.running &= l.finished_at.is_none();
+        }
         None => absent("last_run", "no run has started"),
     }
     match &st.summary {
@@ -1158,7 +1162,7 @@ pub fn message(
     out.statements_outside_app = Some(crate::owner::outside_app(&st.standing, NEEDS_SHOWN));
     out.not_computed = not_computed;
     let _ = value_of::<v1::Level>;
-    Ok(out)
+    Ok(crate::headline::headed(out))
 }
 
 /// A run as the contract gives it.

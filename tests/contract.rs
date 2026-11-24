@@ -117,13 +117,9 @@ fn generate() -> String {
                 let rust = f.type_name().rsplit('.').next().unwrap();
                 let (ser, de) = if f.proto3_optional() {
                     ("optional_enum_name", "optional_enum_from_name")
+                } else if f.label() == Label::Repeated {
+                    ("repeated_enum_name", "repeated_enum_from_name")
                 } else {
-                    assert!(
-                        f.label() != Label::Repeated,
-                        "{}.{}: a repeated enum field has no JSON helper",
-                        m.name(),
-                        f.name()
-                    );
                     ("enum_name", "enum_from_name")
                 };
                 config.field_attribute(
@@ -173,6 +169,27 @@ fn an_enum_prints_as_its_name_and_never_as_a_number() {
     assert_eq!(json["presence"], "held");
     let unnamed = v1::Known {
         presence: 99,
+        ..Default::default()
+    };
+    assert!(serde_json::to_string(&unnamed).is_err());
+    // A repeated one is a list of names, and a word this build does not know reads back as
+    // unspecified.
+    let status = v1::Status {
+        headline_because: vec![v1::HeadlineBecause::Watcher as i32],
+        ..Default::default()
+    };
+    assert_eq!(
+        serde_json::to_value(&status).unwrap()["headline_because"],
+        serde_json::json!(["watcher"])
+    );
+    let read: v1::Status =
+        serde_json::from_str(r#"{"headline_because": ["watcher", "added_later"]}"#).unwrap();
+    assert_eq!(
+        read.headline_because,
+        [v1::HeadlineBecause::Watcher as i32, 0]
+    );
+    let unnamed = v1::Status {
+        headline_because: vec![99],
         ..Default::default()
     };
     assert!(serde_json::to_string(&unnamed).is_err());

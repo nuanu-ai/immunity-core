@@ -30,6 +30,7 @@ mod fsevents;
 mod git_hooks;
 mod guarded;
 mod happens;
+mod headline;
 mod icu;
 mod indicators;
 mod integrity;
@@ -1271,7 +1272,7 @@ fn status_read(store: &Path, now: i64) -> Result<(status::State, contract::v1::S
     if let Some((stage, at)) = st
         .last
         .as_ref()
-        .filter(|_| running)
+        .filter(|_| m.running)
         .and_then(|l| osv::check_stage(&home(store), &l.id))
     {
         m.check_stage = Some(stage as i32);

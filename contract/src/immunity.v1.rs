@@ -2945,6 +2945,7 @@ pub struct Status {
     #[prost(string, optional, tag = "3")]
     pub store_id: ::core::option::Option<::prost::alloc::string::String>,
     /// A full check is in progress now. Everything else describes the latest one that finished.
+    /// False once the latest check that started has finished, while it still tidies the store.
     #[prost(bool, tag = "4")]
     pub running: bool,
     /// The store's file, and whether it exists. Without a store every section but `cannot_judge`,
@@ -3064,6 +3065,22 @@ pub struct Status {
     pub check_stage: ::core::option::Option<i32>,
     #[prost(int64, optional, tag = "34")]
     pub check_stage_started_at: ::core::option::Option<i64>,
+    /// The answer in one word, computed by the core from this message alone, so that every surface
+    /// says calm by one rule. Since 1.28.0.
+    #[prost(enumeration = "Headline", tag = "35")]
+    #[serde(
+        serialize_with = "crate::enum_name::<Headline, _>",
+        deserialize_with = "crate::enum_from_name::<Headline, _>"
+    )]
+    pub headline: i32,
+    /// What keeps a fresh answer with nothing to look at from calm, each named by the section of
+    /// this message that says why. Empty unless `headline` is `in_part`. Since 1.28.0.
+    #[prost(enumeration = "HeadlineBecause", repeated, tag = "36")]
+    #[serde(
+        serialize_with = "crate::repeated_enum_name::<HeadlineBecause, _>",
+        deserialize_with = "crate::repeated_enum_from_name::<HeadlineBecause, _>"
+    )]
+    pub headline_because: ::prost::alloc::vec::Vec<i32>,
 }
 /// The store's file.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -4147,6 +4164,125 @@ pub struct SampleConnections {
     pub matched_indicators: u64,
     #[prost(uint64, tag = "3")]
     pub unreadable: u64,
+}
+/// The answer in one word, by one rule, in this order: no `needs_a_look` is `unknown`; a finding
+/// is `needs_a_look`; no finished full check is `not_checked`; not fresh is `stale`; a
+/// `this_mac.state` that is neither `watched` nor `watched_in_part` is `unknown`; any
+/// `headline_because` is `in_part`; else `calm`. `UNSPECIFIED`, or a value the reader does not
+/// know, is read as `unknown`: never as calm.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum Headline {
+    #[serde(rename = "unspecified")]
+    Unspecified = 0,
+    /// No run of this build has looked for findings, or whether this Mac is watched is not known.
+    #[serde(rename = "unknown")]
+    Unknown = 1,
+    /// No full check has finished; `running` says whether the first one runs.
+    #[serde(rename = "not_checked")]
+    NotChecked = 2,
+    /// A finding needs a look: `needs_a_look.total` is more than 0.
+    #[serde(rename = "needs_a_look")]
+    NeedsALook = 3,
+    /// Nothing needed a look at the latest full check, and it is not fresh: `this_mac.fresh`.
+    #[serde(rename = "stale")]
+    Stale = 4,
+    /// Nothing needs a look in a fresh answer, and `headline_because` names what kept it from calm.
+    #[serde(rename = "in_part")]
+    InPart = 5,
+    /// Nothing needs a look, the answer is fresh, this Mac is watched whole by a live watcher, and
+    /// nothing failed.
+    #[serde(rename = "calm")]
+    Calm = 6,
+}
+impl Headline {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "HEADLINE_UNSPECIFIED",
+            Self::Unknown => "HEADLINE_UNKNOWN",
+            Self::NotChecked => "HEADLINE_NOT_CHECKED",
+            Self::NeedsALook => "HEADLINE_NEEDS_A_LOOK",
+            Self::Stale => "HEADLINE_STALE",
+            Self::InPart => "HEADLINE_IN_PART",
+            Self::Calm => "HEADLINE_CALM",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "HEADLINE_UNSPECIFIED" => Some(Self::Unspecified),
+            "HEADLINE_UNKNOWN" => Some(Self::Unknown),
+            "HEADLINE_NOT_CHECKED" => Some(Self::NotChecked),
+            "HEADLINE_NEEDS_A_LOOK" => Some(Self::NeedsALook),
+            "HEADLINE_STALE" => Some(Self::Stale),
+            "HEADLINE_IN_PART" => Some(Self::InPart),
+            "HEADLINE_CALM" => Some(Self::Calm),
+            _ => None,
+        }
+    }
+}
+/// What keeps a fresh answer with nothing to look at from calm. `UNSPECIFIED`, or a value the
+/// reader does not know, is read as a reason it cannot name, never as none.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum HeadlineBecause {
+    #[serde(rename = "unspecified")]
+    Unspecified = 0,
+    /// `this_mac.live` is false, or a failure in `watching.failed` stands.
+    #[serde(rename = "watcher")]
+    Watcher = 1,
+    /// `this_mac.state` is `watched_in_part`.
+    #[serde(rename = "this_mac")]
+    ThisMac = 2,
+    /// A reading failed or a machine was not reached: `coverage.failed` or
+    /// `coverage.unreached_total` is more than 0.
+    #[serde(rename = "coverage")]
+    Coverage = 3,
+    /// An item of `not_covered` is of class `failed`, or of a class the reader does not know.
+    #[serde(rename = "not_covered")]
+    NotCovered = 4,
+    /// The event level is installed and its state is not `running`.
+    #[serde(rename = "event_level")]
+    EventLevel = 5,
+    /// `last_run` started and did not finish, and no check runs: it died.
+    #[serde(rename = "last_run")]
+    LastRun = 6,
+}
+impl HeadlineBecause {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "HEADLINE_BECAUSE_UNSPECIFIED",
+            Self::Watcher => "HEADLINE_BECAUSE_WATCHER",
+            Self::ThisMac => "HEADLINE_BECAUSE_THIS_MAC",
+            Self::Coverage => "HEADLINE_BECAUSE_COVERAGE",
+            Self::NotCovered => "HEADLINE_BECAUSE_NOT_COVERED",
+            Self::EventLevel => "HEADLINE_BECAUSE_EVENT_LEVEL",
+            Self::LastRun => "HEADLINE_BECAUSE_LAST_RUN",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "HEADLINE_BECAUSE_UNSPECIFIED" => Some(Self::Unspecified),
+            "HEADLINE_BECAUSE_WATCHER" => Some(Self::Watcher),
+            "HEADLINE_BECAUSE_THIS_MAC" => Some(Self::ThisMac),
+            "HEADLINE_BECAUSE_COVERAGE" => Some(Self::Coverage),
+            "HEADLINE_BECAUSE_NOT_COVERED" => Some(Self::NotCovered),
+            "HEADLINE_BECAUSE_EVENT_LEVEL" => Some(Self::EventLevel),
+            "HEADLINE_BECAUSE_LAST_RUN" => Some(Self::LastRun),
+            _ => None,
+        }
+    }
 }
 /// The stage of a full check, in the order a check goes through them. `UNSPECIFIED`, or a value
 /// the reader does not know, is read as a stage it cannot name, of a check that is still running.

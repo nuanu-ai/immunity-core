@@ -13,7 +13,8 @@
 //   it, in `not_covered`, and is never counted in it.
 //
 // Values that will be added. A reader meets values of `ThisMacState`, `FeedOutcome`, `Judged`,
-// `NotWatchingReason`, `ReadingClass` and `CheckStage`, and those the other files name, that it does not know:
+// `NotWatchingReason`, `ReadingClass`, `CheckStage`, `Headline` and `HeadlineBecause`, and those
+// the other files name, that it does not know:
 // the core adds them within version 1. It treats one it does not know as each enum's comment
 // says.
 
@@ -41,6 +42,7 @@ message Status {
   // is no store.
   optional string store_id = 3;
   // A full check is in progress now. Everything else describes the latest one that finished.
+  // False once the latest check that started has finished, while it still tidies the store.
   bool running = 4;
   // The store's file, and whether it exists. Without a store every section but `cannot_judge`,
   // `rules`, `watching` and `this_mac` is absent and named in `not_computed`.
@@ -125,6 +127,53 @@ message Status {
   // `last_finished_run` say that. Since 1.24.0.
   optional CheckStage check_stage = 33;
   optional int64 check_stage_started_at = 34;
+  // The answer in one word, computed by the core from this message alone, so that every surface
+  // says calm by one rule. Since 1.28.0.
+  Headline headline = 35;
+  // What keeps a fresh answer with nothing to look at from calm, each named by the section of
+  // this message that says why. Empty unless `headline` is `in_part`. Since 1.28.0.
+  repeated HeadlineBecause headline_because = 36;
+}
+
+// The answer in one word, by one rule, in this order: no `needs_a_look` is `unknown`; a finding
+// is `needs_a_look`; no finished full check is `not_checked`; not fresh is `stale`; a
+// `this_mac.state` that is neither `watched` nor `watched_in_part` is `unknown`; any
+// `headline_because` is `in_part`; else `calm`. `UNSPECIFIED`, or a value the reader does not
+// know, is read as `unknown`: never as calm.
+enum Headline {
+  HEADLINE_UNSPECIFIED = 0;
+  // No run of this build has looked for findings, or whether this Mac is watched is not known.
+  HEADLINE_UNKNOWN = 1;
+  // No full check has finished; `running` says whether the first one runs.
+  HEADLINE_NOT_CHECKED = 2;
+  // A finding needs a look: `needs_a_look.total` is more than 0.
+  HEADLINE_NEEDS_A_LOOK = 3;
+  // Nothing needed a look at the latest full check, and it is not fresh: `this_mac.fresh`.
+  HEADLINE_STALE = 4;
+  // Nothing needs a look in a fresh answer, and `headline_because` names what kept it from calm.
+  HEADLINE_IN_PART = 5;
+  // Nothing needs a look, the answer is fresh, this Mac is watched whole by a live watcher, and
+  // nothing failed.
+  HEADLINE_CALM = 6;
+}
+
+// What keeps a fresh answer with nothing to look at from calm. `UNSPECIFIED`, or a value the
+// reader does not know, is read as a reason it cannot name, never as none.
+enum HeadlineBecause {
+  HEADLINE_BECAUSE_UNSPECIFIED = 0;
+  // `this_mac.live` is false, or a failure in `watching.failed` stands.
+  HEADLINE_BECAUSE_WATCHER = 1;
+  // `this_mac.state` is `watched_in_part`.
+  HEADLINE_BECAUSE_THIS_MAC = 2;
+  // A reading failed or a machine was not reached: `coverage.failed` or
+  // `coverage.unreached_total` is more than 0.
+  HEADLINE_BECAUSE_COVERAGE = 3;
+  // An item of `not_covered` is of class `failed`, or of a class the reader does not know.
+  HEADLINE_BECAUSE_NOT_COVERED = 4;
+  // The event level is installed and its state is not `running`.
+  HEADLINE_BECAUSE_EVENT_LEVEL = 5;
+  // `last_run` started and did not finish, and no check runs: it died.
+  HEADLINE_BECAUSE_LAST_RUN = 6;
 }
 
 // The stage of a full check, in the order a check goes through them. `UNSPECIFIED`, or a value
