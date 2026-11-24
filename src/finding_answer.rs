@@ -145,19 +145,41 @@ pub fn refs(items: &[Item]) -> BTreeMap<String, v1::FindingRef> {
         .collect()
 }
 
-/// Every "affects me" answer, read once for a whole list.
-pub struct Packages(Vec<vulnerabilities::Affecting>);
+/// Every "affects me" answer, and what each finding about a package kept when it was cleared or
+/// its package left, read once for a whole list.
+pub struct Packages(
+    Vec<vulnerabilities::Affecting>,
+    BTreeMap<String, vulnerabilities::Kept>,
+);
 
 pub fn packages(conn: &Connection) -> rusqlite::Result<Packages> {
-    Ok(Packages(vulnerabilities::affecting(conn)?))
+    Ok(Packages(
+        vulnerabilities::affecting(conn)?,
+        vulnerabilities::kept(conn)?,
+    ))
 }
 
 impl Packages {
     /// The package a finding about the component `about` is about: its name and the releases
     /// of that component a record affects, as `package` gives them for one finding, each once.
     pub fn of(&self, about: &str) -> Option<(String, BTreeSet<String>)> {
+        Self::in_list(&self.0, about)
+    }
+
+    /// The same for the finding `i`, from what it kept when it has kept something.
+    fn of_finding(&self, i: &Item) -> Option<(String, BTreeSet<String>)> {
+        match self.1.get(&i.id) {
+            Some(k) => Self::in_list(&k.was, &i.about),
+            None => self.of(&i.about),
+        }
+    }
+
+    fn in_list(
+        list: &[vulnerabilities::Affecting],
+        about: &str,
+    ) -> Option<(String, BTreeSet<String>)> {
         let mine: Vec<&vulnerabilities::Affecting> =
-            self.0.iter().filter(|a| a.is_about(about)).collect();
+            list.iter().filter(|a| a.is_about(about)).collect();
         let releases = mine.iter().flat_map(|a| a.affected_of(about));
         let releases = releases.map(|(version, _)| version).collect();
         mine.first().map(|a| (a.package.clone(), releases))
@@ -177,7 +199,7 @@ pub fn listed(
     refs: &BTreeMap<String, v1::FindingRef>,
     packages: &Packages,
 ) -> v1::ListedFinding {
-    let package = packages.of(&i.about);
+    let package = packages.of_finding(i);
     v1::ListedFinding {
         short_title: i.words.short.to_string(),
         rule_title_text: rule_title(&i.rule),
@@ -270,7 +292,17 @@ pub fn evidence(conn: &Connection, f: &Found) -> rusqlite::Result<Option<v1::evi
                 indicators_text: became(),
             }),
             Some("processes") => Body::DetachedProcess(detached(conn, &f.id)?),
-            Some("lockfiles") => Body::VulnerablePackage(package(conn, &f.about)?),
+            Some("lockfiles") => {
+                Body::VulnerablePackage(match vulnerabilities::kept(conn)?.remove(&f.id) {
+                    // What it was about when it was cleared or its package left, and why.
+                    Some(k) => v1::VulnerablePackage {
+                        no_longer_found: Some(value_of::<v1::NoLongerFound>(&k.why)),
+                        no_longer_found_at: Some(k.at),
+                        ..package_in(conn, k.was, &f.about)?
+                    },
+                    None => package(conn, &f.about)?,
+                })
+            }
             _ => return Ok(None),
         },
     ))
@@ -401,10 +433,17 @@ fn detached(conn: &Connection, finding: &str) -> rusqlite::Result<v1::DetachedPr
 /// (`vulnerabilities::finding_detail`): every record that affects it, and every release it
 /// affects with where it is declared.
 pub fn package(conn: &Connection, about: &str) -> rusqlite::Result<v1::VulnerablePackage> {
-    let mine: Vec<vulnerabilities::Affecting> = vulnerabilities::affecting(conn)?
-        .into_iter()
-        .filter(|a| a.is_about(about))
-        .collect();
+    package_in(conn, vulnerabilities::affecting(conn)?, about)
+}
+
+/// The same from the answers in `list`.
+fn package_in(
+    conn: &Connection,
+    list: Vec<vulnerabilities::Affecting>,
+    about: &str,
+) -> rusqlite::Result<v1::VulnerablePackage> {
+    let mine: Vec<vulnerabilities::Affecting> =
+        list.into_iter().filter(|a| a.is_about(about)).collect();
     let mut out = v1::VulnerablePackage::default();
     let Some(first) = mine.first() else {
         return Ok(out);

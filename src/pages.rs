@@ -899,6 +899,14 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
             }
         }
         Some(Body::VulnerablePackage(p)) => {
+            if let Some(why) = p.no_longer_found {
+                let said = crate::finding_text::no_longer_found_said(why);
+                let as_then = crate::finding_text::AS_THEN;
+                facts.push(("No longer found", word(&format!("{said}{as_then}"))));
+                if let Some(at) = p.no_longer_found_at {
+                    facts.push(("Since", view::when(at, now)));
+                }
+            }
             if let Some(name) = &p.package_text {
                 facts.push(("Package", data(name)));
             }
@@ -2880,6 +2888,33 @@ pub fn technical() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_package_no_longer_found_says_why_first_and_its_kept_names_stay_escaped() {
+        let f = v1::Finding {
+            evidence: Some(v1::Evidence {
+                body: Some(v1::evidence::Body::VulnerablePackage(
+                    v1::VulnerablePackage {
+                        package_text: Some("<b>left-pad".to_string()),
+                        no_longer_found: Some(v1::NoLongerFound::ProjectGone as i32),
+                        no_longer_found_at: Some(1_800_000_000 - 3600),
+                        ..Default::default()
+                    },
+                )),
+            }),
+            ..Default::default()
+        };
+        let (mut facts, mut voices) = (Vec::new(), Vec::new());
+        evidence(&f, &mut facts, &mut voices, 1_800_000_000);
+        let names: Vec<&str> = facts.iter().map(|(k, _)| *k).collect();
+        assert_eq!(names, ["No longer found", "Since", "Package"]);
+        assert!(
+            facts[0]
+                .1
+                .contains("the project is no longer on this Mac; what follows")
+        );
+        assert!(facts[2].1.contains("&lt;b&gt;left-pad") && !facts[2].1.contains("<b>"));
+    }
 
     /// The band's glyph is the status's headline: the calm disc only for `calm`, the ring for
     /// `in_part`, the clock for `stale`, and the question mark for a headline not known. The line

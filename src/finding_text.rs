@@ -566,12 +566,38 @@ fn place_lines(s: &Screen, f: &v1::Finding, p: &v1::PlaceChanged) -> Vec<String>
     out
 }
 
+/// Why a finding about a package no longer finds it, in the words a person reads in the finding
+/// and on the pages. A value this build does not know is said to be one.
+pub fn no_longer_found_said(why: i32) -> &'static str {
+    match v1::NoLongerFound::try_from(why) {
+        Ok(v1::NoLongerFound::NotDeclared) => "the project's lockfiles no longer declare it",
+        Ok(v1::NoLongerFound::ProjectGone) => "the project is no longer on this Mac",
+        Ok(v1::NoLongerFound::NotNamed) => "no record says this of it now",
+        _ => "no longer found, for a reason this version does not know",
+    }
+}
+
+/// What the evidence of a package no longer found is.
+pub const AS_THEN: &str = "; what follows is what the finding was about then";
+
 /// The evidence of a package a project depends on: the package and its releases, where they are
 /// declared when that is not the place the finding names, each record, and the release each is
 /// fixed in, set apart as the thing to do.
 fn package_lines(s: &Screen, f: &v1::Finding, p: &v1::VulnerablePackage) -> Vec<String> {
     let e = |label: &str, parts: &[(&str, Style)]| field(s, 4, EVIDENCE_LABEL, label, parts);
     let mut out = Vec::new();
+    // Why it is no longer found, first: what follows is then what the finding was about.
+    if let Some(why) = p.no_longer_found {
+        let label = match state_of(f) {
+            v1::FindingState::Cleared => "Cleared",
+            _ => "Now",
+        };
+        let since = (p.no_longer_found_at)
+            .map(|at| format!(", since {}", s.time(at, f.answered_at)))
+            .unwrap_or_default();
+        let said = no_longer_found_said(why);
+        out.extend(e(label, &[(said, PLAIN), (&since, PLAIN), (AS_THEN, DIM)]));
+    }
     if let Some(name) = &p.package_text {
         let mut said = name.clone();
         let versions: Vec<&str> = p.releases.iter().map(|r| r.version_text.as_str()).collect();
@@ -1313,6 +1339,7 @@ mod tests {
                         summary_text: Some(format!("Summary {odd}")),
                         fixed_text: vec![format!("1.0.9{odd}")],
                     }],
+                    ..Default::default()
                 }),
             ),
             (
@@ -1765,6 +1792,71 @@ mod tests {
             ] {
                 assert!(!text.contains(absent), "{absent}\n{text}");
             }
+        }
+    }
+
+    #[test]
+    fn a_package_no_longer_found_says_why_and_that_what_follows_is_what_it_was_about_then() {
+        let s = Screen::terminal(200, false);
+        let at = "~/dev/shop/package-lock.json#node_modules/left-pad";
+        let of = |state: v1::FindingState, why: Option<i32>| {
+            let body = Body::VulnerablePackage(v1::VulnerablePackage {
+                project_text: Some("checkout:machine:example-host/dev/shop".to_string()),
+                ecosystem: Some("npm".to_string()),
+                package_text: Some("left-pad".to_string()),
+                releases: vec![v1::PackageRelease {
+                    version_text: "1.0.7".to_string(),
+                    at_text: at.to_string(),
+                }],
+                records: vec![v1::PackageRecord {
+                    id_text: "MAL-2099-0001".to_string(),
+                    source: "OpenSSF malicious packages".to_string(),
+                    label: "malicious".to_string(),
+                    summary_text: Some("Malicious code in left-pad (npm)".to_string()),
+                    ..Default::default()
+                }],
+                no_longer_found: why,
+                no_longer_found_at: why.map(|_| NOW - 3600),
+            });
+            let rule = (findings::rules().into_iter())
+                .find(|r| r.id == findings::MALICIOUS_PACKAGE)
+                .unwrap();
+            let mut f = finding_of(body, "");
+            let r = f.finding.as_mut().unwrap();
+            (r.state, r.rule) = (state as i32, Some(rule.id.to_string()));
+            (r.severity, r.confidence) = (Some(v1::Level::Critical as i32), None);
+            (f.title, f.short_title) = (rule.words.title.into(), rule.words.short.into());
+            (f.meaning, f.advice) = (rule.words.meaning.into(), rule.words.advice.into());
+            (f.where_text, f.technique_text) = (at.to_string(), None);
+            (f.verdicts, f.rests_on) = (None, Vec::new());
+            finding(&f, &s)
+        };
+        let open = of(v1::FindingState::Open, None);
+        let gone = of(
+            v1::FindingState::Open,
+            Some(v1::NoLongerFound::NotDeclared as i32),
+        );
+        let cleared = of(
+            v1::FindingState::Cleared,
+            Some(v1::NoLongerFound::NotNamed as i32),
+        );
+        let unknown = of(v1::FindingState::Open, Some(99));
+        assert!(!open.contains("what the finding was about then"), "{open}");
+        for (text, label, said) in [
+            (&gone, "Now", "the project's lockfiles no longer declare it"),
+            (&cleared, "Cleared", "no record says this of it now"),
+            (&unknown, "Now", "for a reason this version does not know"),
+        ] {
+            let line = text
+                .lines()
+                .find(|l| l.contains(said))
+                .unwrap_or_else(|| panic!("{text}"));
+            assert!(line.trim_start().starts_with(label), "{text}");
+            assert!(line.contains("since 1 h ago;"), "{text}");
+            assert!(text.contains("the finding was about then"), "{text}");
+            // The kept package, release and record are still shown under it.
+            assert!(text.contains("left-pad 1.0.7 (npm)"), "{text}");
+            assert!(text.contains("MAL-2099-0001, malicious"), "{text}");
         }
     }
 

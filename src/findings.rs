@@ -636,8 +636,9 @@ fn detached_inline_code() -> Rule {
 
 // ---- Packages the projects depend on: what matching the lockfiles against the vulnerability
 // data found, see `vulnerabilities`. These rules find a state: a finding stays while the
-// dependency matches and is cleared when it goes. They are raised by `hold`, never by what a
-// run saw change, so `fires` is false for every observation. ----
+// dependency matches and is cleared when it goes, but for a malicious package that left the
+// project, whose finding stays until the person answers it (`hold`). They are raised by `hold`,
+// never by what a run saw change, so `fires` is false for every observation. ----
 
 /// What these rules are about, as the item's `kind`.
 pub const DEPENDENCY: &str = "lockfile dependency";
@@ -705,10 +706,11 @@ fn exploited_vulnerability() -> Rule {
 
 /// Holds a rule that finds a state for what a run found now: each thing in `now` has a finding
 /// that stands, raised when none does, with the journal entries it rests on. A finding of the
-/// rule about a thing not in `now` is cleared only when the run knows the thing's state
-/// (`known`), so the state is over; one the run cannot tell about is left exactly as it was,
-/// with its answer and its occurrence. A finding the owner answered stays answered while the
-/// thing stays. Returns how many findings were opened.
+/// rule about a thing not in `now` ends only when the run knows the thing's state (`known`), so
+/// the state is over: it is cleared, or for a malicious package that left the project its change
+/// becomes `gone` and it stays (`OPEN_WHEN_GONE`). One the run cannot tell about is left exactly
+/// as it was, with its answer and its occurrence. A finding the owner answered stays answered
+/// while the thing stays. Returns how many findings were opened.
 pub fn hold(
     tx: &Transaction,
     rule: &str,
@@ -730,9 +732,11 @@ pub fn hold(
         match latest {
             Some((id, _, state, until)) if state != "cleared" => {
                 let ended = state == "expected" && until.is_some_and(|u| u <= at);
+                // A package that left and is back is found as it is now.
                 tx.execute(
                     "UPDATE finding SET last_seen_at = ?2, last_seen_run = ?3,
-                            state = CASE WHEN ?4 THEN 'open' ELSE state END
+                            state = CASE WHEN ?4 THEN 'open' ELSE state END,
+                            change = CASE change WHEN 'gone' THEN 'new' ELSE change END
                      WHERE id = ?1",
                     params![id, at, run_id, ended],
                 )?;
@@ -788,28 +792,52 @@ pub fn hold(
             }
         }
     }
-    let standing: Vec<(String, String)> = tx
-        .prepare("SELECT id, about FROM finding WHERE rule = ?1 AND state != 'cleared'")?
-        .query_map([rule], |r| Ok((r.get(0)?, r.get(1)?)))?
+    type Standing = (String, String, String, Option<String>, String);
+    let standing: Vec<Standing> = tx
+        .prepare(
+            "SELECT id, about, state, change, last_seen_run FROM finding
+             WHERE rule = ?1 AND state != 'cleared'",
+        )?
+        .query_map([rule], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
         .collect::<rusqlite::Result<_>>()?;
-    for (id, about) in standing {
+    for (id, about, state, change, since) in standing {
         if now.iter().any(|(a, _)| *a == about) || !known(&about)? {
             continue;
         }
-        tx.execute("UPDATE finding SET state = 'cleared' WHERE id = ?1", [&id])?;
-        journal(
-            tx,
-            at,
-            run_id,
-            "finding_cleared",
-            &id,
-            rule,
-            &about,
-            json!({}),
+        // Why it ended and what it was about, kept in the entry that says so, which it then
+        // rests on. The code of a malicious package may have run when it was installed, which
+        // stays true after it left the project: that finding stays until the person answers it,
+        // unless the data no longer says it is malicious. One the person saw is closed already.
+        let (why, was) = crate::vulnerabilities::ended(tx, &about, &since)?;
+        let stays = OPEN_WHEN_GONE.contains(&rule)
+            && why != crate::vulnerabilities::NOT_NAMED
+            && state != "seen";
+        let (entry, text) = if stays {
+            if change.as_deref() == Some("gone") {
+                continue;
+            }
+            tx.execute("UPDATE finding SET change = 'gone' WHERE id = ?1", [&id])?;
+            (
+                "finding_raised",
+                json!({"change": "gone", "why": why, "was": was}),
+            )
+        } else {
+            tx.execute("UPDATE finding SET state = 'cleared' WHERE id = ?1", [&id])?;
+            ("finding_cleared", json!({"why": why, "was": was}))
+        };
+        journal(tx, at, run_id, entry, &id, rule, &about, text)?;
+        tx.execute(
+            "INSERT INTO finding_basis (finding, journal) VALUES (?1, ?2)",
+            params![id, tx.last_insert_rowid()],
         )?;
     }
     Ok(opened)
 }
+
+/// The rules whose finding stays when what it is about left the project (`hold`).
+const OPEN_WHEN_GONE: [&str; 2] = [MALICIOUS_PACKAGE, MALICIOUS_NAME_REMOVED];
 
 // ---- End of packages the projects depend on. ----
 
@@ -1129,6 +1157,7 @@ fn state_at(
 pub fn all(conn: &Connection, now: i64) -> rusqlite::Result<Vec<Found>> {
     let this = This::of(conn, this_machine(conn)?)?;
     let mut affecting: Option<Vec<crate::vulnerabilities::Affecting>> = None;
+    let mut kept: Option<std::collections::BTreeMap<String, crate::vulnerabilities::Kept>> = None;
     conn.prepare(
         "SELECT id, rule, about, state, change, first_seen_at, first_seen_run, last_seen_at,
                 last_seen_run, answered_at, reason, until_at,
@@ -1197,12 +1226,19 @@ pub fn all(conn: &Connection, now: i64) -> rusqlite::Result<Vec<Found>> {
                 f.thing = Some(first_read_thing(&read));
             }
             // A finding about a dependency says where its lockfile lines are and what records
-            // it rests on, from the answers that stand now. They are read once for all such
-            // findings, not once for each.
+            // it rests on, from the answers that stand now, or from what it kept when it was
+            // cleared or its package left. They are read once for all such findings, not once
+            // for each.
             if f.rule.starts_with("lockfiles.") {
-                let list = affecting.get_or_insert_with(|| {
-                    crate::vulnerabilities::affecting(conn).unwrap_or_default()
+                let kept = kept.get_or_insert_with(|| {
+                    crate::vulnerabilities::kept(conn).unwrap_or_default()
                 });
+                let list = match kept.get(&f.id) {
+                    Some(k) => &k.was,
+                    None => affecting.get_or_insert_with(|| {
+                        crate::vulnerabilities::affecting(conn).unwrap_or_default()
+                    }),
+                };
                 if let Some((place, value)) = crate::vulnerabilities::finding_detail(list, &f.about)
                 {
                     f.place = place;

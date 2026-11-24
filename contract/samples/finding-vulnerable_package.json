@@ -8,6 +8,8 @@
   "evidence": {
     "vulnerable_package": {
       "ecosystem": "npm",
+      "no_longer_found": null,
+      "no_longer_found_at": null,
       "package_text": "ansi-regex",
       "project_text": "checkout:machine:mac/dev/shop",
       "records": [

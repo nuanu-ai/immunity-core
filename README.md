@@ -16,7 +16,7 @@ Immunity Core finds what you have on the Mac: projects and their dependencies, i
 
 - An event is something that happened on the Mac and that the optional collector recorded: a program started, or a file was created or renamed.
 - A match is one rule that matched one event. On its own it claims nothing. There are many, and the app does not list them; a program that judges them reads them with `immunity matches`.
-- A finding is what Immunity Core decided a person should look at. There are few, and each stays open until the person answers it. The one exception is a finding about a state, such as a malicious package in a lockfile, which Immunity Core clears when the state goes.
+- A finding is what Immunity Core decided a person should look at. There are few, and each stays open until the person answers it. The one exception is a finding about a state, such as a vulnerability attackers use in a lockfile, which Immunity Core clears when the state goes. A malicious package stays a finding after it leaves the lockfile, since its code may have run when it was installed.
 
 A match of a rule marked below high, or of a rule whose set states no level, stays a match. A match of a rule marked high or critical also raises that rule's finding, or adds to the one it has, so it shows up both in `immunity matches` and in `immunity findings`. Many findings rest on no event at all: a malicious package, or a shell startup file that changed.
 
