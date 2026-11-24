@@ -1137,18 +1137,15 @@ snapshots:
     #[test]
     fn a_lockfile_of_a_kind_with_no_reader_is_never_opened_and_is_listed_with_its_size() {
         // Its size comes from the folder, so one this user may not open is still named as a
-        // kind with no reader, never as a failed reading, and listed with its size. The six
-        // Python kinds have a row with no reader yet, and a named `pylock.<name>.toml` is a
-        // `pylock.toml`: each leaves PyPI unknown, and npm and crates.io as they were.
+        // kind with no reader, never as a failed reading, and listed with its size. Python
+        // kinds with a row and no reader yet leave PyPI unknown, and npm and crates.io as they
+        // were.
         use std::os::unix::fs::PermissionsExt;
         let text = "bun-lockfile-format-v0\n";
         for (file, kind) in [
             ("bun.lockb", "bun.lockb"),
-            ("uv.lock", "uv.lock"),
             ("poetry.lock", "poetry.lock"),
             ("pdm.lock", "pdm.lock"),
-            ("pylock.toml", "pylock.toml"),
-            ("pylock.dev.toml", "pylock.toml"),
             ("Pipfile.lock", "Pipfile.lock"),
             ("requirements.txt", "requirements.txt"),
         ] {
@@ -1215,6 +1212,8 @@ snapshots:
             ("yarn.lock", YARN, "npm"),
             ("bun.lock", BUN, "npm"),
             ("Cargo.lock", CARGO, "crates.io"),
+            ("uv.lock", &super::uv::tests::sample(), "PyPI"),
+            ("pylock.toml", &super::pylock::tests::sample(), "PyPI"),
         ] {
             let (said, reason) = read_one("own-reader", kind, sample);
             assert_eq!(reason, None, "{kind}");
@@ -1222,7 +1221,7 @@ snapshots:
             assert!(said.iter().any(|s| s.starts_with(&of_it)), "{kind}");
         }
         assert!(has_reader("npm") && has_reader("crates.io"));
-        assert!(!has_reader("PyPI") && !has_reader("RubyGems"));
+        assert!(has_reader("PyPI") && !has_reader("RubyGems"));
     }
 
     #[test]
@@ -1623,10 +1622,10 @@ __metadata:
     fn a_lockfile_of_an_ecosystem_with_no_reader_is_named_as_a_kind_wherever_it_is() {
         // `Pipfile.lock`, `Gemfile.lock` and the rest of the published list are lockfiles: one
         // beside a `Cargo.lock` is a kind with no reader, by name, whether at the root, deep or
-        // set aside. It leaves its own ecosystem unknown and no other: a deep `uv.lock` makes
-        // PyPI partial and not npm, and a name of no ecosystem a record can be about leaves none.
+        // set aside. It leaves its own ecosystem unknown and no other: a deep `go.sum` makes
+        // Go partial and not npm, and a name of no ecosystem a record can be about leaves none.
         for (tag, path, eco) in [
-            ("uv-deep", "a/b/c/d/e/uv.lock", Some("PyPI")),
+            ("go-deep", "a/b/c/d/e/go.sum", Some("Go")),
             ("pipfile", "Pipfile.lock", Some("PyPI")),
             ("gemfile", "api/Gemfile.lock", Some("RubyGems")),
             (

@@ -58,7 +58,7 @@ Every answer names what Immunity Core did not cover, and a missing reading is ne
 
 - Immunity Core stops nothing. It reports, and never blocks, suspends or kills a program.
 - Without the collector no published rule watches, since Immunity Core cannot see the moment a program starts, its command line or which program created a file.
-- Vulnerabilities are matched only for dependencies in npm and crates.io lockfiles, not for installed apps, Homebrew, servers or other languages.
+- Vulnerabilities are matched only for dependencies in crates.io, npm and PyPI lockfiles, not for installed apps, Homebrew, servers or other languages.
 
 The reference has [the full list](docs/reference.md#what-this-version-does-not-see).
 
