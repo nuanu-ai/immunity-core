@@ -30,6 +30,7 @@ mod poetry;
 mod pylock;
 mod pypi;
 mod requirements;
+mod source;
 mod uv;
 mod yarn;
 
@@ -39,6 +40,7 @@ pub use commit::commit;
 use npm::npm;
 use pnpm::pnpm;
 pub use pypi::pypi_normalized;
+pub use source::{Source, component_name, split_name};
 use yarn::yarn;
 
 pub const READER: &str = "lockfiles";
@@ -182,47 +184,6 @@ const NOT_SUPPORTED: [(&str, Option<&str>); 17] = [
     ("flake.lock", None),
 ];
 
-/// Where a lockfile entry comes from. A closed set: only `Registry`, the ecosystem's public
-/// registry, is what the ecosystem's open vulnerability data speaks of.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Source {
-    /// npm's public registry; for Cargo, crates.io.
-    Registry,
-    Git,
-    /// A file, a link or a folder on disk: npm's `file:` and linked entries, Cargo's path and
-    /// workspace crates.
-    Path,
-    /// Any other registry, or an address that is not the public registry's.
-    OtherRegistry,
-}
-
-/// The name part of a component's id: the real name, and for any source but the public registry
-/// the source in brackets.
-fn component_name(name: &str, source: Source) -> String {
-    let source = match source {
-        Source::Registry => return name.to_string(),
-        Source::Git => "git",
-        Source::Path => "path",
-        Source::OtherRegistry => "other registry",
-    };
-    format!("{name} ({source})")
-}
-
-/// The name part of a component's id told apart: the package's name, and where it comes from
-/// when that is not the public registry. The inverse of `component_name`.
-pub fn split_name(name: &str) -> (&str, Option<&'static str>) {
-    for (suffix, from) in [
-        (" (git)", "git"),
-        (" (path)", "a path"),
-        (" (other registry)", "another registry"),
-    ] {
-        if let Some(package) = name.strip_suffix(suffix) {
-            return (package, Some(from));
-        }
-    }
-    (name, None)
-}
-
 /// The ecosystem whose dependencies a kind of lockfile declares, by its name as `read` names
 /// it, a version of its format with no reader as `<kind> version <n>`; `None` for one not known
 /// here.
@@ -232,6 +193,16 @@ pub fn ecosystem_of(kind: &str) -> Option<&'static str> {
         .chain(NOT_SUPPORTED)
         .find(|(name, _)| *name == kind)
         .and_then(|(_, ecosystem)| ecosystem)
+}
+
+/// The predicate of a lockfile found in a checkout: the checkout `has_lockfile` the file at
+/// this path relative to it.
+pub const HAS_LOCKFILE: &str = "has_lockfile";
+
+/// The ecosystem whose dependencies the lockfile at a path declares, by its file name as
+/// `lockfile_kind` tells it; `None` for a kind of no ecosystem a record can be about.
+pub fn ecosystem_of_file(path: &str) -> Option<&'static str> {
+    lockfile_kind(path.rsplit('/').next()?).and_then(ecosystem_of)
 }
 
 /// Whether a partial reading leaves the dependencies of one ecosystem in part unknown. What the
@@ -549,7 +520,16 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize) -> Option<Outcome> {
         }
     }
 
-    let mut statements = Vec::new();
+    // Every lockfile found, of any kind, read or not: the ecosystems matching has something to
+    // say of in this checkout (`vulnerabilities::match_all`).
+    let mut statements: Vec<Statement> = (walked.lockfiles.iter())
+        .map(|(rel, ..)| Statement {
+            subject: id.to_string(),
+            predicate: HAS_LOCKFILE,
+            object: rel.clone(),
+            source_ref: rel.clone(),
+        })
+        .collect();
     for ((ecosystem, name), (first, versions)) in deps {
         let component = format!("component:{id}/{ecosystem}/{name}");
         statements.push(Statement {
@@ -745,9 +725,9 @@ fn version_shape(v: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CACHE_SIGNATURE, Checkout, DEEPER, FORMATS, LINKED, LOCKFILE_KIND, NOT_LOOKED, NOT_TOLD,
-        SET_ASIDE, ecosystem_of, has_reader, lockfile_kind, partial_for, read, read_as_text,
-        read_within,
+        CACHE_SIGNATURE, Checkout, DEEPER, FORMATS, HAS_LOCKFILE, LINKED, LOCKFILE_KIND,
+        NOT_LOOKED, NOT_TOLD, SET_ASIDE, ecosystem_of, has_reader, lockfile_kind, partial_for,
+        read, read_as_text, read_within,
     };
 
     fn file_name(path: &str) -> &str {
@@ -1070,8 +1050,9 @@ snapshots:
             Dir(dir)
         }
 
-        /// What the reader says of it: each statement as `subject|predicate|object|where`,
-        /// with the checkout's id left out.
+        /// What the reader says of its dependencies: each statement as
+        /// `subject|predicate|object|where`, with the checkout's id left out. The lockfiles
+        /// found (`HAS_LOCKFILE`) are left to `found`.
         pub(super) fn read(&self) -> (super::Outcome, Vec<String>) {
             let checkout = Checkout {
                 rel: "dev/shop".to_string(),
@@ -1081,6 +1062,7 @@ snapshots:
             let said = o
                 .statements
                 .iter()
+                .filter(|s| s.predicate != HAS_LOCKFILE)
                 .map(|s| {
                     let subject = s
                         .subject

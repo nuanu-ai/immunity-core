@@ -1324,6 +1324,8 @@ fn deleted_checkout_is_retracted_with_everything_inside_it_as_one_removed_event(
             )
         ),
         [
+            format!("{id}|has_lockfile|Cargo.lock"),
+            format!("{id}|has_lockfile|api/yarn.lock"),
             format!("component:{id}/crates.io/serde|has_version|1.0.210"),
             format!("component:{id}/crates.io/serde|part_of|{id}"),
         ]
@@ -4049,7 +4051,8 @@ fn a_checkout_seen_by_both_readers_is_one_entity() {
                  ORDER BY reader"
             )
         ),
-        ["agent-folders", "checkouts"]
+        // The reading of lockfiles states the lockfile it found there of the same entity.
+        ["agent-folders", "checkouts", "lockfiles"]
     );
     // Its lockfile is read once.
     assert_eq!(
@@ -10472,7 +10475,8 @@ fn a_lockfile_of_a_kind_without_a_reader_is_named_as_such_by_status_and_the_repo
     // A lockfile this build cannot read is not a reading that failed: the build has no reader
     // for it. What the build cannot judge on this estate is part of every report, and
     // `immunity status` names it, with how many places hold it. Saying so is not a change: a second
-    // run on the same inputs still reports no changes.
+    // run on the same inputs counts nothing added, changed or removed. The partial readings
+    // state the lockfiles they found, so what they did not see may have been removed.
     let dir = Dir::new("no-reader");
     let store = dir.store();
     let root = dir.0.join("dev");
@@ -10559,7 +10563,10 @@ fn a_lockfile_of_a_kind_without_a_reader_is_named_as_such_by_status_and_the_repo
 
     let second = immunity_home(&store, &brew, &absent);
     assert!(
-        second.contains(" Since last run: no changes. ") && second.contains(said),
+        second.contains(
+            " Since last run: +0 added, 0 changed, 0 removed; \
+             removals unknown where a reading was partial. "
+        ) && second.contains(said),
         "{second}"
     );
 
