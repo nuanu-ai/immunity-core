@@ -82,6 +82,9 @@ const MAX_DEPTH: usize = 4;
 /// trees (`android/app/build/intermediates`, a large Java package tree) hold several thousand.
 /// Past this the reading is partial for every ecosystem, since what lies there is not known.
 const LOOK_LIMIT: usize = 50_000;
+/// A lockfile, or git's `packed-refs`, larger than this is not read: the cap this build has
+/// for a file read whole. A real one is far under it.
+const CAP: u64 = crate::targets::CAP;
 /// Folders never entered, at any depth, since none holds what the project itself declares:
 /// `.git` is git's own database, never a working file; `node_modules` holds installed copies of
 /// packages, which the project's lockfile beside it declares, and a lockfile inside one is a
@@ -427,11 +430,12 @@ pub fn read_as_text(checkout: &Path) -> Texts {
 /// Reads one checkout. `None` when it holds no lockfile at all: then there is nothing
 /// to cover. Where the checkout is, is said by the `checkouts` reader.
 pub fn read(checkout: &Checkout, id: &str) -> Option<Outcome> {
-    read_within(checkout, id, LOOK_LIMIT)
+    read_within(checkout, id, LOOK_LIMIT, CAP)
 }
 
-/// `read`, with the look for names below the folders opened stopping after `limit` folders.
-fn read_within(checkout: &Checkout, id: &str, limit: usize) -> Option<Outcome> {
+/// `read`, with the look for names below the folders opened stopping after `limit` folders,
+/// and lockfiles read up to `cap`.
+fn read_within(checkout: &Checkout, id: &str, limit: usize, cap: u64) -> Option<Outcome> {
     let walked = walk(&checkout.path, limit);
     if walked.lockfiles.is_empty() && walked.unlisted.is_empty() && !walked.stopped {
         return None;
@@ -475,16 +479,17 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize) -> Option<Outcome> {
             continue;
         }
         let path = checkout.path.join(rel);
-        // A kind with no reader is never opened: its size is the file's own, 0 when that cannot
-        // be had, as for a lockfile that could not be read.
+        // Its size is the file's own, never what was read of it, 0 when that cannot be had. A
+        // kind with no reader is never opened.
+        let size = std::fs::symlink_metadata(&path).map_or(0, |m| m.len());
+        lockfiles.push((source.clone(), size));
         let Some(reader) = reader_of(name) else {
-            let size = std::fs::symlink_metadata(&path).map_or(0, |m| m.len());
-            lockfiles.push((source, size));
             not_supported.insert(name.to_string());
             continue;
         };
-        let text = std::fs::read(&path).ok();
-        lockfiles.push((source.clone(), text.as_ref().map_or(0, |t| t.len() as u64)));
+        // Opened as the walk found it: a regular file, a link in its place not followed,
+        // without waiting, up to the cap. One refused could not be read.
+        let text = crate::autorun::read_capped_resolved(&path, cap).ok();
         let parsed = match text.and_then(|t| String::from_utf8(t).ok()) {
             None => Parsed::Failed,
             Some(t) => reader(&t, name),

@@ -1,7 +1,7 @@
 use super::{
-    CACHE_SIGNATURE, Checkout, DEEPER, FORMATS, HAS_LOCKFILE, LINKED, LOCKFILE_KIND, NOT_LOOKED,
-    NOT_TOLD, SET_ASIDE, ecosystem_of, has_reader, lockfile_kind, partial_for, read, read_as_text,
-    read_within,
+    CACHE_SIGNATURE, CAP, Checkout, DEEPER, FORMATS, HAS_LOCKFILE, LINKED, LOCKFILE_KIND,
+    NOT_LOOKED, NOT_TOLD, SET_ASIDE, ecosystem_of, has_reader, lockfile_kind, partial_for, read,
+    read_as_text, read_within,
 };
 
 fn file_name(path: &str) -> &str {
@@ -1145,7 +1145,7 @@ fn folders_past_the_look_through_limit_leave_every_ecosystem_unknown() {
         rel: "dev/shop".to_string(),
         path: dir.0.clone(),
     };
-    let within = |limit| read_within(&checkout, "checkout:machine:mac/dev/shop", limit);
+    let within = |limit| read_within(&checkout, "checkout:machine:mac/dev/shop", limit, CAP);
     let o = within(3).unwrap();
     assert_eq!((o.completeness, o.reason), ("full", None));
     let o = within(2).unwrap();
@@ -1203,4 +1203,23 @@ fn what_a_reading_did_not_open_is_decided_from_its_lacks_and_never_from_its_word
             "{eco}"
         );
     }
+}
+
+#[test]
+fn a_lockfile_over_the_cap_is_not_read_and_leaves_the_reading_partial_with_its_own_size() {
+    // No false calm: a file over the cap is one that could not be read, never one with no
+    // packages. The size listed is the file's own, not what was read of it.
+    let dir = Dir::new("over-cap", &[("Cargo.lock", CARGO)]);
+    let checkout = Checkout {
+        rel: "dev/shop".to_string(),
+        path: dir.0.clone(),
+    };
+    let size = CARGO.len() as u64;
+    let within = |cap| read_within(&checkout, "checkout:machine:mac/dev/shop", 1, cap).unwrap();
+    assert_eq!(within(size).completeness, "full");
+    let o = within(size - 1);
+    assert_eq!(o.reason.as_deref(), Some("could not be read: Cargo.lock"));
+    assert_eq!(o.gap.cause, Some(Cause::Failed));
+    assert_eq!(unknown_for(&o), [false, true]);
+    assert_eq!(o.lockfiles, [("dev/shop/Cargo.lock".to_string(), size)]);
 }

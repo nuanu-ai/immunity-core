@@ -5058,6 +5058,8 @@ fn read_indicators(
     // checkouts not looked into are no place.
     let mut matches = indicators::match_hashes(run.tx, &list)?;
     let (mut read, mut look) = (BTreeSet::new(), look::Look::default());
+    let homes = watched::homes(&args.home);
+    let homes = [homes[0].as_path(), homes[1].as_path()];
     for c in found {
         let texts = lockfiles::read_as_text(&c.path);
         let in_project = |rel: &str| format!("{}/{rel}", c.rel);
@@ -5080,16 +5082,24 @@ fn read_indicators(
             );
             look.short_of([Unit::whole(&c.rel)], Cause::NoReader, why);
         }
-        let mut opened = texts.opened;
+        let mut opened: Vec<(String, PathBuf)> = (texts.opened.into_iter())
+            .map(|rel| (rel.clone(), c.path.join(rel)))
+            .collect();
         use std::io::ErrorKind::{NotADirectory, NotFound};
-        match std::fs::symlink_metadata(c.path.join(autorun::TASKS)) {
-            Ok(_) => opened.push(autorun::TASKS.to_string()),
-            Err(e) if matches!(e.kind(), NotFound | NotADirectory) => {}
-            Err(e) => look.not_looked_at(Unit::whole(in_project(autorun::TASKS)), e.to_string()),
+        // The task file, or `.vscode` on its way, may be a link: it is made real first, and
+        // not looked into where it leads into a guarded folder.
+        let tasks = Unit::whole(in_project(autorun::TASKS));
+        match guarded::under(&c.path, Path::new(autorun::TASKS), &homes) {
+            Err(g) => look.not_into(tasks, g, &args.home),
+            Ok(real) => match std::fs::symlink_metadata(&real) {
+                Ok(_) => opened.push((autorun::TASKS.to_string(), real)),
+                Err(e) if matches!(e.kind(), NotFound | NotADirectory) => {}
+                Err(e) => look.not_looked_at(tasks, e.to_string()),
+            },
         }
-        for rel in opened {
+        for (rel, path) in opened {
             let shown = in_project(&rel);
-            match autorun::read_capped(&c.path.join(&rel), indicators::CAP) {
+            match autorun::read_capped(&path, indicators::CAP) {
                 Ok(bytes) => {
                     let text = String::from_utf8_lossy(&bytes);
                     let file = format!("file:{machine}/{shown}");
