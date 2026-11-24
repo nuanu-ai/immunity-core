@@ -290,8 +290,9 @@ pub fn judge<R: Scheme>(v: &R, ranges: &Value, versions: &Value) -> Verdict {
     for range in &ranges {
         let kind = range["type"].as_str().unwrap_or_default();
         if !R::KINDS.contains(&kind) {
-            // A range of commits says nothing about a release unless releases are listed.
-            if listed.is_empty() {
+            // OSV's `versions` enumerates what a range of commits covers, so with releases
+            // listed such a range says no more. A range of any other kind may hold the release.
+            if kind != "GIT" || listed.is_empty() {
                 uncomparable.get_or_insert(format!("the record gives a range of kind {kind}"));
             }
             continue;
@@ -329,7 +330,15 @@ pub fn judge<R: Scheme>(v: &R, ranges: &Value, versions: &Value) -> Verdict {
             uncomparable.get_or_insert(why);
             continue;
         }
-        events.sort_by(|a, b| Bound::order(&a.1, &b.1));
+        // At one version, a `fixed` ends the interval before an `introduced` begins the next,
+        // and a `last_affected`, which ends its interval after its version, comes last. An
+        // `introduced` and a `fixed` at one version so read as affected from there on: loud.
+        let at = |key: &str| match key {
+            "fixed" => 0,
+            "introduced" => 1,
+            _ => 2,
+        };
+        events.sort_by(|a, b| Bound::order(&a.1, &b.1).then(at(a.0).cmp(&at(b.0))));
         let mut vulnerable = false;
         let mut off_by_fix = false;
         for (key, bound) in &events {
@@ -2690,6 +2699,94 @@ mod tests {
         }
         // An ecosystem with no scheme here has no release, so it is never "not affected".
         assert!(version("Go", "1.0.0").is_err());
+    }
+
+    #[test]
+    fn a_range_of_a_kind_not_ordered_is_passed_over_only_when_it_is_commits_and_releases_are_listed()
+     {
+        // OSV's `versions` enumerates what a range of commits covers, and nothing else: a range
+        // of any other kind not ordered here, a SEMVER range in a PyPI record or a kind OSV adds
+        // later, may hold the release, so it is never passed over for "not affected".
+        let judged = |eco: &str, release: &str, other: &str, listed: Value| {
+            let ranges = json!([
+                { "type": "ECOSYSTEM", "events": [{"introduced": "0"}, {"fixed": "1.1.0"}] },
+                { "type": other, "repo": "https://example.org/x",
+                  "events": [{"introduced": "2.0.0"}, {"fixed": "3.0.0"}] },
+            ]);
+            version(eco, release).unwrap().judge(&ranges, &listed)
+        };
+        let reason = |v: Verdict| match v {
+            Verdict::Unknown(r, _) => r,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            reason(judged("PyPI", "2.5.0", "SEMVER", json!(["1.0.0"]))),
+            NOT_COMPARABLE
+        );
+        for eco in ["npm", "crates.io"] {
+            for listed in [json!(["1.0.0"]), json!([])] {
+                assert_eq!(
+                    reason(judged(eco, "2.5.0", "NEWKIND", listed)),
+                    NOT_COMPARABLE
+                );
+            }
+            // What is found affected is affected, whatever else cannot be compared.
+            assert_eq!(
+                judged(eco, "1.0.0", "NEWKIND", json!([])),
+                Verdict::Affected
+            );
+            assert_eq!(
+                judged(eco, "2.5.0", "GIT", json!(["1.0.0"])),
+                Verdict::NotAffected { fixed: true }
+            );
+            assert_eq!(
+                reason(judged(eco, "2.5.0", "GIT", json!([]))),
+                NOT_COMPARABLE
+            );
+        }
+    }
+
+    #[test]
+    fn at_one_version_an_event_that_ends_an_interval_comes_before_one_that_begins_the_next() {
+        // Two adjacent intervals in either input order, in both schemes: a release at the
+        // version where one ends and the next begins is in the next. A `last_affected` ends its
+        // interval after its version, so it comes after an `introduced` there.
+        let adjacent = |end: &str| {
+            [
+                json!([{"introduced": "1.0.0"}, {"fixed": "2.0.0"}, {"introduced": "0"}, {"fixed": end}]),
+                json!([{"introduced": "0"}, {"fixed": end}, {"introduced": "1.0.0"}, {"fixed": "2.0.0"}]),
+            ]
+        };
+        let one_release = [
+            json!([{"last_affected": "1.0.0"}, {"introduced": "1.0.0"}, {"introduced": "2.0.0"}, {"fixed": "3.0.0"}]),
+            json!([{"introduced": "1.0.0"}, {"last_affected": "1.0.0"}, {"introduced": "2.0.0"}, {"fixed": "3.0.0"}]),
+        ];
+        let range = |events: &Value| json!([{ "type": "ECOSYSTEM", "events": events }]);
+        let none = json!([]);
+        for events in adjacent("1.0") {
+            assert_eq!(
+                judge(&p("1.0.0"), &range(&events), &none),
+                Verdict::Affected
+            );
+            assert_eq!(judge(&p("0.5"), &range(&events), &none), Verdict::Affected);
+        }
+        for events in adjacent("1.0.0") {
+            assert_eq!(
+                judge(&v("1.0.0"), &range(&events), &none),
+                Verdict::Affected
+            );
+        }
+        for events in &one_release {
+            assert_eq!(judge(&v("1.0.0"), &range(events), &none), Verdict::Affected);
+            assert_eq!(
+                judge(&v("1.5.0"), &range(events), &none),
+                Verdict::NotAffected { fixed: false }
+            );
+            assert_eq!(
+                judge(&p("1.5"), &range(events), &none),
+                Verdict::NotAffected { fixed: false }
+            );
+        }
     }
 
     /// node-semver's fixture rows, `[a, b, opt]`, as data. `opt` is loose when it is `true`
