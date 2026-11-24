@@ -1,19 +1,21 @@
 //! The text for a person of `immunity status`, `immunity status --coverage` and `immunity findings`,
-//! rendered from the message alone for a screen (`screen.rs`), in the layout of the core's
-//! language for a person (`docs/how-it-works.md`): the answer first, in one line with the count
-//! that matters; then what needs the person, most urgent first, grouped where rows would repeat;
-//! then context, one labelled line each, with the detail behind a named command; last, the next
-//! command after `→`. On a terminal no line is longer than the width; in a pipe nothing is cut,
-//! no style is written and times are exact.
+//! rendered from the message alone for a screen (`screen.rs`). The default status says a state
+//! and its faults, and nothing else: the answer in one line, then what needs a look by rule, each
+//! with the command that shows it, then how this Mac is watched, then one line marked `!` for each
+//! thing that should work on this Mac and does not now, with the command that ends it at the end
+//! of its line. What this version does not read here, the counts of what was read and the detail
+//! are in `--coverage` and in the machine forms. On a terminal no line is longer than the width;
+//! in a pipe nothing is cut, no style is written and times are exact.
 //!
 //! Text from a source is in a message's `_text` fields, already escaped one to one
 //! (`known::whole`), and every piece of text is escaped again as it reaches the screen, before
 //! it is measured, cut or styled (`screen.rs`). In a column or beside a label it is data by its
 //! place and goes without quotes; inside a sentence it keeps them (`text::quoted`).
 //!
-//! Nothing a status says is calmer than the message: what needs a look is never counted without
-//! how many are urgent; a failure, a loss or what is not judged is in the default status or in
-//! `--coverage`, and a failure is always in the default status, never dim.
+//! Nothing a status says is calmer than the message: a fault the message holds (a check that
+//! died, a watcher that does not watch live, an event level that records nothing or lost part of
+//! it, a cause of class `failed`, a failed download) is always a line of the default status,
+//! never dim.
 
 use crate::contract::v1;
 use crate::findings::SHORT_MAX;
@@ -27,10 +29,6 @@ use crate::view;
 /// At most this many findings are listed in the text of `immunity findings`; the total is always
 /// given.
 const FINDINGS_SHOWN: usize = 200;
-
-/// At most this many rules are listed in the text of `immunity status`; the rest are counted in
-/// one line.
-pub(crate) const GROUPS_SHOWN: usize = 6;
 
 /// `n one` or `n many`, with thousands grouped.
 pub(crate) fn count(n: u64, one: &str, many: &str) -> String {
@@ -156,29 +154,6 @@ fn examples(u: &v1::Uncovered) -> String {
         .join("; ")
 }
 
-/// The causes of what is not covered a section lists: what the person can fix; what nobody can,
-/// on this Mac or on every Mac. A value of `holds_on` this build does not know is this Mac's.
-fn causes<'a>(s: &'a v1::Status, who: &'a str, every_mac: Option<bool>) -> Vec<&'a v1::Uncovered> {
-    let on_every_mac = |u: &v1::Uncovered| u.holds_on == v1::HoldsOn::EveryMac as i32;
-    s.not_covered
-        .iter()
-        .filter(|u| u.who == who && every_mac.is_none_or(|e| on_every_mac(u) == e))
-        .collect()
-}
-
-/// How a section of causes is set.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Causes {
-    /// The status: each title whole, and under it what it is about without quotes: plain names
-    /// joined with commas, or one name and its reason a line, at most `PAIRS_SHOWN`.
-    Listed,
-    /// Each title and what it is about whole, both broken into lines: `--coverage`.
-    Whole,
-}
-
-/// The pairs of a name and a reason the status lists under a cause before it counts the rest.
-const PAIRS_SHOWN: usize = 3;
-
 /// A name from a source, escaped as everywhere, with the one character that separates it from
 /// what follows written as an escape too: a comma in a list of names, a colon before a reason.
 /// So a name holding ", " or ": " never passes for two names or for a name and a reason, and a
@@ -187,54 +162,19 @@ fn name_in(name: &str, separator: char) -> String {
     view::shown(name).replace(separator, &format!("\\u{{{:x}}}", u32::from(separator)))
 }
 
-/// What a cause is about, in lines for the status: its names joined with commas, or one name and
-/// its reason a line, the first `PAIRS_SHOWN` and then how many more; then what its source said
-/// of it as a whole. Every piece is escaped before it is joined; nothing is cut.
-fn about_lines(u: &v1::Uncovered) -> (Vec<String>, u64) {
-    let reasons: Vec<Option<&str>> = (0..u.examples_text.len())
-        .map(|i| u.examples.get(i).and_then(|e| e.reason_text.as_deref()))
-        .collect();
-    let mut lines = Vec::new();
-    // A cause that names nothing counts itself, not things left out of a list.
-    let mut more = if u.examples_text.is_empty() {
-        0
-    } else {
-        u.count.saturating_sub(u.examples_text.len() as u64)
-    };
-    if reasons.iter().any(Option::is_some) {
-        for (name, reason) in u.examples_text.iter().zip(&reasons).take(PAIRS_SHOWN) {
-            lines.push(match reason {
-                Some(r) => format!("{}: {}", name_in(name, ':'), view::shown(r)),
-                None => name_in(name, ':'),
-            });
-        }
-        more += u.examples_text.len().saturating_sub(PAIRS_SHOWN) as u64;
-    } else if !u.examples_text.is_empty() {
-        let names: Vec<String> = u.examples_text.iter().map(|n| name_in(n, ',')).collect();
-        lines.push(names.join(", "));
-    }
-    if let Some(v) = &u.value_text {
-        lines.push(view::shown(v));
-    }
-    (lines, more)
-}
-
-/// A section of causes: its label bold on a line, then each cause's title and the things it is
-/// about. A failed reading or download is red wherever it is listed.
-pub(crate) fn cause_section(
-    screen: &Screen,
-    out: &mut Vec<String>,
-    label: &str,
-    list: &[&v1::Uncovered],
-    layout: Causes,
-) {
+/// A section of causes for `--coverage`: its label bold on a line when it has one, then each
+/// cause's title and the things it is about, whole, both broken into lines. A failed reading or
+/// download is red wherever it is listed.
+fn cause_section(screen: &Screen, out: &mut Vec<String>, label: &str, list: &[&v1::Uncovered]) {
     if list.is_empty() {
         return;
     }
     let style = |u: &v1::Uncovered| {
         if is_failure(u) { RED } else { PLAIN }
     };
-    out.push(format!("  {}", screen.paint(BOLD, label)));
+    if !label.is_empty() {
+        out.push(format!("  {}", screen.paint(BOLD, label)));
+    }
     let room = screen.fits().map(|w| w.saturating_sub(6));
     for u in list {
         for l in screen::wrap(
@@ -243,27 +183,18 @@ pub(crate) fn cause_section(
         ) {
             out.push(format!("    {}", screen.paint(style(u), &l)));
         }
-        let (lines, more) = match layout {
-            Causes::Listed => about_lines(u),
-            Causes::Whole => (vec![view::shown(&examples(u))], 0),
-        };
-        for line in lines.iter().filter(|l| !l.is_empty()) {
-            // A line of its own for each piece, broken where it is too long and never cut; the
-            // lines a break makes are set in further, so they never pass for a piece of their own.
-            for (i, l) in screen::wrap(line, room.map(|r| r.saturating_sub(2)))
-                .iter()
-                .enumerate()
-            {
-                let indent = if i == 0 { "      " } else { "        " };
-                out.push(format!("{indent}{}", screen.paint(PLAIN, l)));
-            }
+        let about = view::shown(&examples(u));
+        if about.is_empty() {
+            continue;
         }
-        if more > 0 {
-            out.push(format!(
-                "      {}   {}",
-                screen.paint(PLAIN, &format!("… {} more", grouped(more))),
-                screen.paint(CYAN, "immunity status --coverage")
-            ));
+        // Broken where it is too long and never cut; the lines a break makes are set in further,
+        // so they never pass for a piece of their own.
+        for (i, l) in screen::wrap(&about, room.map(|r| r.saturating_sub(2)))
+            .iter()
+            .enumerate()
+        {
+            let indent = if i == 0 { "      " } else { "        " };
+            out.push(format!("{indent}{}", screen.paint(PLAIN, l)));
         }
     }
 }
@@ -289,8 +220,6 @@ fn watching(s: &v1::Status, screen: &Screen) -> (String, Style) {
                 .collect()
         })
         .unwrap_or_default();
-    let parts = watching_parts(s, screen);
-    let text: Vec<&str> = parts.iter().map(|(t, _)| t.as_str()).collect();
     let style = if !failed.is_empty() {
         RED
     } else if state == "yes" && m.live {
@@ -298,133 +227,37 @@ fn watching(s: &v1::Status, screen: &Screen) -> (String, Style) {
     } else {
         YELLOW
     };
-    (format!("{state}; {}", text.join("; ")), style)
-}
-
-/// How this Mac is watched, one clause each, in its own style: whether a watcher runs, and only
-/// when it applies, that some places are not watched or nothing was checked yet.
-pub(crate) fn watching_parts(s: &v1::Status, screen: &Screen) -> Vec<(String, Style)> {
-    let Some(m) = &s.this_mac else {
-        return vec![("whether it is watched is not said".to_string(), YELLOW)];
-    };
-    let failed: Vec<&str> = s
-        .watching
-        .as_ref()
-        .map(|w| {
-            w.failed
-                .iter()
-                .map(|f| crate::watch::failed_words(&f.what))
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut parts = vec![if m.live && failed.is_empty() {
-        ("live".to_string(), PLAIN)
+    let watcher = if m.live && failed.is_empty() {
+        "live".to_string()
     } else if m.live {
-        (format!("live, with a failed {}", failed.join(" and ")), RED)
+        format!("live, with a failed {}", failed.join(" and "))
     } else if !failed.is_empty() {
-        (crate::watch::failing_words(&failed), RED)
+        crate::watch::failing_words(&failed)
     } else if s.watching.is_some() {
-        (crate::watch::STARTING_WORDS.to_string(), YELLOW)
+        crate::watch::STARTING_WORDS.to_string()
     } else if s.watcher_restarting_since_at.is_some() {
-        (crate::watch::RESTARTING_WORDS.to_string(), YELLOW)
+        crate::watch::RESTARTING_WORDS.to_string()
     } else if let Some(on) = off_not_by_command(s) {
-        (
-            format!(
-                "Immunity Core is off, and immunity off did not turn it off. It was turned on {}; its job is gone. Turn it on with: immunity on",
-                screen.time(on, s.answered_at)
-            ),
-            RED,
+        format!(
+            "Immunity Core is off, and immunity off did not turn it off. It was turned on {}; its job is gone. Turn it on with: immunity on",
+            screen.time(on, s.answered_at)
         )
-    } else if let Some(off) = s
-        .turned_off_at
-        .filter(|_| s.login_job_installed == Some(false))
-    {
-        (
-            format!(
-                "Immunity Core is off: turned off {} with immunity off",
-                screen.time(off, s.answered_at)
-            ),
-            PLAIN,
+    } else if let Some(off) = off_by_command(s) {
+        format!(
+            "Immunity Core is off: turned off {} with immunity off",
+            screen.time(off, s.answered_at)
         )
     } else {
         match s.login_job_installed {
             // Read from the property list alone: whether launchd has the job is not asked.
-            Some(true) => (
-                "installed, not running: the login job is in place and no watcher runs now, so changes are seen at each check".to_string(),
-                YELLOW,
-            ),
-            Some(false) => (
-                "not installed: no watcher runs now, so changes are seen at each check"
-                    .to_string(),
-                PLAIN,
-            ),
-            None => (
-                "no watcher runs now: changes are seen at each check".to_string(),
-                PLAIN,
-            ),
+            Some(true) => "installed, not running: the login job is in place and no watcher runs now, so changes are seen at each check".to_string(),
+            Some(false) => {
+                "not installed: no watcher runs now, so changes are seen at each check".to_string()
+            }
+            None => "no watcher runs now: changes are seen at each check".to_string(),
         }
-    }];
-    // What is watched leads, then the watcher.
-    match v1::ThisMacState::try_from(m.state) {
-        Ok(v1::ThisMacState::Watched) => {}
-        Ok(v1::ThisMacState::WatchedInPart) => parts.insert(0, (in_part(s), YELLOW)),
-        _ => parts.insert(0, ("not checked yet".to_string(), YELLOW)),
-    }
-    parts
-}
-
-/// "in part", and what is not watched in full, from the message: the kinds of place whose
-/// reading was not whole, and program starts when the event level is installed and records
-/// none, or runs and lost some since the latest full check, or could not read some of its lines
-/// over the last day, a failed reading: as the core holds this Mac in part.
-fn in_part(s: &v1::Status) -> String {
-    let full = v1::Completeness::Full as i32;
-    let mut what: Vec<String> = s
-        .watched
-        .iter()
-        .flat_map(|w| &w.kinds)
-        .filter(|k| k.coverage.is_some_and(|c| c != full))
-        .map(|k| k.kind.clone())
-        .collect();
-    if let Some(l) = &s.event_level {
-        let running = l.state == v1::CollectorState::Running as i32;
-        let installed = l.state != v1::CollectorState::NotInstalled as i32;
-        let lost = [
-            &l.lost,
-            &l.unknown_losses,
-            &l.unreadable_lines,
-            &l.files_removed_by_cap,
-            &l.files_removed_unread,
-        ]
-        .into_iter()
-        .any(|n| n.as_ref().is_some_and(|n| n.since_check > 0))
-            || l.unreadable_lines.as_ref().is_some_and(|n| n.last_day > 0);
-        if installed && !running {
-            what.push("program starts".to_string());
-        } else if running && lost {
-            what.push("some program starts".to_string());
-        }
-    }
-    match what.as_slice() {
-        [] => "in part".to_string(),
-        [one] => format!("in part: {one} not watched in full"),
-        [rest @ .., last] => format!(
-            "in part: {} and {last} not watched in full",
-            rest.join(", ")
-        ),
-    }
-}
-
-/// Clauses joined with "; ", each in its own style.
-pub(crate) fn clauses(parts: Vec<(String, Style)>) -> Vec<(String, Style)> {
-    let mut out = Vec::new();
-    for (i, (text, style)) in parts.into_iter().enumerate() {
-        if i > 0 {
-            out.push(("; ".to_string(), PLAIN));
-        }
-        out.push((text, style));
-    }
-    out
+    };
+    (format!("{state}; {watcher}"), style)
 }
 
 /// When Immunity Core was last turned on, if it went off since by something other than `immunity off`: no
@@ -438,13 +271,24 @@ fn off_not_by_command(s: &v1::Status) -> Option<i64> {
     (gone && s.turned_on_latest == Some(true)).then_some(on)
 }
 
-/// The downloads of public threat data that failed at the last check: one clause for those whose
-/// data read before stays in force, yellow, and one for those of which nothing is known yet, red;
-/// `None` when none failed. A line of its own in the default status even while the headline stays
-/// calm because the data kept is current, since every failure the status holds is said there. The
-/// reasons are in `--coverage`. An outcome this build does not know is read as failed, as the
-/// schema says.
-pub(crate) fn downloads_failed(s: &v1::Status) -> Option<Vec<(String, Style)>> {
+/// When Immunity Core was turned off with `immunity off`, while it stays off: no watcher holds
+/// the store or is restarting, the login job's property list is not there, and it did not go off
+/// by something else (`off_not_by_command`).
+fn off_by_command(s: &v1::Status) -> Option<i64> {
+    let off = s.turned_off_at?;
+    let gone = s.watching.is_none()
+        && s.watcher_restarting_since_at.is_none()
+        && s.login_job_installed == Some(false);
+    (gone && off_not_by_command(s).is_none()).then_some(off)
+}
+
+/// The downloads of public threat data that failed at the last check, in two sentences: those
+/// whose data read before stays in force, and those of which nothing is known yet; none when none
+/// failed. Said even while the headline stays calm because the data kept is current. What a
+/// cause of `not_covered` already says is left out: the catalogue (`catalogue_said`), and a feed
+/// that answers rest on and that was never read (`data_said`), which is not current. An outcome
+/// this build does not know is read as failed, as the schema says.
+fn downloads_failed(s: &v1::Status, catalogue_said: bool, data_said: bool) -> Vec<String> {
     let failed = |outcome: i32| {
         !matches!(
             v1::FeedOutcome::try_from(outcome),
@@ -454,7 +298,11 @@ pub(crate) fn downloads_failed(s: &v1::Status) -> Option<Vec<(String, Style)>> {
     // What failed, in two groups: the catalogue, and the ecosystems of the OSV data.
     let mut kept = (false, Vec::new());
     let mut none = (false, Vec::new());
-    if let Some(t) = s.threats.as_ref().filter(|t| failed(t.outcome)) {
+    if let Some(t) = s
+        .threats
+        .as_ref()
+        .filter(|t| failed(t.outcome) && !catalogue_said)
+    {
         let group = if t.entries.is_some() || t.read_at.is_some() {
             &mut kept
         } else {
@@ -466,7 +314,7 @@ pub(crate) fn downloads_failed(s: &v1::Status) -> Option<Vec<(String, Style)>> {
         .vulnerability_data
         .iter()
         .flat_map(|d| &d.feeds)
-        .filter(|f| failed(f.outcome))
+        .filter(|f| failed(f.outcome) && !(data_said && f.matched && f.read_at.is_none()))
     {
         let group = if f.read_at.is_some() {
             &mut kept
@@ -485,142 +333,420 @@ pub(crate) fn downloads_failed(s: &v1::Status) -> Option<Vec<(String, Style)>> {
         }
         names.join(" and ")
     };
-    let mut parts = Vec::new();
+    let mut said = Vec::new();
     if kept.0 || !kept.1.is_empty() {
-        parts.push((
-            format!(
-                "{} not downloaded at the last check, the data read before stays in force",
-                named(&kept)
-            ),
-            YELLOW,
+        said.push(format!(
+            "{} not downloaded at the last check, the data read before stays in force",
+            named(&kept)
         ));
     }
     if none.0 || !none.1.is_empty() {
-        parts.push((
-            format!(
-                "{} not downloaded, nothing of it is known yet",
-                named(&none)
-            ),
-            RED,
+        said.push(format!(
+            "{} not downloaded, nothing of it is known yet",
+            named(&none)
         ));
     }
-    (!parts.is_empty()).then(|| clauses(parts))
+    said
 }
 
-/// The event level when it is not as it should be (running with nothing lost), in two clauses:
-/// its state, and what is wrong, which is yellow, or red for a collector that does not run;
-/// `None` when it is as it should be. The detail is in `--coverage`.
-pub(crate) fn event_level_short(l: &v1::EventLevel) -> Option<Vec<(String, Style)>> {
-    let words = l.in_words.clone().unwrap_or_default();
-    let running = l.state == v1::CollectorState::Running as i32;
-    if running && words.notes.is_empty() {
-        return None;
+/// The causes of `not_covered` the event level's own line says when none of them is there.
+const EVENT_CAUSES: [&str; 3] = [
+    crate::covered::EVENTS_REFUSED.id,
+    crate::covered::EVENTS_FAILING.id,
+    crate::covered::EVENTS_SILENT.id,
+];
+/// The causes of `not_covered` that say a failed download of the catalogue, which the line of
+/// downloads then leaves out.
+const CATALOGUE_CAUSES: [&str; 2] = [
+    crate::covered::THREATS_UNREAD.id,
+    crate::covered::THREATS_FIXABLE.id,
+];
+/// The causes of `not_covered` that say the vulnerability data answers rest on is not current.
+const DATA_CAUSES: [&str; 2] = [
+    crate::covered::VULNERABILITY_DATA_OLD.id,
+    crate::covered::VULNERABILITY_DATA_FIXABLE.id,
+];
+
+/// Something that should work on this Mac and does not now, as one line of the default status,
+/// marked `!`: the core's words, what a source said of it, the core's words after that, and the
+/// command that ends it, with what the person can do on a line of its own under it.
+pub(crate) struct Fault {
+    words: String,
+    /// What a source said, cut on a terminal to a line: a sentence keeps its start, names their
+    /// start and end. Whole in a pipe.
+    said: Option<(String, Cut)>,
+    tail: String,
+    command: Option<&'static str>,
+    advice: Option<String>,
+    /// That no watcher watches live, without a failure of one: what a status that is not fresh
+    /// gives as its reason.
+    not_live: bool,
+}
+
+impl Fault {
+    fn new(words: impl Into<String>) -> Fault {
+        Fault {
+            words: words.into(),
+            said: None,
+            tail: String::new(),
+            command: None,
+            advice: None,
+            not_live: false,
+        }
     }
-    if !running {
-        let style = if l.state == v1::CollectorState::NotInstalled as i32 {
-            YELLOW
-        } else {
-            RED
-        };
-        return Some(vec![(words.state, style)]);
+
+    fn said(mut self, text: Option<&str>, cut: Cut) -> Fault {
+        self.said = text.filter(|t| !t.is_empty()).map(|t| (t.to_string(), cut));
+        self
     }
-    // Each caveat in words, from its stable name and the count the message gives for it over
-    // the last day; a caveat this build does not know, by the core's own few words.
-    let last_day = |s: &Option<v1::Span>| s.as_ref().map_or(0, |s| s.last_day);
-    let mut wrong: Vec<String> = words
-        .caveats
+
+    fn run(mut self, command: &'static str) -> Fault {
+        self.command = Some(command);
+        self
+    }
+}
+
+/// A sentence of the core's own with its first letter a capital.
+fn sentence(s: &str) -> String {
+    let mut chars = s.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().chain(chars).collect())
+        .unwrap_or_default()
+}
+
+/// How often, in words: once, twice, or a count of times.
+fn times(n: u64) -> String {
+    match n {
+        1 => "once".to_string(),
+        2 => "twice".to_string(),
+        n => count(n, "time", "times"),
+    }
+}
+
+/// Every fault the message holds, in the order a person acts on them: a check that died, the
+/// watcher, the event level, every cause of class `failed` (only `with_causes`, as `--coverage`
+/// lists them whole on their own), the downloads that failed. A limit of this version is none of
+/// them.
+fn faults(s: &v1::Status, screen: &Screen, with_causes: bool) -> Vec<Fault> {
+    let now = s.answered_at;
+    let mut out = Vec::new();
+    // The core says `running` only of the latest start, by that run's own lock.
+    if let Some(l) = s
+        .last_run
+        .as_ref()
+        .filter(|l| l.finished_at.is_none() && !s.running)
+    {
+        out.push(
+            Fault::new(format!(
+                "The check started {} did not finish",
+                screen.time(l.started_at, now)
+            ))
+            .run("immunity run"),
+        );
+    }
+    out.extend(watcher_faults(s, screen));
+    let failed: Vec<&v1::Uncovered> = s.not_covered.iter().filter(|u| is_failure(u)).collect();
+    let any = |ids: &[&str]| failed.iter().any(|u| ids.contains(&u.id.as_str()));
+    if let Some(l) = &s.event_level {
+        out.extend(event_faults(l, any(&EVENT_CAUSES)));
+    }
+    if with_causes {
+        out.extend(failed.iter().map(|u| cause_fault(u)));
+    }
+    out.extend(
+        downloads_failed(s, any(&CATALOGUE_CAUSES), any(&DATA_CAUSES))
+            .into_iter()
+            .map(Fault::new),
+    );
+    out
+}
+
+/// The watcher when it does not watch live: each failure that stands, with when and what it
+/// said; or, with none, why no watcher watches live and the command that starts one. None while
+/// a watcher watches live, as the headline's rule has it: `this_mac.live`, a watcher on the store
+/// and no failure.
+fn watcher_faults(s: &v1::Status, screen: &Screen) -> Vec<Fault> {
+    let now = s.answered_at;
+    let out: Vec<Fault> = s
+        .watching
         .iter()
-        .map(|c| match c.kind.as_str() {
-            // A caveat whose count the message does not give is said in the core's words.
-            "restarts" => match last_day(&l.unknown_losses) {
-                0 => c.short.clone(),
-                1 => "the collector restarted once".to_string(),
-                2 => "the collector restarted twice".to_string(),
-                n => format!("the collector restarted {} times", grouped(n)),
-            },
-            "lost" => match last_day(&l.lost) {
-                0 => c.short.clone(),
-                n => format!(
-                    "{} lost",
-                    count(n, "program start was", "program starts were")
-                ),
-            },
-            "unreadable" => match last_day(&l.unreadable_lines) {
-                0 => c.short.clone(),
-                n => format!("{} of the log could not be read", count(n, "line", "lines")),
-            },
-            "deleted_early" => match last_day(&l.files_removed_by_cap) {
-                0 => c.short.clone(),
-                n => format!("{} of the log deleted early", count(n, "file", "files")),
-            },
-            "deleted_unread" => match last_day(&l.files_removed_unread) {
-                0 => c.short.clone(),
-                n => format!("{} of the log deleted unread", count(n, "file", "files")),
-            },
-            "earlier_collector" => "the collector needs installing again".to_string(),
-            _ => c.short.clone(),
+        .flat_map(|w| &w.failed)
+        .map(|f| {
+            let fault = Fault::new(format!(
+                "The watcher's latest {} failed {}",
+                crate::watch::failed_words(&f.what),
+                screen.time(f.at, now)
+            ))
+            .said(Some(&f.detail_text), Cut::End);
+            match f.what == crate::watch::FULL_CHECK {
+                true => fault.run("immunity run"),
+                false => fault,
+            }
         })
         .collect();
-    if wrong.is_empty() {
-        wrong.push(count(words.notes.len() as u64, "note", "notes"));
+    let live = s.this_mac.as_ref().is_some_and(|m| m.live) && s.watching.is_some();
+    if live || !out.is_empty() {
+        return out;
     }
-    let wrong = match wrong.split_last() {
-        Some((last, [])) => last.clone(),
-        Some((last, rest)) => format!("{}, and {last}", rest.join(", ")),
-        None => String::new(),
+    let fault = if s.watching.is_some() {
+        Fault::new(sentence(crate::watch::STARTING_WORDS))
+    } else if s.watcher_restarting_since_at.is_some() {
+        Fault::new(sentence(crate::watch::RESTARTING_WORDS))
+    } else if let Some(on) = off_not_by_command(s) {
+        Fault::new(format!(
+            "Immunity Core is off: its job, turned on {}, is gone, and immunity off did not turn it off",
+            screen.time(on, now)
+        ))
+        .run("immunity on")
+    } else if let Some(off) = off_by_command(s) {
+        Fault::new(format!(
+            "Immunity Core is off: turned off {} with immunity off",
+            screen.time(off, now)
+        ))
+        .run("immunity on")
+    } else if s.login_job_installed == Some(true) {
+        // Read from the property list alone: whether launchd has the job is not asked.
+        Fault::new("The watcher is not running: its login job is in place").run("immunity on")
+    } else {
+        Fault::new("No watcher runs: changes are seen only at a check you run").run("immunity on")
     };
-    Some(vec![(words.state, PLAIN), (wrong, YELLOW)])
+    vec![Fault {
+        not_live: true,
+        ..fault
+    }]
 }
 
-/// What the latest check did not read, by kind, a failure yellow; when it read all that this
-/// version reads here, that. Readings with nothing to read are not held against the Mac.
-pub(crate) fn coverage_parts(c: &v1::CoverageSummary) -> Vec<(String, Style)> {
-    let mut parts: Vec<(String, Style)> = Vec::new();
-    if c.failed > 0 {
-        parts.push((count(c.failed, "reading failed", "readings failed"), YELLOW));
-    }
-    if c.no_reader > 0 {
-        parts.push((
-            count(
-                c.no_reader,
-                "kind of place this version does not read",
-                "kinds of place this version does not read",
-            ),
-            PLAIN,
-        ));
-    }
-    if c.not_given > 0 {
-        parts.push((
-            count(
-                c.not_given,
-                "reading its source does not give",
-                "readings their source does not give",
-            ),
-            PLAIN,
-        ));
-    }
-    if c.unreached_total > 0 {
-        parts.push((
-            count(
-                c.unreached_total,
-                "machine not reached",
-                "machines not reached",
-            ),
-            YELLOW,
-        ));
-    }
-    if parts.is_empty() {
-        return vec![(
-            "everything this version reads here was read".to_string(),
-            PLAIN,
-        )];
-    }
-    let mut out = Vec::new();
-    for (i, p) in parts.into_iter().enumerate() {
-        if i > 0 {
-            out.push((", ".to_string(), PLAIN));
+/// The event level when it is installed and records nothing, unless a cause of `not_covered`
+/// says so (`said_by_cause`); or, while it records, what it lost since the latest full check, by
+/// the counts the message gives. Not installed is a limit and says nothing.
+fn event_faults(l: &v1::EventLevel, said_by_cause: bool) -> Vec<Fault> {
+    use v1::CollectorState as C;
+    match C::try_from(l.state) {
+        Ok(C::NotInstalled) => return Vec::new(),
+        Ok(C::Running) => {}
+        _ if said_by_cause => return Vec::new(),
+        _ => {
+            let state = l.in_words.as_ref().map_or("", |w| w.state.as_str());
+            let state = if state.is_empty() {
+                "not running"
+            } else {
+                state
+            };
+            let said = l.said_text.as_deref().or(l.reason_text.as_deref());
+            return vec![
+                Fault::new(format!("Program starts are not seen; event level: {state}"))
+                    .said(said, Cut::End),
+            ];
         }
-        out.push(p);
+    }
+    // Each loss since the latest full check, which a check that finishes reads past.
+    let since = |s: &Option<v1::Span>| s.as_ref().map_or(0, |s| s.since_check);
+    let file_events = l.file_events.as_ref().filter(|f| f.collected);
+    let unreadable = l.unreadable_lines.unwrap_or_default();
+    let counted =
+        |n: u64, one: &str, many: &str| format!("{} since the latest check", count(n, one, many));
+    let restarted = |n: u64, what: &str, after: &str| {
+        format!("{what} {} since the latest check{after}", times(n))
+    };
+    let losses = [
+        (
+            since(&l.lost),
+            counted(
+                since(&l.lost),
+                "program start was missed",
+                "program starts were missed",
+            ),
+        ),
+        (
+            since(&l.unknown_losses),
+            restarted(
+                since(&l.unknown_losses),
+                "The collector restarted",
+                ", and program starts in those moments were not seen",
+            ),
+        ),
+        (
+            unreadable.since_check,
+            counted(
+                unreadable.since_check,
+                "line of the event log could not be read",
+                "lines of the event log could not be read",
+            ),
+        ),
+        (
+            since(&l.files_removed_unread),
+            counted(
+                since(&l.files_removed_unread),
+                "file of the event log was deleted before it was read",
+                "files of the event log were deleted before they were read",
+            ),
+        ),
+        (
+            file_events.map_or(0, |f| since(&f.lost) + since(&f.unreadable_events)),
+            counted(
+                file_events.map_or(0, |f| since(&f.lost) + since(&f.unreadable_events)),
+                "file event was missed",
+                "file events were missed",
+            ),
+        ),
+        (
+            file_events.map_or(0, |f| since(&f.unknown_losses)),
+            restarted(
+                file_events.map_or(0, |f| since(&f.unknown_losses)),
+                "The numbering of file events started again",
+                "",
+            ),
+        ),
+    ];
+    let mut out: Vec<Fault> = losses
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(_, said)| Fault::new(said).run("immunity run"))
+        .collect();
+    // Lines it could not read are a failed reading, which holds this Mac in part for the day.
+    if unreadable.since_check == 0 && unreadable.last_day > 0 {
+        out.push(Fault::new(format!(
+            "{} in the last day",
+            count(
+                unreadable.last_day,
+                "line of the event log could not be read",
+                "lines of the event log could not be read"
+            )
+        )));
+    }
+    out
+}
+
+/// A cause of class `failed` as a fault: what could not be read, by name, for one of this Mac or
+/// the projects that names its things; any other by its title and what its source said. What the
+/// person can do follows when the person can change it.
+fn cause_fault(u: &v1::Uncovered) -> Fault {
+    // Each name with what its source said of it, where it said something; names alone
+    // otherwise. A place of this Mac or a project is said as a place that could not be read;
+    // anything else by its title, with its names where they come with a reason.
+    let reason = |i: usize| u.examples.get(i).and_then(|e| e.reason_text.as_deref());
+    let with_reasons = (0..u.examples_text.len()).any(|i| reason(i).is_some());
+    let place = ["this_mac", "projects"].contains(&u.scope.as_str());
+    let mut fault = if !u.examples_text.is_empty() && (place || with_reasons) {
+        let names: Vec<String> = u
+            .examples_text
+            .iter()
+            .enumerate()
+            .map(|(i, n)| match (with_reasons, reason(i)) {
+                (true, Some(r)) => format!("{}: {r}", name_in(n, ':')),
+                (true, None) => name_in(n, ':'),
+                (false, _) => name_in(n, ','),
+            })
+            .collect();
+        let names = names.join(if with_reasons { "; " } else { ", " });
+        let words = if place {
+            "Could not read"
+        } else {
+            unstopped(&u.title)
+        };
+        let mut fault = Fault::new(words).said(Some(&names), Cut::Middle);
+        let more = u.count.saturating_sub(u.examples_text.len() as u64);
+        if more > 0 {
+            fault.tail = format!(", and {} more", grouped(more));
+        }
+        fault
+    } else {
+        Fault::new(unstopped(&u.title)).said(u.value_text.as_deref(), Cut::End)
+    };
+    fault.advice = (u.who == "you" && !u.advice.is_empty()).then(|| u.advice.clone());
+    fault
+}
+
+/// A line under the headline, set in by `indent`: `mark` and a space before it when one is given,
+/// then `lines`, each painted and with the columns it takes, the lines after the first set in
+/// under the start of the first; and `command` cyan at the right edge of the last, or on a line
+/// of its own set to the right where they do not fit side by side. In a pipe the command follows
+/// the last line.
+fn aside(
+    screen: &Screen,
+    indent: usize,
+    mark: Option<(&str, Style)>,
+    lines: &[(String, usize)],
+    command: Option<&str>,
+) -> Vec<String> {
+    let lead = indent + mark.map_or(0, |(m, _)| screen::columns(m) + 1);
+    let mut out: Vec<String> = lines
+        .iter()
+        .enumerate()
+        .map(|(i, (l, _))| match (i, mark) {
+            (0, Some((m, st))) => format!("{}{} {l}", " ".repeat(indent), screen.paint(st, m)),
+            _ => format!("{}{l}", " ".repeat(lead)),
+        })
+        .collect();
+    let Some(c) = command else { return out };
+    let painted = screen.paint(CYAN, c);
+    let last = lead + lines.last().map_or(0, |(_, n)| *n);
+    let wide = screen::columns(c);
+    match (screen.fits(), out.last_mut()) {
+        (Some(width), Some(line)) if last + 3 + wide <= width => {
+            line.push_str(&" ".repeat(width - last - wide));
+            line.push_str(&painted);
+        }
+        (Some(width), _) => out.push(format!(
+            "{}{painted}",
+            " ".repeat(width.saturating_sub(wide))
+        )),
+        (None, Some(line)) => line.push_str(&format!("   {painted}")),
+        (None, None) => out.push(painted),
+    }
+    out
+}
+
+/// A text already escaped, broken into lines that fit after `lead` columns on a terminal and one
+/// line in a pipe, each painted in `style`, with the columns it takes.
+fn painted(screen: &Screen, lead: usize, text: &str, style: Style) -> Vec<(String, usize)> {
+    screen::wrap(text, screen.fits().map(|w| w.saturating_sub(lead).max(1)))
+        .into_iter()
+        .map(|l| (screen.paint(style, &l), screen::columns(&l)))
+        .collect()
+}
+
+/// A fault's lines: `!` yellow, the words, what the source said and the command; then what the
+/// person can do, set in under the words. On a terminal what the source said follows the words
+/// on their line when it fits there whole, and otherwise has a line of its own, cut to it.
+fn fault_lines(screen: &Screen, indent: usize, f: &Fault) -> Vec<String> {
+    let lead = indent + 2;
+    let room = screen.fits().map(|w| w.saturating_sub(lead).max(1));
+    let tail = view::shown(&f.tail);
+    let mut text = view::shown(&f.words);
+    let mut own_line = None;
+    if let Some((said, cut)) = &f.said {
+        let said = view::shown(said);
+        text.push(':');
+        let last = screen::wrap(&text, room)
+            .last()
+            .map_or(0, |l| screen::columns(l));
+        match room {
+            Some(r) if last + 1 + screen::columns(&said) + screen::columns(&tail) > r => {
+                let r = r.saturating_sub(screen::columns(&tail)).max(1);
+                own_line = Some(match cut {
+                    Cut::Middle => screen::cut_middle(&said, r),
+                    _ => screen::cut_end(&said, r),
+                });
+            }
+            _ => text.push_str(&format!(" {said}")),
+        }
+    }
+    let mut lines = painted(screen, lead, &text, PLAIN);
+    match own_line {
+        Some(said) => lines.extend(painted(screen, lead, &format!("{said}{tail}"), PLAIN)),
+        None if !tail.is_empty() => {
+            text.push_str(&tail);
+            lines = painted(screen, lead, &text, PLAIN);
+        }
+        None => {}
+    }
+    let mut out = aside(screen, indent, Some(("!", YELLOW)), &lines, f.command);
+    if let Some(a) = &f.advice {
+        for (l, _) in painted(screen, lead, &view::shown(a), PLAIN) {
+            out.push(format!("{}{l}", " ".repeat(lead)));
+        }
     }
     out
 }
@@ -643,95 +769,6 @@ fn event_level_long(l: &v1::EventLevel) -> String {
     unstopped(&line.join(" ")).to_string()
 }
 
-/// The machines not reached in one line: the first by name, since when and why, and how many
-/// more.
-pub(crate) fn unreached_short(
-    screen: &Screen,
-    c: &v1::CoverageSummary,
-    now: i64,
-) -> Option<String> {
-    let first = c.unreached.first()?;
-    let mut said = format!(
-        "{} {}",
-        machine_name(&first.scope_text),
-        screen.since(first.since_at, now)
-    );
-    if let Some(r) = &first.reason_text {
-        said.push_str(&format!(": {r}"));
-    }
-    let more = c.unreached_total.saturating_sub(1);
-    if more > 0 {
-        said.push_str(&format!(", and {} more", grouped(more)));
-    }
-    Some(said)
-}
-
-/// What is not judged on this Mac in one line: the places by name, as many as fit, and how many
-/// more causes there are; what nobody can fix and is not a failure.
-pub(crate) fn not_judged_line(
-    screen: &Screen,
-    s: &v1::Status,
-    room: Option<usize>,
-) -> Option<String> {
-    let mut names: Vec<String> = Vec::new();
-    let mut unnamed = 0u64;
-    let failed = is_failure;
-    for u in causes(s, "nothing", None)
-        .into_iter()
-        .filter(|u| !failed(u))
-    {
-        let on_every_mac = u.holds_on == v1::HoldsOn::EveryMac as i32;
-        if u.examples_text.is_empty() || on_every_mac {
-            unnamed += 1;
-            continue;
-        }
-        for n in &u.examples_text {
-            let n = name_in(n, ',');
-            if !names.contains(&n) {
-                names.push(n);
-            }
-        }
-    }
-    if names.is_empty() && unnamed == 0 {
-        return None;
-    }
-    if names.is_empty() {
-        return Some(count(
-            unnamed,
-            "limit of this version",
-            "limits of this version",
-        ));
-    }
-    let more = |shown: usize| unnamed + (names.len() - shown) as u64;
-    let said = |shown: usize| {
-        let mut l = names[..shown].join(", ");
-        if more(shown) > 0 {
-            l.push_str(&format!(" +{}", grouped(more(shown))));
-        }
-        l
-    };
-    match (screen.fits(), room) {
-        (Some(_), Some(room)) => {
-            // As many names as fit; at least one, cut if it must be. The count of the rest is
-            // never cut: room is kept for it, and only the names give way, to `…` at the least.
-            let mut shown = names.len();
-            while shown > 1 && screen::columns(&said(shown)) > room {
-                shown -= 1;
-            }
-            let rest = match more(shown) {
-                0 => String::new(),
-                n => format!(" +{}", grouped(n)),
-            };
-            let left = room.saturating_sub(screen::columns(&rest)).max(1);
-            Some(format!(
-                "{}{rest}",
-                screen::cut_end(&names[..shown].join(", "), left)
-            ))
-        }
-        _ => Some(said(names.len())),
-    }
-}
-
 /// `immunity status` for a person. With `coverage`, `immunity status --coverage`: everything the
 /// last check read and did not read, laid out by the same rules.
 pub fn status(s: &v1::Status, screen: &Screen, coverage: bool) -> String {
@@ -748,7 +785,7 @@ pub fn status(s: &v1::Status, screen: &Screen, coverage: bool) -> String {
     if coverage {
         coverage_text(s, screen, &mut out);
     } else {
-        default_text(s, screen, &mut out);
+        out.extend(answer(s, screen, "", None, &[]));
     }
     joined(&out)
 }
@@ -761,143 +798,246 @@ fn checked(screen: &Screen, s: &v1::Status) -> Option<String> {
         .map(|at| format!("checked {}", screen.time(at, s.answered_at)))
 }
 
-/// The headline of `immunity status` and `immunity run`, in the words of the status's own
-/// `headline`. A value this build does not know is said as not known, never as calm.
-pub(crate) fn answer(s: &v1::Status) -> (String, Style) {
-    use v1::{Headline as H, HeadlineBecause as B};
-    let said = |words: &str, style: Style| (words.to_string(), style);
-    match H::try_from(s.headline) {
-        Ok(H::NeedsALook) => {
-            let n = s.needs_a_look.clone().unwrap_or_default();
+/// The default text of `immunity status` and the text of `immunity run`, from the message alone:
+/// the headline in the words of the status's own `headline`, with `tail` after its words and
+/// `right` at its right edge, or the status's own time there without one; what needs a look by
+/// rule; the line that says the state, with its command; the lines the command adds of its own
+/// (`own`); then every fault. A value of `headline` this build does not know is said as not
+/// known, never as calm.
+pub(crate) fn answer(
+    s: &v1::Status,
+    screen: &Screen,
+    tail: &str,
+    right: Option<String>,
+    own: &[String],
+) -> Vec<String> {
+    use v1::Headline as H;
+    let now = s.answered_at;
+    let mut faults = faults(s, screen, true);
+    let not_live = faults.iter().position(|f| f.not_live);
+    let look = s.needs_a_look.as_ref();
+    let checking = |at: Option<String>| match (at, s.running) {
+        (Some(at), true) => Some(format!("{at} · checking now")),
+        (None, true) => Some("checking now".to_string()),
+        (at, false) => at,
+    };
+    let headline = H::try_from(s.headline);
+    let off = off_by_command(s).filter(|_| headline != Ok(H::NeedsALook));
+    // The state under the headline: its words and command, or a fault taken to say it.
+    let mut state: Option<(String, Option<&'static str>)> = None;
+    let take_not_live = |faults: &mut Vec<Fault>| {
+        not_live.map(|i| {
+            let f = faults.remove(i);
+            (f.words, f.command)
+        })
+    };
+    let (said, style, own_right) = match (off, headline) {
+        (Some(at), _) => {
+            take_not_live(&mut faults);
+            state = Some((
+                "Nothing is watched or checked until it is turned on".to_string(),
+                Some("immunity on"),
+            ));
             (
-                format!("✗ {}", needing(n.total, n.urgent_total)),
-                RED.bold(),
+                "○ Immunity Core is off".to_string(),
+                BOLD,
+                Some(format!("turned off {}", screen.time(at, now))),
             )
         }
-        Ok(H::NotChecked) if s.running => said("The first full check is running", YELLOW.bold()),
-        Ok(H::NotChecked) => said("No full check has finished yet", YELLOW.bold()),
-        Ok(H::Stale) => said("Nothing needed a look at the last check", BOLD),
-        // Everything was read; only the watcher keeps it from calm.
-        Ok(H::InPart) if s.headline_because == [B::Watcher as i32] => {
-            match s.this_mac.as_ref().is_some_and(|m| m.live) {
-                true => said(
-                    "Nothing needs a look; live watching has a failure",
-                    YELLOW.bold(),
+        (None, Ok(H::NeedsALook)) => {
+            let n = look.cloned().unwrap_or_default();
+            let urgent = match n.urgent_total {
+                0 => String::new(),
+                u => format!(" · {} urgent", grouped(u)),
+            };
+            let style = if n.urgent_total > 0 { RED } else { YELLOW };
+            (
+                format!(
+                    "● {}{urgent}",
+                    count(n.total, "thing needs a look", "things need a look")
                 ),
-                false => said(
-                    "Nothing needs a look; nothing is watching live",
-                    YELLOW.bold(),
-                ),
-            }
+                style.bold(),
+                checking(checked(screen, s)),
+            )
         }
-        Ok(H::InPart) => said("Nothing needs a look in what could be read", YELLOW.bold()),
-        Ok(H::Calm) => said("✓ Nothing needs a look", GREEN.bold()),
-        _ if s.needs_a_look.is_none() => {
-            said("No run of this build has looked for findings yet", BOLD)
+        (None, Ok(H::NotChecked)) if s.running => {
+            state = stage(s, screen).map(|said| (sentence(&said), None));
+            (
+                "… The first check is running".to_string(),
+                YELLOW.bold(),
+                s.last_run
+                    .as_ref()
+                    .map(|l| format!("started {}", screen.time(l.started_at, now))),
+            )
         }
-        _ => said("Whether this Mac is watched is not known", BOLD),
-    }
-}
-
-fn default_text(s: &v1::Status, screen: &Screen, out: &mut Vec<String>) {
-    let right = checked(screen, s);
-    let look = s.needs_a_look.as_ref();
-    let (said, style) = answer(s);
-    out.extend(screen.headline(&said, style, right.as_deref()));
-    // What needs the person: the rules, most urgent first.
-    if let Some(n) = look.filter(|n| n.total > 0 && !n.by_rule.is_empty()) {
-        out.push(String::new());
-        let shown = &n.by_rule[..n.by_rule.len().min(GROUPS_SHOWN)];
-        let rows: Vec<Vec<Cell>> = shown
-            .iter()
-            .map(|g| {
-                let (lv, style) = level(g.severity);
-                vec![
-                    Cell::new(lv, style),
-                    Cell::plain(short_title(
-                        screen,
-                        g.rule_title_text.as_deref(),
-                        &g.short_title,
-                        &g.rule,
-                    )),
-                    Cell::new(grouped(g.count), BOLD),
-                    Cell::new(urgent_cell(g.count, g.urgent), RED),
-                ]
-            })
-            .collect();
-        out.extend(screen.table(
-            2,
-            &[
-                Column::new(Cut::Never),
-                Column::new(Cut::End),
-                Column::right(Cut::Never),
-                Column::new(Cut::Never),
-            ],
+        (None, Ok(H::NotChecked)) => {
+            state = Some(("Check this Mac now".to_string(), Some("immunity run")));
+            (
+                "? No check has finished yet".to_string(),
+                YELLOW.bold(),
+                None,
+            )
+        }
+        (None, Ok(H::Stale)) => {
+            let m = s.this_mac.clone().unwrap_or_default();
+            // No watcher is why no check ran; otherwise the core's own reason.
+            state = take_not_live(&mut faults).or_else(|| {
+                let why = m
+                    .stale_reason
+                    .as_deref()
+                    .unwrap_or("the core does not say why");
+                Some((sentence(why), Some("immunity run")))
+            });
+            let since = m
+                .checked_at
+                .map_or_else(String::new, |at| format!(" {}", screen.since(at, now)));
+            (
+                format!("? Not checked{since}"),
+                YELLOW.bold(),
+                checking(None),
+            )
+        }
+        (None, Ok(H::InPart | H::Calm)) => (
+            "✓ Nothing needs a look".to_string(),
+            GREEN.bold(),
+            checking(checked(screen, s)),
+        ),
+        (None, _) if look.is_none() => {
+            state = Some(("Check this Mac now".to_string(), Some("immunity run")));
+            (
+                "? No run of this build has looked for findings yet".to_string(),
+                YELLOW.bold(),
+                None,
+            )
+        }
+        (None, _) => (
+            "? Whether this Mac is watched is not known".to_string(),
+            YELLOW.bold(),
             None,
-            &rows,
-        ));
-        let rest = &n.by_rule[shown.len()..];
-        if !rest.is_empty() {
-            let more: u64 = rest.iter().map(|g| g.count).sum();
-            let urgent: u64 = rest.iter().map(|g| g.urgent).sum();
-            let indent = 2
-                + shown
-                    .iter()
-                    .map(|g| screen::columns(&level(g.severity).0))
-                    .max()
-                    .unwrap_or(0)
-                + 2;
-            let said = format!(
-                "… {} more in {}, {}",
-                grouped(more),
-                count(rest.len() as u64, "kind", "kinds"),
-                match urgent {
-                    0 => "none urgent".to_string(),
-                    u => format!("{} urgent", grouped(u)),
-                }
-            );
-            let room = screen.fits().map(|w| w.saturating_sub(indent));
-            for l in screen::wrap(&said, room) {
-                let style = if urgent > 0 { RED } else { PLAIN };
-                out.push(format!("{}{}", " ".repeat(indent), screen.paint(style, &l)));
-            }
-        }
+        ),
+    };
+    // A watcher watching live says so under a headline that says what was found.
+    let live = s.this_mac.as_ref().is_some_and(|m| m.live) && s.watching.is_some();
+    if state.is_none() && live && matches!(headline, Ok(H::NeedsALook | H::InPart | H::Calm)) {
+        let projects = s.estate.as_ref().map_or(0, |e| e.checkouts);
+        let what = match projects {
+            0 => "this Mac".to_string(),
+            n => format!("this Mac and {}", count(n, "project", "projects")),
+        };
+        state = Some((format!("Watching live · {what}"), None));
     }
-    // Context: one labelled line each.
-    out.push(String::new());
-    let whole = context(s, screen, Vec::new(), out);
-    // The next steps, each on its own line, only those that apply, at most three.
-    out.push(String::new());
-    let mut next: Vec<(&str, &str)> = Vec::new();
-    match look {
-        None => next.push(("immunity run", "checks this Mac now")),
-        Some(n) if n.total > 0 => {
-            next.push(("immunity findings", "lists every one, most urgent first"))
-        }
-        Some(_) => {}
+    let mut out = screen.headline(
+        &format!("{said}{tail}"),
+        style,
+        right.or(own_right).as_deref(),
+    );
+    if headline == Ok(H::NeedsALook)
+        && let Some(n) = look
+    {
+        out.extend(needing_lines(screen, n));
     }
-    next.extend(watcher_step(s));
-    if !whole || next.is_empty() {
-        next.push((
-            "immunity status --coverage",
-            "what was read and what was not",
-        ));
+    if let Some((words, command)) = &state {
+        let lines = painted(screen, 2, &view::shown(words), PLAIN);
+        out.extend(aside(screen, 2, None, &lines, *command));
     }
-    next.truncate(3);
-    out.extend(screen.nexts(&next));
+    for line in own {
+        let lines = painted(screen, 2, &view::shown(line), PLAIN);
+        out.extend(aside(screen, 2, None, &lines, None));
+    }
+    for f in &faults {
+        out.extend(fault_lines(screen, 2, f));
+    }
+    out
 }
 
-/// The next step that starts a watcher, while none holds the store and none is restarting on a
-/// new core, which comes back by itself: a job installed and not running is loaded again by the
-/// same command.
-pub(crate) fn watcher_step(s: &v1::Status) -> Option<(&'static str, &'static str)> {
-    if s.watching.is_some() || s.watcher_restarting_since_at.is_some() {
-        return None;
+/// What needs a look, by rule as the message orders them, each on two lines: its level and what
+/// it is, then the command that shows it. A rule with one finding the message lists says what
+/// that one is about and names it; a rule with more says how many, and how many of them are
+/// urgent, and the command that lists them.
+fn needing_lines(screen: &Screen, n: &v1::NeedsALook) -> Vec<String> {
+    if n.by_rule.is_empty() {
+        return vec![format!("  {}", screen.paint(CYAN, "immunity findings"))];
     }
-    Some(match s.login_job_installed {
-        Some(true) => ("immunity on", "loads the login job again"),
-        _ => ("immunity on", "starts a watcher that outlives the terminal"),
-    })
+    let mut rows: Vec<Vec<Cell>> = Vec::new();
+    let mut under: Vec<(Vec<(String, Style)>, String)> = Vec::new();
+    for g in &n.by_rule {
+        let (lv, style) = level(g.severity);
+        let title = short_title(
+            screen,
+            g.rule_title_text.as_deref(),
+            &g.short_title,
+            &g.rule,
+        );
+        let one = n
+            .items
+            .iter()
+            .filter_map(|i| i.finding.as_ref())
+            .find(|l| l.finding.as_ref().and_then(|r| r.rule.as_deref()) == Some(g.rule.as_str()))
+            .filter(|_| g.count == 1);
+        let urgent = urgent_cell(g.count, g.urgent);
+        let mut next: Vec<(String, Style)> = Vec::new();
+        let (cell, command) = match one {
+            Some(l) => {
+                let about = telling(l);
+                let id = l.finding.as_ref().map_or("", |r| r.id.as_str());
+                let command = format!("immunity finding {id}");
+                if about.text.is_empty() {
+                    (Cell::plain(title), command)
+                } else {
+                    let keep = screen::columns(&view::shown(&title)) + 2 + about.keep;
+                    let cell = Cell::plain(format!("{title}: {}", about.text)).keeping(keep);
+                    (cell, command)
+                }
+            }
+            None => {
+                next.push((count(g.count, "finding", "findings"), BOLD));
+                (Cell::plain(title), "immunity findings".to_string())
+            }
+        };
+        if !urgent.is_empty() {
+            if !next.is_empty() {
+                next.push((", ".to_string(), PLAIN));
+            }
+            next.push((urgent, RED));
+        }
+        rows.push(vec![Cell::new(lv, style), cell]);
+        under.push((next, command));
+    }
+    let indent = 2
+        + n.by_rule
+            .iter()
+            .map(|g| screen::columns(&level(g.severity).0))
+            .max()
+            .unwrap_or(0)
+        + 2;
+    let drawn = screen.table(
+        2,
+        &[Column::new(Cut::Never), Column::new(Cut::Middle)],
+        None,
+        &rows,
+    );
+    // Under each, how many and the command after them, or the command on a line of its own
+    // where both do not fit.
+    let mut out = Vec::new();
+    for (line, (next, command)) in drawn.into_iter().zip(under) {
+        out.push(line);
+        let wide: usize = next.iter().map(|(t, _)| screen::columns(t)).sum();
+        let mut said: String = next.iter().map(|(t, st)| screen.paint(*st, t)).collect();
+        let fits = screen
+            .fits()
+            .is_none_or(|w| indent + wide + 3 + screen::columns(&command) <= w);
+        let command = screen.paint(CYAN, &command);
+        match (wide, fits) {
+            (0, _) => said = command,
+            (_, true) => said = format!("{said}   {command}"),
+            (_, false) => {
+                out.push(format!("{}{said}", " ".repeat(indent)));
+                said = command;
+            }
+        }
+        out.push(format!("{}{said}", " ".repeat(indent)));
+    }
+    out
 }
 
 /// The command that lists every application bundle with what macOS says of its seal.
@@ -919,9 +1059,6 @@ fn not_verifying(i: &v1::Integrity) -> Option<String> {
         )
     })
 }
-
-/// A value in parts, each part in its own style.
-pub(crate) type Parts = Vec<(String, Style)>;
 
 /// Why what the status says is not fresh, for both texts; `None` when it is fresh. While a full
 /// check runs and none has finished, that one is running and since when, never that there has
@@ -949,7 +1086,6 @@ fn not_fresh(s: &v1::Status, screen: &Screen) -> Option<String> {
 /// The line of a check that started and has not finished: it runs, with the stage it noted and
 /// for how long, or it died. The stage is said only beside `running`, which alone says it runs.
 fn unfinished(s: &v1::Status, screen: &Screen, started_at: i64) -> (String, Style) {
-    use v1::CheckStage as C;
     let started = screen.time(started_at, s.answered_at);
     if !s.running {
         let said = format!(
@@ -957,6 +1093,15 @@ fn unfinished(s: &v1::Status, screen: &Screen, started_at: i64) -> (String, Styl
         );
         return (said, RED);
     }
+    let stage = stage(s, screen).map_or_else(String::new, |said| format!(", {said}"));
+    let said = format!("started {started} and has not finished: it is running{stage}");
+    (said, YELLOW)
+}
+
+/// The stage the running check noted and for how long, such as "reading events for 3 min";
+/// `None` for a stage this build cannot name or one without its time.
+fn stage(s: &v1::Status, screen: &Screen) -> Option<String> {
+    use v1::CheckStage as C;
     let words = match s.check_stage.and_then(|v| C::try_from(v).ok()) {
         Some(C::Downloading) => "downloading vulnerability data",
         Some(C::Packages) => "reading packages and servers",
@@ -968,95 +1113,8 @@ fn unfinished(s: &v1::Status, screen: &Screen, started_at: i64) -> (String, Styl
         Some(C::Saving) => "matching and saving",
         Some(C::Unspecified) | None => "",
     };
-    let stage = match s.check_stage_started_at {
-        Some(at) if !words.is_empty() => format!(", {words} {}", screen.since(at, s.answered_at)),
-        _ => String::new(),
-    };
-    let said = format!("started {started} and has not finished: it is running{stage}");
-    (said, YELLOW)
-}
-
-/// What a screen about the store says after its headline and what needs a look, the same for
-/// `immunity status` and `immunity run`, so that a run never says less than the status of the same
-/// store: a run that did not finish, freshness, how this Mac is watched, the event level,
-/// coverage, machines not reached and downloads, one labelled line each, after the lines the
-/// command adds of its own (`own`, first); then every failure, what the person can fix, and what
-/// is not judged. True when nothing of it says that something was not read or not seen.
-pub(crate) fn context(
-    s: &v1::Status,
-    screen: &Screen,
-    own: Vec<(&'static str, Parts)>,
-    out: &mut Vec<String>,
-) -> bool {
-    let now = s.answered_at;
-    let mut lines: Vec<(&str, Parts)> = own;
-    if let Some(l) = s.last_run.as_ref().filter(|l| l.finished_at.is_none()) {
-        lines.push(("Last run", vec![unfinished(s, screen, l.started_at)]));
-    }
-    if let Some(said) = not_fresh(s, screen) {
-        lines.push(("Not fresh", vec![(said, YELLOW)]));
-    }
-    lines.push(("Watching", clauses(watching_parts(s, screen))));
-    let event_level = s.event_level.as_ref().and_then(event_level_short);
-    if let Some(parts) = event_level.clone() {
-        lines.push(("Event level", clauses(parts)));
-    }
-    // Whether coverage is whole: nothing failed, nothing this version does not read, nothing
-    // its source does not give, no machine unreached.
-    let coverage_whole = s.coverage.as_ref().is_some_and(|c| {
-        c.failed == 0 && c.no_reader == 0 && c.not_given == 0 && c.unreached_total == 0
-    });
-    match &s.coverage {
-        Some(c) => {
-            lines.push(("Coverage", coverage_parts(c)));
-            if let Some(said) = unreached_short(screen, c, now) {
-                lines.push(("Not reached", vec![(said, RED)]));
-            }
-        }
-        None => lines.push((
-            "Coverage",
-            vec![("nothing has been read yet".to_string(), YELLOW)],
-        )),
-    }
-    let downloads = downloads_failed(s);
-    if let Some(parts) = downloads.clone() {
-        lines.push(("Downloads", parts));
-    }
-    let width = lines
-        .iter()
-        .map(|(l, _)| screen::columns(l))
-        // "Signatures" is as long.
-        .chain(std::iter::once(screen::columns("Not judged")))
-        .max()
-        .unwrap_or(0);
-    // A value has the whole width after its label; the commands are the next steps at the end.
-    let room = screen.fits().map(|w| w.saturating_sub(2 + width + 3));
-    let not_judged = not_judged_line(screen, s, room);
-    for (label, parts) in &lines {
-        let parts: Vec<(&str, Style)> = parts.iter().map(|(t, st)| (t.as_str(), *st)).collect();
-        out.extend(screen.labelled_parts(2, width, label, &parts, None, 0));
-    }
-    // What stands as it was: the bundles that do not verify, which are not a finding.
-    if let Some(said) = s.integrity.as_ref().and_then(not_verifying) {
-        out.extend(screen.labelled(2, width, "Signatures", &said, PLAIN, Some(LISTS_SEALS), 0));
-    }
-    // Every failure, whoever can fix it; what the person can fix that is not one.
-    let failed: Vec<&v1::Uncovered> = s.not_covered.iter().filter(|u| is_failure(u)).collect();
-    let fixable: Vec<&v1::Uncovered> = causes(s, "you", None)
-        .into_iter()
-        .filter(|u| !is_failure(u))
-        .collect();
-    cause_section(screen, out, "Failed", &failed, Causes::Listed);
-    cause_section(screen, out, "You can fix", &fixable, Causes::Listed);
-    if let Some(said) = &not_judged {
-        out.extend(screen.labelled(2, width, "Not judged", said, PLAIN, None, 0));
-    }
-    coverage_whole
-        && event_level.is_none()
-        && downloads.is_none()
-        && failed.is_empty()
-        && fixable.is_empty()
-        && not_judged.is_none()
+    let at = s.check_stage_started_at.filter(|_| !words.is_empty())?;
+    Some(format!("{words} {}", screen.since(at, s.answered_at)))
 }
 
 /// What the latest check that finished counted, one labelled part each, in the words today's
@@ -1526,10 +1584,13 @@ fn coverage_text(s: &v1::Status, screen: &Screen, out: &mut Vec<String>) {
         }
     }
     if let Some(l) = &s.event_level {
-        let style = match event_level_short(l) {
-            Some(parts) if parts.iter().any(|(_, st)| *st == RED) => RED,
-            Some(_) => YELLOW,
-            None => PLAIN,
+        // A collector installed that does not run red, one that runs with a note yellow.
+        let running = l.state == v1::CollectorState::Running as i32;
+        let noted = l.in_words.as_ref().is_some_and(|w| !w.notes.is_empty());
+        let style = match (running, l.state == v1::CollectorState::NotInstalled as i32) {
+            (false, false) => RED,
+            _ if noted => YELLOW,
+            _ => PLAIN,
         };
         lines.push(("Event level", event_level_long(l), style));
     }
@@ -1569,17 +1630,22 @@ fn coverage_text(s: &v1::Status, screen: &Screen, out: &mut Vec<String>) {
             &watched,
         );
     }
-    // What is not covered, one section per who and where.
-    let sections = [
-        ("You can fix", causes(s, "you", None)),
-        ("Limits of this version", causes(s, "nothing", Some(true))),
-        ("Not judged on this Mac", causes(s, "nothing", Some(false))),
-    ];
-    for (label, list) in &sections {
-        if !list.is_empty() {
-            out.push(String::new());
-            cause_section(screen, out, label, list, Causes::Whole);
+    // Every cause in two groups: what should work here and does not now, the faults the default
+    // status says, each cause of them whole; and the limits of this version here.
+    let (failed, limits): (Vec<&v1::Uncovered>, Vec<&v1::Uncovered>) =
+        s.not_covered.iter().partition(|u| is_failure(u));
+    let others = faults(s, screen, false);
+    if !others.is_empty() || !failed.is_empty() {
+        out.push(String::new());
+        out.push(format!("  {}", screen.paint(BOLD, "Faults")));
+        for f in &others {
+            out.extend(fault_lines(screen, 4, f));
         }
+        cause_section(screen, out, "", &failed);
+    }
+    if !limits.is_empty() {
+        out.push(String::new());
+        cause_section(screen, out, "Limits of this version here", &limits);
     }
     if let Some(c) = &s.coverage {
         out.push(String::new());
@@ -2579,288 +2645,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn what_needs_a_look_is_never_counted_without_how_many_are_urgent() {
-        assert_eq!(needing(1, 0), "1 thing needs a look, none urgent");
-        assert_eq!(
-            needing(1_234_567, 765_432),
-            "1,234,567 things need a look, 765,432 urgent"
-        );
-        let text = status(&status_of("x"), &Screen::pipe(), false);
-        assert!(
-            text.starts_with("✗ 1,234,567 things need a look, 765,432 urgent"),
-            "{text}"
-        );
-        // The rules past the sixth are counted with their urgent ones.
-        assert!(
-            text.contains("… 234,548 more in 3 kinds, 2 urgent"),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn a_status_lists_six_rules_most_urgent_first_with_their_counts_over_all_findings() {
-        let text = status(&status_of("x"), &Screen::pipe(), false);
-        let rows: Vec<&str> = text
-            .lines()
-            .filter(|l| l.contains("Short title of") || l.contains("A published rule"))
-            .collect();
-        assert_eq!(rows.len(), 6, "{text}");
-        assert!(
-            rows[0].starts_with("  critical  A published rule"),
-            "{text}"
-        );
-        assert!(rows[0].trim_end().ends_with("1,000,000  urgent"), "{text}");
-        // Some of a rule's findings urgent: how many.
-        assert!(
-            rows[3].contains("autorun.folder-open") && rows[3].trim_end().ends_with("3  2 urgent"),
-            "{text}"
-        );
-        assert!(!text.contains("Short title of watched.git-hook"), "{text}");
-    }
-
-    /// Each headline in its own words, green only for `calm`: what keeps a fresh answer from calm
-    /// says "in what could be read", unless the watcher alone does, since then everything was read.
-    #[test]
-    fn a_calm_headline_is_green_only_when_the_status_headline_is_calm() {
-        type Change = fn(&mut v1::Status);
-        let screen = Screen::terminal(80, true);
-        let said = |s: &v1::Status| status(s, &screen, false);
-        assert!(
-            said(&calm_status()).starts_with("\u{1b}[1;32m✓ Nothing needs a look\u{1b}[0m"),
-            "{}",
-            said(&calm_status())
-        );
-        let in_part = "\u{1b}[1;33mNothing needs a look in what could be read";
-        let cases: [(&str, Change); 8] = [
-            (
-                "\u{1b}[1;33mNothing needs a look; nothing is watching live",
-                |s| s.this_mac.as_mut().unwrap().live = false,
-            ),
-            (
-                "\u{1b}[1;33mNothing needs a look; live watching has a failure",
-                |s| s.watching.as_mut().unwrap().failed = vec![v1::WatcherFailure::default()],
-            ),
-            (in_part, |s| {
-                s.this_mac.as_mut().unwrap().state = v1::ThisMacState::WatchedInPart as i32
-            }),
-            (in_part, |s| s.coverage.as_mut().unwrap().failed = 1),
-            (in_part, |s| {
-                s.not_covered.push(v1::Uncovered {
-                    id: "vulnerability-list-not-downloaded-fixable".to_string(),
-                    who: "you".to_string(),
-                    class: v1::Cause::Failed as i32,
-                    ..Default::default()
-                })
-            }),
-            (in_part, |s| {
-                s.event_level = Some(v1::EventLevel {
-                    state: v1::CollectorState::Failing as i32,
-                    ..Default::default()
-                })
-            }),
-            (in_part, |s| s.last_run = Some(v1::CheckMark::default())),
-            // The watcher and another reason: not everything was read.
-            (in_part, |s| {
-                s.this_mac.as_mut().unwrap().live = false;
-                s.coverage.as_mut().unwrap().unreached_total = 1;
-            }),
-        ];
-        for (i, (words, change)) in cases.iter().enumerate() {
-            let mut s = calm_status();
-            change(&mut s);
-            assert!(said(&s).starts_with(words), "{i}: {}", said(&s));
-        }
-        let mut s = calm_status();
-        s.this_mac.as_mut().unwrap().fresh = false;
-        let stale = said(&s);
-        assert!(
-            stale.starts_with("\u{1b}[1mNothing needed a look at the last check")
-                && stale.contains("Not fresh"),
-            "{stale}"
-        );
-        s.this_mac.as_mut().unwrap().fresh = true;
-        s.this_mac.as_mut().unwrap().state = v1::ThisMacState::Unspecified as i32;
-        let unknown_state = said(&s);
-        assert!(
-            unknown_state.starts_with("\u{1b}[1mWhether this Mac is watched is not known"),
-            "{unknown_state}"
-        );
-        s.needs_a_look = None;
-        let unknown = said(&s);
-        assert!(
-            unknown.starts_with("\u{1b}[1mNo run of this build has looked for findings yet"),
-            "{unknown}"
-        );
-        assert!(
-            ![stale, unknown_state, unknown]
-                .iter()
-                .any(|t| t.contains('✓'))
-        );
-    }
-
-    #[test]
-    fn a_status_with_a_check_running_and_none_finished_never_says_no_full_check() {
-        let mut s = status_of("x");
-        s.running = true;
-        s.last_finished_run = None;
-        s.this_mac.as_mut().unwrap().checked_at = None;
-        for coverage in [false, true] {
-            let text = status(&s, &Screen::pipe(), coverage);
-            let line = text
-                .lines()
-                .find(|l| l.trim_start().starts_with("Not fresh"))
-                .unwrap_or_else(|| panic!("{text}"));
-            let started = Screen::pipe().time(NOW - 600, NOW);
-            assert!(
-                line.contains(&format!("a full check is running, started {started},")),
-                "{text}"
-            );
-            assert!(!text.to_lowercase().contains("no full check"), "{text}");
-        }
-        // A check that died is not running, and once one has finished, the core's reason is
-        // said as it is.
-        for (running, checked_at) in [(false, None), (true, Some(CHECKED))] {
-            s.running = running;
-            s.this_mac.as_mut().unwrap().checked_at = checked_at;
-            assert!(status(&s, &Screen::pipe(), false).contains("no full check has finished"));
-        }
-    }
-
-    #[test]
-    fn a_running_check_says_its_stage_and_since_when_and_nothing_else_says_a_stage() {
-        let mut s = status_of("x");
-        s.running = true;
-        s.check_stage = Some(v1::CheckStage::Events as i32);
-        s.check_stage_started_at = Some(NOW - 120);
-        let since = Screen::pipe().since(NOW - 120, NOW);
-        for coverage in [false, true] {
-            let text = status(&s, &Screen::pipe(), coverage);
-            let said = format!("has not finished: it is running, reading events {since}\n");
-            assert!(text.contains(&said), "{text}");
-        }
-        // A stage this build cannot name, or one without its time, is no stage; a check that
-        // died is in none, whatever the message carries.
-        let events = Some(v1::CheckStage::Events as i32);
-        for (stage, at, running) in [
-            (Some(99), Some(NOW - 120), true),
-            (Some(0), Some(NOW - 120), true),
-            (events, None, true),
-            (events, Some(NOW - 120), false),
-        ] {
-            (s.check_stage, s.check_stage_started_at, s.running) = (stage, at, running);
-            for coverage in [false, true] {
-                let text = status(&s, &Screen::pipe(), coverage);
-                let said = match running {
-                    true => "has not finished: it is running\n",
-                    false => "has not finished: it died",
-                };
-                assert!(
-                    text.contains(said) && !text.contains("reading events"),
-                    "{text}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_status_whose_first_check_is_running_and_found_nothing_never_says_nothing_needed_a_look() {
-        let mut s = status_of("x");
-        s.running = true;
-        s.last_finished_run = None;
-        s.needs_a_look = Some(v1::NeedsALook::default());
-        s.this_mac.as_mut().unwrap().checked_at = None;
-        for text in [status(&s, &Screen::pipe(), false), ran(&s, &Screen::pipe())] {
-            assert!(
-                text.starts_with("The first full check is running"),
-                "{text}"
-            );
-            let lower = text.to_lowercase();
-            assert!(
-                !lower.contains("nothing need") && !text.contains('✓'),
-                "{text}"
-            );
-        }
-        s.running = false;
-        assert!(status(&s, &Screen::pipe(), false).starts_with("No full check has finished yet"));
-    }
-
-    #[test]
-    fn the_first_lines_while_no_full_check_has_finished_are_yellow_on_a_screen_with_colour() {
-        let screen = Screen::terminal(200, true);
-        let mut s = status_of("x");
-        s.last_finished_run = None;
-        s.needs_a_look = Some(v1::NeedsALook::default());
-        let m = s.this_mac.as_mut().unwrap();
-        (m.checked_at, m.fresh) = (None, true);
-        for (running, said) in [
-            (true, "The first full check is running"),
-            (false, "No full check has finished yet"),
-        ] {
-            s.running = running;
-            for text in [status(&s, &screen, false), ran(&s, &screen)] {
-                assert!(
-                    text.starts_with(&format!("\u{1b}[1;33m{said}\u{1b}[0m")),
-                    "{text}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn every_failure_is_in_the_default_status_and_none_is_dim() {
-        // Wide enough that no value is broken into lines, so each failure is found on one.
-        let screen = Screen::terminal(400, true);
-        let text = status(&status_of("x"), &screen, false);
-        for words in [
-            "its latest write to the store failed",
-            "Event level",
-            "Not reached",
-            "2 things could not be read at the last check",
-            "has not finished: it died",
-            "Not fresh",
-            "1,234,567 readings failed",
-        ] {
-            let line = text
-                .lines()
-                .find(|l| visible(l).contains(words))
-                .unwrap_or_else(|| panic!("{words}\n{text}"));
-            assert!(!line.contains("\u{1b}[2m"), "{line:?}");
-        }
-        // On a narrow terminal a failure keeps every word of its title, broken into lines.
-        let mut s = status_of("x");
-        s.not_covered.push(v1::Uncovered {
-            id: "vulnerability-list-not-downloaded".to_string(),
-            who: "nothing".to_string(),
-            class: v1::Cause::Failed as i32,
-            title: "The list of vulnerabilities attackers are using could not be downloaded since the first check.".to_string(),
-            value_text: Some(format!("cannot read {LONG}")),
-            ..Default::default()
-        });
-        let narrow = status(&s, &Screen::terminal(60, true), false);
-        let words: Vec<String> = narrow
-            .lines()
-            .map(|l| visible(l).trim().to_string())
-            .collect();
-        let words = words.join(" ");
-        for u in s.not_covered.iter().filter(|u| is_failure(u)) {
-            assert!(words.contains(unstopped(&u.title)), "{}\n{narrow}", u.title);
-        }
-        // The event level as it should be has no line; a failed one has.
-        let mut s = status_of("x");
-        if let Some(l) = s.event_level.as_mut() {
-            l.in_words = Some(v1::EventLevelWords {
-                state: "on".to_string(),
-                ..Default::default()
-            });
-        }
-        assert!(!status(&s, &screen, false).contains("Event level"));
-        if let Some(l) = s.event_level.as_mut() {
-            l.state = v1::CollectorState::Failing as i32;
-        }
-        assert!(status(&s, &screen, false).contains("Event level"));
-    }
-
     /// The labelled line about OSV data in the coverage view of `s`, unwrapped.
     fn osv_line(s: &v1::Status) -> String {
         let text = status(s, &Screen::pipe(), true);
@@ -3015,9 +2799,8 @@ mod tests {
             "Watched",
             "Event level",
             "Needs a look",
-            "You can fix",
-            "Limits of this version",
-            "Not judged on this Mac",
+            "Faults",
+            "Limits of this version here",
             "Readings",
             "Machines not reached",
             "Readings that were not full",
@@ -3422,298 +3205,6 @@ mod tests {
         }
     }
 
-    /// A status with only these causes of what is not covered.
-    fn with_causes(causes: Vec<v1::Uncovered>) -> v1::Status {
-        let mut s = status_of("x");
-        s.not_covered = causes;
-        s
-    }
-
-    #[test]
-    fn what_a_cause_is_about_is_under_it_without_quotes_and_no_name_passes_for_two() {
-        let names = v1::Uncovered {
-            id: "servers-not-swept".to_string(),
-            who: "you".to_string(),
-            class: v1::Cause::NotGiven as i32,
-            title: "2 of your servers were not checked last time.".to_string(),
-            count: 4,
-            examples_text: vec!["staging-api".into(), "old-mail".into(), "a, b".into()],
-            ..Default::default()
-        };
-        let pairs = v1::Uncovered {
-            id: "servers-not-opened".to_string(),
-            who: "you".to_string(),
-            class: v1::Cause::NotGiven as i32,
-            title: "5 servers could not be opened at the last server check.".to_string(),
-            count: 5,
-            examples_text: vec![
-                "db-1".into(),
-                "web: new".into(),
-                "line\u{a}feed".into(),
-                "fourth".into(),
-                "fifth".into(),
-            ],
-            examples: [
-                "Permission denied (publickey).",
-                "timed out: 22",
-                "refused",
-                "x",
-                "y",
-            ]
-            .iter()
-            .zip(["db-1", "web: new", "line\u{a}feed", "fourth", "fifth"])
-            .map(|(r, n)| v1::UncoveredExample {
-                name_text: n.to_string(),
-                reason_text: Some(r.to_string()),
-            })
-            .collect(),
-            ..Default::default()
-        };
-        // A cause that names nothing has no list under it, and nothing counted as left out.
-        let alone = v1::Uncovered {
-            id: "event-level-not-installed".to_string(),
-            who: "you".to_string(),
-            class: v1::Cause::NotGiven as i32,
-            title: "Program starts on this Mac are not seen.".to_string(),
-            count: 1,
-            ..Default::default()
-        };
-        let s = with_causes(vec![names, pairs, alone]);
-        for screen in [Screen::pipe(), Screen::terminal(60, false)] {
-            let text = status(&s, &screen, false);
-            let lines: Vec<&str> = text.lines().collect();
-            let at = lines
-                .iter()
-                .position(|l| *l == "    Program starts on this Mac are not seen")
-                .unwrap_or_else(|| panic!("{text}"));
-            assert!(!lines[at + 1].starts_with("      "), "{text}");
-            // Plain names, joined with commas, no quotes; a comma inside a name is written out.
-            assert!(
-                lines.contains(&"      staging-api, old-mail, a\\u{2c} b"),
-                "{text}"
-            );
-            assert!(
-                lines.contains(&"      … 1 more   immunity status --coverage"),
-                "{text}"
-            );
-            // One name and its reason a line, at most three, a colon in a name written out, a
-            // line feed in a name an escape on the same line; then how many more.
-            let at = lines
-                .iter()
-                .position(|l| *l == "      db-1: Permission denied (publickey).")
-                .unwrap_or_else(|| panic!("{text}"));
-            assert_eq!(
-                lines[at + 1],
-                "      web\\u{3a} new: timed out: 22",
-                "{text}"
-            );
-            assert_eq!(lines[at + 2], "      line\\u{a}feed: refused", "{text}");
-            assert_eq!(
-                lines[at + 3],
-                "      … 2 more   immunity status --coverage",
-                "{text}"
-            );
-            assert!(!text.contains("\"db-1\"") && !text.contains("\"staging-api\""));
-        }
-        // A long reason is broken into lines set in further, never cut.
-        let mut long = with_causes(vec![]);
-        long.not_covered.push(v1::Uncovered {
-            id: "file-permissions".to_string(),
-            who: "you".to_string(),
-            class: v1::Cause::NotGiven as i32,
-            title: "1 file could not be opened because of its permissions.".to_string(),
-            count: 1,
-            examples_text: vec!["example-host".into()],
-            examples: vec![v1::UncoveredExample {
-                name_text: "example-host".into(),
-                reason_text: Some(format!("could not be read: {LONG} (Permission denied)")),
-            }],
-            ..Default::default()
-        });
-        let width = 60;
-        let text = status(&long, &Screen::terminal(width, false), false);
-        let (section, _) = text
-            .split_once("\n  You can fix\n")
-            .and_then(|(_, after)| after.split_once("\n\n"))
-            .unwrap_or_else(|| panic!("{text}"));
-        let bare: String = section.split_whitespace().collect();
-        assert!(
-            bare.contains(&format!("{LONG}(Permissiondenied)")),
-            "{text}"
-        );
-        assert!(!section.contains('…'), "{section}");
-        assert!(
-            section.lines().all(|line| screen::columns(line) <= width),
-            "{section}"
-        );
-        assert!(
-            section
-                .lines()
-                .skip(2)
-                .all(|line| line.starts_with("        ")),
-            "{section}"
-        );
-    }
-
-    #[test]
-    fn the_context_lines_say_what_is_true_one_clause_each() {
-        let screen = Screen::terminal(200, true);
-        let line = |text: &str, label: &str| -> String {
-            text.lines()
-                .find(|l| visible(l).trim_start().starts_with(label))
-                .map(str::to_string)
-                .unwrap_or_else(|| panic!("{label}\n{text}"))
-        };
-        let mut s = status_of("x");
-        // No watcher, watched in part: what is not watched leads, then the watcher; no command
-        // beside it, and installing one is a next step at the end.
-        s.watching = None;
-        let text = status(&s, &screen, false);
-        let watching = visible(&line(&text, "Watching"));
-        assert_eq!(
-            watching.trim_end(),
-            "  Watching      in part: authentication module and some program starts not watched in full; no watcher runs now: changes are seen at each check",
-        );
-        // Losses of the last day that a later full check cleared are not why this Mac is in
-        // part; one since it, of any kind, is, and lines that could not be read that day are.
-        let losses: [fn(&mut v1::EventLevel) -> &mut Option<v1::Span>; 5] = [
-            |l| &mut l.lost,
-            |l| &mut l.unknown_losses,
-            |l| &mut l.unreadable_lines,
-            |l| &mut l.files_removed_by_cap,
-            |l| &mut l.files_removed_unread,
-        ];
-        let losing = |loss: Option<usize>, unreadable_day: u64| {
-            let mut s = s.clone();
-            for (i, field) in losses.iter().enumerate() {
-                *field(s.event_level.as_mut().unwrap()) = Some(v1::Span {
-                    since_check: u64::from(Some(i) == loss),
-                    last_day: if i == 2 { unreadable_day } else { 1 },
-                });
-            }
-            visible(&line(&status(&s, &screen, false), "Watching"))
-        };
-        let cleared = losing(None, 0);
-        assert!(
-            cleared.contains("in part: authentication module not watched in full;"),
-            "{cleared}"
-        );
-        for held in (0..losses.len())
-            .map(|i| losing(Some(i), 0))
-            .chain([losing(None, 1)])
-        {
-            assert!(
-                held.contains("and some program starts not watched in full"),
-                "{held}"
-            );
-        }
-        // A collector removed after a loss watches nothing: the loss is not named.
-        let mut gone = s.clone();
-        gone.event_level.as_mut().unwrap().state = v1::CollectorState::NotInstalled as i32;
-        let gone = visible(&line(&status(&gone, &screen, false), "Watching"));
-        assert!(
-            gone.contains("in part: authentication module not watched in full;"),
-            "{gone}"
-        );
-        assert!(
-            visible(&text)
-                .lines()
-                .any(|l| l.starts_with("→ immunity on ")
-                    && l.ends_with("   starts a watcher that outlives the terminal")),
-            "{text}"
-        );
-        // Watched in full with no watcher: the watcher clause alone.
-        if let Some(m) = s.this_mac.as_mut() {
-            m.state = v1::ThisMacState::Watched as i32;
-        }
-        let text = status(&s, &screen, false);
-        assert_eq!(
-            visible(&line(&text, "Watching")).trim_end(),
-            "  Watching      no watcher runs now: changes are seen at each check"
-        );
-        // The login job's property list in place, or not, read from the file alone; a watcher
-        // that left for a new core comes back by itself and is never a failure, nor a step.
-        let watching_with = |installed: Option<bool>, restarting: Option<i64>| {
-            let mut s = s.clone();
-            s.login_job_installed = installed;
-            s.watcher_restarting_since_at = restarting;
-            let text = visible(&status(&s, &screen, false));
-            (
-                visible(&line(&text, "Watching")).trim_end().to_string(),
-                text,
-            )
-        };
-        let (installed, text) = watching_with(Some(true), None);
-        assert_eq!(
-            installed,
-            "  Watching      installed, not running: the login job is in place and no watcher runs now, so changes are seen at each check"
-        );
-        assert!(
-            text.lines()
-                .any(|l| l.starts_with("→ immunity on ")
-                    && l.ends_with("   loads the login job again")),
-            "{text}"
-        );
-        let (not_installed, text) = watching_with(Some(false), None);
-        assert_eq!(
-            not_installed,
-            "  Watching      not installed: no watcher runs now, so changes are seen at each check"
-        );
-        assert!(
-            text.contains("starts a watcher that outlives the terminal"),
-            "{text}"
-        );
-        let (restarting, text) = watching_with(Some(true), Some(1_800_000_000));
-        assert_eq!(
-            restarting,
-            "  Watching      the watcher is restarting on a new core"
-        );
-        assert!(!text.contains("immunity on "), "{text}");
-        // A live watcher on a Mac watched in full: one word, no command.
-        s.watching = Some(v1::Watcher::default());
-        if let Some(m) = s.this_mac.as_mut() {
-            m.live = true;
-            m.state = v1::ThisMacState::Watched as i32;
-        }
-        let text = status(&s, &screen, false);
-        assert_eq!(
-            visible(&line(&text, "Watching")).trim_end(),
-            "  Watching      live"
-        );
-        assert!(!text.contains("immunity on "), "{text}");
-        // The event level: its state, then what is wrong in yellow.
-        let event = line(&text, "Event level");
-        assert!(
-            event.contains(
-                "on; \u{1b}[33mthe collector restarted once, and 1,234,567 program starts were lost\u{1b}[0m"
-            ),
-            "{event:?}"
-        );
-        // Coverage: what is missing, by kind; a failure yellow, never dim.
-        let coverage = line(&text, "Coverage");
-        assert!(
-            coverage.contains("\u{1b}[33m1,234,567 readings failed\u{1b}[0m")
-                && !coverage.contains("\u{1b}[2m"),
-            "{coverage:?}"
-        );
-        assert!(!visible(&coverage).contains("full"), "{coverage:?}");
-        // Nothing missing: said so, and readings with nothing to read are not held against it.
-        if let Some(c) = s.coverage.as_mut() {
-            c.failed = 0;
-            c.no_reader = 0;
-            c.not_given = 0;
-            c.unreached_total = 0;
-            c.unreached.clear();
-            c.read_nothing = 5;
-        }
-        let text = status(&s, &screen, false);
-        assert!(
-            visible(&line(&text, "Coverage"))
-                .contains("everything this version reads here was read"),
-            "{text}"
-        );
-    }
-
     #[test]
     fn the_coverage_of_a_status_lists_what_is_watched_as_a_table() {
         let mut s = status_of("x");
@@ -3752,164 +3243,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_next_steps_are_at_the_end_each_on_its_own_line_only_when_they_apply() {
-        // Each step with the room before what it does as `next` gives it alone: the column they
-        // are lined up in is pinned below.
-        let ends = |text: &str| -> Vec<String> {
-            text.lines()
-                .filter(|l| l.starts_with('→'))
-                .map(|l| match l.split_once("   ") {
-                    Some((command, does)) => format!("{command}   {}", does.trim_start()),
-                    None => l.to_string(),
-                })
-                .collect()
-        };
-        let findings_step = "→ immunity findings   lists every one, most urgent first";
-        let install_step = "→ immunity on   starts a watcher that outlives the terminal";
-        let coverage_step = "→ immunity status --coverage   what was read and what was not";
-        // Something needs a look, no watcher runs, and coverage is not whole: all three, in order.
-        let mut s = status_of("x");
-        s.watching = None;
-        for screen in [Screen::pipe(), Screen::terminal(80, false)] {
-            let text = status(&s, &screen, false);
-            assert_eq!(
-                ends(&text),
-                [findings_step, install_step, coverage_step],
-                "{text}"
-            );
-            // What they do starts in one column.
-            let at: Vec<usize> = text
-                .lines()
-                .filter(|l| l.starts_with('→'))
-                .map(|l| {
-                    l.find(" what")
-                        .or(l.find(" lists"))
-                        .or(l.find(" starts"))
-                        .unwrap()
-                })
-                .collect();
-            assert!(at.windows(2).all(|w| w[0] == w[1]), "{text}");
-            // No context line carries a command beside its value.
-            for l in text.lines().filter(|l| {
-                [
-                    "Watching",
-                    "Event level",
-                    "Coverage",
-                    "Not judged",
-                    "Not reached",
-                ]
-                .iter()
-                .any(|label| l.trim_start().starts_with(label))
-            }) {
-                assert!(!l.contains("immunity "), "{l}\n{text}");
-            }
-        }
-        // Wholly calm, with a watcher: the one line it had.
-        let mut calm = status_of("x");
-        calm.needs_a_look = Some(v1::NeedsALook::default());
-        calm.watching = Some(v1::Watcher::default());
-        calm.event_level = None;
-        calm.not_covered.clear();
-        if let Some(t) = calm.threats.as_mut() {
-            t.outcome = v1::FeedOutcome::Unchanged as i32;
-        }
-        if let Some(c) = calm.coverage.as_mut() {
-            c.failed = 0;
-            c.no_reader = 0;
-            c.not_given = 0;
-            c.unreached_total = 0;
-            c.unreached.clear();
-        }
-        assert_eq!(
-            ends(&status(&calm, &Screen::pipe(), false)),
-            [coverage_step]
-        );
-        // The same with no watcher: installing one is the step.
-        calm.watching = None;
-        assert_eq!(ends(&status(&calm, &Screen::pipe(), false)), [install_step]);
-        // Calm, with a watcher, and one thing not judged: what was not read is the step.
-        calm.watching = Some(v1::Watcher::default());
-        calm.not_covered.push(v1::Uncovered {
-            id: "not-understood".to_string(),
-            who: "nothing".to_string(),
-            class: v1::Cause::NoReader as i32,
-            holds_on: v1::HoldsOn::ThisMac as i32,
-            title: "Some files are not understood by this version yet.".to_string(),
-            examples_text: vec!["poetry.lock".to_string()],
-            ..Default::default()
-        });
-        assert_eq!(
-            ends(&status(&calm, &Screen::pipe(), false)),
-            [coverage_step]
-        );
-        calm.watching = None;
-        assert_eq!(
-            ends(&status(&calm, &Screen::pipe(), false)),
-            [install_step, coverage_step]
-        );
-    }
-
-    /// The line of a text whose label is this, as a person sees it.
-    fn line(text: &str, label: &str) -> String {
-        text.lines()
-            .map(visible)
-            .find(|l| l.trim_start().starts_with(label))
-            .unwrap_or_else(|| panic!("{label}\n{text}"))
-    }
-
-    #[test]
-    fn bundles_that_did_not_verify_at_the_first_check_are_one_line_with_the_command_that_lists_them_and_no_finding()
-     {
-        let with = |n: u64, first: u64| {
-            let mut s = calm_status();
-            s.integrity = Some(v1::Integrity {
-                bundles: 9,
-                bundles_not_verifying: n,
-                not_verifying_since_first_reading: first,
-                ..Default::default()
-            });
-            s
-        };
-        let screen = Screen::terminal(90, false);
-        let calm = status(&with(0, 0), &screen, false);
-        let five = status(&with(5, 5), &screen, false);
-        assert_eq!(
-            visible(&line(&five, "Signatures")),
-            "  Signatures   5 apps do not verify, all since the first check    immunity machine --json"
-        );
-        assert!(
-            visible(&line(&status(&with(1, 1), &screen, false), "Signatures"))
-                .contains(" 1 app does not verify, since the first check "),
-        );
-        // Not a finding: the headline and the steps are those of the same Mac with none.
-        let rest = |t: &str| -> Vec<String> {
-            t.lines()
-                .filter(|l| !l.contains("Signatures"))
-                .map(String::from)
-                .collect()
-        };
-        assert_eq!(rest(&five), rest(&calm));
-        assert!(five.starts_with("✓ Nothing needs a look"), "{five}");
-        assert!(!calm.contains("Signatures"), "{calm}");
-        // Some that stopped verifying since, or came later, are counted apart.
-        let seven = status(&with(7, 5), &screen, false);
-        assert!(
-            visible(&line(&seven, "Signatures"))
-                .contains("7 apps do not verify, 5 of them since the first check"),
-            "{seven}"
-        );
-        // `--coverage` says the same in a sentence: the baseline, what would be a finding, and
-        // the command; with none, nothing of it.
-        let whole = |s: &v1::Status| visible(&status(s, &Screen::pipe(), true));
-        assert!(
-            whole(&with(5, 5)).contains("; 5 apps do not verify, all since the first check, which kept them as the baseline: a change of their seal or signer while the version stays is a finding, and immunity machine --json lists each with its seal"),
-            "{}",
-            whole(&with(5, 5))
-        );
-        assert!(!whole(&with(0, 0)).contains("verif"));
-    }
-
     /// A status with nothing found, after a fresh check, on a Mac watched whole by a live
     /// watcher, nothing failed and every download current: the one the green headline is for.
     fn calm_status() -> v1::Status {
@@ -3935,259 +3268,808 @@ mod tests {
         s
     }
 
-    /// A job gone while the journal's latest word is `immunity on` is said as off and not by
-    /// `immunity off`, under no calm headline, in the status and in the run; gone with `immunity off`
-    /// the latest word, or in the same second, it is said as turned off with its time. With no
-    /// watcher, nothing is calm: it is said as nothing watching live.
+    /// The fault lines of a text, as a terminal shows them, each with the lines it goes on to.
+    fn fault_lines_of(text: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for l in text.lines().map(visible) {
+            if l.starts_with("  ! ") {
+                out.push(l.trim().to_string());
+            } else if l.starts_with("    ")
+                && let Some(last) = out.last_mut()
+            {
+                last.push(' ');
+                last.push_str(l.trim());
+            }
+        }
+        out
+    }
+
+    /// The fault lines of the default status of `s` in a pipe.
+    fn faults_in(s: &v1::Status) -> Vec<String> {
+        fault_lines_of(&status(s, &Screen::pipe(), false))
+    }
+
     #[test]
-    fn a_job_gone_after_immunity_on_is_off_not_by_immunity_off_and_never_calm() {
-        let screen = Screen::pipe();
-        let green = "✓ Nothing needs a look";
-        let unwatched = "Nothing needs a look; nothing is watching live";
-        // The latest of the two is the journal's word, `turned_on_latest`, never the clock's.
-        let said = |on: Option<i64>, off: Option<i64>, latest: Option<bool>, job: Option<bool>| {
-            let mut s = calm_status();
-            s.watching = None;
-            s.this_mac.as_mut().unwrap().live = false;
-            (s.turned_on_at, s.turned_off_at) = (on, off);
-            (s.turned_on_latest, s.login_job_installed) = (latest, job);
-            (status(&s, &screen, false), ran(&s, &screen))
-        };
-        let (on_at, earlier) = (1_800_000_000, 1_799_999_000);
-        let (never, never_run) = said(None, None, None, Some(false));
-        assert!(
-            never.starts_with(unwatched) && never_run.starts_with(unwatched),
-            "{never_run}"
-        );
-        let gone = "Immunity Core is off, and immunity off did not turn it off. It was turned on 2027-01-15 08:00 UTC; its job is gone. Turn it on with: immunity on";
-        // Turned on last, though the clock gives the turning off a later time.
-        for (status, run) in [
-            said(Some(on_at), None, Some(true), Some(false)),
-            said(Some(on_at), Some(on_at + 1), Some(true), Some(false)),
-        ] {
-            assert!(
-                status.contains(gone) && status.starts_with(unwatched),
-                "{status}"
-            );
-            assert!(run.starts_with(unwatched), "{run}");
-        }
-        // Turned off last, though the clock gives it an earlier time or the same second.
-        for turned_off in [earlier, on_at] {
-            let (status, _) = said(Some(on_at), Some(turned_off), Some(false), Some(false));
-            assert!(
-                status.starts_with(unwatched) && !status.contains("did not"),
-                "{status}"
-            );
-            let when = view::utc(turned_off);
-            assert!(
-                status.contains(&format!(
-                    "Immunity Core is off: turned off {when} with immunity off"
-                )),
-                "{status}"
-            );
-        }
-        // The job there, or not known: today's words.
-        for installed in [Some(true), None] {
-            let (status, _) = said(Some(on_at), Some(earlier), Some(true), installed);
-            assert!(
-                status.starts_with(unwatched) && !status.contains("Immunity Core is off"),
-                "{status}"
-            );
-        }
-        // A watcher that holds the store, or is restarting on a new core, is not off; only the
-        // live one is calm.
+    fn a_calm_status_is_the_headline_and_how_this_mac_is_watched_and_nothing_else() {
         let mut s = calm_status();
-        (s.turned_on_at, s.login_job_installed) = (Some(on_at), Some(false));
-        s.turned_on_latest = Some(true);
-        assert!(status(&s, &screen, false).starts_with(green));
-        s.watching = None;
-        s.this_mac.as_mut().unwrap().live = false;
-        s.watcher_restarting_since_at = Some(on_at);
-        let restarting = status(&s, &screen, false);
-        assert!(
-            restarting.starts_with(unwatched) && !restarting.contains("Immunity Core is off"),
-            "{restarting}"
+        s.estate.as_mut().unwrap().checkouts = 46;
+        let text = status(&s, &Screen::terminal(80, false), false);
+        assert_eq!(
+            text,
+            "✓ Nothing needs a look                                         checked 3 min ago\n  Watching live · this Mac and 46 projects\n"
+        );
+        // A store that knows no project says this Mac alone.
+        s.estate = None;
+        assert_eq!(
+            status(&s, &Screen::pipe(), false),
+            format!(
+                "✓ Nothing needs a look   checked {}\n  Watching live · this Mac\n",
+                view::utc(CHECKED)
+            )
         );
     }
 
     #[test]
-    fn the_calm_headline_shows_only_when_no_cause_is_a_failure_whoever_can_fix_it() {
+    fn a_limit_of_this_version_leaves_the_default_text_and_the_headline_calm() {
+        // Every cause of a class other than failed, as the core gives it, with the counts of
+        // what was read and not read, bundles that do not verify and kinds no reader reads.
+        let mut s = calm_status();
+        for cause in crate::covered::CAUSES
+            .iter()
+            .filter(|c| c.class != crate::store::Cause::Failed)
+        {
+            s.not_covered.push(v1::Uncovered {
+                advice: "Do something.".to_string(),
+                ..uncovered(
+                    cause.id,
+                    cause.who,
+                    false,
+                    &format!("What the cause {} says.", cause.id),
+                    &[("example-limit", None)],
+                )
+            });
+        }
+        if let Some(c) = s.coverage.as_mut() {
+            (c.no_reader, c.not_given) = (9, 7);
+        }
+        s.integrity.as_mut().unwrap().bundles_not_verifying = 4;
+        s.event_level = Some(v1::EventLevel {
+            state: v1::CollectorState::NotInstalled as i32,
+            ..Default::default()
+        });
+        let calm = calm_status();
+        for screen in screens() {
+            assert_eq!(status(&s, &screen, false), status(&calm, &screen, false));
+        }
+        assert!(
+            status(&s, &Screen::pipe(), false).starts_with("✓ Nothing needs a look"),
+            "{}",
+            status(&s, &Screen::pipe(), false)
+        );
+        // `--coverage` keeps each of them, under the limits.
+        let whole = status(&s, &Screen::pipe(), true);
+        assert!(whole.contains("  Limits of this version here\n"), "{whole}");
+        assert!(
+            whole.contains("What the cause not-understood says"),
+            "{whole}"
+        );
+    }
+
+    #[test]
+    fn a_check_that_died_is_a_fault_line_with_the_command_that_runs_one() {
+        let mut s = calm_status();
+        s.last_run = Some(v1::CheckMark {
+            id: "run-3".to_string(),
+            started_at: NOW - 600,
+            finished_at: None,
+        });
+        let said = format!(
+            "! The check started {} did not finish   immunity run",
+            view::utc(NOW - 600)
+        );
+        assert_eq!(faults_in(&s), [said]);
+        assert!(status(&s, &Screen::pipe(), false).starts_with("✓ Nothing needs a look"));
+        // While it runs, it has not died: the headline says it is checking now.
+        s.running = true;
+        assert!(faults_in(&s).is_empty());
+        assert!(
+            status(&s, &Screen::terminal(80, false), false)
+                .lines()
+                .next()
+                .unwrap()
+                .ends_with("checked 3 min ago · checking now"),
+        );
+    }
+
+    #[test]
+    fn a_status_that_is_not_fresh_says_since_when_and_why_and_is_never_calm() {
+        let mut s = calm_status();
+        let m = s.this_mac.as_mut().unwrap();
+        (m.fresh, m.checked_at) = (false, Some(NOW - 3 * 3600));
+        m.stale_reason = Some("the latest full check finished more than 2 hours ago".to_string());
+        let text = status(&s, &Screen::terminal(80, false), false);
+        assert_eq!(
+            text,
+            "? Not checked for 3 h\n  The latest full check finished more than 2 hours ago              immunity run\n"
+        );
+        // With no watcher, the watcher is the reason, said once.
+        s.watching = None;
+        s.this_mac.as_mut().unwrap().live = false;
+        let text = status(&s, &Screen::terminal(80, false), false);
+        assert_eq!(
+            text,
+            "? Not checked for 3 h\n  No watcher runs: changes are seen only at a check you run          immunity on\n"
+        );
+        assert!(!text.contains('✓'));
+        // Yellow on a screen with colour.
+        assert!(
+            status(&s, &Screen::terminal(80, true), false).starts_with("\u{1b}[1;33m? Not checked")
+        );
+    }
+
+    #[test]
+    fn a_watcher_that_does_not_watch_live_is_a_fault_line_with_the_command_that_starts_one() {
+        let on = "immunity on";
+        let not_running = |change: fn(&mut v1::Status)| {
+            let mut s = calm_status();
+            s.watching = None;
+            s.this_mac.as_mut().unwrap().live = false;
+            change(&mut s);
+            faults_in(&s)
+        };
+        assert_eq!(
+            not_running(|_| {}),
+            [format!(
+                "! No watcher runs: changes are seen only at a check you run   {on}"
+            )]
+        );
+        assert_eq!(
+            not_running(|s| s.login_job_installed = Some(true)),
+            [format!(
+                "! The watcher is not running: its login job is in place   {on}"
+            )]
+        );
+        assert_eq!(
+            not_running(|s| s.watcher_restarting_since_at = Some(NOW - 5)),
+            ["! The watcher is restarting on a new core"]
+        );
+        // Gone after `immunity on`, by something other than `immunity off`.
+        assert_eq!(
+            not_running(|s| {
+                (s.turned_on_at, s.turned_on_latest) = (Some(NOW - 60), Some(true));
+                s.login_job_installed = Some(false);
+            }),
+            [format!(
+                "! Immunity Core is off: its job, turned on {}, is gone, and immunity off did not turn it off   {on}",
+                view::utc(NOW - 60)
+            )]
+        );
+        // A watcher that holds the store and has not read yet.
+        let mut s = calm_status();
+        s.this_mac.as_mut().unwrap().live = false;
+        assert_eq!(
+            faults_in(&s),
+            ["! A watcher runs and has not completed its first reading"]
+        );
+        // Live, as the message says, but no watcher holds the store: not live.
+        let mut s = calm_status();
+        s.watching = None;
+        assert_eq!(faults_in(&s).len(), 1, "{:?}", faults_in(&s));
+        // None of them leaves the headline green, and the line is never dim.
+        let screen = Screen::terminal(100, true);
+        let text = status(&s, &screen, false);
+        assert!(text.contains("\u{1b}[33m!\u{1b}[0m"), "{text:?}");
+        assert!(!text.contains("\u{1b}[2m!"), "{text:?}");
+    }
+
+    #[test]
+    fn each_failure_of_the_watcher_is_a_fault_line_with_when_and_what_it_said() {
+        let mut s = calm_status();
+        s.this_mac.as_mut().unwrap().live = false;
+        s.watching.as_mut().unwrap().failed = vec![
+            v1::WatcherFailure {
+                what: crate::watch::FULL_CHECK.to_string(),
+                at: NOW - 3600,
+                detail_text: "the store was busy".to_string(),
+            },
+            v1::WatcherFailure {
+                what: crate::watch::READ.to_string(),
+                at: NOW - 120,
+                detail_text: format!("could not be read: {LONG}"),
+            },
+        ];
+        assert_eq!(
+            faults_in(&s),
+            [
+                format!(
+                    "! The watcher's latest full check failed {}: the store was busy   immunity run",
+                    view::utc(NOW - 3600)
+                ),
+                format!(
+                    "! The watcher's latest reading of the watched places failed {}: could not be read: {LONG}",
+                    view::utc(NOW - 120)
+                ),
+            ]
+        );
+        // On a terminal what the source said is cut to a line, from its start, and the time is
+        // how long ago.
+        let text = status(&s, &Screen::terminal(80, false), false);
+        let lines = fault_lines_of(&text);
+        assert!(
+            lines[0].starts_with(
+                "! The watcher's latest full check failed 1 h ago: the store was busy"
+            ) && lines[0].ends_with("immunity run"),
+            "{text}"
+        );
+        assert!(lines[1].ends_with('…') && !text.contains(LONG), "{text}");
+    }
+
+    #[test]
+    fn immunity_off_is_the_off_form_and_never_calm() {
+        let mut s = calm_status();
+        s.watching = None;
+        s.this_mac.as_mut().unwrap().live = false;
+        (s.turned_off_at, s.turned_on_latest) = (Some(NOW - 7200), Some(false));
+        s.login_job_installed = Some(false);
+        let text = status(&s, &Screen::terminal(80, false), false);
+        assert_eq!(
+            text,
+            "○ Immunity Core is off                                        turned off 2 h ago\n  Nothing is watched or checked until it is turned on                immunity on\n"
+        );
+        // Not fresh as well: still the off form, since being off is why.
+        s.this_mac.as_mut().unwrap().fresh = false;
+        assert!(status(&s, &Screen::pipe(), false).starts_with("○ Immunity Core is off"));
+        // With something to look at, the finding leads and being off is a fault line.
+        s.needs_a_look = Some(v1::NeedsALook {
+            total: 1,
+            by_rule: vec![group("watched.git-hook", v1::Level::Medium, 1, 0)],
+            ..Default::default()
+        });
+        let text = status(&s, &Screen::pipe(), false);
+        assert!(text.starts_with("● 1 thing needs a look"), "{text}");
+        assert_eq!(
+            fault_lines_of(&text),
+            [format!(
+                "! Immunity Core is off: turned off {} with immunity off   immunity on",
+                view::utc(NOW - 7200)
+            )]
+        );
+    }
+
+    #[test]
+    fn an_event_level_that_records_nothing_is_a_fault_line_said_once() {
+        let level = |state: v1::CollectorState, words: &str| v1::EventLevel {
+            state: state as i32,
+            said_text: Some("eslogger: Not permitted".to_string()),
+            in_words: Some(v1::EventLevelWords {
+                state: words.to_string(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        for (state, words) in [
+            (v1::CollectorState::Refused, "refused by macOS"),
+            (v1::CollectorState::Failing, "stopped by an error"),
+            (v1::CollectorState::Silent, "silent"),
+            (v1::CollectorState::Failed, "cannot be read"),
+            (v1::CollectorState::Unspecified, ""),
+        ] {
+            let mut s = calm_status();
+            s.event_level = Some(level(state, words));
+            let words = if words.is_empty() {
+                "not running"
+            } else {
+                words
+            };
+            assert_eq!(
+                faults_in(&s),
+                [format!(
+                    "! Program starts are not seen; event level: {words}: eslogger: Not permitted"
+                )]
+            );
+        }
+        // As the core gives it, with its cause: the cause's words and advice, and the level's
+        // own line is not said again.
+        let mut s = calm_status();
+        s.event_level = Some(level(v1::CollectorState::Refused, "refused by macOS"));
+        s.not_covered.push(v1::Uncovered {
+            advice: "Open System Settings and turn on eslogger.".to_string(),
+            value_text: Some("eslogger: Not permitted".to_string()),
+            ..uncovered(
+                "eslogger-refused",
+                "you",
+                false,
+                "Program starts are not seen: macOS refuses eslogger Full Disk Access.",
+                &[],
+            )
+        });
+        assert_eq!(
+            faults_in(&s),
+            [
+                "! Program starts are not seen: macOS refuses eslogger Full Disk Access: eslogger: Not permitted Open System Settings and turn on eslogger."
+            ]
+        );
+        // Not installed is a limit and says nothing.
+        let mut s = calm_status();
+        s.event_level = Some(level(v1::CollectorState::NotInstalled, "not installed"));
+        assert!(faults_in(&s).is_empty());
+    }
+
+    #[test]
+    fn what_the_event_level_lost_since_the_latest_check_is_a_fault_line_each() {
+        let span = |since_check: u64, last_day: u64| {
+            Some(v1::Span {
+                since_check,
+                last_day,
+            })
+        };
+        let running = v1::EventLevel {
+            state: v1::CollectorState::Running as i32,
+            ..Default::default()
+        };
+        let mut s = calm_status();
+        s.event_level = Some(v1::EventLevel {
+            lost: span(3, 9),
+            unknown_losses: span(1, 4),
+            unreadable_lines: span(1_234_567, 1_234_567),
+            files_removed_unread: span(2, 2),
+            files_removed_by_cap: span(5, 5),
+            file_events: Some(v1::FileEvents {
+                collected: true,
+                lost: span(4, 4),
+                unreadable_events: span(1, 1),
+                unknown_losses: span(2, 2),
+                ..Default::default()
+            }),
+            ..running.clone()
+        });
+        let run = "   immunity run";
+        assert_eq!(
+            faults_in(&s),
+            [
+                format!("! 3 program starts were missed since the latest check{run}"),
+                format!(
+                    "! The collector restarted once since the latest check, and program starts in those moments were not seen{run}"
+                ),
+                format!(
+                    "! 1,234,567 lines of the event log could not be read since the latest check{run}"
+                ),
+                format!(
+                    "! 2 files of the event log were deleted before they were read since the latest check{run}"
+                ),
+                format!("! 5 file events were missed since the latest check{run}"),
+                format!(
+                    "! The numbering of file events started again twice since the latest check{run}"
+                ),
+            ]
+        );
+        // Lines it could not read in the last day only, before the latest check: no command
+        // ends them. Losses over the last day before the check, files the cap deleted once they
+        // were read, and file events not collected say nothing.
+        s.event_level = Some(v1::EventLevel {
+            lost: span(0, 9),
+            unreadable_lines: span(0, 1),
+            files_removed_by_cap: span(5, 5),
+            file_events: Some(v1::FileEvents {
+                collected: false,
+                lost: span(4, 4),
+                ..Default::default()
+            }),
+            ..running
+        });
+        assert_eq!(
+            faults_in(&s),
+            ["! 1 line of the event log could not be read in the last day"]
+        );
+    }
+
+    #[test]
+    fn every_cause_of_class_failed_is_a_fault_line_whoever_can_fix_it() {
         let screen = Screen::terminal(400, true);
-        let green = "\u{1b}[1;32m✓ Nothing needs a look";
-        assert!(status(&calm_status(), &screen, false).starts_with(green));
         // Every cause the core can raise, alone in that status, as the core gives it.
         for cause in crate::covered::CAUSES {
-            let class = crate::status::cause_class(cause.class);
             let title = format!("What the cause {} says.", cause.id);
             let mut s = calm_status();
             s.not_covered.push(v1::Uncovered {
-                id: cause.id.to_string(),
-                who: cause.who.to_string(),
-                class: class as i32,
-                holds_on: v1::HoldsOn::ThisMac as i32,
-                title: title.clone(),
-                examples_text: vec!["example-host".to_string()],
-                ..Default::default()
+                scope: cause.scope.to_string(),
+                ..uncovered(cause.id, cause.who, false, &title, &[])
             });
-            let text = status(&s, &screen, false);
-            let failure = cause.class == crate::store::Cause::Failed;
-            assert_eq!(!text.starts_with(green), failure, "{}\n{text}", cause.id);
-            if failure {
-                // Its line is in the default status, red or yellow, never plain and never dim.
-                let line = text
-                    .lines()
-                    .find(|l| visible(l).contains(unstopped(&title)))
-                    .unwrap_or_else(|| panic!("{}\n{text}", cause.id));
-                assert!(
-                    (line.contains("\u{1b}[31m") || line.contains("\u{1b}[33m"))
-                        && !line.contains("\u{1b}[2m"),
-                    "{line:?}"
-                );
+            let faults = faults_in(&s);
+            match cause.class == crate::store::Cause::Failed {
+                true => assert_eq!(faults, [format!("! {}", unstopped(&title))], "{}", cause.id),
+                false => assert!(faults.is_empty(), "{}: {faults:?}", cause.id),
             }
-        }
-        // Each class is given in the contract's word for it.
-        for (store, word) in [
-            (crate::store::Cause::Failed, "failed"),
-            (crate::store::Cause::NoReader, "no_reader"),
-            (crate::store::Cause::NotGiven, "not_given"),
-        ] {
-            let said = serde_json::to_value(v1::Uncovered {
-                class: crate::status::cause_class(store) as i32,
-                ..Default::default()
-            })
-            .unwrap();
-            assert_eq!(said["class"], word);
+            // The headline stays as the status's rule has it: `in_part` is green too.
+            assert!(status(&s, &screen, false).starts_with("\u{1b}[1;32m✓ Nothing needs a look"));
         }
         // A class this build does not know, or none, is a failure.
         for class in [0, 99] {
             let mut s = calm_status();
             s.not_covered.push(v1::Uncovered {
                 id: "a-cause-of-a-later-core".to_string(),
-                who: "you".to_string(),
+                who: "nothing".to_string(),
                 class,
                 title: "Something a later core says.".to_string(),
                 ..Default::default()
             });
-            assert!(!status(&s, &screen, false).starts_with(green), "{class}");
+            assert_eq!(faults_in(&s), ["! Something a later core says"], "{class}");
         }
     }
 
     #[test]
-    fn a_failed_download_is_said_by_default_even_when_the_data_kept_is_current() {
-        let screen = Screen::terminal(400, true);
-        let downloads = |s: &v1::Status| -> Option<String> {
+    fn a_failed_reading_of_this_mac_names_what_could_not_be_read_and_what_the_person_can_do() {
+        let mut s = calm_status();
+        let one = v1::Uncovered {
+            scope: "this_mac".to_string(),
+            count: 1,
+            advice: "If they are yours, make them readable again.".to_string(),
+            ..uncovered(
+                "not-permitted",
+                "you",
+                false,
+                "1 file could not be opened because of its permissions.",
+                &[(
+                    "~/Library/LaunchAgents/com.example.sync.plist",
+                    Some("Permission denied"),
+                )],
+            )
+        };
+        let many = v1::Uncovered {
+            scope: "this_mac".to_string(),
+            count: 1_234_567,
+            advice: "Nothing to do for now.".to_string(),
+            ..uncovered(
+                "could-not-read",
+                "nothing",
+                false,
+                "1,234,567 things could not be read at the last check.",
+                &[("~/a, b", None), ("~/.zshrc", None)],
+            )
+        };
+        s.not_covered = vec![one, many];
+        assert_eq!(
+            faults_in(&s),
+            [
+                "! Could not read: ~/Library/LaunchAgents/com.example.sync.plist: Permission denied If they are yours, make them readable again.",
+                // A name holding ", " never passes for two; only the person's own advice is said.
+                "! Could not read: ~/a\\u{2c} b, ~/.zshrc, and 1,234,565 more",
+            ]
+        );
+        // Where a source said why of one, each name has what its source said after it.
+        s.not_covered[1].examples[1].reason_text = Some("Is a directory".to_string());
+        assert_eq!(
+            faults_in(&s)[1],
+            "! Could not read: ~/a, b; ~/.zshrc: Is a directory, and 1,234,565 more"
+        );
+        // On a terminal a long path is cut in its middle, and the count of the rest is whole.
+        s.not_covered[1].examples_text = vec![format!("{LONG}/poetry.lock")];
+        s.not_covered[1].examples.clear();
+        let text = status(&s, &Screen::terminal(60, false), false);
+        let line = &fault_lines_of(&text)[1];
+        assert!(
+            line.contains('…') && line.ends_with("poetry.lock, and 1,234,566 more"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_failed_download_is_a_fault_line_even_when_the_data_kept_is_current() {
+        let mut s = calm_status();
+        assert!(faults_in(&s).is_empty());
+        // One ecosystem's data could not be downloaded; what was read before is current, so the
+        // core raises no cause and the headline stays calm, but the failure has its line.
+        let feed =
+            |ecosystem: &str, outcome: v1::FeedOutcome, read_at: Option<i64>| v1::FeedState {
+                ecosystem: ecosystem.to_string(),
+                outcome: outcome as i32,
+                read_at,
+                matched: true,
+                ..Default::default()
+            };
+        let feeds = &mut s.vulnerability_data.as_mut().unwrap().feeds;
+        feeds.push(feed("PyPI", v1::FeedOutcome::Failed, Some(CHECKED - 3600)));
+        assert_eq!(
+            faults_in(&s),
+            [
+                "! OSV data for PyPI not downloaded at the last check, the data read before stays in force"
+            ]
+        );
+        // The catalogue too, and an ecosystem never read whole; an outcome this build does not
+        // know is a failure.
+        s.threats.as_mut().unwrap().outcome = 99;
+        let feeds = &mut s.vulnerability_data.as_mut().unwrap().feeds;
+        feeds.push(feed("crates.io", v1::FeedOutcome::Unspecified, None));
+        assert_eq!(
+            faults_in(&s),
+            [
+                "! CISA catalogue and OSV data for PyPI not downloaded at the last check, the data read before stays in force",
+                "! OSV data for crates.io not downloaded, nothing of it is known yet",
+            ]
+        );
+        // As the core gives them, with the causes that say the same: each said once.
+        s.not_covered.push(uncovered(
+            "vulnerability-list-not-downloaded",
+            "nothing",
+            false,
+            "The list of vulnerabilities attackers are using could not be downloaded since the first check.",
+            &[],
+        ));
+        s.not_covered.push(uncovered(
+            "vulnerability-data-old",
+            "nothing",
+            false,
+            "The list of known vulnerabilities could not be updated since the first check.",
+            &[],
+        ));
+        assert_eq!(
+            faults_in(&s),
+            [
+                "! The list of vulnerabilities attackers are using could not be downloaded since the first check",
+                "! The list of known vulnerabilities could not be updated since the first check",
+                "! OSV data for PyPI not downloaded at the last check, the data read before stays in force",
+            ]
+        );
+        // What was read whole, or never asked for, is no failure.
+        let mut s = calm_status();
+        let feeds = &mut s.vulnerability_data.as_mut().unwrap().feeds;
+        feeds.push(feed("PyPI", v1::FeedOutcome::NeverRead, None));
+        assert!(faults_in(&s).is_empty());
+    }
+
+    #[test]
+    fn each_headline_has_its_glyph_and_only_nothing_to_look_at_is_green() {
+        let screen = Screen::terminal(80, true);
+        let first = |s: &v1::Status| {
             status(s, &screen, false)
                 .lines()
-                .find(|l| visible(l).trim_start().starts_with("Downloads"))
-                .map(str::to_string)
+                .next()
+                .unwrap()
+                .to_string()
         };
+        assert!(first(&calm_status()).starts_with("\u{1b}[1;32m✓ Nothing needs a look\u{1b}[0m"));
+        // In part: the same words; what keeps it from calm is a fault line under it, or for
+        // machines beyond this Mac not reached, nothing in this text.
         let mut s = calm_status();
-        assert_eq!(downloads(&s), None);
-        // One ecosystem's data could not be downloaded; what was read before is current, so the
-        // core raises no cause and the headline may stay calm, but the failure has its line.
-        s.vulnerability_data
-            .as_mut()
-            .unwrap()
-            .feeds
-            .push(v1::FeedState {
-                ecosystem: "PyPI".to_string(),
-                outcome: v1::FeedOutcome::Failed as i32,
-                read_at: Some(CHECKED - 3600),
-                reason_text: Some("curl: (28) timed out".to_string()),
-                ..Default::default()
-            });
-        let line = downloads(&s).unwrap_or_else(|| panic!("{}", status(&s, &screen, false)));
+        s.coverage.as_mut().unwrap().unreached_total = 1;
         assert_eq!(
-            visible(&line).trim(),
-            "Downloads    OSV data for PyPI not downloaded at the last check, the data read before stays in force"
+            crate::headline::headed(s.clone()).headline,
+            v1::Headline::InPart as i32
         );
-        assert!(
-            line.contains("\u{1b}[33m") && !line.contains("\u{1b}[2m"),
-            "{line:?}"
+        assert_eq!(
+            status(&s, &screen, false),
+            status(&calm_status(), &screen, false)
         );
-        // The catalogue too, and an ecosystem never read whole, red; an outcome this build does
-        // not know is a failure.
-        s.threats.as_mut().unwrap().outcome = 99;
-        s.vulnerability_data
-            .as_mut()
-            .unwrap()
-            .feeds
-            .push(v1::FeedState {
-                ecosystem: "crates.io".to_string(),
-                outcome: v1::FeedOutcome::Unspecified as i32,
-                ..Default::default()
-            });
-        let line = downloads(&s).unwrap();
-        assert!(
-            visible(&line).contains(
-                "CISA catalogue and OSV data for PyPI not downloaded at the last check, the data read before stays in force; OSV data for crates.io not downloaded, nothing of it is known yet"
-            ),
-            "{line}"
-        );
-        assert!(line.contains("\u{1b}[31m"), "{line:?}");
-        // And what was read whole, or never asked for, is no failure.
+        // Something to look at: red when some of it is urgent, yellow when none is.
         let mut s = calm_status();
-        s.vulnerability_data
-            .as_mut()
-            .unwrap()
-            .feeds
-            .push(v1::FeedState {
-                ecosystem: "PyPI".to_string(),
-                outcome: v1::FeedOutcome::NeverRead as i32,
-                ..Default::default()
-            });
-        assert_eq!(downloads(&s), None);
-        // The line keeps the detail as a next step, as every line of what was not read: with
-        // coverage whole and only installing a watcher to do, it is the one that adds it.
-        s.watching = None;
-        if let Some(c) = s.coverage.as_mut() {
-            c.no_reader = 0;
-            c.not_given = 0;
-        }
-        let step = "→ immunity status --coverage   what was read and what was not";
-        assert!(!status(&s, &Screen::pipe(), false).contains(step));
-        s.threats.as_mut().unwrap().outcome = v1::FeedOutcome::Failed as i32;
-        assert!(status(&s, &Screen::pipe(), false).contains(step));
+        s.needs_a_look = Some(v1::NeedsALook {
+            total: 4,
+            urgent_total: 1,
+            by_rule: vec![group("watched.git-hook", v1::Level::Medium, 4, 1)],
+            ..Default::default()
+        });
+        assert!(
+            first(&s).starts_with("\u{1b}[1;31m● 4 things need a look · 1 urgent\u{1b}[0m"),
+            "{}",
+            first(&s)
+        );
+        let n = s.needs_a_look.as_mut().unwrap();
+        (n.urgent_total, n.by_rule[0].urgent) = (0, 0);
+        assert!(first(&s).starts_with("\u{1b}[1;33m● 4 things need a look\u{1b}[0m"));
+        // Not known: never calm.
+        let mut s = calm_status();
+        s.this_mac.as_mut().unwrap().state = v1::ThisMacState::Unspecified as i32;
+        assert!(first(&s).starts_with("\u{1b}[1;33m? Whether this Mac is watched is not known"));
+        s.needs_a_look = None;
+        let unknown = status(&s, &Screen::pipe(), false);
+        assert!(
+            unknown.starts_with("? No run of this build has looked for findings yet\n  Check this Mac now   immunity run\n"),
+            "{unknown}"
+        );
     }
 
     #[test]
-    fn the_count_of_what_is_not_judged_is_never_cut() {
+    fn what_needs_a_look_is_listed_by_every_rule_with_the_command_that_shows_it() {
         let mut s = calm_status();
-        s.not_covered.push(v1::Uncovered {
-            id: "not-understood".to_string(),
-            who: "nothing".to_string(),
-            class: v1::Cause::NoReader as i32,
-            holds_on: v1::HoldsOn::ThisMac as i32,
-            title: "Some files are not understood by this version yet.".to_string(),
-            examples_text: vec![format!("{LONG}/poetry.lock"), "yarn.lock".to_string()],
+        let mut hook = listed(7, v1::Level::Critical, true, "~/dev/site".to_string());
+        hook.package_text = Some("left-pad".to_string());
+        hook.releases_text = vec!["1.0.7".to_string()];
+        hook.short_title = "Malicious package in a project".to_string();
+        hook.where_text = "~/dev/site/package-lock.json#node_modules/left-pad".to_string();
+        if let Some(r) = hook.finding.as_mut() {
+            r.rule = Some("lockfiles.malicious-package".to_string());
+        }
+        let mut by_rule = vec![v1::RuleCount {
+            short_title: "Malicious package in a project".to_string(),
+            ..group("lockfiles.malicious-package", v1::Level::Critical, 1, 1)
+        }];
+        // Nine rules more, none left out for a number.
+        for i in 0..9 {
+            by_rule.push(group(&format!("rule.{i}"), v1::Level::Medium, 2 + i, i % 2));
+        }
+        s.needs_a_look = Some(v1::NeedsALook {
+            items: vec![v1::LookFinding {
+                finding: Some(hook),
+                ..Default::default()
+            }],
+            total: 1 + (0..9).map(|i| 2 + i).sum::<u64>(),
+            urgent_total: 5,
+            by_rule,
+        });
+        let text = status(&s, &Screen::pipe(), false);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[0],
+            format!(
+                "● 55 things need a look · 5 urgent   checked {}",
+                view::utc(CHECKED)
+            )
+        );
+        assert_eq!(
+            lines[1],
+            "  critical  Malicious package in a project: left-pad 1.0.7 in ~/dev/site"
+        );
+        assert_eq!(
+            lines[2],
+            "            urgent   immunity finding f0000000007"
+        );
+        assert_eq!(lines[3], "  medium    Short title of rule.0");
+        assert_eq!(lines[4], "            2 findings   immunity findings");
+        assert_eq!(
+            lines[6],
+            "            3 findings, 1 urgent   immunity findings"
+        );
+        assert_eq!(lines[19], "  medium    Short title of rule.8");
+        assert_eq!(lines[20], "            10 findings   immunity findings");
+        assert_eq!(
+            lines[21],
+            "  Watching live · this Mac and 1,234,567 projects"
+        );
+        // A rule of one finding that the message does not list is counted like the others.
+        s.needs_a_look.as_mut().unwrap().items.clear();
+        let text = status(&s, &Screen::pipe(), false);
+        assert_eq!(
+            text.lines().nth(2),
+            Some("            1 finding, urgent   immunity findings")
+        );
+        assert_eq!(
+            text.lines().nth(1),
+            Some("  critical  Malicious package in a project")
+        );
+    }
+
+    #[test]
+    fn a_running_first_check_says_when_it_started_and_its_stage_and_never_that_nothing_needed_a_look()
+     {
+        let mut s = calm_status();
+        s.running = true;
+        s.last_run = Some(v1::CheckMark {
+            id: "run-1".to_string(),
+            started_at: NOW - 120,
+            finished_at: None,
+        });
+        s.last_finished_run = None;
+        s.this_mac.as_mut().unwrap().checked_at = None;
+        s.check_stage = Some(v1::CheckStage::Lockfiles as i32);
+        s.check_stage_started_at = Some(NOW - 40);
+        for text in [
+            status(&s, &Screen::terminal(80, false), false),
+            ran(&s, &Screen::terminal(80, false)),
+        ] {
+            assert!(
+                text.starts_with("… The first check is running                                   started 2 min ago\n  Reading lockfiles for less than a minute\n"),
+                "{text}"
+            );
+            assert!(!text.to_lowercase().contains("nothing need") && !text.contains('✓'));
+        }
+        // A stage this build cannot name, or one without its time, is no stage.
+        for (stage, at) in [
+            (Some(99), Some(NOW - 40)),
+            (Some(0), Some(NOW - 40)),
+            (Some(4), None),
+        ] {
+            (s.check_stage, s.check_stage_started_at) = (stage, at);
+            let text = status(&s, &Screen::pipe(), false);
+            assert_eq!(text.lines().count(), 1, "{text}");
+        }
+        // None running and none finished: what to run.
+        s.running = false;
+        s.last_run = None;
+        let text = status(&s, &Screen::terminal(80, true), false);
+        assert!(
+            text.starts_with(
+                "\u{1b}[1;33m? No check has finished yet\u{1b}[0m\n  Check this Mac now"
+            ),
+            "{text:?}"
+        );
+        assert!(text.contains("\u{1b}[36mimmunity run\u{1b}[0m"));
+    }
+
+    #[test]
+    fn a_command_that_does_not_fit_beside_its_line_goes_on_the_next_line_set_to_the_right() {
+        let mut s = calm_status();
+        s.last_run = Some(v1::CheckMark {
+            started_at: NOW - 600,
             ..Default::default()
         });
-        s.not_covered.push(v1::Uncovered {
-            id: "persistence-not-read".to_string(),
-            who: "nothing".to_string(),
-            class: v1::Cause::NoReader as i32,
-            holds_on: v1::HoldsOn::EveryMac as i32,
-            title: "Some places are not checked.".to_string(),
-            ..Default::default()
-        });
-        // The value has the width less 15 columns, for the label: from 2 columns up.
-        for width in [17, 19, 20, 26, 40, 80] {
+        // Its last line ends where the screen does, whatever the width.
+        for width in [40, 50, 60, 80, 100] {
             let text = status(&s, &Screen::terminal(width, false), false);
-            let line = text
-                .lines()
-                .find(|l| l.trim_start().starts_with("Not judged"))
-                .unwrap_or_else(|| panic!("{width}\n{text}"));
-            // The long name gives way, to `…` at the least; the count of the rest stays whole,
-            // on the line where there is room for it and broken onto the next where there is not.
-            if width >= 19 {
-                assert!(line.ends_with("… +2"), "{width}: {line:?}");
-            } else {
-                let words: Vec<&str> = text.split_whitespace().collect();
-                assert!(
-                    words.join(" ").contains("Not judged … +2"),
-                    "{width}\n{text}"
-                );
+            let line = text.lines().find(|l| l.contains("immunity run")).unwrap();
+            assert_eq!(screen::columns(line), width, "{width}\n{text}");
+        }
+        // At 50 columns the words take 47 of them: the command goes under them, to the right.
+        let narrow = status(&s, &Screen::terminal(50, false), false);
+        assert!(
+            narrow.ends_with(&format!(
+                "  ! The check started 10 min ago did not finish\n{}immunity run\n",
+                " ".repeat(38)
+            )),
+            "{narrow}"
+        );
+        // In a pipe the command follows the line.
+        assert!(status(&s, &Screen::pipe(), false).contains(" did not finish   immunity run\n"));
+    }
+
+    #[test]
+    fn the_default_text_never_says_coverage_reading_store_or_estate_but_in_what_a_source_said() {
+        let mut s = status_of("x");
+        s.not_covered.retain(is_failure);
+        for screen in screens() {
+            let text = visible(&status(&s, &screen, false)).to_lowercase();
+            for word in ["coverage", "reading", "store", "estate"] {
+                // The one source text here that holds a word of them is a watcher's failure.
+                let said = text.replace("the watcher's latest write to the store failed", "");
+                assert!(!said.contains(word), "{word}\n{text}");
             }
         }
     }
+
+    #[test]
+    fn the_json_of_a_status_with_faults_and_limits_is_unchanged_by_what_its_text_leaves_out() {
+        let s = crate::headline::headed(v1::Status {
+            answered_at: NOW,
+            needs_a_look: Some(v1::NeedsALook::default()),
+            this_mac: Some(v1::ThisMac {
+                state: v1::ThisMacState::Watched as i32,
+                live: true,
+                checked_at: Some(CHECKED),
+                fresh: true,
+                ..Default::default()
+            }),
+            watching: Some(v1::Watcher {
+                failed: vec![v1::WatcherFailure {
+                    what: crate::watch::READ.to_string(),
+                    at: CHECKED,
+                    detail_text: "busy".to_string(),
+                }],
+                ..Default::default()
+            }),
+            not_covered: vec![
+                uncovered(
+                    "could-not-read",
+                    "nothing",
+                    false,
+                    "1 thing.",
+                    &[("~/a", None)],
+                ),
+                uncovered(
+                    "not-understood",
+                    "nothing",
+                    false,
+                    "Some files.",
+                    &[("x.lock", None)],
+                ),
+            ],
+            ..Default::default()
+        });
+        let before = serde_json::to_string(&s).unwrap();
+        let _ = status(&s, &Screen::terminal(80, true), false);
+        let _ = status(&s, &Screen::pipe(), true);
+        let _ = ran(&s, &Screen::pipe());
+        assert_eq!(serde_json::to_string(&s).unwrap(), before);
+        assert_eq!(before, JSON_GOLDEN);
+    }
+
+    /// The JSON of the status above, as this build gives it and gave it before its text changed.
+    const JSON_GOLDEN: &str = r#"{"format":0,"answered_at":1794807960,"store_id":null,"running":false,"store":null,"cannot_judge":[],"rules":null,"watching":{"since_at":null,"last_read_at":null,"failed":[{"what":"read","at":1794807780,"detail_text":"busy"}],"cannot_see":[]},"this_mac":{"state":"watched","live":true,"checked_at":1794807780,"live_read_at":null,"watched":[],"fresh":true,"stale_reason":null,"fresh_for_seconds":0},"event_level":null,"not_covered":[{"id":"could-not-read","who":"nothing","scope":"","kind":"","title":"1 thing.","meaning":"","advice":"","count":0,"since_at":null,"value_text":null,"examples_text":["~/a"],"holds_on":"this_mac","examples":[{"name_text":"~/a","reason_text":null}],"class":"failed"},{"id":"not-understood","who":"nothing","scope":"","kind":"","title":"Some files.","meaning":"","advice":"","count":0,"since_at":null,"value_text":null,"examples_text":["x.lock"],"holds_on":"this_mac","examples":[{"name_text":"x.lock","reason_text":null}],"class":"no_reader"}],"last_run":null,"last_finished_run":null,"estate":null,"watched":null,"threats":null,"vulnerability_data":null,"vulnerabilities":null,"integrity":null,"no_reader_for":null,"coverage":null,"needs_a_look":{"items":[],"total":0,"urgent_total":0,"by_rule":[]},"answers_note":"","answered_outside_app":null,"statements_outside_app":null,"not_computed":[],"journal_seq":null,"login_job_installed":null,"watcher_restarting_since_at":null,"turned_on_at":null,"turned_off_at":null,"turned_on_latest":null,"check_stage":null,"check_stage_started_at":null,"headline":"in_part","headline_because":["watcher","not_covered"]}"#;
 }

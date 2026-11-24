@@ -4,12 +4,10 @@
 //! person; then context, one labelled line each; last, the next command after `→`.
 //!
 //! `immunity run` answers with the status the check left, read back from the store (`Status`), so
-//! its text is made from that message too: what it raised is told by the findings first seen
-//! since the check began, and whether it may say "nothing needs a look" is decided by the
-//! status's own headline (`Status.headline`), never by a second rule. After the lines that are the
-//! run's own (what changed, what was read), it says what the status says of the same store after
-//! its headline, from the status's own function (`overview::context`), so a run is never calmer
-//! than `immunity status`.
+//! its text is made from that message too, by the status's own function (`overview::answer`): the
+//! same headline by the status's own rule (`Status.headline`), the same findings and the same
+//! faults, so a run is never calmer than `immunity status`. Its own are how long the check took,
+//! how many findings it first saw, and on the first check that what it found is the baseline.
 //!
 //! Text from a source (a path, a name, what a source said of a failure) is escaped as it reaches
 //! the screen, before it is measured, cut or styled (`screen.rs`), and is set in a column or
@@ -17,7 +15,7 @@
 
 use crate::contract::v1;
 use crate::overview;
-use crate::screen::{self, BOLD, Cell, Column, Cut, DIM, GREEN, PLAIN, RED, Screen, Style, YELLOW};
+use crate::screen::{self, BOLD, DIM, GREEN, PLAIN, RED, Screen, Style, YELLOW};
 use crate::view;
 use std::io::{IsTerminal, Write};
 
@@ -34,14 +32,6 @@ fn duration(seconds: i64) -> String {
         s if s < 3600 => format!("{} min {} s", s / 60, s % 60),
         s => format!("{} h {} min", s / 3600, s % 3600 / 60),
     }
-}
-
-/// The findings of one rule, counted: a row of the list of what was found.
-struct Group {
-    title: String,
-    severity: Option<i32>,
-    count: u64,
-    urgent: u64,
 }
 
 /// The fewest columns a value is given beside its label before it goes under it.
@@ -69,254 +59,54 @@ fn beside(screen: &Screen, width: usize, label: &str, parts: &[(String, Style)])
     }
 }
 
-/// The rules of the findings first seen at or after `since`, among those the message lists,
-/// each counted, in the order the status lists its rules: urgent ones first, then the most
-/// severe, then the most findings, then by rule.
-fn new_groups(screen: &Screen, n: &v1::NeedsALook, since: i64) -> Vec<Group> {
-    let mut groups: Vec<(String, Group)> = Vec::new();
-    for item in n.items.iter().filter_map(|i| i.finding.as_ref()) {
-        if item.first_seen_at < since {
-            continue;
-        }
-        let r = item.finding.clone().unwrap_or_default();
-        let key = r.rule.clone().unwrap_or_else(|| item.short_title.clone());
-        let at = match groups.iter().position(|(k, _)| *k == key) {
-            Some(at) => at,
-            None => {
-                let title = overview::short_title(
-                    screen,
-                    item.rule_title_text.as_deref(),
-                    &item.short_title,
-                    &item.title,
-                );
-                groups.push((
-                    key,
-                    Group {
-                        title,
-                        severity: r.severity,
-                        count: 0,
-                        urgent: 0,
-                    },
-                ));
-                groups.len() - 1
-            }
-        };
-        let g = &mut groups[at].1;
-        // The most severe of them; not known when one of them is not known.
-        g.severity = match (g.severity, r.severity) {
-            (Some(a), Some(b)) if overview::rank(Some(b)) > overview::rank(Some(a)) => Some(b),
-            (Some(a), Some(_)) => Some(a),
-            _ => None,
-        };
-        g.count += 1;
-        g.urgent += u64::from(r.urgent);
-    }
-    groups.sort_by(|(ka, a), (kb, b)| {
-        (b.urgent > 0)
-            .cmp(&(a.urgent > 0))
-            .then(overview::rank(b.severity).cmp(&overview::rank(a.severity)))
-            .then(b.count.cmp(&a.count))
-            .then(ka.cmp(kb))
-    });
-    groups.into_iter().map(|(_, g)| g).collect()
-}
-
-/// The rules of every finding that needs a look, as the status counts them.
-fn all_groups(screen: &Screen, n: &v1::NeedsALook) -> Vec<Group> {
-    n.by_rule
-        .iter()
-        .map(|g| Group {
-            title: overview::short_title(
-                screen,
-                g.rule_title_text.as_deref(),
-                &g.short_title,
-                &g.rule,
-            ),
-            severity: g.severity,
-            count: g.count,
-            urgent: g.urgent,
-        })
-        .collect()
-}
-
-/// A list of rules under its label: a row each, the first `overview::GROUPS_SHOWN`, then the
-/// rest counted in one line, never without how many of them are urgent.
-fn groups_section(screen: &Screen, out: &mut Vec<String>, label: &str, groups: &[Group]) {
-    out.push(format!("  {}", screen.paint(BOLD, label)));
-    let shown = &groups[..groups.len().min(overview::GROUPS_SHOWN)];
-    let rows: Vec<Vec<Cell>> = shown
-        .iter()
-        .map(|g| {
-            let (lv, style) = overview::level(g.severity);
-            vec![
-                Cell::new(lv, style),
-                Cell::plain(g.title.clone()),
-                Cell::new(overview::grouped(g.count), BOLD),
-                Cell::new(overview::urgent_cell(g.count, g.urgent), RED),
-            ]
-        })
-        .collect();
-    out.extend(screen.table(
-        4,
-        &[
-            Column::new(Cut::Never),
-            Column::new(Cut::End),
-            Column::right(Cut::Never),
-            Column::new(Cut::Never),
-        ],
-        None,
-        &rows,
-    ));
-    let rest = &groups[shown.len()..];
-    if !rest.is_empty() {
-        let more: u64 = rest.iter().map(|g| g.count).sum();
-        let urgent: u64 = rest.iter().map(|g| g.urgent).sum();
-        let said = format!(
-            "… {} more in {}, {}",
-            overview::grouped(more),
-            overview::count(rest.len() as u64, "kind", "kinds"),
-            match urgent {
-                0 => "none urgent".to_string(),
-                u => format!("{} urgent", overview::grouped(u)),
-            }
-        );
-        let style = if urgent > 0 { RED } else { PLAIN };
-        for l in screen::wrap(&said, screen.fits().map(|w| w.saturating_sub(4))) {
-            out.push(format!("    {}", screen.paint(style, &l)));
-        }
-    }
-}
-
-/// What the check counted as changed since the check before, by kind of change, with what
-/// cannot be known about it.
-fn changed(f: &v1::FinishedCheck) -> String {
-    let mut said = match &f.since_previous_run {
-        None => "nothing to compare with: what this check read is the baseline".to_string(),
-        Some(c) => match c.added + c.changed + c.removed {
-            0 => "nothing since the last check".to_string(),
-            total => format!(
-                "{} since the last check: {} added, {} changed, {} removed",
-                overview::count(total, "change", "changes"),
-                overview::grouped(c.added),
-                overview::grouped(c.changed),
-                overview::grouped(c.removed)
-            ),
-        },
-    };
-    if f.since_previous_run.is_some() && !f.unknown.is_empty() {
-        said.push_str(&format!("; {}", f.unknown.join(", ")));
-    }
-    if f.set_aside > 0 {
-        said.push_str(&format!(
-            "; {} set aside as no longer read by this version, not counted as removed",
-            overview::count(f.set_aside, "fact", "facts")
-        ));
-    }
-    said
-}
-
-/// What the store holds of this Mac and its surroundings after the check, counted.
-fn read(s: &v1::Status) -> Option<String> {
-    let mut parts = Vec::new();
-    if let Some(e) = &s.estate {
-        parts.push(overview::count(e.checkouts, "project", "projects"));
-        parts.push(overview::count(e.components, "package", "packages"));
-        parts.push(match e.servers {
-            0 => "no servers known".to_string(),
-            n => format!(
-                "{} known, {} read",
-                overview::count(n, "server", "servers"),
-                overview::grouped(e.servers_read)
-            ),
-        });
-    }
-    if let Some(w) = &s.watched {
-        parts.push(format!(
-            "{} in watched places",
-            overview::count(w.files, "file", "files")
-        ));
-    }
-    if let Some(i) = &s.integrity {
-        parts.push(overview::count(i.bundles, "application", "applications"));
-    }
-    (!parts.is_empty()).then(|| parts.join(", "))
-}
-
-/// `immunity run` for a person, from the status the check left.
+/// `immunity run` for a person, from the status the check left: the status's own text, with how
+/// long the check took at the right and the run's own tail after the headline's words.
 pub fn run(s: &v1::Status, screen: &Screen) -> String {
     if !s.store.as_ref().is_some_and(|f| f.exists) {
         return overview::status(s, screen, false);
     }
-    let mut out: Vec<String> = Vec::new();
     let finished = s.last_finished_run.as_ref();
     let check = finished.and_then(|f| f.check.as_ref());
     let first = finished.is_some_and(|f| f.first_run);
     let took = check
         .and_then(|c| c.finished_at.map(|end| end - c.started_at))
         .map(|t| format!("took {}", duration(t)));
-    let look = s.needs_a_look.as_ref();
     // What this check raised: the findings first seen since it began, among those listed. The
     // message lists at most some of them and carries no count of those this check opened, so a
     // number of new findings is said only when every finding is listed, and never "none new": a
     // finding opened again keeps the day it was first seen.
+    let look = s.needs_a_look.as_ref();
     let new = match (look, check) {
-        (Some(n), Some(c)) => new_groups(screen, n, c.started_at),
-        _ => Vec::new(),
+        (Some(n), Some(c)) => n
+            .items
+            .iter()
+            .filter_map(|i| i.finding.as_ref())
+            .filter(|l| l.first_seen_at >= c.started_at)
+            .count() as u64,
+        _ => 0,
     };
-    let new_count: u64 = new.iter().map(|g| g.count).sum();
-    let listed = look.map_or(0, |n| n.items.len() as u64);
-    let listed_whole = look.is_some_and(|n| listed >= n.total);
+    let listed_whole = look.is_some_and(|n| n.items.len() as u64 >= n.total);
     let tail = if first {
         " · the first check of this Mac".to_string()
-    } else if new_count > 0 && listed_whole {
-        format!(" · {} new in this check", overview::grouped(new_count))
+    } else if new > 0 && listed_whole {
+        format!(" · {} new in this check", overview::grouped(new))
     } else {
         String::new()
     };
-    // The status's own headline, by its own rule.
-    let (answer, style) = overview::answer(s);
-    let tail = if look.is_some_and(|n| n.total == 0) && !first {
-        String::new()
-    } else {
-        tail
-    };
-    out.extend(screen.headline(&format!("{answer}{tail}"), style, took.as_deref()));
-    // What needs the person: what this check raised, or on the first check all it found. When
-    // not every finding is listed, the new ones are those among the listed, and it says so.
-    if let Some(n) = look.filter(|n| n.total > 0) {
-        let among = format!("New among the {} listed", overview::grouped(listed));
-        let (label, groups) = if first {
-            ("Found", all_groups(screen, n))
-        } else if listed_whole {
-            ("New", new)
-        } else {
-            (among.as_str(), new)
-        };
-        if !groups.is_empty() {
-            out.push(String::new());
-            groups_section(screen, &mut out, label, &groups);
-        }
+    // What the run adds of its own: that the first check is the baseline, and what it set aside.
+    let mut own = Vec::new();
+    if first {
+        own.push(
+            "What it found is kept as the baseline: a change from now on is a finding".to_string(),
+        );
     }
-    // What the run adds of its own, then all that the status says of the same store after its
-    // headline, from the status's own function: never less.
-    let mut own: Vec<(&'static str, overview::Parts)> = Vec::new();
-    if let Some(f) = finished {
-        own.push(("Changed", vec![(changed(f), PLAIN)]));
+    if let Some(f) = finished.filter(|f| f.set_aside > 0) {
+        own.push(format!(
+            "{} set aside as no longer read by this version, not counted as removed",
+            overview::count(f.set_aside, "fact", "facts")
+        ));
     }
-    if let Some(said) = read(s) {
-        own.push(("Read", vec![(said, PLAIN)]));
-    }
-    out.push(String::new());
-    overview::context(s, screen, own, &mut out);
-    out.push(String::new());
-    let mut next = Vec::new();
-    if look.is_some_and(|n| n.total > 0) {
-        next.push(("immunity findings", "lists every one, most urgent first"));
-    }
-    next.extend(overview::watcher_step(s));
-    next.push(("immunity status", "what is watched and what was not read"));
-    out.extend(screen.nexts(&next));
-    joined(&out)
+    joined(&overview::answer(s, screen, &tail, took, &own))
 }
 
 /// The dim line on standard error that says a check is running, while it runs: written only
@@ -877,6 +667,7 @@ mod tests {
         v1::Uncovered {
             id: "watched-not-read".to_string(),
             who: "you".to_string(),
+            scope: "this_mac".to_string(),
             title: "A watched place could not be read".to_string(),
             count: 1,
             examples_text: vec![name.to_string()],
@@ -895,257 +686,74 @@ mod tests {
     }
 
     #[test]
-    fn a_run_says_its_answer_then_what_it_raised_then_context_then_the_next_commands() {
+    fn a_run_says_the_status_with_how_long_it_took_and_how_many_findings_it_first_saw() {
         let text = run(&status(), &Screen::pipe());
-        let l = lines(&text);
         assert_eq!(
-            l[0],
-            "✗ 4 things need a look, 1 urgent · 3 new in this check   took 12 s"
+            lines(&text),
+            [
+                "● 4 things need a look · 1 urgent · 3 new in this check   took 12 s",
+                "  critical  Malicious package in a project",
+                "            urgent   immunity finding f1",
+                "  high      Program files changed in place",
+                "            2 findings   immunity findings",
+                "  medium    Shell startup file changed",
+                "            immunity finding f4",
+                "  ! No watcher runs: changes are seen only at a check you run   immunity on",
+            ]
         );
-        assert_eq!(l[1], "");
-        assert_eq!(l[2], "  New");
-        assert!(
-            l[3].starts_with(&format!("    critical  {MALICIOUS}")) && l[3].ends_with("1  urgent"),
-            "{text}"
-        );
-        assert!(
-            l[4].starts_with(&format!("    high      {CHANGED}")) && l[4].ends_with('2'),
-            "{text}"
-        );
-        assert_eq!(l[5], "");
-        assert_eq!(
-            l[6],
-            "  Changed      14 changes since the last check: 9 added, 4 changed, 1 removed"
-        );
-        assert_eq!(
-            l[7],
-            "  Read         15 projects, 70 packages, 9 servers known, 7 read, 31 files in watched places"
-        );
-        // Then what the status says of the same store, in its words.
-        assert_eq!(
-            l[8],
-            "  Watching     no watcher runs now: changes are seen at each check"
-        );
-        assert_eq!(l[9], "  Coverage     nothing has been read yet");
-        assert_eq!(l[10], "");
-        assert_eq!(
-            l[11],
-            "→ immunity findings   lists every one, most urgent first"
-        );
-        // With no watcher, what starts one; what they do is lined up.
-        assert_eq!(
-            l[12],
-            "→ immunity on         starts a watcher that outlives the terminal"
-        );
-        assert_eq!(
-            l[13],
-            "→ immunity status     what is watched and what was not read"
-        );
-        assert_eq!(l.len(), 14, "{text}");
-        // What was found before this check is not among what it raised.
-        assert!(!text.contains(PROFILE), "{text}");
+    }
+
+    /// The text of a run and of the status of the same store, each without its first line.
+    fn after_headline(s: &v1::Status, screen: &Screen) -> (String, String) {
+        let s = crate::headline::headed(s.clone());
+        let rest = |t: String| t.lines().skip(1).collect::<Vec<_>>().join("\n");
+        (
+            rest(run(&s, screen)),
+            rest(overview::status(&s, screen, false)),
+        )
     }
 
     #[test]
-    fn with_no_watcher_a_run_names_the_command_that_starts_one_and_with_one_running_none() {
-        let step = "→ immunity on         starts a watcher that outlives the terminal";
-        assert!(lines(&run(&status(), &Screen::pipe())).contains(&step.to_string()));
-        let mut watched = status();
-        watched.watching = Some(v1::Watcher::default());
-        let text = run(&watched, &Screen::pipe());
-        assert!(!text.contains("immunity on"), "{text}");
-    }
-
-    /// The lines a screen of the store says between what needs a look and the next steps.
-    fn context_lines(text: &str) -> Vec<String> {
-        let l = lines(text);
-        let blanks: Vec<usize> = (0..l.len()).filter(|&i| l[i].is_empty()).collect();
-        let [.., from, to] = blanks[..] else {
-            panic!("{text}")
-        };
-        l[from + 1..to].to_vec()
-    }
-
-    #[test]
-    fn a_run_never_says_less_than_the_status_of_the_same_store_after_its_headline() {
+    fn a_run_never_says_less_than_the_status_of_the_same_store() {
         let calm = || {
             let mut s = status();
             s.needs_a_look = Some(v1::NeedsALook::default());
             s.this_mac.as_mut().unwrap().live = true;
             s.watching = Some(v1::Watcher::default());
-            s.coverage = Some(v1::CoverageSummary::default());
             s
         };
-        let not_seen = v1::Uncovered {
-            id: "program-starts-not-seen".to_string(),
-            who: "you".to_string(),
-            title: "Program starts on this Mac are not seen".to_string(),
-            count: 1,
-            class: v1::Cause::NotGiven as i32,
-            holds_on: v1::HoldsOn::ThisMac as i32,
-            ..Default::default()
-        };
-        let mut states = vec![("calm", calm())];
-        let mut s = calm();
-        s.event_level = Some(v1::EventLevel {
-            state: v1::CollectorState::NotInstalled as i32,
-            in_words: Some(v1::EventLevelWords {
-                state: "not installed".to_string(),
-                ..Default::default()
-            }),
-            ..Default::default()
-        });
-        s.coverage.as_mut().unwrap().not_given = 2;
-        s.not_covered = vec![not_seen];
-        states.push(("event level not installed, readings not given", s));
+        let mut states = vec![("calm", calm()), ("findings", status())];
         let mut s = calm();
         s.not_covered = vec![failed_cause("~/.zshrc", "Permission denied")];
-        s.coverage.as_mut().unwrap().failed = 1;
         states.push(("a failed reading", s));
         let mut s = calm();
-        s.watching = None;
-        s.this_mac.as_mut().unwrap().live = false;
-        states.push(("no watcher", s));
-        let mut s = status();
-        s.watching = Some(v1::Watcher {
-            failed: vec![v1::WatcherFailure {
-                what: "fsevents".to_string(),
-                ..Default::default()
-            }],
-            ..Default::default()
-        });
-        states.push(("a watcher that failed, with findings", s));
-        for (name, s) in &states {
-            for screen in [
-                Screen::pipe(),
-                Screen::terminal(80, false),
-                Screen::terminal(40, false),
-            ] {
-                let s = &crate::headline::headed(s.clone());
-                let ran = run(s, &screen);
-                let status_text = overview::status(s, &screen, false);
-                let said = context_lines(&ran);
-                for line in context_lines(&status_text) {
-                    assert!(
-                        said.contains(&line),
-                        "{name}: {line:?}\n{ran}\n{status_text}"
-                    );
-                }
-                // And never calmer in its headline.
-                assert!(
-                    !ran.starts_with('✓') || status_text.starts_with('✓'),
-                    "{name}\n{ran}\n{status_text}"
-                );
-            }
-        }
-        // The causes are said in the run, by name.
-        let text = run(&states[1].1, &Screen::pipe());
-        for said in [
-            "You can fix",
-            "Program starts on this Mac are not seen",
-            "readings their source does not give",
-            "not installed",
-        ] {
-            assert!(text.contains(said), "{said}: {text}");
-        }
-    }
-
-    #[test]
-    fn a_run_reads_calm_only_when_the_status_s_own_rule_allows_it() {
-        let mut calm = status();
-        calm.needs_a_look = Some(v1::NeedsALook::default());
-        calm.this_mac.as_mut().unwrap().live = true;
-        calm.watching = Some(v1::Watcher::default());
-        let text = run(&calm, &Screen::pipe());
-        assert!(
-            text.starts_with("✓ Nothing needs a look   took 12 s\n"),
-            "{text}"
-        );
-        // A reading that failed: the status's rule says it is not calm, and the failure is said.
-        let mut failed = calm.clone();
-        failed.not_covered = vec![failed_cause("~/.zshrc", "Permission denied")];
-        let text = run(&failed, &Screen::pipe());
-        assert!(
-            text.starts_with("Nothing needs a look in what could be read"),
-            "{text}"
-        );
-        assert!(!text.contains('✓'), "{text}");
-        assert!(
-            text.contains("  Failed\n    A watched place could not be read\n"),
-            "{text}"
-        );
-        assert!(text.contains("~/.zshrc: Permission denied"), "{text}");
-        // A status that is not fresh is never calm.
-        let mut stale = calm.clone();
-        stale.this_mac.as_mut().unwrap().fresh = false;
-        assert!(!run(&stale, &Screen::pipe()).contains('✓'));
-        // A download that failed is said with its word; whether the headline is calm is the
-        // status's own decision, the same in both.
-        let mut download = calm;
-        download.threats = Some(v1::Threats {
-            outcome: v1::FeedOutcome::Failed as i32,
-            ..Default::default()
-        });
-        let text = run(&download, &Screen::pipe());
-        let status_text = overview::status(
-            &crate::headline::headed(download.clone()),
-            &Screen::pipe(),
-            false,
-        );
-        assert_eq!(
-            text.starts_with('✓'),
-            status_text.starts_with('✓'),
-            "{text}\n{status_text}"
-        );
-        assert!(
-            text.contains("Downloads    CISA catalogue not downloaded, nothing of it is known yet"),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn a_failure_in_a_run_is_never_dim() {
-        let mut s = status();
-        s.not_covered = vec![failed_cause("~/.zshrc", "Permission denied")];
         s.threats = Some(v1::Threats {
             outcome: v1::FeedOutcome::Failed as i32,
             ..Default::default()
         });
-        let text = run(&s, &Screen::terminal(100, true));
-        let failing: Vec<&str> = text
-            .lines()
-            .filter(|l| {
-                l.contains("could not be read")
-                    || l.contains("not downloaded")
-                    || l.contains("Permission")
-            })
-            .collect();
-        assert_eq!(failing.len(), 3, "{text}");
-        for line in failing {
-            assert!(!line.contains("\u{1b}[2m"), "{line:?}");
+        states.push(("a failed download", s));
+        let mut s = calm();
+        s.this_mac.as_mut().unwrap().fresh = false;
+        states.push(("not fresh", s));
+        for (name, s) in &states {
+            for screen in [
+                Screen::pipe(),
+                Screen::terminal(80, true),
+                Screen::terminal(100, false),
+            ] {
+                let (ran, said) = after_headline(s, &screen);
+                assert_eq!(ran, said, "{name}");
+                // And the same headline, but for how long it took.
+                let s = crate::headline::headed(s.clone());
+                let head = |t: &str| t.lines().next().unwrap_or_default().to_string();
+                let words = |t: &str| visible(&head(t)).split("   ").next().unwrap().to_string();
+                assert_eq!(
+                    words(&run(&s, &Screen::pipe())).replace(" · 3 new in this check", ""),
+                    words(&overview::status(&s, &Screen::pipe(), false)),
+                    "{name}"
+                );
+            }
         }
-        assert!(
-            text.contains("\u{1b}[31mA watched place could not be read\u{1b}[0m"),
-            "{text:?}"
-        );
-        // A machine not reached is said by itself, with nothing else failed.
-        let mut unreached = status();
-        unreached.coverage = Some(v1::CoverageSummary {
-            unreached: vec![v1::Unreached {
-                scope_text: "machine:build-box".to_string(),
-                since_at: STARTED,
-                reason_text: Some("timed out".to_string()),
-            }],
-            unreached_total: 1,
-            ..Default::default()
-        });
-        let text = run(&unreached, &Screen::pipe());
-        assert!(
-            text.contains("\n  Coverage ")
-                && text.contains("build-box")
-                && text.contains("timed out"),
-            "{text}"
-        );
     }
 
     #[test]
@@ -1157,231 +765,53 @@ mod tests {
         // None first seen in this check is not "none new": one may have been opened again.
         let text = run(&s, &Screen::pipe());
         assert!(
-            text.starts_with("✗ 4 things need a look, 1 urgent   took"),
+            text.starts_with("● 4 things need a look · 1 urgent   took 12 s\n"),
             "{text}"
         );
-        assert!(!text.contains("New") && !text.contains("new"), "{text}");
-        // More findings than the message lists: no count of new ones, and the rows say they are
-        // those among the listed.
+        assert!(!text.contains("new"), "{text}");
+        // More findings than the message lists: no count of new ones.
         let mut cut = status();
         cut.needs_a_look.as_mut().unwrap().total = 400;
         let text = run(&cut, &Screen::pipe());
         assert!(
-            text.starts_with("✗ 400 things need a look, 1 urgent   took"),
-            "{text}"
-        );
-        assert!(text.contains("\n  New among the 4 listed\n"), "{text}");
-        // And none of the listed ones new says nothing of the rest.
-        let mut unknown = s;
-        unknown.needs_a_look.as_mut().unwrap().total = 400;
-        let text = run(&unknown, &Screen::pipe());
-        assert!(
-            text.starts_with("✗ 400 things need a look, 1 urgent   took"),
+            text.starts_with("● 400 things need a look · 1 urgent   took 12 s\n"),
             "{text}"
         );
     }
 
     #[test]
-    fn the_rules_a_run_raised_are_ordered_urgent_then_severe_then_most() {
+    fn a_first_run_says_it_is_the_first_and_that_what_it_found_is_the_baseline() {
         let mut s = status();
-        let items = &mut s.needs_a_look.as_mut().unwrap().items;
-        items.push(listed(
-            "f5",
-            "z.low",
-            "Low thing",
-            v1::Level::Low,
-            false,
-            STARTED + 1,
-        ));
-        items.push(listed(
-            "f6",
-            "a.low",
-            "Other low thing",
-            v1::Level::Low,
-            false,
-            STARTED + 1,
-        ));
-        // A rule whose findings differ in severity is said at its most severe.
-        items.push(listed(
-            "f7",
-            "a.low",
-            "Other low thing",
-            v1::Level::Medium,
-            false,
-            STARTED + 1,
-        ));
-        items.push(listed(
-            "f8",
-            "b.high",
-            "High urgent",
-            v1::Level::High,
-            true,
-            STARTED + 1,
-        ));
-        let mut unknown = listed(
-            "f9",
-            "b.high",
-            "High urgent",
-            v1::Level::High,
-            false,
-            STARTED,
-        );
-        unknown
-            .finding
-            .as_mut()
-            .unwrap()
-            .finding
-            .as_mut()
-            .unwrap()
-            .severity = None;
-        items.push(unknown);
-        s.needs_a_look.as_mut().unwrap().total = 9;
-        let text = run(&s, &Screen::pipe());
-        // A severity that is not known is taken as the most severe, as the status takes it.
-        let order: Vec<&str> = [
-            "High urgent",
-            MALICIOUS,
-            CHANGED,
-            "Other low thing",
-            "Low thing",
-        ]
-        .into_iter()
-        .collect();
-        let at: Vec<usize> = order.iter().map(|t| text.find(t).unwrap()).collect();
-        assert!(at.windows(2).all(|w| w[0] < w[1]), "{text}");
-        // A rule with a finding whose severity is not known is said so, never as its known one.
-        assert!(text.contains("    not known  High urgent "), "{text}");
-        assert!(
-            text.lines()
-                .any(|l| l.contains("medium     Other low thing") && l.ends_with(" 2")),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn a_run_lists_six_rules_and_counts_the_rest_with_how_many_are_urgent() {
-        let with = |urgent: bool| {
-            let mut s = status();
-            let items = &mut s.needs_a_look.as_mut().unwrap().items;
-            for i in 0..8 {
-                let rule = format!("rule.{i}");
-                items.push(listed(
-                    "f",
-                    &rule,
-                    &rule,
-                    v1::Level::Low,
-                    urgent,
-                    STARTED + 1,
-                ));
-            }
-            s.needs_a_look.as_mut().unwrap().total = 12;
-            s
-        };
-        let text = run(&with(false), &Screen::pipe());
-        assert!(
-            text.contains("\n    … 4 more in 4 kinds, none urgent\n"),
-            "{text}"
-        );
-        assert!(
-            text.contains("rule.3") && !text.contains("rule.4"),
-            "{text}"
-        );
-        // Urgent ones come first, and those left out are counted with how many are urgent, red.
-        let text = run(&with(true), &Screen::terminal(80, true));
-        assert!(
-            text.contains("    \u{1b}[31m… 5 more in 4 kinds, 3 urgent\u{1b}[0m\n"),
-            "{text:?}"
-        );
-    }
-
-    #[test]
-    fn a_first_run_says_it_is_the_first_and_lists_all_it_found() {
-        let mut s = status();
-        let f = s.last_finished_run.as_mut().unwrap();
-        f.first_run = true;
-        f.since_previous_run = None;
-        let text = run(&s, &Screen::pipe());
-        let l = lines(&text);
-        assert_eq!(
-            l[0],
-            "✗ 4 things need a look, 1 urgent · the first check of this Mac   took 12 s"
-        );
-        assert_eq!(l[2], "  Found");
-        assert!(text.contains(PROFILE), "{text}");
-        assert!(
-            text.contains("nothing to compare with: what this check read is the baseline"),
-            "{text}"
-        );
-        let mut calm = s.clone();
-        calm.needs_a_look = Some(v1::NeedsALook::default());
-        calm.this_mac.as_mut().unwrap().live = true;
-        calm.watching = Some(v1::Watcher::default());
-        let text = run(&calm, &Screen::pipe());
-        assert!(
-            text.starts_with("✓ Nothing needs a look · the first check of this Mac"),
-            "{text}"
-        );
-    }
-
-    #[test]
-    fn a_run_says_nothing_the_message_does_not_hold() {
-        let mut s = status();
-        s.estate = None;
-        s.watched = None;
         s.needs_a_look = Some(v1::NeedsALook::default());
-        let text = run(&s, &Screen::pipe());
-        for absent in [
-            "Read",
-            "Failed",
-            "Not judged",
-            "Downloads",
-            "Event level",
-            "immunity findings",
-            "New",
-        ] {
-            assert!(!text.contains(absent), "{absent}: {text}");
-        }
-        // Without a finished check, no time and no changes are made up.
-        s.last_finished_run = None;
-        let text = run(&s, &Screen::pipe());
-        assert!(
-            !text.contains("took") && !text.contains("Changed"),
-            "{text}"
+        let f = s.last_finished_run.as_mut().unwrap();
+        (f.first_run, f.since_previous_run) = (true, None);
+        let text = run(&s, &Screen::terminal(80, false));
+        assert_eq!(
+            text,
+            "✓ Nothing needs a look · the first check of this Mac                   took 12 s\n  What it found is kept as the baseline: a change from now on is a finding\n  ! No watcher runs: changes are seen only at a check you run        immunity on\n"
         );
+        // Not the first: no word of a baseline.
+        s.last_finished_run.as_mut().unwrap().first_run = false;
+        assert!(!run(&s, &Screen::pipe()).contains("baseline"));
     }
 
     #[test]
-    fn a_run_says_what_cannot_be_known_of_its_changes_and_what_was_set_aside() {
+    fn a_run_says_what_it_set_aside_and_nothing_else_of_what_it_counted() {
         let mut s = status();
+        s.needs_a_look = Some(v1::NeedsALook::default());
+        s.this_mac.as_mut().unwrap().live = true;
+        s.watching = Some(v1::Watcher::default());
         let f = s.last_finished_run.as_mut().unwrap();
         f.unknown = vec!["removals unknown where a reading was partial".to_string()];
         f.set_aside = 2;
         let text = run(&s, &Screen::pipe());
-        assert!(
-            text.contains(
-                "1 removed; removals unknown where a reading was partial; 2 facts set aside as no longer read by this version, not counted as removed"
-            ),
-            "{text}"
+        assert_eq!(
+            text,
+            "✓ Nothing needs a look   took 12 s\n  Watching live · this Mac and 15 projects\n  2 facts set aside as no longer read by this version, not counted as removed\n"
         );
-        // With nothing to compare with, what cannot be known of the changes is not said.
-        let mut baseline = s.clone();
-        let f = baseline.last_finished_run.as_mut().unwrap();
-        f.since_previous_run = None;
-        f.set_aside = 0;
-        let text = run(&baseline, &Screen::pipe());
-        assert!(
-            text.contains("what this check read is the baseline\n") && !text.contains("partial"),
-            "{text}"
-        );
-        f_none(&mut s);
-        assert!(run(&s, &Screen::pipe()).contains("Changed      nothing since the last check"));
-    }
-
-    fn f_none(s: &mut v1::Status) {
-        let f = s.last_finished_run.as_mut().unwrap();
-        f.since_previous_run = Some(v1::SinceCheck::default());
-        f.unknown.clear();
-        f.set_aside = 0;
+        // Without a finished check, no time is made up.
+        s.last_finished_run = None;
+        assert!(!run(&s, &Screen::pipe()).contains("took"));
     }
 
     /// No hidden character, no control and no style of a source's reaches the screen: every
@@ -1681,8 +1111,12 @@ mod tests {
             ] {
                 for line in text.lines() {
                     // At 20 columns a row of what is never cut, a level, a count and the word
-                    // urgent with the room between them, is wider than the screen; it stays whole.
-                    let never_cut = width == 20 && line.contains("urgent");
+                    // urgent with the room between them, is wider than the screen; it stays
+                    // whole, and so do the count of a rule's findings and a command.
+                    let never_cut = width == 20
+                        && ["urgent", "findings", "immunity "]
+                            .iter()
+                            .any(|w| line.contains(w));
                     assert!(
                         screen::columns(&visible(line)) <= width || never_cut,
                         "{width}: {line:?}"

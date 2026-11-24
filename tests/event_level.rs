@@ -1760,14 +1760,9 @@ fn not_installed_is_a_limit_the_owner_can_lift_and_never_a_failure_or_a_claim_of
     );
 }
 
-/// The lines a screen of the store says between what needs a look and the next steps.
+/// The lines a screen of the store says after its headline.
 fn context_lines(text: &str) -> Vec<&str> {
-    let l: Vec<&str> = text.lines().collect();
-    let blanks: Vec<usize> = (0..l.len()).filter(|&i| l[i].is_empty()).collect();
-    let [.., from, to] = blanks[..] else {
-        panic!("{text}")
-    };
-    l[from + 1..to].to_vec()
+    text.lines().skip(1).collect()
 }
 
 #[test]
@@ -1789,12 +1784,15 @@ fn a_run_says_all_that_the_status_of_the_same_store_says_of_what_was_not_seen() 
             "{ran}\n{status}"
         );
     }
-    // Not installed: what the person can fix is said after the run, as main's line said it.
+    // Not installed is a limit: the run's text leaves it out, as the status's does, and the
+    // status's `--coverage` keeps it.
     let dir = Dir::new("same-as-status-absent");
     let ran = dir.run_text();
+    assert!(!ran.contains("Program starts"), "{ran}");
+    let whole = dir.immunity(&["status", "--coverage"]);
     assert!(
-        ran.contains("You can fix") && ran.contains("Event level"),
-        "{ran}"
+        whole.contains("Limits of this version here") && whole.contains("Program starts"),
+        "{whole}"
     );
 }
 
@@ -5010,7 +5008,7 @@ fn a_collector_that_lost_part_of_what_it_was_to_record_leaves_this_mac_watched_i
     assert_eq!(dir.status()["this_mac"]["state"], "watched_in_part");
     let text = dir.immunity(&["status"]);
     assert!(
-        text.contains("in part: some program starts not watched in full"),
+        text.contains("\n  ! 1 line of the event log could not be read in the last day\n"),
         "{text}"
     );
 }

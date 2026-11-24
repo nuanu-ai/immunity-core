@@ -3931,7 +3931,7 @@ fn a_checkout_named_only_in_a_codex_session_compressed_or_not_is_found_and_an_ag
         report.contains("files this version does not understand yet"),
         "{report}"
     );
-    let (_, text, _) = status_out(&a.store(), &[]);
+    let (_, text, _) = status_out(&a.store(), &["--coverage"]);
     assert!(text.contains("Gemini CLI"), "{text}");
     // What is said of the projects as a whole speaks of the projects found, with why.
     let found = &status["vulnerabilities"]["projects_found"];
@@ -8305,15 +8305,21 @@ fn a_watched_folder_that_cannot_be_listed_retracts_nothing_and_reports_no_change
         printed.contains("0 new, 0 changed, 0 gone since the last reading; not read in full: launch agents and daemons (partial), programs that launch agents, daemons and login hooks run (nothing read)."),
         "{printed}"
     );
-    // Each place not read is named with why where a failure is said: under "Failed", in the
-    // status and in what the run prints, which the same section makes.
+    // Each place not read is named with why where a fault is said: on a fault line of the
+    // status, which the run prints too, and among the faults of the full account.
     let (_, text, _) = status_out(&w.store(), &[]);
-    let failed = &text[text.find("\n  Failed\n").expect(&text)..];
+    let (_, whole, _) = status_out(&w.store(), &["--coverage"]);
+    let faults = &whole[whole.find("\n  Faults\n").expect(&whole)..];
     for place in [
         "Library/LaunchAgents/com.example.a.plist",
         "/Library/LaunchDaemons",
     ] {
-        assert!(failed.contains(&format!("{place} ({denied})")), "{text}");
+        assert!(
+            text.lines()
+                .any(|l| l.starts_with("  ! ") && l.contains(place) && l.contains(denied)),
+            "{text}"
+        );
+        assert!(faults.contains(&format!("{place} ({denied})")), "{whole}");
     }
     assert!(watched_rows(&w.store()).is_empty(), "{printed}");
 
@@ -8759,18 +8765,11 @@ fn shell_word(path: &Path) -> String {
     }
 }
 
-/// The value beside a label at the left of a person's text, whatever the column it starts in.
-fn labelled<'a>(text: &'a str, label: &str) -> Option<&'a str> {
-    text.lines()
-        .find_map(|l| l.strip_prefix(&format!("  {label} ")))
-        .map(str::trim_start)
-}
-
 #[test]
 fn what_a_run_prints_for_a_person_is_told_from_the_status_it_left_with_every_failure_named() {
-    // The answer first, with the count the status gives and how many are urgent; what the check
-    // raised; the changes counted; every failure by its title; the next commands last. In a pipe
-    // no style is written.
+    // The answer first, with the count the status gives and how many are urgent and new; every
+    // failure on a fault line by its title; nothing of what was counted. In a pipe no style is
+    // written.
     let w = Watch::new("run-text");
     put(w.home(), ".zshrc", "bindkey -e\n");
     w.run();
@@ -8781,20 +8780,14 @@ fn what_a_run_prints_for_a_person_is_told_from_the_status_it_left_with_every_fai
     let r = status_json(&w.store());
     let n = &r["needs_a_look"];
     let urgent = match n["urgent_total"].as_u64().unwrap() {
-        0 => "none urgent".to_string(),
-        u => format!("{u} urgent"),
+        0 => String::new(),
+        u => format!(" · {u} urgent"),
     };
     let head = format!(
-        "✗ {}, {urgent} · 1 new in this check   took ",
+        "● {}{urgent} · 1 new in this check   took ",
         counted(&n["total"], "thing needs a look", "things need a look")
     );
     assert!(text.starts_with(&head), "{head}\n{text}");
-    assert!(
-        text.contains("\n  New\n    medium  ")
-            && labelled(&text, "Changed")
-                == Some("1 change since the last check: 0 added, 1 changed, 0 removed"),
-        "{text}"
-    );
     let failed: Vec<&str> = r["not_covered"]
         .as_array()
         .unwrap()
@@ -8803,20 +8796,17 @@ fn what_a_run_prints_for_a_person_is_told_from_the_status_it_left_with_every_fai
         .map(|u| u["title"].as_str().unwrap().trim_end_matches('.'))
         .collect();
     assert!(!failed.is_empty(), "{r:#}");
-    let section = &text[text.find("\n  Failed\n").expect(&text)..];
     for title in failed {
         assert!(
-            section.contains(&format!("\n    {title}\n")),
+            text.lines()
+                .any(|l| l.starts_with("  ! ") && l.contains(title)),
             "{title}\n{text}"
         );
     }
     assert!(!text.contains('\u{1b}'), "{text:?}");
-    assert!(
-        text.ends_with(
-            "\n→ immunity findings   lists every one, most urgent first\n→ immunity on         starts a watcher that outlives the terminal\n→ immunity status     what is watched and what was not read\n"
-        ),
-        "{text}"
-    );
+    for counted in ["Changed", "→", "Not judged"] {
+        assert!(!text.contains(counted), "{text}");
+    }
 }
 
 #[test]
@@ -10146,8 +10136,12 @@ fn status_answers_while_a_run_is_in_progress_and_never_makes_it_fail() {
     assert!(died["last_run"]["finished_at"].is_null(), "{died}");
     assert_ne!(died["last_finished_run"]["check"]["id"], "died");
     let (_, text, _) = status_out(&w.store(), &[]);
-    assert!(text.contains("has not finished: it died"), "{text}");
-    assert!(!text.contains('✓'), "{text}");
+    assert!(
+        text.contains(
+            "\n  ! The check started 1970-01-01 00:00 UTC did not finish   immunity run\n"
+        ),
+        "{text}"
+    );
     // What is counted is said to come from the run that finished.
     let (_, text, _) = status_out(&w.store(), &["--coverage"]);
     assert!(text.contains("has not finished: it died"), "{text}");
@@ -10184,12 +10178,13 @@ fn a_status_whose_last_check_is_old_is_not_fresh_says_why_and_is_never_calm() {
         "{why}"
     );
     let (_, text, _) = status_out(&w.store(), &[]);
-    let line = text
-        .lines()
-        .find(|l| l.trim_start().starts_with("Not fresh"))
-        .unwrap_or_else(|| panic!("{text}"));
+    // Since when, and why under it: here no watcher runs, so changes wait for a check.
     assert!(
-        line.contains(why) && line.ends_with("do not take it for calm until a check finishes"),
+        text.starts_with("? Not checked since ")
+            && text.lines().nth(1)
+                == Some(
+                    "  No watcher runs: changes are seen only at a check you run   immunity on"
+                ),
         "{text}"
     );
     assert!(!text.contains('✓'), "{text}");
@@ -10703,16 +10698,14 @@ fn a_machine_that_could_not_be_reached_is_named_once_and_what_it_leaves_unread_i
         rows[0].ends_with("2026-01-03 04:00 UTC  Permission denied (publickey)."),
         "{printed}"
     );
-    // The status names it once, on its line of machines not reached.
+    // The status names it once too, on the fault line of the servers that could not be opened,
+    // and has no line of machines not reached of its own.
     let (_, printed, _) = status_out(&h.store(), &[]);
-    let line = printed
-        .lines()
-        .find(|l| l.trim_start().starts_with("Not reached"))
-        .unwrap_or_else(|| panic!("{printed}"));
+    assert_eq!(printed.matches("db-1").count(), 1, "{printed}");
     assert!(
-        line.contains(
-            "db-1 since 2026-01-03 04:00 UTC: Permission denied (publickey)., and 2 more"
-        ),
+        printed.contains(
+            "\n  ! 2 servers could not be opened at the last server check: db-1: Permission denied (publickey).; "
+        ) && !printed.contains("not reached"),
         "{printed}"
     );
 }
@@ -11030,7 +11023,7 @@ fn status_without_json_is_a_short_summary_for_a_person() {
     // The limits of this version in the same words as the page and the app.
     let limits = whole
         .split("\n\n")
-        .find(|s| s.trim_start().starts_with("Limits of this version\n"))
+        .find(|s| s.trim_start().starts_with("Limits of this version here\n"))
         .unwrap_or_else(|| panic!("{whole}"));
     assert!(
         limits.lines().any(|l| l.trim()
@@ -11918,7 +11911,7 @@ fn a_change_in_a_watched_place_stays_open_through_quiet_runs_and_is_the_number_t
 
     let (_, printed, _) = status_out(&w.store(), &[]);
     assert!(
-        printed.starts_with("✗ 1 thing needs a look, none urgent"),
+        printed.starts_with("● 1 thing needs a look   "),
         "{printed}"
     );
     let listed = ok(immunity_cmd(w.home())
@@ -12093,16 +12086,14 @@ fn an_urgent_finding_is_never_cut_from_what_needs_a_look_while_one_that_is_not_i
     // The text counts the urgent one in its headline and gives its rule first, marked urgent.
     let (_, text, _) = status_out(&w.store(), &[]);
     assert!(
-        text.starts_with(&format!("✗ {} things need a look, 1 urgent", before + 51)),
+        text.starts_with(&format!("● {} things need a look · 1 urgent", before + 51)),
         "{text}"
     );
-    let first = text
-        .lines()
-        .skip(1)
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or_else(|| panic!("{text}"));
+    let mut lines = text.lines().skip(1);
+    let (first, under) = (lines.next().unwrap(), lines.next().unwrap());
     assert!(
-        first.contains("App files changed after signing") && first.ends_with("1  urgent"),
+        first.contains("App files changed after signing")
+            && under.trim() == "urgent   immunity finding f0000000000",
         "{text}"
     );
     // `immunity findings`, which cuts nothing, gives the urgent one first too.
@@ -12379,16 +12370,22 @@ fn a_server_that_cannot_be_opened_is_one_thing_the_owner_can_fix_with_its_reason
         (&2.into(), &1.into()),
         "{r:#}"
     );
+    // A server that could not be opened is a fault, though the owner can fix it: a fault line
+    // with the name and its reason, without quotes, and in the full account among the faults,
+    // the reason on the line under the cause.
     let (_, printed, _) = status_out(&h.store(), &[]);
-    // The name and its reason on the line under the cause, without quotes; among what failed,
-    // since a server that could not be opened is a failure, though the owner can fix it.
-    let cause = "\n    1 server could not be opened at the last server check\n      db-1: Permission denied (publickey).\n";
+    assert!(
+        printed.contains("\n  ! 1 server could not be opened at the last server check: db-1: Permission denied (publickey).\n"),
+        "{printed}"
+    );
+    let (_, printed, _) = status_out(&h.store(), &["--coverage"]);
+    let cause = "\n    1 server could not be opened at the last server check\n      \"db-1\": \"Permission denied (publickey).\"\n";
     let at = printed.find(cause).unwrap_or_else(|| panic!("{printed}"));
-    let failed = printed[..=at]
-        .rfind("\n  Failed\n")
+    let faults = printed[..=at]
+        .rfind("\n  Faults\n")
         .unwrap_or_else(|| panic!("{printed}"));
     assert!(
-        !printed[failed..at].contains("\n  You can fix\n"),
+        !printed[faults..at].contains("\n  Limits of this version here\n"),
         "{printed}"
     );
 
@@ -12502,15 +12499,22 @@ fn a_name_and_what_its_source_said_stay_apart_as_data_and_a_secret_in_what_it_sa
         ]),
         "{item:#}"
     );
-    // As text, each name with its reason on a line of its own under the program's words; a
-    // colon in a name is written out, so the name never passes for a name and a reason.
+    // As text, a fault line with each name and its reason, a colon in a name written out, so the
+    // name never passes for a name and a reason; in the full account, each quoted.
     let (_, printed, _) = status_out(&h.store(), &[]);
     let name = shown_name.replace(':', "\\u{3a}");
     assert!(
         printed.contains(&format!(
-            "\n    2 servers could not be opened at the last server check\n      db-1: Connection refused\n      {name}: {shown_reason}\n"
+            "\n  ! 2 servers could not be opened at the last server check: db-1: Connection refused; {name}: {shown_reason}\n"
         )),
         "{printed}"
+    );
+    let (_, whole, _) = status_out(&h.store(), &["--coverage"]);
+    assert!(
+        whole.contains(&format!(
+            "\n    2 servers could not be opened at the last server check\n      \"db-1\": \"Connection refused\"; \"{shown_name}\": \"{shown_reason}\"\n"
+        )),
+        "{whole}"
     );
     // On the page, escaped, the reason next to its name and cut.
     let page = view(&h.store());
@@ -12520,7 +12524,7 @@ fn a_name_and_what_its_source_said_stay_apart_as_data_and_a_secret_in_what_it_sa
         ),
         "{page}"
     );
-    for out in [serde_json::to_string(&item).unwrap(), printed] {
+    for out in [serde_json::to_string(&item).unwrap(), printed, whole] {
         assert!(!out.contains(password), "{out}");
     }
     let you_can_fix = section(&page, "you-can-fix");
@@ -13024,11 +13028,13 @@ fn what_needs_a_look_is_listed_up_to_fifty_with_its_total() {
     // A person reads the total and how many are urgent, the findings counted by rule.
     let (_, printed, _) = status_out(&w.store(), &[]);
     assert!(
-        printed.starts_with("✗ 51 things need a look, none urgent")
+        printed.starts_with("● 51 things need a look   ")
             && printed
                 .lines()
-                .any(|l| l.contains("Program set to start by itself changed")
-                    && l.trim_end().ends_with("  51")),
+                .any(|l| l.contains("Program set to start by itself changed"))
+            && printed
+                .lines()
+                .any(|l| l.trim() == "51 findings   immunity findings"),
         "{printed}"
     );
 }

@@ -875,28 +875,30 @@ fn the_text_of_a_status_renders_every_rule_its_message_counts_with_its_urgency()
             && total > 0
         {
             let first = text.lines().next().unwrap();
-            let urgent = match urgent {
-                0 => "none urgent".to_string(),
-                u => format!("{u} urgent"),
-            };
             assert!(
-                first.contains(&format!(" {total} th")) && first.contains(&urgent),
+                first.contains(&format!(" {total} th"))
+                    && (urgent == 0) != first.contains(&format!(" · {urgent} urgent")),
                 "{text}"
             );
         }
-        // The rules a person is shown, each with its level, its count and its urgency.
+        // Every rule a person is shown, with its level and title on a line, and under it its
+        // count when it has more than one finding and its urgency.
+        let lines: Vec<&str> = text.lines().collect();
         let groups = look["by_rule"].as_array().cloned().unwrap_or_default();
-        for g in groups.iter().take(6) {
+        for g in &groups {
             let urgent = g["urgent"].as_u64().unwrap();
             urgent_seen += usize::from(urgent > 0);
             let level = g["severity"].as_str().unwrap();
             let title = g["short_title"].as_str().unwrap();
             let count = g["count"].as_u64().unwrap();
+            let at = lines
+                .iter()
+                .position(|l| l.starts_with(&format!("  {level}  ")) && l.contains(title))
+                .unwrap_or_else(|| panic!("{title} {level}\n{text}"));
+            let under = lines[at + 1];
             assert!(
-                text.lines().any(|l| l.contains(&format!("  {level}  "))
-                    && l.contains(title)
-                    && l.contains(&format!("  {count}"))
-                    && (urgent == 0) != l.trim_end().ends_with("urgent")),
+                (count == 1 || under.contains(&format!("{count} findings")))
+                    && (urgent == 0) != under.contains("urgent"),
                 "{title} {level}\n{text}"
             );
         }
@@ -1180,7 +1182,8 @@ fn words_taken_from_the_mac_never_enter_a_field_that_is_not_text_nor_a_sentence(
     for args in [&["status"][..], &["status", "--coverage"][..]] {
         let out = e.immunity(args);
         let text = String::from_utf8(out.stdout).unwrap();
-        assert!(text.contains(MARKER), "{text}");
+        // The causes that name it are limits, which `--coverage` lists and the status leaves out.
+        assert!(text.contains(MARKER) || args.len() == 1, "{text}");
         for line in text.lines() {
             let unquoted = unquoted(line);
             let first = unquoted

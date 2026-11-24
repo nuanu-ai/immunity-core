@@ -1284,7 +1284,7 @@ fn the_status_tells_a_job_installed_and_not_running_from_one_not_installed() {
     let (installed, text) = said(&login);
     assert_eq!(installed, json!(true));
     assert!(
-        text.contains("installed, not running") && text.contains("loads the login job again"),
+        text.contains("! The watcher is not running: its login job is in place   immunity on"),
         "{text}"
     );
     service(&login.run("off", &[]));
@@ -1293,10 +1293,7 @@ fn the_status_tells_a_job_installed_and_not_running_from_one_not_installed() {
     // Turned off by its own command, said with its time.
     let v: Value = serde_json::from_slice(&login.status(&["--json"]).stdout).unwrap();
     let at = v["turned_off_at"].as_i64().unwrap();
-    let when = format!(
-        "Immunity Core is off: turned off {} with immunity off",
-        utc(at)
-    );
+    let when = format!("○ Immunity Core is off   turned off {}", utc(at));
     assert!(
         text.contains(&when) && !text.contains("not running") && !text.contains("did not"),
         "{text}"
@@ -1501,7 +1498,7 @@ fn after_off_then_on_the_job_s_watcher_says_on_once_and_a_job_gone_after_is_not_
     );
     let text = String::from_utf8(login.status(&[]).stdout).unwrap();
     let gone = format!(
-        "Immunity Core is off, and immunity off did not turn it off. It was turned on {}; its job is gone. Turn it on with: immunity on",
+        "! Immunity Core is off: its job, turned on {}, is gone, and immunity off did not turn it off   immunity on",
         utc(on)
     );
     assert!(
