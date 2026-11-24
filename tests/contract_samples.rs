@@ -91,6 +91,7 @@ impl Mac {
             .args(["--tailscale", "none", "--threats-input", "none"])
             .args(["--osv-crates-input", "none", "--osv-npm-input"])
             .arg(p("npm.zip"))
+            .args(["--osv-pypi-input", "none"])
             .arg("--checkouts-root")
             .arg(p("home"))
             .arg("--sessions-root")

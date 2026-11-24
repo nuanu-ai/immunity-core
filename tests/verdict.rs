@@ -199,6 +199,7 @@ impl Mac {
             .arg(self.0.join("brew.json"))
             .args(["--osv-crates-input", "none", "--osv-npm-input"])
             .arg(self.0.join("npm.zip"))
+            .args(["--osv-pypi-input", "none"])
             .args(["--tailscale", "none", "--threats-input", "none"])
             .arg("--checkouts-root")
             .arg(self.home())
