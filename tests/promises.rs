@@ -10480,7 +10480,7 @@ fn a_lockfile_of_a_kind_without_a_reader_is_named_as_such_by_status_and_the_repo
         let shop = checkout(&root, shop);
         put(&shop, "yarn.lock", "# yarn lockfile v2\n");
         put(&shop, "api/yarn.lock", "# yarn lockfile v2\n");
-        put(&shop, "uv.lock", "version = 1\n");
+        put(&shop, "Gemfile.lock", "version = 1\n");
     }
     let (brew, absent) = (dir.input("brew.txt", SAMPLE), dir.0.join("absent"));
     let said = " Limits of this version: files this version does not understand yet,";
@@ -10502,7 +10502,7 @@ fn a_lockfile_of_a_kind_without_a_reader_is_named_as_such_by_status_and_the_repo
     );
     assert_eq!(
         item["examples_text"],
-        serde_json::json!(["uv.lock", "yarn.lock version 2"])
+        serde_json::json!(["Gemfile.lock", "yarn.lock version 2"])
     );
     // The names are data beside the words, never inside a sentence.
     for words in [&item["title"], &item["meaning"], &item["advice"]] {
@@ -10520,7 +10520,7 @@ fn a_lockfile_of_a_kind_without_a_reader_is_named_as_such_by_status_and_the_repo
     assert_eq!(
         r["no_reader_for"]["items"],
         serde_json::json!([
-            {"what": "lockfile kind", "what_text": "uv.lock", "where_count": 2},
+            {"what": "lockfile kind", "what_text": "Gemfile.lock", "where_count": 2},
             {"what": "lockfile kind", "what_text": "yarn.lock version 2", "where_count": 2},
         ])
     );
@@ -10546,7 +10546,7 @@ fn a_lockfile_of_a_kind_without_a_reader_is_named_as_such_by_status_and_the_repo
     };
     assert!(
         printed.contains("\n  No reader in this build for\n")
-            && row("uv.lock")
+            && row("Gemfile.lock")
             && row("yarn.lock version 2"),
         "{printed}"
     );
@@ -10565,7 +10565,7 @@ fn a_lockfile_of_a_kind_without_a_reader_is_named_as_such_by_status_and_the_repo
 
     // A kind no longer found is no longer named.
     for shop in ["work/shop", "work/blog"] {
-        std::fs::remove_file(root.join(shop).join("uv.lock")).unwrap();
+        std::fs::remove_file(root.join(shop).join("Gemfile.lock")).unwrap();
     }
     immunity_home(&store, &brew, &absent);
     assert_eq!(

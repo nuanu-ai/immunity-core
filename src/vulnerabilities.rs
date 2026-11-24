@@ -434,8 +434,12 @@ pub struct Fresh {
 /// word that says packages were compared. Any other feed is downloaded, read, counted and shown
 /// as a feed, and nothing else.
 pub fn matched_feeds() -> impl Iterator<Item = &'static Feed> {
-    let feeds: &'static [Feed] = &FEEDS;
-    (feeds.iter()).filter(|f| crate::lockfiles::has_reader(f.ecosystem))
+    matched_of(&FEEDS, crate::lockfiles::has_reader)
+}
+
+/// The feeds of `feeds` whose ecosystem `read` says some kind of lockfile is read for.
+fn matched_of(feeds: &[Feed], read: fn(&str) -> bool) -> impl Iterator<Item = &Feed> {
+    feeds.iter().filter(move |f| read(f.ecosystem))
 }
 
 /// Each feed as a feed: whether it was read whole within its limit and its newest change is
@@ -2469,6 +2473,19 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_feed_is_matched_only_when_some_kind_of_lockfile_of_its_ecosystem_is_read() {
+        // A feed of an ecosystem no lockfile is read for gives no place, answer or word of
+        // comparison. Every feed of this build has a reader, so the rule is held on a predicate
+        // that refuses one ecosystem.
+        let matched =
+            |read| -> Vec<&str> { matched_of(&FEEDS, read).map(|f| f.ecosystem).collect() };
+        assert_eq!(matched(|e| e != "PyPI"), ["crates.io", "npm"]);
+        assert_eq!(matched(|e| e == "npm"), ["npm"]);
+        let all: Vec<&str> = matched_feeds().map(|f| f.ecosystem).collect();
+        assert_eq!(all, ["crates.io", "npm", "PyPI"]);
+    }
 
     #[test]
     fn a_thing_the_store_holds_no_fact_of_is_never_known_so_its_finding_is_never_cleared() {

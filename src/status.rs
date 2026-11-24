@@ -1971,8 +1971,9 @@ mod tests {
     }
 
     #[test]
-    fn a_feed_is_said_matched_only_when_some_kind_of_lockfile_of_its_ecosystem_is_read() {
-        // PyPI's data is downloaded while no Python lockfile is read: it is not matched.
+    fn a_feed_is_said_matched_when_some_kind_of_lockfile_of_its_ecosystem_is_read() {
+        // Every feed of this build has a reader; the rule for one without is held on
+        // `vulnerabilities::matched_of`.
         let state = |feed| crate::osv::State {
             feed,
             latest: None,
@@ -1988,7 +1989,7 @@ mod tests {
             .collect();
         assert_eq!(
             matched,
-            [("crates.io", true), ("npm", true), ("PyPI", false)]
+            [("crates.io", true), ("npm", true), ("PyPI", true)]
         );
     }
 }
