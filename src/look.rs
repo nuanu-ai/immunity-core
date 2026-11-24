@@ -2,8 +2,10 @@
 //! readings of them, kept here once. Both readers of the table (`autorun::POINTS`), the watched
 //! places reader (`watched.rs`) and the reader of parts (`autorun.rs`), record what they found
 //! through `Look`, and the store compares and retracts through it (`read_watched` in
-//! `main.rs`). The search for projects (`read_checkouts`) and the matching of indicators
-//! against the texts of projects (`read_indicators`) say what they did not read through it too:
+//! `main.rs`). The search for projects (`read_checkouts`), the reading of agent sessions
+//! (`agent_folders.rs`), the reading of software changed in place (`integrity.rs`) and the
+//! matching of indicators against the texts of projects (`read_indicators`) say what they did
+//! not read through it too:
 //!
 //! - Not read is not absent. A unit is read in full only by `absent`, which takes proof that
 //!   its path is not there, or by `read`, `read_part`; a unit that could not be read is
@@ -29,7 +31,7 @@
 
 use crate::autorun::{self, POINTS, Point};
 use crate::baseline::{self, Unit};
-use crate::store::{Cause, Reading};
+use crate::store::{Cause, Gap, Lack, Reading};
 use crate::watched::{self, Entry};
 use rusqlite::{Transaction, params};
 use std::collections::BTreeSet;
@@ -57,14 +59,139 @@ impl Absent {
 /// The note of a full reading when none of its places is on this machine.
 pub const NOT_HERE: &str = "none of these places is on this machine";
 
-/// A unit a reading did not read, with why: it failed, or it leads into a folder macOS asks
-/// permission for, which the owner did not give (`Cause::NotGiven`). Whether it holds anything
-/// is not known.
+/// A unit a reading did not read, with why and how its reason says it, which gives its cause:
+/// it failed, or it was not given, as when it leads into a folder macOS asks permission for.
+/// Whether it holds anything is not known.
 #[derive(Debug)]
 pub struct Unread {
     pub unit: Unit,
     pub cause: Cause,
     pub why: String,
+    pub said: Said,
+}
+
+/// How a reading's reason says the units of one kind it did not read, and so their cause. Each
+/// kind is one clause, and the clauses come in the order of this list, with the reader's note
+/// and what is no unit of the reading (`Look::short`) between `SourceInto` and `FilesInto`. The
+/// words are those the store holds, and some are parsed back (`covered.rs`, `known.rs`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Said {
+    /// It could not be read: `could not be read: a (why); b (why)`.
+    Failed,
+    /// A session file that could not be read, counted among those met: `1 of 4 session files
+    /// could not be read`.
+    SessionFile,
+    /// A folder of sessions that could not be listed in full, counted.
+    SessionFolder,
+    /// This many lines of a session file that name a working folder and could not be parsed.
+    Lines(usize),
+    /// A working folder named by a session that could not be looked at, counted.
+    WorkingFolder,
+    /// A checkout held before that could not be checked and is kept as it was, counted.
+    Checkout,
+    /// Not recorded, since another one read first has its name.
+    SameName,
+    /// Not recorded, over a limit the kind names, which `why` gives. A limit that leaves the
+    /// reading full is no unit not read.
+    OverCap,
+    /// It leads into a folder macOS asks permission for, which `why` names.
+    Into,
+    /// The same, said of a source whose reading read nothing at all: the folders alone.
+    SourceInto,
+    /// The same, said of session files after everything else, so that what comes before names
+    /// no folder (`covered::projects_found`).
+    FilesInto,
+}
+
+impl Said {
+    /// The clauses said before the note and what is no unit, then the rest.
+    const BEFORE: [Said; 10] = [
+        Said::Failed,
+        Said::SessionFile,
+        Said::SessionFolder,
+        Said::Lines(0),
+        Said::WorkingFolder,
+        Said::Checkout,
+        Said::SameName,
+        Said::OverCap,
+        Said::Into,
+        Said::SourceInto,
+    ];
+    const AFTER: [Said; 1] = [Said::FilesInto];
+
+    /// Why a unit said so was not read: it failed, or it was not given.
+    pub fn cause(self) -> Cause {
+        match self {
+            Said::Failed
+            | Said::SessionFile
+            | Said::SessionFolder
+            | Said::Lines(_)
+            | Said::WorkingFolder
+            | Said::Checkout => Cause::Failed,
+            Said::SameName | Said::OverCap | Said::Into | Said::SourceInto | Said::FilesInto => {
+                Cause::NotGiven
+            }
+        }
+    }
+
+    fn of_kind(self, other: Said) -> bool {
+        std::mem::discriminant(&self) == std::mem::discriminant(&other)
+    }
+
+    /// The clause of the units of this kind, of the reading `look`.
+    fn clause(self, units: &[&Unread], look: &Look) -> String {
+        let n = units.len() as i64;
+        let named = |head: &str, sep: &str, each: fn(&Unread) -> String| {
+            let said: Vec<String> = units.iter().map(|u| each(u)).collect();
+            format!("{head}{}", said.join(sep))
+        };
+        let counted = |one: &str, many: &str| crate::things(n, one, many);
+        match self {
+            Said::Failed => named("could not be read: ", "; ", |u| {
+                format!("{} ({})", u.unit, u.why)
+            }),
+            Said::SessionFile => format!(
+                "{n} of {} could not be read",
+                crate::things(look.files_met() as i64, "session file", "session files")
+            ),
+            Said::SessionFolder => format!(
+                "{} could not be listed",
+                counted("session folder", "session folders")
+            ),
+            Said::Lines(_) => {
+                let lines = units.iter().map(|u| match u.said {
+                    Said::Lines(n) => n as i64,
+                    _ => 0,
+                });
+                let lines = crate::things(lines.sum(), "line", "lines");
+                format!("{lines} with a working folder could not be parsed")
+            }
+            Said::WorkingFolder => format!(
+                "{} could not be looked at",
+                counted("working folder", "working folders")
+            ),
+            Said::Checkout => format!(
+                "{} could not be checked and {} kept",
+                counted("checkout", "checkouts"),
+                if n == 1 { "is" } else { "are" }
+            ),
+            Said::SameName => named(
+                "not recorded, since another one has the same name: ",
+                "; ",
+                |u| u.unit.to_string(),
+            ),
+            Said::OverCap => named("not recorded, over a cap: ", "; ", |u| {
+                format!("{} ({})", u.unit, u.why)
+            }),
+            Said::Into => named(crate::guarded::NOT_LOOKED_INTO, "; ", |u| {
+                format!("{}: {}", u.unit, u.why)
+            }),
+            Said::SourceInto => named(crate::guarded::NOT_LOOKED_INTO, ", ", |u| u.why.clone()),
+            Said::FilesInto => named(crate::agent_folders::FILES_NOT_LOOKED_INTO, "; ", |u| {
+                u.why.clone()
+            }),
+        }
+    }
 }
 
 /// What looking at the places of one reading found.
@@ -97,6 +224,8 @@ pub struct Look {
     listed: Vec<Unit>,
     /// Whether the reading could not tell every place its units may be (`unplaced`).
     unplaced: bool,
+    /// What this build has no reader for in what the reading met (`lack`).
+    lacks: Vec<Lack>,
 }
 
 impl Look {
@@ -136,20 +265,73 @@ impl Look {
     /// A unit that could not be looked at, with why: whether it is there is not known. A part
     /// of a file that could not be read is one too: only it is not known.
     pub fn not_looked_at(&mut self, unit: Unit, why: String) {
-        let cause = Cause::Failed;
-        self.unread.push(Unread { unit, cause, why });
+        self.unread_as(unit, Said::Failed, why);
+    }
+
+    /// A unit not read, said as `said` says it, with why.
+    pub fn unread_as(&mut self, unit: Unit, said: Said, why: String) {
+        let cause = said.cause();
+        self.unread.push(Unread {
+            unit,
+            cause,
+            why,
+            said,
+        });
     }
 
     /// A unit that leads into a guarded folder: not looked into, and said.
     pub fn not_into(&mut self, unit: Unit, folder: PathBuf, home: &Path) {
-        let (cause, why) = (Cause::NotGiven, crate::guarded::leads_into(&folder, home));
-        self.unread.push(Unread { unit, cause, why });
+        self.not_into_as(unit, folder, home, Said::Into);
+    }
+
+    /// The same, said as `said` says it.
+    pub fn not_into_as(&mut self, unit: Unit, folder: PathBuf, home: &Path, said: Said) {
+        self.unread_as(unit, said, crate::guarded::leads_into(&folder, home));
         self.met(folder);
     }
 
-    /// Something the reading did not read that is no unit of it, with its cause and why.
+    /// Something this build has no reader for, met by the reading. It is recorded whatever the
+    /// reading's cause; a `short` says it.
+    pub fn lack(&mut self, lack: Lack) {
+        if !self.lacks.contains(&lack) {
+            self.lacks.push(lack);
+        }
+    }
+
+    /// Takes in what another reading of the same kind found, as one reading: what was said
+    /// once by both is said once.
+    pub fn add(&mut self, other: Look) {
+        self.entries.extend(other.entries);
+        self.present += other.present;
+        for folder in other.guarded {
+            self.met(folder);
+        }
+        self.unread.extend(other.unread);
+        for (cause, why) in other.short {
+            self.short(cause, why);
+        }
+        self.hidden.extend(other.hidden);
+        self.read.extend(other.read);
+        self.seen.extend(other.seen);
+        self.listed.extend(other.listed);
+        self.unplaced |= other.unplaced;
+        for lack in other.lacks {
+            self.lack(lack);
+        }
+    }
+
+    /// The session files a reading of sessions met: each was read in full and not listed, as a
+    /// folder of them is, or seen and not read (`Said::SessionFile`). Every unit listed is read.
+    pub fn files_met(&self) -> usize {
+        self.read.len() - self.listed.len() + self.seen.len()
+    }
+
+    /// Something the reading did not read that is no unit of it, with its cause and why, said
+    /// once however often it was met.
     pub fn short(&mut self, cause: Cause, why: String) {
-        self.short.push((cause, why));
+        if !self.short.contains(&(cause, why.clone())) {
+            self.short.push((cause, why));
+        }
     }
 
     /// Units not read, said together by `why` with its cause.
@@ -247,38 +429,40 @@ impl Look {
     /// The completeness of the reading of which entries are there, and its reason or note. A
     /// reading of places none of which is here is full, with the note that says so.
     pub fn completeness(&self) -> (&'static str, Option<String>) {
-        match self.completeness_noted(None) {
-            ("full", _) => ("full", (self.present == 0).then(|| NOT_HERE.to_string())),
-            said => said,
-        }
+        self.completeness_here(NOT_HERE, None)
+    }
+
+    /// The same, for a reader that says in its own words that none of its places is here, with
+    /// its `note` after that.
+    pub fn completeness_here(
+        &self,
+        not_here: &str,
+        note: Option<String>,
+    ) -> (&'static str, Option<String>) {
+        let here = (self.cause().is_none() && self.present == 0).then(|| not_here.to_string());
+        let note = here
+            .into_iter()
+            .chain(note)
+            .reduce(|a, b| format!("{a}; {b}"));
+        self.completeness_noted(note)
     }
 
     /// The completeness of the reading and its reason, with `note` said after the units not
-    /// read and before what else it did not read; a full reading says the note alone. A
-    /// reading that did not read everything is `none` when it read no unit in full, or when
+    /// read and before what else it did not read (`Said`); a full reading says the note alone.
+    /// A reading that did not read everything is `none` when it read no unit in full, or when
     /// the units it could not read are all it met that is there; else `partial`.
     pub fn completeness_noted(&self, note: Option<String>) -> (&'static str, Option<String>) {
-        let said = |given: bool, head: &str, how: fn(&Unread) -> String| {
-            let units = self
-                .unread
-                .iter()
-                .filter(|u| (u.cause == Cause::NotGiven) == given);
-            let units: Vec<String> = units.map(how).collect();
-            (!units.is_empty()).then(|| format!("{head}{}", units.join("; ")))
+        let clause = |said: &Said| {
+            let units: Vec<&Unread> = (self.unread.iter())
+                .filter(|u| u.said.of_kind(*said))
+                .collect();
+            (!units.is_empty()).then(|| said.clause(&units, self))
         };
-        let reasons: Vec<String> = [
-            said(false, "could not be read: ", |u| {
-                format!("{} ({})", u.unit, u.why)
-            }),
-            said(true, crate::guarded::NOT_LOOKED_INTO, |u| {
-                format!("{}: {}", u.unit, u.why)
-            }),
-            note,
-        ]
-        .into_iter()
-        .flatten()
-        .chain(self.short.iter().map(|(_, why)| why.clone()))
-        .collect();
+        let reasons: Vec<String> = (Said::BEFORE.iter().filter_map(clause))
+            .chain(note)
+            .chain(self.short.iter().map(|(_, why)| why.clone()))
+            .chain(Said::AFTER.iter().filter_map(clause))
+            .collect();
         let reason = (!reasons.is_empty()).then(|| reasons.join("; "));
         let completeness = match self.cause() {
             None => "full",
@@ -294,8 +478,26 @@ impl Look {
     /// when it read everything. What it did not look into because macOS asks permission for it
     /// was not given; the rest failed or, as hooks kept elsewhere, has no reader.
     pub fn cause(&self) -> Option<Cause> {
+        Cause::worst(self.causes())
+    }
+
+    /// Whether anything the reading did not read has a cause other than `cause`, whichever
+    /// cause is the worst: a folder not given beside one with no reader is still not given.
+    pub fn short_of_other_than(&self, cause: Cause) -> bool {
+        self.causes().any(|c| c != cause)
+    }
+
+    fn causes(&self) -> impl Iterator<Item = Cause> + '_ {
         let units = self.unread.iter().map(|u| u.cause);
-        Cause::worst(units.chain(self.short.iter().map(|(cause, _)| *cause)))
+        units.chain(self.short.iter().map(|(cause, _)| *cause))
+    }
+
+    /// Why the reading is not full, and what this build has no reader for in it.
+    pub fn gap(&self) -> Gap {
+        Gap {
+            cause: self.cause(),
+            lacks: self.lacks.clone(),
+        }
     }
 }
 
@@ -819,6 +1021,78 @@ mod tests {
         looked.look.short(Cause::NotGiven, missed.to_string());
         let said = format!("{both}; {whole}; {missed}");
         assert_eq!(looked.coverage(mcp), ("partial", Some(said)));
+    }
+
+    #[test]
+    fn every_kind_of_unit_not_read_is_said_in_its_words_in_its_place_with_its_cause() {
+        // The words of sessions and of installed things a format-9 row holds, kept as they were
+        // when each reader built its own; the store parses the folders' clauses back.
+        let home = Path::new("/Users/example");
+        let docs = || home.join("Documents");
+        let mut look = Look {
+            present: 1,
+            ..Look::default()
+        };
+        look.listed(Unit::whole("sessions"));
+        look.read(Unit::whole("sessions/a.jsonl"));
+        look.not_into_as(Unit::whole("s"), docs(), home, Said::FilesInto);
+        look.short(
+            Cause::NoReader,
+            "sessions of Gemini CLI are not read".into(),
+        );
+        look.lack(Lack::new("sessions of a coding agent", Some("Gemini CLI")));
+        for (unit, said) in [
+            ("sessions/b.jsonl", Said::SessionFile),
+            ("sessions/x", Said::SessionFolder),
+            ("sessions/a.jsonl", Said::Lines(2)),
+            ("sessions/b.jsonl", Said::Lines(1)),
+            ("/w", Said::WorkingFolder),
+            ("/c", Said::Checkout),
+            ("/d", Said::Checkout),
+            ("Applications/B.app", Said::SameName),
+            ("Library/Application Support/T", Said::OverCap),
+        ] {
+            look.unread_as(Unit::whole(unit), said, "cap".into());
+        }
+        look.there(Unit::whole("sessions/b.jsonl"));
+        look.not_looked_at(Unit::whole("/codex"), "denied".into());
+        look.not_into(Unit::whole("Applications"), docs(), home);
+        let into = "it leads into ~/Documents, which macOS asks permission for";
+        let said = [
+            "could not be read: /codex (denied)",
+            "1 of 2 session files could not be read",
+            "1 session folder could not be listed",
+            "3 lines with a working folder could not be parsed",
+            "1 working folder could not be looked at",
+            "2 checkouts could not be checked and are kept",
+            "not recorded, since another one has the same name: Applications/B.app",
+            "not recorded, over a cap: Library/Application Support/T (cap)",
+            &format!("not looked into: Applications: {into}"),
+            "the note",
+            "sessions of Gemini CLI are not read",
+            &format!("session files not looked into: {into}"),
+        ];
+        let reason = look.completeness_noted(Some("the note".into()));
+        assert_eq!(reason, ("partial", Some(said.join("; "))));
+        assert_eq!(look.gap().cause, Some(Cause::Failed));
+        assert_eq!(look.gap().lacks.len(), 1);
+        // Not given is told from failed by the units alone: a folder macOS asks permission for,
+        // a name taken first and a cap are not given; the rest failed.
+        let causes: Vec<(String, Cause)> = (look.not_read())
+            .map(|u| (u.unit.to_string(), u.cause))
+            .collect();
+        let given = |c: &(String, Cause)| c.1 == Cause::NotGiven;
+        assert_eq!(causes.iter().filter(|c| given(c)).count(), 4);
+        assert!(causes.contains(&("/c".into(), Cause::Failed)));
+        // A source whose reading read nothing names the folders alone, as the rows of folders
+        // macOS asks permission for do, and with nothing else not read is not given.
+        let mut source = Look::default();
+        for unit in ["a", "b"] {
+            source.not_into_as(Unit::whole(unit), docs(), home, Said::SourceInto);
+        }
+        let not_given = format!("not looked into: {into}, {into}");
+        assert_eq!(source.completeness(), ("none", Some(not_given)));
+        assert_eq!(source.gap(), Gap::of(Cause::NotGiven));
     }
 
     #[test]

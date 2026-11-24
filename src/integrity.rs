@@ -33,8 +33,10 @@
 //! forward, and the reading's note says from when. Who signed it is asked on every reading:
 //! that takes the signature alone.
 
+use crate::baseline::Unit;
 use crate::codesign;
-use crate::store::{Cause, Gap, Statement};
+use crate::look::{Look, NOT_HERE, Said};
+use crate::store::{Gap, Statement};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -118,21 +120,12 @@ pub struct Thing {
 pub struct Kind {
     pub kind: &'static str,
     pub things: Vec<Thing>,
-    /// Places or things that are there and could not be read, with why.
-    pub failed: Vec<(String, String)>,
-    /// Things not recorded because another one took their name first, by path.
-    pub shared: Vec<String>,
-    /// Things not recorded because they are over a cap, by path, with the cap.
-    pub capped: Vec<(String, String)>,
-    /// Places of this kind that are there.
-    pub present: usize,
+    /// The places of this kind listed and what was not recorded, each with why: a place or
+    /// thing that could not be read, one whose name another took first, one over a cap, one
+    /// that leads into a folder macOS asks permission for. Its places there are `present`.
+    pub look: Look,
     /// What the full reading's note says besides what it cannot judge.
     pub notes: Vec<String>,
-    /// Places not looked into because they lead into a folder macOS asks permission for,
-    /// with why.
-    pub unreached: Vec<(String, String)>,
-    /// Those folders, for the reader's coverage.
-    pub guarded: Vec<PathBuf>,
     cannot: &'static str,
 }
 
@@ -141,75 +134,37 @@ impl Kind {
         Kind {
             kind,
             things: Vec::new(),
-            failed: Vec::new(),
-            shared: Vec::new(),
-            capped: Vec::new(),
-            present: 0,
+            look: Look::default(),
             notes: Vec::new(),
-            unreached: Vec::new(),
-            guarded: Vec::new(),
             cannot,
         }
     }
 
-    /// Completeness, the reason or note, and why it is incomplete. A place that is not there
-    /// is not a failure; a place or thing that could not be read makes the reading partial,
-    /// so nothing of this kind is retracted, or none when nothing could be read.
-    pub fn coverage(&self) -> (&'static str, String, Gap) {
-        let mut said = Vec::new();
-        if !self.failed.is_empty() {
-            let failed: Vec<String> = self
-                .failed
-                .iter()
-                .map(|(path, why)| format!("{path} ({why})"))
-                .collect();
-            said.push(format!("could not be read: {}", failed.join("; ")));
-        }
-        if !self.shared.is_empty() {
-            said.push(format!(
-                "not recorded, since another one has the same name: {}",
-                self.shared.join("; ")
-            ));
-        }
-        if !self.capped.is_empty() {
-            let capped: Vec<String> = self
-                .capped
-                .iter()
-                .map(|(path, cap)| format!("{path} ({cap})"))
-                .collect();
-            said.push(format!("not recorded, over a cap: {}", capped.join("; ")));
-        }
-        if !self.unreached.is_empty() {
-            let unreached: Vec<String> = self
-                .unreached
-                .iter()
-                .map(|(path, why)| format!("{path}: {why}"))
-                .collect();
-            said.push(format!(
-                "{}{}",
-                crate::guarded::NOT_LOOKED_INTO,
-                unreached.join("; ")
-            ));
-        }
-        let unrecorded =
-            !self.shared.is_empty() || !self.capped.is_empty() || !self.unreached.is_empty();
-        let cause = Cause::worst(
-            (!self.failed.is_empty())
-                .then_some(Cause::Failed)
-                .into_iter()
-                .chain(unrecorded.then_some(Cause::NotGiven)),
-        );
-        let completeness = match cause {
-            None => "full",
-            Some(_) if self.present == 0 => "none",
-            Some(_) => "partial",
-        };
-        if self.present == 0 && cause.is_none() {
-            said.push("none of these places is on this machine".to_string());
-        }
-        said.extend(self.notes.iter().cloned());
-        said.push(self.cannot.to_string());
-        (completeness, said.join("; "), Gap::when(cause))
+    /// Completeness, the reason or note, and why it is incomplete, as `look` says them, with
+    /// the notes and what the reader cannot judge last. A place that is not there is not a
+    /// failure; a place or thing not recorded makes the reading partial, so nothing of this
+    /// kind is retracted, or none when nothing there was read.
+    pub fn coverage(&self) -> (&'static str, Option<String>, Gap) {
+        let notes = self.notes.iter().map(String::as_str);
+        let note = notes.chain([self.cannot]).collect::<Vec<_>>().join("; ");
+        let (completeness, reason) = self.look.completeness_here(NOT_HERE, Some(note));
+        (completeness, reason, self.look.gap())
+    }
+
+    /// A place of this kind there, listed.
+    fn listed(&mut self, shown: &str) {
+        self.look.present += 1;
+        self.look.listed(Unit::whole(shown));
+    }
+
+    /// A place or thing there that could not be read, with why.
+    fn failed(&mut self, shown: String, why: String) {
+        self.look.not_looked_at(Unit::whole(shown), why);
+    }
+
+    /// A thing seen and not recorded, as `said` says, with why.
+    fn not_recorded(&mut self, shown: String, said: Said, why: String) {
+        self.look.unread_as(Unit::whole(shown), said, why);
     }
 
     /// The statements of this reading, each pointing at its line of the raw copy.
@@ -342,12 +297,12 @@ fn app_support(
         }
     }
     // An application that could not be read is not matched: its folder must not look gone.
-    for (path, _) in &bundles.failed {
-        kind.failed.push((
-            path.clone(),
+    for u in bundles.look.not_read().filter(|u| u.said == Said::Failed) {
+        kind.failed(
+            u.unit.to_string(),
             "applications there could not be read, so their folders were not looked for"
                 .to_string(),
-        ));
+        );
     }
     let base = roots.home.join(APP_SUPPORT_PLACE);
     if !reachable(&base, APP_SUPPORT_PLACE, roots, &mut kind) {
@@ -356,14 +311,13 @@ fn app_support(
     let entries = match list(&base) {
         None => return kind,
         Some(Err(e)) => {
-            kind.failed
-                .push((APP_SUPPORT_PLACE.to_string(), e.to_string()));
+            kind.failed(APP_SUPPORT_PLACE.to_string(), e.to_string());
             return kind;
         }
         Some(Ok(entries)) => entries,
     };
     let own = roots.store.parent().map(same_place);
-    kind.present += 1;
+    kind.listed(APP_SUPPORT_PLACE);
     let (mut matched, mut files, mut kept) = (0, 0, Vec::new());
     for entry in entries {
         let text = entry.to_string_lossy().into_owned();
@@ -379,10 +333,10 @@ fn app_support(
         // taken for a folder that went. Asked before anything that follows a link.
         if !real_folder(&path) {
             if before.is_some() {
-                kind.failed.push((
+                kind.failed(
                     format!("{APP_SUPPORT_PLACE}/{text}"),
                     NOT_A_FOLDER.to_string(),
-                ));
+                );
             }
             continue;
         }
@@ -399,8 +353,8 @@ fn app_support(
         }
         let (mut records, mut count) = (Vec::new(), 0);
         match walk_code(&path, b"", 0, &mut records, &mut count) {
-            Err(e) => kind.failed.push((shown, e.to_string())),
-            Ok(Walked::Capped(cap)) => kind.capped.push((shown, cap)),
+            Err(e) => kind.failed(shown, e.to_string()),
+            Ok(Walked::Capped(cap)) => kind.not_recorded(shown, Said::OverCap, cap),
             // No application read now matches it and no code is left in it: nothing to hold.
             Ok(Walked::Done) if unmatched && count == 0 => {}
             Ok(Walked::Done) => {
@@ -570,11 +524,7 @@ fn reachable(dir: &Path, shown: &str, roots: &Roots, kind: &mut Kind) -> bool {
     let homes = crate::watched::homes(roots.home);
     match crate::guarded::real(dir, &[&homes[0], &homes[1]]) {
         crate::guarded::Real::Guarded(g) => {
-            let why = crate::guarded::leads_into(&g, roots.home);
-            kind.unreached.push((shown.to_string(), why));
-            if !kind.guarded.contains(&g) {
-                kind.guarded.push(g);
-            }
+            kind.look.not_into(Unit::whole(shown), g, roots.home);
             false
         }
         _ => true,
@@ -700,12 +650,12 @@ fn find_bundles(roots: &Roots, kind: &mut Kind) -> Vec<Found> {
         let names = match list(&dir) {
             None => continue,
             Some(Err(e)) => {
-                kind.failed.push((shown, e.to_string()));
+                kind.failed(shown, e.to_string());
                 continue;
             }
             Some(Ok(names)) => names,
         };
-        kind.present += 1;
+        kind.listed(&shown);
         for name in names {
             let path = dir.join(&name);
             let text = name.to_string_lossy();
@@ -720,7 +670,7 @@ fn find_bundles(roots: &Roots, kind: &mut Kind) -> Vec<Found> {
             // One folder down, where installers put suites.
             match list(&path) {
                 None => {}
-                Some(Err(e)) => kind.failed.push((here, e.to_string())),
+                Some(Err(e)) => kind.failed(here, e.to_string()),
                 Some(Ok(inner)) => {
                     for name in inner {
                         let text = name.to_string_lossy();
@@ -820,7 +770,7 @@ fn bundles(conn: &Connection, roots: &Roots, machine: &str) -> rusqlite::Result<
         let digest = match digest(&f.path) {
             Ok(d) => d,
             Err(why) => {
-                kind.failed.push((f.shown, why));
+                kind.failed(f.shown, why);
                 continue;
             }
         };
@@ -828,7 +778,7 @@ fn bundles(conn: &Connection, roots: &Roots, machine: &str) -> rusqlite::Result<
         let folder = f.path.file_name().unwrap_or_default().to_string_lossy();
         let name = plist_value(&plist, "CFBundleIdentifier").unwrap_or_else(|| folder.to_string());
         if !names.insert(name.clone()) {
-            kind.shared.push(f.shown);
+            kind.not_recorded(f.shown, Said::SameName, String::new());
             continue;
         }
         let version = bundle_version(
@@ -869,8 +819,7 @@ fn bundles(conn: &Connection, roots: &Roots, machine: &str) -> rusqlite::Result<
             }
             // A thread that could not record its answer: never taken for a bundle gone.
             (None, None) => {
-                kind.failed
-                    .push((p.found.shown, "not examined".to_string()));
+                kind.failed(p.found.shown, "not examined".to_string());
                 continue;
             }
         };
@@ -897,7 +846,7 @@ fn bundles(conn: &Connection, roots: &Roots, machine: &str) -> rusqlite::Result<
             crate::view::utc(oldest)
         ));
     }
-    if kind.present > 0 {
+    if kind.look.present > 0 {
         kind.notes.push(note);
     }
     Ok(kind)
@@ -920,12 +869,12 @@ fn kegs(roots: &Roots, machine: &str) -> Kind {
         let names = match list(&cellar) {
             None => continue,
             Some(Err(e)) => {
-                kind.failed.push((shown, e.to_string()));
+                kind.failed(shown, e.to_string());
                 continue;
             }
             Some(Ok(names)) => names,
         };
-        kind.present += 1;
+        kind.listed(&shown);
         for name in names {
             let formula = cellar.join(&name);
             let here = format!("{shown}/{}", name.to_string_lossy());
@@ -935,7 +884,7 @@ fn kegs(roots: &Roots, machine: &str) -> Kind {
             let versions = match list(&formula) {
                 None => continue,
                 Some(Err(e)) => {
-                    kind.failed.push((here, e.to_string()));
+                    kind.failed(here, e.to_string());
                     continue;
                 }
                 Some(Ok(versions)) => versions,
@@ -947,7 +896,7 @@ fn kegs(roots: &Roots, machine: &str) -> Kind {
                     continue;
                 }
                 match listing(&keg) {
-                    Err(why) => kind.failed.push((shown, why)),
+                    Err(why) => kind.failed(shown, why),
                     Ok(list) => kind.things.push(Thing {
                         subject: format!("file:{machine}/{shown}"),
                         facts: vec![
@@ -983,12 +932,12 @@ fn npm(roots: &Roots, machine: &str) -> Kind {
         let entries = match list(&root) {
             None => continue,
             Some(Err(e)) => {
-                kind.failed.push((shown, e.to_string()));
+                kind.failed(shown, e.to_string());
                 continue;
             }
             Some(Ok(entries)) => entries,
         };
-        kind.present += 1;
+        kind.listed(&shown);
         let mut packages = Vec::new();
         for entry in entries {
             let text = entry.to_string_lossy().into_owned();
@@ -1002,7 +951,7 @@ fn npm(roots: &Roots, machine: &str) -> Kind {
             }
             match list(&path) {
                 None => {}
-                Some(Err(e)) => kind.failed.push((format!("{shown}/{text}"), e.to_string())),
+                Some(Err(e)) => kind.failed(format!("{shown}/{text}"), e.to_string()),
                 Some(Ok(scoped)) => {
                     for name in scoped {
                         let inside = path.join(&name);
@@ -1018,12 +967,12 @@ fn npm(roots: &Roots, machine: &str) -> Kind {
             let list = match listing(&path) {
                 Ok(list) => list,
                 Err(why) => {
-                    kind.failed.push((here, why));
+                    kind.failed(here, why);
                     continue;
                 }
             };
             if !names.insert(name.clone()) {
-                kind.shared.push(here);
+                kind.not_recorded(here, Said::SameName, String::new());
                 continue;
             }
             let mut facts = vec![
@@ -1034,11 +983,8 @@ fn npm(roots: &Roots, machine: &str) -> Kind {
             match crate::guarded::followed(&path.join("package.json"), &[&homes[0], &homes[1]]) {
                 Ok(file) => facts.extend(package_version(&file).map(|v| ("has_version", v))),
                 Err(g) => {
-                    let why = crate::guarded::leads_into(&g, roots.home);
-                    kind.unreached.push((format!("{here}/package.json"), why));
-                    if !kind.guarded.contains(&g) {
-                        kind.guarded.push(g);
-                    }
+                    let unit = Unit::whole(format!("{here}/package.json"));
+                    kind.look.not_into(unit, g, roots.home);
                 }
             }
             facts.push(("has_digest", stat(&list)));
@@ -1562,8 +1508,42 @@ pub fn message(s: &Summary) -> crate::contract::v1::Integrity {
 
 #[cfg(test)]
 mod tests {
-    use super::{Told, bundle_version, compare, kept_file};
+    use super::{Kind, NPM, NPM_CANNOT, Said, Told, Unit, bundle_version, compare, kept_file};
+    use crate::store::Cause;
     use std::path::Path;
+
+    #[test]
+    fn a_thing_not_recorded_is_named_with_its_cause_and_the_reading_is_never_full() {
+        // A global package that could not be read failed; one over a cap, one whose name
+        // another took, or one that leads into a folder macOS asks permission for was not
+        // given. Each is named, and any one keeps the reading from being full.
+        let home = Path::new("/Users/example");
+        for (i, cause) in [
+            (0, Cause::NotGiven),
+            (1, Cause::NotGiven),
+            (2, Cause::NotGiven),
+        ]
+        .into_iter()
+        .chain([(3, Cause::Failed)])
+        {
+            let mut kind = Kind::new(NPM, NPM_CANNOT);
+            kind.listed("/l");
+            let tool = || "/l/tool".to_string();
+            match i {
+                0 => kind.not_recorded(tool(), Said::OverCap, "cap".into()),
+                1 => kind.not_recorded(tool(), Said::SameName, String::new()),
+                2 => (kind.look).not_into(Unit::whole(tool()), home.join("Documents"), home),
+                _ => kind.failed(tool(), "denied".into()),
+            }
+            let (completeness, reason, gap) = kind.coverage();
+            assert_eq!((completeness, gap.cause), ("partial", Some(cause)));
+            assert!(reason.is_some_and(|r| r.contains("/l/tool")));
+            assert_eq!(kind.look.not_read().count(), 1);
+        }
+        let mut whole = Kind::new(NPM, NPM_CANNOT);
+        whole.listed("/l");
+        assert_eq!(whole.coverage().0, "full");
+    }
 
     #[test]
     fn a_kept_copy_is_a_file_only_at_a_path_of_the_shape_the_store_writes() {
