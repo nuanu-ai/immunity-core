@@ -74,6 +74,33 @@ where
     }
 }
 
+/// A repeated enum field as the names of its values. A number this build does not know is
+/// refused, as in `enum_name`.
+fn repeated_enum_name<E, S>(values: &[i32], s: S) -> Result<S::Ok, S::Error>
+where
+    E: TryFrom<i32> + Serialize,
+    S: Serializer,
+{
+    let named: Result<Vec<E>, S::Error> = values
+        .iter()
+        .map(|v| {
+            E::try_from(*v)
+                .map_err(|_| serde::ser::Error::custom(format!("{v} is not a value of this enum")))
+        })
+        .collect();
+    named?.serialize(s)
+}
+
+/// A repeated enum field from the names of its values, each word this build does not know read
+/// as the enum's unspecified value, as in `enum_from_name`.
+fn repeated_enum_from_name<'de, E, D>(d: D) -> Result<Vec<i32>, D::Error>
+where
+    E: DeserializeOwned + Into<i32>,
+    D: Deserializer<'de>,
+{
+    Vec::<String>::deserialize(d).map(|words| words.iter().map(|w| value_of::<E>(w)).collect())
+}
+
 /// An optional enum field from the name of its value, or null. A word this build does not know
 /// reads as the enum's unspecified value, as in `enum_from_name`.
 fn optional_enum_from_name<'de, E, D>(d: D) -> Result<Option<i32>, D::Error>

@@ -17,6 +17,7 @@
 
 use crate::contract::v1;
 use crate::findings::SHORT_MAX;
+use crate::headline::is_failure;
 use crate::screen::{
     self, BOLD, CYAN, Cell, Column, Cut, DIM, GREEN, PLAIN, RED, Screen, Style, YELLOW,
 };
@@ -30,16 +31,6 @@ const FINDINGS_SHOWN: usize = 200;
 /// At most this many rules are listed in the text of `immunity status`; the rest are counted in
 /// one line.
 pub(crate) const GROUPS_SHOWN: usize = 6;
-
-/// Whether a cause of what is not covered is a failure, as its class says: a reading or a
-/// download that was tried and did not succeed, whoever can fix it. A class this build does not
-/// know, or none, is read as a failure, as the schema says.
-pub(crate) fn is_failure(u: &v1::Uncovered) -> bool {
-    !matches!(
-        v1::Cause::try_from(u.class),
-        Ok(v1::Cause::NoReader | v1::Cause::NotGiven)
-    )
-}
 
 /// `n one` or `n many`, with thousands grouped.
 pub(crate) fn count(n: u64, one: &str, many: &str) -> String {
@@ -439,34 +430,12 @@ pub(crate) fn clauses(parts: Vec<(String, Style)>) -> Vec<(String, Style)> {
 /// When Immunity Core was last turned on, if it went off since by something other than `immunity off`: no
 /// watcher holds the store or is restarting, the login job's property list is not there, and the
 /// journal's latest entry of the two, by its order and not by the clock, is `turned_on`.
-pub(crate) fn off_not_by_command(s: &v1::Status) -> Option<i64> {
+fn off_not_by_command(s: &v1::Status) -> Option<i64> {
     let on = s.turned_on_at?;
     let gone = s.watching.is_none()
         && s.watcher_restarting_since_at.is_none()
         && s.login_job_installed == Some(false);
     (gone && s.turned_on_latest == Some(true)).then_some(on)
-}
-
-/// Whether the status holds a failure: a reading or a download that failed, a watcher that
-/// failed, an event level that is neither running nor simply not installed, a machine not
-/// reached, a run that died, or Immunity Core turned off by something other than `immunity off`. A status
-/// with one is never calm, whatever it found.
-pub(crate) fn failing(s: &v1::Status) -> bool {
-    let failed_cause = s.not_covered.iter().any(is_failure);
-    let watcher = s.watching.as_ref().is_some_and(|w| !w.failed.is_empty());
-    let level = s.event_level.as_ref().is_some_and(|l| {
-        l.state != v1::CollectorState::Running as i32
-            && l.state != v1::CollectorState::NotInstalled as i32
-    });
-    let readings = s
-        .coverage
-        .as_ref()
-        .is_some_and(|c| c.failed > 0 || c.unreached_total > 0);
-    let died = s
-        .last_run
-        .as_ref()
-        .is_some_and(|l| l.finished_at.is_none() && !s.running);
-    failed_cause || watcher || level || readings || died || off_not_by_command(s).is_some()
 }
 
 /// The downloads of public threat data that failed at the last check: one clause for those whose
@@ -792,32 +761,41 @@ fn checked(screen: &Screen, s: &v1::Status) -> Option<String> {
         .map(|at| format!("checked {}", screen.time(at, s.answered_at)))
 }
 
-/// The headline of `immunity status` and `immunity run`, by one rule: calm only when fresh and
-/// nothing failed, and never of "the last check" when no full check has finished.
+/// The headline of `immunity status` and `immunity run`, in the words of the status's own
+/// `headline`. A value this build does not know is said as not known, never as calm.
 pub(crate) fn answer(s: &v1::Status) -> (String, Style) {
-    let fresh = s.this_mac.as_ref().is_some_and(|m| m.fresh);
-    let none_finished = s.this_mac.as_ref().is_none_or(|m| m.checked_at.is_none());
-    match s.needs_a_look.as_ref() {
-        None => (
-            "No run of this build has looked for findings yet".to_string(),
-            BOLD,
-        ),
-        Some(n) if n.total == 0 && none_finished => match s.running {
-            true => ("The first full check is running".to_string(), YELLOW.bold()),
-            false => ("No full check has finished yet".to_string(), YELLOW.bold()),
-        },
-        Some(n) if n.total == 0 && fresh && !failing(s) => {
-            ("✓ Nothing needs a look".to_string(), GREEN.bold())
+    use v1::{Headline as H, HeadlineBecause as B};
+    let said = |words: &str, style: Style| (words.to_string(), style);
+    match H::try_from(s.headline) {
+        Ok(H::NeedsALook) => {
+            let n = s.needs_a_look.clone().unwrap_or_default();
+            (
+                format!("✗ {}", needing(n.total, n.urgent_total)),
+                RED.bold(),
+            )
         }
-        Some(n) if n.total == 0 && fresh => (
-            "Nothing needs a look in what could be read".to_string(),
-            YELLOW.bold(),
-        ),
-        Some(n) if n.total == 0 => ("Nothing needed a look at the last check".to_string(), BOLD),
-        Some(n) => (
-            format!("✗ {}", needing(n.total, n.urgent_total)),
-            RED.bold(),
-        ),
+        Ok(H::NotChecked) if s.running => said("The first full check is running", YELLOW.bold()),
+        Ok(H::NotChecked) => said("No full check has finished yet", YELLOW.bold()),
+        Ok(H::Stale) => said("Nothing needed a look at the last check", BOLD),
+        // Everything was read; only the watcher keeps it from calm.
+        Ok(H::InPart) if s.headline_because == [B::Watcher as i32] => {
+            match s.this_mac.as_ref().is_some_and(|m| m.live) {
+                true => said(
+                    "Nothing needs a look; live watching has a failure",
+                    YELLOW.bold(),
+                ),
+                false => said(
+                    "Nothing needs a look; nothing is watching live",
+                    YELLOW.bold(),
+                ),
+            }
+        }
+        Ok(H::InPart) => said("Nothing needs a look in what could be read", YELLOW.bold()),
+        Ok(H::Calm) => said("✓ Nothing needs a look", GREEN.bold()),
+        _ if s.needs_a_look.is_none() => {
+            said("No run of this build has looked for findings yet", BOLD)
+        }
+        _ => said("Whether this Mac is watched is not known", BOLD),
     }
 }
 
@@ -2070,6 +2048,17 @@ mod tests {
     use super::*;
     use crate::screen::visible;
 
+    /// The text of a status made by hand, with the headline `status::message` would give it,
+    /// computed from the message as it stands.
+    fn status(s: &v1::Status, screen: &Screen, coverage: bool) -> String {
+        super::status(&crate::headline::headed(s.clone()), screen, coverage)
+    }
+
+    /// The same for the text of `immunity run`.
+    fn ran(s: &v1::Status, screen: &Screen) -> String {
+        crate::after_run::run(&crate::headline::headed(s.clone()), screen)
+    }
+
     /// When the invented answers were made, and a check that finished three minutes before.
     const NOW: i64 = 1_794_807_960;
     const CHECKED: i64 = NOW - 180;
@@ -2630,89 +2619,84 @@ mod tests {
         assert!(!text.contains("Short title of watched.git-hook"), "{text}");
     }
 
+    /// Each headline in its own words, green only for `calm`: what keeps a fresh answer from calm
+    /// says "in what could be read", unless the watcher alone does, since then everything was read.
     #[test]
-    fn a_calm_headline_is_green_only_after_a_fresh_check_that_found_nothing() {
+    fn a_calm_headline_is_green_only_when_the_status_headline_is_calm() {
+        type Change = fn(&mut v1::Status);
         let screen = Screen::terminal(80, true);
-        let mut s = status_of("x");
-        s.needs_a_look = Some(v1::NeedsALook::default());
-        s.last_run = None;
-        if let Some(m) = s.this_mac.as_mut() {
-            m.fresh = true;
-        }
-        // Each failure the status holds, one at a time, keeps it from being calm.
-        let clear = |s: &mut v1::Status| {
-            s.watching = None;
-            s.event_level = None;
-            s.not_covered.retain(|u| !is_failure(u));
-            if let Some(c) = s.coverage.as_mut() {
-                c.failed = 0;
-                c.unreached_total = 0;
-                c.unreached.clear();
-            }
-        };
-        clear(&mut s);
-        let calm = status(&s, &screen, false);
+        let said = |s: &v1::Status| status(s, &screen, false);
         assert!(
-            calm.starts_with("\u{1b}[1;32m✓ Nothing needs a look\u{1b}[0m"),
-            "{calm}"
+            said(&calm_status()).starts_with("\u{1b}[1;32m✓ Nothing needs a look\u{1b}[0m"),
+            "{}",
+            said(&calm_status())
         );
-        let failures: [fn(&mut v1::Status); 5] = [
-            |s| s.coverage.as_mut().unwrap().failed = 1,
-            |s| s.coverage.as_mut().unwrap().unreached_total = 1,
-            |s| {
-                s.watching = Some(v1::Watcher {
-                    failed: vec![v1::WatcherFailure::default()],
+        let in_part = "\u{1b}[1;33mNothing needs a look in what could be read";
+        let cases: [(&str, Change); 8] = [
+            (
+                "\u{1b}[1;33mNothing needs a look; nothing is watching live",
+                |s| s.this_mac.as_mut().unwrap().live = false,
+            ),
+            (
+                "\u{1b}[1;33mNothing needs a look; live watching has a failure",
+                |s| s.watching.as_mut().unwrap().failed = vec![v1::WatcherFailure::default()],
+            ),
+            (in_part, |s| {
+                s.this_mac.as_mut().unwrap().state = v1::ThisMacState::WatchedInPart as i32
+            }),
+            (in_part, |s| s.coverage.as_mut().unwrap().failed = 1),
+            (in_part, |s| {
+                s.not_covered.push(v1::Uncovered {
+                    id: "vulnerability-list-not-downloaded-fixable".to_string(),
+                    who: "you".to_string(),
+                    class: v1::Cause::Failed as i32,
                     ..Default::default()
                 })
-            },
-            |s| {
+            }),
+            (in_part, |s| {
                 s.event_level = Some(v1::EventLevel {
                     state: v1::CollectorState::Failing as i32,
                     ..Default::default()
                 })
-            },
-            |s| {
-                s.last_run = Some(v1::CheckMark::default());
-                s.running = false;
-            },
+            }),
+            (in_part, |s| s.last_run = Some(v1::CheckMark::default())),
+            // The watcher and another reason: not everything was read.
+            (in_part, |s| {
+                s.this_mac.as_mut().unwrap().live = false;
+                s.coverage.as_mut().unwrap().unreached_total = 1;
+            }),
         ];
-        for (i, fail) in failures.iter().enumerate() {
-            let mut failing = s.clone();
-            fail(&mut failing);
-            let said = status(&failing, &screen, false);
-            assert!(
-                said.starts_with("\u{1b}[1;33mNothing needs a look in what could be read"),
-                "{i}: {said}"
-            );
+        for (i, (words, change)) in cases.iter().enumerate() {
+            let mut s = calm_status();
+            change(&mut s);
+            assert!(said(&s).starts_with(words), "{i}: {}", said(&s));
         }
-        let mut feed = status_of("x");
-        feed.needs_a_look = Some(v1::NeedsALook::default());
-        feed.last_run = None;
-        clear(&mut feed);
-        feed.this_mac.as_mut().unwrap().fresh = true;
-        feed.not_covered.push(v1::Uncovered {
-            id: "vulnerability-list-not-downloaded-fixable".to_string(),
-            who: "you".to_string(),
-            class: v1::Cause::Failed as i32,
-            ..Default::default()
-        });
-        assert!(!status(&feed, &screen, false).contains("✓"));
-        if let Some(m) = s.this_mac.as_mut() {
-            m.fresh = false;
-        }
-        let stale = status(&s, &screen, false);
+        let mut s = calm_status();
+        s.this_mac.as_mut().unwrap().fresh = false;
+        let stale = said(&s);
         assert!(
             stale.starts_with("\u{1b}[1mNothing needed a look at the last check")
                 && stale.contains("Not fresh"),
             "{stale}"
         );
+        s.this_mac.as_mut().unwrap().fresh = true;
+        s.this_mac.as_mut().unwrap().state = v1::ThisMacState::Unspecified as i32;
+        let unknown_state = said(&s);
+        assert!(
+            unknown_state.starts_with("\u{1b}[1mWhether this Mac is watched is not known"),
+            "{unknown_state}"
+        );
         s.needs_a_look = None;
-        let unknown = status(&s, &screen, false);
+        let unknown = said(&s);
         assert!(
             unknown.starts_with("\u{1b}[1mNo run of this build has looked for findings yet"),
             "{unknown}"
         );
-        assert!(!stale.contains("✓") && !unknown.contains("✓"));
+        assert!(
+            ![stale, unknown_state, unknown]
+                .iter()
+                .any(|t| t.contains('✓'))
+        );
     }
 
     #[test]
@@ -2786,10 +2770,7 @@ mod tests {
         s.last_finished_run = None;
         s.needs_a_look = Some(v1::NeedsALook::default());
         s.this_mac.as_mut().unwrap().checked_at = None;
-        for text in [
-            status(&s, &Screen::pipe(), false),
-            crate::after_run::run(&s, &Screen::pipe()),
-        ] {
+        for text in [status(&s, &Screen::pipe(), false), ran(&s, &Screen::pipe())] {
             assert!(
                 text.starts_with("The first full check is running"),
                 "{text}"
@@ -2817,10 +2798,7 @@ mod tests {
             (false, "No full check has finished yet"),
         ] {
             s.running = running;
-            for text in [
-                status(&s, &screen, false),
-                crate::after_run::run(&s, &screen),
-            ] {
+            for text in [status(&s, &screen, false), ran(&s, &screen)] {
                 assert!(
                     text.starts_with(&format!("\u{1b}[1;33m{said}\u{1b}[0m")),
                     "{text}"
@@ -3932,8 +3910,8 @@ mod tests {
         assert!(!whole(&with(0, 0)).contains("verif"));
     }
 
-    /// A status with nothing found, after a fresh check, with a watcher, nothing failed and
-    /// every download current: the one the green headline is for.
+    /// A status with nothing found, after a fresh check, on a Mac watched whole by a live
+    /// watcher, nothing failed and every download current: the one the green headline is for.
     fn calm_status() -> v1::Status {
         let mut s = status_of("x");
         s.needs_a_look = Some(v1::NeedsALook::default());
@@ -3943,6 +3921,8 @@ mod tests {
         s.not_covered.clear();
         if let Some(m) = s.this_mac.as_mut() {
             m.fresh = true;
+            m.live = true;
+            m.state = v1::ThisMacState::Watched as i32;
         }
         if let Some(t) = s.threats.as_mut() {
             t.outcome = v1::FeedOutcome::Unchanged as i32;
@@ -3957,27 +3937,27 @@ mod tests {
 
     /// A job gone while the journal's latest word is `immunity on` is said as off and not by
     /// `immunity off`, under no calm headline, in the status and in the run; gone with `immunity off`
-    /// the latest word, or in the same second, it is said as turned off with its time.
+    /// the latest word, or in the same second, it is said as turned off with its time. With no
+    /// watcher, nothing is calm: it is said as nothing watching live.
     #[test]
     fn a_job_gone_after_immunity_on_is_off_not_by_immunity_off_and_never_calm() {
         let screen = Screen::pipe();
         let green = "✓ Nothing needs a look";
+        let unwatched = "Nothing needs a look; nothing is watching live";
         // The latest of the two is the journal's word, `turned_on_latest`, never the clock's.
         let said = |on: Option<i64>, off: Option<i64>, latest: Option<bool>, job: Option<bool>| {
             let mut s = calm_status();
             s.watching = None;
+            s.this_mac.as_mut().unwrap().live = false;
             (s.turned_on_at, s.turned_off_at) = (on, off);
             (s.turned_on_latest, s.login_job_installed) = (latest, job);
-            (
-                status(&s, &screen, false),
-                crate::after_run::run(&s, &screen),
-            )
+            (status(&s, &screen, false), ran(&s, &screen))
         };
         let (on_at, earlier) = (1_800_000_000, 1_799_999_000);
-        let (calm, calm_run) = said(None, None, None, Some(false));
+        let (never, never_run) = said(None, None, None, Some(false));
         assert!(
-            calm.starts_with(green) && calm_run.starts_with(green),
-            "{calm_run}"
+            never.starts_with(unwatched) && never_run.starts_with(unwatched),
+            "{never_run}"
         );
         let gone = "Immunity Core is off, and immunity off did not turn it off. It was turned on 2027-01-15 08:00 UTC; its job is gone. Turn it on with: immunity on";
         // Turned on last, though the clock gives the turning off a later time.
@@ -3986,16 +3966,16 @@ mod tests {
             said(Some(on_at), Some(on_at + 1), Some(true), Some(false)),
         ] {
             assert!(
-                status.contains(gone) && !status.starts_with(green),
+                status.contains(gone) && status.starts_with(unwatched),
                 "{status}"
             );
-            assert!(!run.starts_with(green), "{run}");
+            assert!(run.starts_with(unwatched), "{run}");
         }
         // Turned off last, though the clock gives it an earlier time or the same second.
         for turned_off in [earlier, on_at] {
             let (status, _) = said(Some(on_at), Some(turned_off), Some(false), Some(false));
             assert!(
-                status.starts_with(green) && !status.contains("did not"),
+                status.starts_with(unwatched) && !status.contains("did not"),
                 "{status}"
             );
             let when = view::utc(turned_off);
@@ -4006,22 +3986,28 @@ mod tests {
                 "{status}"
             );
         }
-        // The job there, or not known: today's words, and calm.
+        // The job there, or not known: today's words.
         for installed in [Some(true), None] {
             let (status, _) = said(Some(on_at), Some(earlier), Some(true), installed);
             assert!(
-                status.starts_with(green) && !status.contains("Immunity Core is off"),
+                status.starts_with(unwatched) && !status.contains("Immunity Core is off"),
                 "{status}"
             );
         }
-        // A watcher that holds the store, or is restarting on a new core, is not off.
+        // A watcher that holds the store, or is restarting on a new core, is not off; only the
+        // live one is calm.
         let mut s = calm_status();
         (s.turned_on_at, s.login_job_installed) = (Some(on_at), Some(false));
         s.turned_on_latest = Some(true);
         assert!(status(&s, &screen, false).starts_with(green));
         s.watching = None;
+        s.this_mac.as_mut().unwrap().live = false;
         s.watcher_restarting_since_at = Some(on_at);
-        assert!(status(&s, &screen, false).starts_with(green));
+        let restarting = status(&s, &screen, false);
+        assert!(
+            restarting.starts_with(unwatched) && !restarting.contains("Immunity Core is off"),
+            "{restarting}"
+        );
     }
 
     #[test]

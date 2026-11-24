@@ -84,7 +84,7 @@ fn at(path: &Path, homes: &[&Path]) -> Option<PathBuf> {
 
 /// The one line a pointer file of git holds, trimmed. The file is reached without following a
 /// link into a guarded folder and is opened without waiting.
-fn pointer(path: &Path, homes: &[&Path]) -> Option<String> {
+pub fn pointer(path: &Path, homes: &[&Path]) -> Option<String> {
     let path = guarded::followed(path, homes).ok()?;
     let bytes = crate::autorun::read_capped(&path, POINTER_CAP).ok()?;
     Some(String::from_utf8(bytes).ok()?.trim().to_string())

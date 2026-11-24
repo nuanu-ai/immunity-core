@@ -1,7 +1,7 @@
 {
   "advice": "Do not open or run what is named here; find out how it got there, and treat this Mac as affected until you know.",
   "answer": null,
-  "answered_at": 1795414792,
+  "answered_at": 1795522661,
   "answered_together": [],
   "answered_with": null,
   "answers_note": "Answer a finding only after the owner has agreed in this conversation, having been told what it is and what the options are. Pass --via agent and the reason the owner agreed to. The app shows every answer given this way.",
@@ -19,14 +19,14 @@
     "state": "open",
     "urgent": true
   },
-  "first_seen_at": 1795414791,
+  "first_seen_at": 1795522660,
   "folder_text": null,
   "format": 1,
   "group": null,
-  "journal_seq": 44,
+  "journal_seq": 45,
   "kind": "match of an indicator from the list",
   "kind_title": "Indicator match",
-  "last_seen_at": 1795414791,
+  "last_seen_at": 1795522660,
   "meaning": "The list names files, sites and addresses that the attack is known to use, so a match is rarely chance; it is wrong only when the list itself is wrong.",
   "rests_on": [
     {
@@ -36,9 +36,9 @@
       "old_value_text": "sha256:5a2dd1f378a67a0883bfb4290feefd00d3e30811fb5d31f5bb605411de3f131a",
       "predicate": "has_content",
       "reader": "watched-places",
-      "recorded_at": 1795414791,
-      "run_id": "1795414791-577802000",
-      "seq": 31,
+      "recorded_at": 1795522660,
+      "run_id": "1795522660-950903000",
+      "seq": 32,
       "subject_text": "file:machine:mac/.zshrc"
     },
     {
@@ -48,14 +48,14 @@
       "old_value_text": null,
       "predicate": "matches_indicator",
       "reader": "indicators",
-      "recorded_at": 1795414791,
-      "run_id": "1795414791-577802000",
-      "seq": 34,
+      "recorded_at": 1795522660,
+      "run_id": "1795522660-950903000",
+      "seq": 35,
       "subject_text": "file:machine:mac/.zshrc"
     }
   ],
   "short_title": "Matches a sign of attack from your list",
-  "store_id": "ca39a775246e52e4152fbc2df562bd15",
+  "store_id": "84bbae1d1fb371a64ed32c10e45504dd",
   "technique_text": null,
   "thing": null,
   "title": "Something on this Mac matches a sign of a known attack from the list you gave.",

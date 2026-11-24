@@ -469,14 +469,7 @@ fn freshness_of(
 ) -> rusqlite::Result<Vec<Fresh>> {
     let mut out = Vec::new();
     for feed in feeds {
-        let reading: Option<(i64, i64)> = conn
-            .query_row(
-                "SELECT id, at FROM feed_reading WHERE source = ?1 AND outcome != 'failed'
-                 ORDER BY id DESC LIMIT 1",
-                [feed.source],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
+        let reading = crate::osv::last_good_at(conn, feed.source)?;
         let newest: Option<String> = conn.query_row(
             "SELECT MAX(modified) FROM advisory WHERE source = ?1 AND gone_at IS NULL",
             [feed.source],

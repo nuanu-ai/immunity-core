@@ -2,7 +2,7 @@
   "advice": "Read the command it ran and the folder it ran in, shown here with secrets cut. If it is your own command or one a tool or an agent of yours runs, mark it seen; if nobody knows it, ask your agent to look into it.",
   "answer": {
     "given": "expected",
-    "given_at": 1795521983,
+    "given_at": 1795522661,
     "in_force": true,
     "reason_cuts": [
       {
@@ -12,10 +12,10 @@
       }
     ],
     "reason_text": "invented: my own tool, started as tool --password=\\cut{immunity:flag-value 18}",
-    "until_at": 1798113983,
+    "until_at": 1798114661,
     "via": "agent"
   },
-  "answered_at": 1795521983,
+  "answered_at": 1795522661,
   "answered_together": [],
   "answered_with": null,
   "answers_note": "Answer a finding only after the owner has agreed in this conversation, having been told what it is and what the options are. Pass --via agent and the reason the owner agreed to. The app shows every answer given this way.",
@@ -34,7 +34,7 @@
         "signed_by_text": null
       },
       "session_leader": null,
-      "start_micros": 1795518383123456,
+      "start_micros": 1795519061123456,
       "working_directory_text": "/Users/example/dev/tool"
     }
   },
@@ -47,14 +47,14 @@
     "state": "expected",
     "urgent": true
   },
-  "first_seen_at": 1795521923,
+  "first_seen_at": 1795522601,
   "folder_text": null,
   "format": 1,
   "group": null,
   "journal_seq": 45,
   "kind": "interpreter running code from its command line, detached",
   "kind_title": "Script running in the background",
-  "last_seen_at": 1795521923,
+  "last_seen_at": 1795522601,
   "meaning": "Tools and agents do this for a moment while they work; staying alive on its own, with no terminal or app it belongs to, is how some malware keeps hidden code running.",
   "rests_on": [
     {
@@ -64,14 +64,14 @@
       "old_value_text": null,
       "predicate": null,
       "reader": "processes",
-      "recorded_at": 1795521923,
-      "run_id": "sample-1795521983-125536000",
+      "recorded_at": 1795522601,
+      "run_id": "sample-1795522661-106255000",
       "seq": 41,
       "subject_text": "file:machine:mac//opt/tools/bin/node"
     }
   ],
   "short_title": "Script running hidden in the background",
-  "store_id": "a1dbcbd0ecd0510ffa84234401195ceb",
+  "store_id": "84bbae1d1fb371a64ed32c10e45504dd",
   "technique_text": "T1059",
   "thing": null,
   "title": "A program that runs scripts has been running code it was handed when it started, on its own in the background, for at least a minute.",
