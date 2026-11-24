@@ -10247,7 +10247,7 @@ fn unknown_is_never_given_as_zero_or_full() {
     assert_eq!(none["this_mac"]["state"], "not_checked");
     assert!(
         none["cannot_judge"].as_array().unwrap().contains(
-            &"no vulnerability is matched against installed software, servers' packages or ecosystems other than npm and crates.io yet".into()
+            &"no vulnerability is matched against installed software, servers' packages or ecosystems other than crates.io, npm and PyPI yet".into()
         ),
         "{none}"
     );

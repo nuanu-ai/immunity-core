@@ -20,7 +20,7 @@ A match of a rule marked below high, or of a rule whose set states no level, rai
 | The program each launch agent, daemon and login hook starts, named by its full path | A checksum of the file, its signer with the code's identifier, and whether its code verifies, asked again only when the checksum changed | At every full check |
 | Software changed in place: app bundles, Homebrew kegs, global npm packages, code that apps keep under Application Support | The app's code signature, verified by macOS; for the rest, a digest of file paths and change times | At every full check |
 | Files that make a tool run code by itself: package install scripts and pnpm hooks, editor tasks that run when a folder opens, editor and dev container settings, coding agents' settings, hooks and MCP server lists, editor extensions, the files of git hook managers | A checksum of the file or the part that runs code. `immunity status` says how many of the known ways in a project and places in the home folder are read | At every full check, and within seconds for most while the watcher runs |
-| Dependencies in `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `yarn.lock`, `bun.lock` and `Cargo.lock` | Matched against OSV's data for npm and crates.io and against CISA's catalogue | At every full check |
+| Dependencies in `package-lock.json`, `npm-shrinkwrap.json`, `pnpm-lock.yaml`, `yarn.lock`, `bun.lock`, `Cargo.lock`, `uv.lock` and `pylock.toml` | Matched against OSV's data for crates.io, npm and PyPI and against CISA's catalogue | At every full check |
 | The user's running programs and their internet connections | Read without administrator rights. An interpreter given code on its command line and left running without a terminal is a finding | Every 30 seconds while the watcher runs |
 | Every program start and every file created or renamed, with the collector | Checked against 198 published rules for macOS: the 75 of SigmaHQ, and 66 of Elastic's detection rules and 57 of its behaviour rules translated into Sigma. 175 are evaluated in full and 23 in part | About every 10 seconds while the watcher runs, and at every check |
 | Indicators from an incident report that the user gives as `indicators.json`: SHA-256 hashes, domains, IPv4 addresses, URLs | Matched against watched files, lockfiles, editor tasks and connections | At every check |
@@ -310,7 +310,7 @@ A trimmed answer of `immunity status --json` from an invented Mac:
     }
   ],
   "cannot_judge": [
-    "no vulnerability is matched against installed software, servers' packages or ecosystems other than npm and crates.io yet"
+    "no vulnerability is matched against installed software, servers' packages or ecosystems other than crates.io, npm and PyPI yet"
   ]
 }
 ```

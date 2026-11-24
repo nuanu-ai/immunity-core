@@ -47,9 +47,9 @@ pub const CANNOT_JUDGE: &[&str] = &[
     PERSISTENCE_UNREAD,
     // A watched file that starts by itself is read; what it runs in turn is not (`autorun.rs`).
     RUN_IN_TURN_UNREAD,
-    // Lockfiles of npm and crates.io are matched (`vulnerabilities`); the rest is planned in
+    // Lockfiles of crates.io, npm and PyPI are matched (`vulnerabilities`); the rest is planned in
     // docs/threats.md.
-    "no vulnerability is matched against installed software, servers' packages or ecosystems other than npm and crates.io yet",
+    "no vulnerability is matched against installed software, servers' packages or ecosystems other than crates.io, npm and PyPI yet",
     // Homebrew and npm are read; other package managers are named only when looked for, and
     // every tool is looked for at its installers' default places only (`managers`, `tools`).
     OTHER_MANAGERS,
