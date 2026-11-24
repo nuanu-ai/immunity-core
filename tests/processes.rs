@@ -548,7 +548,7 @@ fn the_finding_of_a_process_that_has_ended_still_says_what_the_sample_that_raise
     for line in [
         "    Command      zsh -c \"sleep 600\"\n",
         "    Folder       /Users/example/dev/site\n",
-        "    Group        led by pid 812, /bin/zsh, signed by apple",
+        "    Group        led by pid 812, signed by apple: /bin/zsh\n",
     ] {
         assert!(text.contains(line), "{line}\n{text}");
     }
@@ -767,6 +767,41 @@ fn run(dir: &Dir) {
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn the_finding_of_a_detached_script_shows_its_own_process_when_another_of_its_program_matches_an_indicator()
+ {
+    // Both processes run the same program, so the journal entries of the sample that raised the
+    // finding name the same subject: the finding shows the process that raised it and its
+    // command, never the one whose connection matched the list.
+    let dir = Dir::new("same-program");
+    std::fs::write(
+        dir.0.join("indicators.json"),
+        r#"[{"kind": "ipv4-addr:value", "value": "203.0.113.47"}]"#,
+    )
+    .unwrap();
+    run(&dir);
+    let table = [
+        process(500, 1, 1, "/opt/tools/bin/tool", &["tool"], false),
+        process(4242, 7, 1, "/bin/zsh", &["zsh", "-c", "sleep 600"], false),
+        process(4243, 9, 500, "/bin/zsh", &["zsh"], false),
+    ];
+    let listed = json!({ "pid": 4243, "start": 9, "transport": "tcp",
+                         "address": "203.0.113.47", "port": 80 });
+    sample_with(&dir, T, &table, &[]);
+    let said = sample_with(&dir, T + 60, &table, &[listed]);
+    assert_eq!(said["connections"]["matched_indicators"], 1);
+    let detached: Vec<Value> = findings(&dir)
+        .into_iter()
+        .filter(|f| f["finding"]["rule"] == "processes.detached-inline-code")
+        .collect();
+    assert_eq!(detached.len(), 1, "{detached:?}");
+    assert_eq!(identity(&detached[0]), (4242, 7));
+    assert_eq!(
+        detached[0]["evidence"]["detached_process"]["args_text"],
+        json!(["zsh", "-c", "sleep 600"])
     );
 }
 

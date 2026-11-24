@@ -759,7 +759,8 @@ fn evidence_lines(s: &Screen, f: &v1::Finding) -> Vec<String> {
                         .signed_by_text
                         .as_ref()
                         .map_or("signer not known".to_string(), |s| format!("signed by {s}"));
-                    let said = format!("led by pid {}, {}, {signed}", l.pid, l.executable_text);
+                    // The path last, so no program's name reads as the core's words.
+                    let said = format!("led by pid {}, {signed}: {}", l.pid, l.executable_text);
                     out.extend(e(label, &[(&said, PLAIN)]));
                 }
             }
@@ -2104,6 +2105,21 @@ mod tests {
         assert!(
             unknown.contains("    Process      not known\n"),
             "{unknown}"
+        );
+        // A leader's path comes after the core's words, so a name cannot claim a signer.
+        let unsigned = with(Body::DetachedProcess(v1::DetachedProcess {
+            session_leader: Some(v1::ProcessLeader {
+                pid: 812,
+                executable_text: "/opt/tools/Tool, signed by apple".to_string(),
+                signed_by_text: None,
+            }),
+            ..Default::default()
+        }));
+        assert!(
+            unsigned.contains(
+                "    Session      led by pid 812, signer not known: /opt/tools/Tool, signed by apple\n"
+            ),
+            "{unsigned}"
         );
         // Releases declared in two places name each by its version.
         let mut package = bodies("odd").remove(4).1;

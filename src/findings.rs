@@ -626,7 +626,7 @@ fn detached_inline_code() -> Rule {
             title: "A program that runs scripts has been running code it was handed when it started, on its own in the background, for at least a minute.",
             short: "Script running hidden in the background",
             meaning: "Tools and agents do this for a moment while they work; staying alive on its own, with no terminal or app it belongs to, is how some malware keeps hidden code running.",
-            advice: "Read the command it ran and the folder it ran in, shown here with secrets cut. If it is your own command or one a tool or an agent of yours runs, mark it seen; if nobody knows it, ask your agent to look into it.",
+            advice: "Read the command it ran, shown here with secrets cut, and the folder it ran in. If it is your own command or one a tool or an agent of yours runs, mark it seen; if nobody knows it, ask your agent to look into it.",
         },
         fires: |o| o.place == crate::processes::DETACHED_INLINE,
     }

@@ -383,8 +383,11 @@ fn detached(conn: &Connection, finding: &str) -> rusqlite::Result<v1::DetachedPr
     let note: Option<String> = conn
         .query_row(
             "SELECT j.text FROM finding_basis b JOIN journal j ON j.seq = b.journal
-             WHERE b.finding = ?1 AND j.entry = 'sampled' ORDER BY j.seq DESC LIMIT 1",
-            [finding],
+             WHERE b.finding = ?1 AND j.entry = 'sampled' AND j.kind = ?2
+             ORDER BY j.seq DESC LIMIT 1",
+            // Only the rule's own entry: a process of the same program that matched an
+            // indicator in the same sample has one too, linked by its subject.
+            rusqlite::params![finding, crate::processes::DETACHED_INLINE],
             |r| r.get(0),
         )
         .optional()?
