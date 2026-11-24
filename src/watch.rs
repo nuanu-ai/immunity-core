@@ -603,7 +603,8 @@ struct Heartbeat<'a> {
     lock: &'a std::fs::File,
     since: i64,
     tx: Sender<()>,
-    next: Instant,
+    /// When the file was last touched, on the calendar the status judges it by.
+    touched: SystemTime,
     /// Whether a first reading has completed.
     read: bool,
     /// The kinds whose latest failure the store did not take, each with when and what the
@@ -633,7 +634,7 @@ impl<'a> Heartbeat<'a> {
             lock,
             since,
             tx,
-            next: Instant::now(),
+            touched: SystemTime::UNIX_EPOCH,
             read: false,
             unrecorded: BTreeMap::new(),
             unwatched: None,
@@ -685,10 +686,11 @@ impl<'a> Heartbeat<'a> {
         if let Some(why) = &self.broken {
             return Err(std::io::Error::other(why.clone()));
         }
-        if Instant::now() >= self.next {
-            self.lock.set_modified(SystemTime::now())?;
+        let now = SystemTime::now();
+        if touch_due(self.touched, now) {
+            self.lock.set_modified(now)?;
             self.tx.send(()).map_err(std::io::Error::other)?;
-            self.next = Instant::now() + ALIVE;
+            self.touched = now;
         }
         Ok(())
     }
@@ -725,6 +727,14 @@ impl<'a> Heartbeat<'a> {
             let _ = self.write();
         }
     }
+}
+
+/// Whether the lock file is due a touch. The status judges the file's time on the calendar, so
+/// the touch is counted on it too: the first turn after a sleep, or after the calendar went
+/// back, touches the file.
+fn touch_due(last: SystemTime, now: SystemTime) -> bool {
+    now.duration_since(last)
+        .map_or(true, |since| since >= ALIVE)
 }
 
 fn stalled(rx: mpsc::Receiver<()>, timeout: Duration) -> bool {
@@ -1110,7 +1120,7 @@ impl Watcher<'_> {
             return false;
         }
         if let Some(checks) = &mut self.checks
-            && let Some(result) = checks.tick(crate::now_secs())
+            && let Some(result) = checks.tick(crate::now_secs(), Instant::now())
         {
             if let Err(why) = &result
                 && !emit(&problem("full_check_failed", why))
@@ -1994,6 +2004,18 @@ mod tests {
     fn put_lock(lock: &std::fs::File, text: &str) {
         lock.write_all_at(text.as_bytes(), 0).unwrap();
         lock.set_len(text.len() as u64).unwrap();
+    }
+
+    /// The status judges the lock file's time on the calendar, so after a sleep the first turn
+    /// of the watcher's loop touches it, though no awake time passed.
+    #[test]
+    fn the_heartbeat_is_due_after_a_minute_of_the_calendar_or_when_the_calendar_went_back() {
+        let last = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        assert!(!touch_due(last, last));
+        assert!(!touch_due(last, last + ALIVE - Duration::from_millis(1)));
+        assert!(touch_due(last, last + ALIVE));
+        assert!(touch_due(last, last + Duration::from_secs(3 * 3600)));
+        assert!(touch_due(last, last - Duration::from_secs(1)));
     }
 
     /// The job's watcher leaves when the path it was started from holds another file, as after
