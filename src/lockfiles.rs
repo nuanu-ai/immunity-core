@@ -1142,11 +1142,7 @@ snapshots:
         // were.
         use std::os::unix::fs::PermissionsExt;
         let text = "bun-lockfile-format-v0\n";
-        for (file, kind) in [
-            ("bun.lockb", "bun.lockb"),
-            ("pdm.lock", "pdm.lock"),
-            ("requirements.txt", "requirements.txt"),
-        ] {
+        for (file, kind) in [("bun.lockb", "bun.lockb"), ("pdm.lock", "pdm.lock")] {
             let dir = Dir::new("kind-closed", &[("Cargo.lock", CARGO), (file, text)]);
             let path = dir.0.join(file);
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
@@ -1214,6 +1210,7 @@ snapshots:
             ("pylock.toml", &super::pylock::tests::sample(), "PyPI"),
             ("Pipfile.lock", super::pipfile::tests::PIPFILE, "PyPI"),
             ("poetry.lock", &super::poetry::tests::lock(), "PyPI"),
+            ("requirements.txt", "widget==1.0 --hash=sha256:00\n", "PyPI"),
         ] {
             let (said, reason) = read_one("own-reader", kind, sample);
             assert_eq!(reason, None, "{kind}");
