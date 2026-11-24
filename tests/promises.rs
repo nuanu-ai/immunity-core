@@ -584,7 +584,7 @@ fn view_does_not_change_or_create_the_store() {
         .arg(&missing)
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(out.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&out.stderr).contains("no store"));
     assert!(!missing.exists() && !dir.0.join("none").exists());
 }
@@ -1498,9 +1498,9 @@ fn store_from_an_older_format_is_refused_with_a_message_and_left_untouched() {
         .arg(&store)
         .output()
         .unwrap();
-    // A run fails as every command does on a store it cannot read; the view, which prints no
-    // message, with 1.
-    for (out, code) in [(run, 3), (view, 1)] {
+    // A run fails as every command does on a store it cannot read, and so does the view, which
+    // prints no message.
+    for (out, code) in [(run, 3), (view, 3)] {
         assert_eq!(out.status.code(), Some(code));
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("made by another build"), "{stderr}");

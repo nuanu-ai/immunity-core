@@ -28,7 +28,8 @@
 
 use crate::answer::{self, Form};
 use crate::contract::{self, v1, value_of};
-use crate::{Stop, checkouts, findings, guarded, status, store};
+use crate::outcome::Outcome;
+use crate::{checkouts, findings, guarded, status, store};
 use prost::Message;
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::{BTreeMap, BTreeSet};
@@ -216,16 +217,19 @@ pub fn command_told<M: Message + serde::Serialize>(
     match read(store, |conn| ask(conn, crate::now_secs())) {
         Ok(Ok(m)) => answer::print(op, form, &m, text),
         Ok(Err(r)) => answer::fail_as(op, form, r.error(), crate::EXIT_USAGE, refused),
-        Err(e) => {
-            let (error, exit) = answer::stopped(&e, "immunity status --json --store <file>");
-            answer::fail(op, form, error, exit)
+        Err(o) => {
+            let error = o.error(op, "immunity status --json --store <file>");
+            answer::fail(op, form, error, o.exit())
         }
     }
 }
 
-fn read<T>(store: &Path, ask: impl FnOnce(&Connection) -> rusqlite::Result<T>) -> Result<T, Stop> {
+fn read<T>(
+    store: &Path,
+    ask: impl FnOnce(&Connection) -> rusqlite::Result<T>,
+) -> Result<T, Outcome> {
     if !store.is_file() {
-        return Err(Stop::Store(store::absent(store)));
+        return Err(store::absent(store));
     }
     let conn = store::open_read_only(store)?;
     let tx = conn.unchecked_transaction()?;
