@@ -282,6 +282,9 @@ INSERT OR IGNORE INTO coverage_kind (name) VALUES
     ('indicator list given as a file'),
     ('indicators matched against watched files and texts read in checkouts'),
     ('indicators against what this build does not match them with');
+-- A lockfile found in a checkout, see src/lockfiles.rs.
+INSERT OR IGNORE INTO predicate (name, object_kind, status) VALUES
+    ('has_lockfile', 'literal', 'used');
 -- Folders macOS asks the owner's permission for, see src/guarded.rs.
 INSERT OR IGNORE INTO coverage_kind (name) VALUES ('folders macOS asks permission for');
 ";

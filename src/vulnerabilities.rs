@@ -442,8 +442,12 @@ pub struct Fresh {
 /// word that says packages were compared. Any other feed is downloaded, read, counted and shown
 /// as a feed, and nothing else.
 pub fn matched_feeds() -> impl Iterator<Item = &'static Feed> {
-    let feeds: &'static [Feed] = &FEEDS;
-    (feeds.iter()).filter(|f| crate::lockfiles::has_reader(f.ecosystem))
+    matched_of(&FEEDS, crate::lockfiles::has_reader)
+}
+
+/// The feeds of `feeds` whose ecosystem `read` says some kind of lockfile is read for.
+fn matched_of(feeds: &[Feed], read: fn(&str) -> bool) -> impl Iterator<Item = &Feed> {
+    feeds.iter().filter(move |f| read(f.ecosystem))
 }
 
 /// Each feed as a feed: whether it was read whole within its limit and its newest change is
@@ -513,9 +517,17 @@ fn freshness_of(
     Ok(out)
 }
 
-/// A checkout's lockfiles reading: its scope, completeness, reason, run, and the names of what
-/// it says it did not read (`coverage_lack`), `None` for one without a name.
-type LockfileReading = (String, String, Option<String>, String, Vec<Option<String>>);
+/// A checkout's lockfiles reading: its scope, completeness, reason, run, the names of what it
+/// says it did not read (`coverage_lack`), `None` for one without a name, and the ecosystems of
+/// the lockfiles found in it, read or not (`lockfiles::HAS_LOCKFILE`).
+type LockfileReading = (
+    String,
+    String,
+    Option<String>,
+    String,
+    Vec<Option<String>>,
+    HashSet<&'static str>,
+);
 
 /// The lockfiles reader's latest reading of each checkout that is still there.
 fn lockfile_readings(conn: &Connection) -> rusqlite::Result<Vec<LockfileReading>> {
@@ -532,13 +544,30 @@ fn lockfile_readings(conn: &Connection) -> rusqlite::Result<Vec<LockfileReading>
         })?
         .collect::<rusqlite::Result<_>>()?;
     let mut lacks = conn.prepare("SELECT name FROM coverage_lack WHERE coverage = ?1")?;
+    let mut found = conn.prepare(
+        "SELECT object FROM assertion
+         WHERE layer = 'live' AND reader = ?1 AND scope = ?2 AND subject = ?2 AND predicate = ?3",
+    )?;
     readings
         .into_iter()
         .map(|(id, scope, completeness, reason, run)| {
             let names = lacks
                 .query_map([id], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?;
-            Ok((scope, completeness, reason, run, names))
+            let paths: Vec<String> = found
+                .query_map(
+                    params![
+                        crate::lockfiles::READER,
+                        scope,
+                        crate::lockfiles::HAS_LOCKFILE
+                    ],
+                    |r| r.get(0),
+                )?
+                .collect::<rusqlite::Result<_>>()?;
+            let of = (paths.iter())
+                .filter_map(|p| crate::lockfiles::ecosystem_of_file(p))
+                .collect();
+            Ok((scope, completeness, reason, run, names, of))
         })
         .collect()
 }
@@ -725,7 +754,7 @@ pub fn match_all(tx: &Transaction, run_id: &str, at: i64) -> rusqlite::Result<Ma
     let mut places: HashMap<(String, &'static str), (&'static str, Option<String>)> =
         HashMap::new();
     let mut read = HashSet::new();
-    for (scope, completeness, reason, reading_run, lacks) in &readings {
+    for (scope, completeness, reason, reading_run, lacks, found) in &readings {
         for f in &fresh {
             let eco = f.feed.ecosystem;
             let (lockfiles, why) = lockfiles_for(
@@ -736,12 +765,18 @@ pub fn match_all(tx: &Transaction, run_id: &str, at: i64) -> rusqlite::Result<Ma
                 run_id,
                 eco,
             );
+            // Read in full with no lockfile of the ecosystem left, the checkout holds none of its
+            // packages for certain, so a finding about one it held is over (`Matched::known`).
             if lockfiles == "full" {
                 read.insert((scope.clone(), eco));
             }
-            // A checkout with no lockfile has no place: it is one counted item
-            // (`unread_places`), never a place of every ecosystem that would read as compared.
-            if reason.as_deref() == Some(crate::lockfiles::NONE_FOUND_NOTE) {
+            // A place only where there is something to say of the ecosystem: a lockfile of it
+            // was found, read or not, or the reading may hide one, as folders not looked through
+            // or a reading not of the latest check (`lockfiles_for`). A checkout with no lockfile
+            // of it is never a place that would read as compared; one in which the reading found
+            // no lockfile at all is one counted item (`unread_places`).
+            let none = reason.as_deref() == Some(crate::lockfiles::NONE_FOUND_NOTE);
+            if !found.contains(eco) && (lockfiles == "full" || none) {
                 continue;
             }
             tx.execute(
@@ -2549,6 +2584,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_feed_is_matched_only_when_some_kind_of_lockfile_of_its_ecosystem_is_read() {
+        // A feed of an ecosystem no lockfile is read for gives no place, answer or word of
+        // comparison. Every feed of this build has a reader, so the rule is held on a predicate
+        // that refuses one ecosystem.
+        let matched =
+            |read| -> Vec<&str> { matched_of(&FEEDS, read).map(|f| f.ecosystem).collect() };
+        assert_eq!(matched(|e| e != "PyPI"), ["crates.io", "npm"]);
+        assert_eq!(matched(|e| e == "npm"), ["npm"]);
+        let all: Vec<&str> = matched_feeds().map(|f| f.ecosystem).collect();
+        assert_eq!(all, ["crates.io", "npm", "PyPI"]);
+    }
+
+    #[test]
     fn a_thing_the_store_holds_no_fact_of_is_never_known_so_its_finding_is_never_cleared() {
         let dir = crate::common::Scratch::new("known-nothing");
         let conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
@@ -2737,9 +2785,12 @@ mod tests {
                 params![crate::lockfiles::READER, NOW, scope, crate::lockfiles::KIND],
             )
             .unwrap();
-            let facts = std::iter::once(("part_of", scope.as_str()))
-                .chain(releases.iter().map(|r| ("has_version", *r)));
-            for (predicate, object) in facts {
+            // The lockfile the reader found, which gives the checkout its place for npm.
+            let found = (&scope, crate::lockfiles::HAS_LOCKFILE, "package-lock.json");
+            let facts = [found, (&subject, "part_of", scope.as_str())]
+                .into_iter()
+                .chain(releases.iter().map(|r| (&subject, "has_version", *r)));
+            for (subject, predicate, object) in facts {
                 tx.execute(
                     "INSERT INTO assertion (layer, subject, predicate, object, reader, scope,
                                             kind, source_ref, basis, observed_at, run_id)

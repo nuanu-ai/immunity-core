@@ -93,7 +93,7 @@ fn about(what: &str) -> &'static str {
             "Code that applications not made by Apple keep in your Library folder, outside the application itself."
         }
         covered::DEPENDENCIES => {
-            "Packages your projects list in their npm and crates.io lockfiles, compared at every check with the known vulnerabilities and malicious packages of those ecosystems."
+            "Packages your projects list in their crates.io, npm and PyPI lockfiles, compared at every check with the known vulnerabilities and malicious packages of those ecosystems."
         }
         _ => crate::autorun::about(what),
     }
