@@ -1137,31 +1137,27 @@ snapshots:
     #[test]
     fn a_lockfile_of_a_kind_with_no_reader_is_never_opened_and_is_listed_with_its_size() {
         // Its size comes from the folder, so one this user may not open is still named as a
-        // kind with no reader, never as a failed reading, and listed with its size. Python
-        // kinds with a row and no reader yet leave PyPI unknown, and npm and crates.io as they
-        // were.
+        // kind with no reader, never as a failed reading, and listed with its size. It leaves its
+        // own ecosystem unknown, npm for `bun.lockb`, and crates.io and PyPI as they were.
         use std::os::unix::fs::PermissionsExt;
-        let text = "bun-lockfile-format-v0\n";
-        for (file, kind) in [("bun.lockb", "bun.lockb"), ("pdm.lock", "pdm.lock")] {
-            let dir = Dir::new("kind-closed", &[("Cargo.lock", CARGO), (file, text)]);
-            let path = dir.0.join(file);
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
-            let (o, _) = dir.read();
-            let texts = read_as_text(&dir.0);
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-            assert_eq!(lacks(&o), [format!("{LOCKFILE_KIND} {kind}")], "{file}");
-            assert_eq!(o.gap.cause, Some(Cause::NoReader), "{file}");
-            let reason = format!("not supported yet: {kind}");
-            assert_eq!(o.reason.as_deref(), Some(reason.as_str()), "{file}");
-            let size = text.len() as u64;
-            assert!(o.lockfiles.contains(&(format!("dev/shop/{file}"), size)));
-            assert_eq!(unknown_for(&o), [kind == "bun.lockb", false], "{file}");
-            let names: Vec<Option<String>> = o.gap.lacks.iter().map(|l| l.name.clone()).collect();
-            let python = partial_for(&reason, &names, "PyPI");
-            assert_eq!(python, kind != "bun.lockb", "{file}");
-            assert_eq!(texts.opened, ["Cargo.lock"], "{file}");
-            assert!(texts.not_opened.is_empty(), "{file}");
-        }
+        let (text, file) = ("bun-lockfile-format-v0\n", "bun.lockb");
+        let dir = Dir::new("kind-closed", &[("Cargo.lock", CARGO), (file, text)]);
+        let path = dir.0.join(file);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let (o, _) = dir.read();
+        let texts = read_as_text(&dir.0);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(lacks(&o), [format!("{LOCKFILE_KIND} {file}")]);
+        assert_eq!(o.gap.cause, Some(Cause::NoReader));
+        let reason = format!("not supported yet: {file}");
+        assert_eq!(o.reason.as_deref(), Some(reason.as_str()));
+        let size = text.len() as u64;
+        assert!(o.lockfiles.contains(&(format!("dev/shop/{file}"), size)));
+        assert_eq!(unknown_for(&o), [true, false]);
+        let names: Vec<Option<String>> = o.gap.lacks.iter().map(|l| l.name.clone()).collect();
+        assert!(!partial_for(&reason, &names, "PyPI"));
+        assert_eq!(texts.opened, ["Cargo.lock"]);
+        assert!(texts.not_opened.is_empty());
     }
 
     #[test]
@@ -1210,6 +1206,7 @@ snapshots:
             ("pylock.toml", &super::pylock::tests::sample(), "PyPI"),
             ("Pipfile.lock", super::pipfile::tests::PIPFILE, "PyPI"),
             ("poetry.lock", &super::poetry::tests::lock(), "PyPI"),
+            ("pdm.lock", &super::pdm::tests::lock(false), "PyPI"),
             ("requirements.txt", "widget==1.0 --hash=sha256:00\n", "PyPI"),
         ] {
             let (said, reason) = read_one("own-reader", kind, sample);
