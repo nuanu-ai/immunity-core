@@ -1,10 +1,11 @@
 //! Matching: what the projects' lockfiles declare against the open vulnerability data of their
 //! ecosystem (`osv.rs`), with the four answers of docs/threats.md.
 //!
-//! A match is the OSV schema's own `IsVulnerable`, on SemVer precedence, on an entry from the
-//! ecosystem's public registry only. Versions are parsed strictly and never coerced. Whatever
-//! cannot be compared is "don't know" with its reason from a closed list, never "not affected":
-//! an entry not from the registry, a version or a range that is not strict SemVer, a release
+//! A match is the OSV schema's own `IsVulnerable`, in the order of the ecosystem's versions
+//! (SemVer for npm and crates.io, PEP 440 for PyPI), on an entry from the ecosystem's public
+//! registry only. Versions are parsed strictly and never coerced. Whatever cannot be compared is
+//! "don't know" with its reason from a closed list, never "not affected": an entry not from the
+//! registry, a version or a range its ecosystem's scheme does not read, a release
 //! above a record's `last_affected` with no fix, a lockfile reading that is partial or old, a
 //! feed that is not current. "Affects me" wins over every reason.
 //!
@@ -20,7 +21,6 @@ use crate::contract::v1;
 use crate::known::whole;
 use crate::osv::{FEEDS, Feed};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
-use semver::Version;
 use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -102,7 +102,7 @@ CREATE TABLE vulnerability_linked (
 pub const PLACE_NOT_READ: &str = "place_not_read";
 /// The data set was not read whole within its limit, or its newest change is old.
 pub const FEED_NOT_READ: &str = "feed_not_read";
-/// An entry's version, or the record's range or versions, is not strict SemVer.
+/// An entry's version, or the record's range or versions, is not read by the ecosystem's scheme.
 pub const NOT_COMPARABLE: &str = "version_cannot_be_compared";
 /// Git, a path or a file, a link, or another registry.
 pub const NOT_FROM_REGISTRY: &str = "not_from_registry";
@@ -130,33 +130,105 @@ pub const DECLARED: &str = "This speaks for what the project's lockfiles declare
 
 // ---- Ordering versions. ----
 
-/// A version as SemVer 2.0 writes it, strictly: three numbers, no leading `v`, no `=`, no
-/// spaces. Anything else is `None` and is never coerced. The parser is the `semver` crate's.
-pub fn version(s: &str) -> Option<Version> {
-    Version::parse(s).ok()
+/// How the versions of an ecosystem are read and ordered. A string the scheme does not read is
+/// not a version and is never coerced.
+pub trait Scheme: Sized {
+    /// The scheme's name, in what is said.
+    const NAME: &'static str;
+    /// The kinds of OSV range ordered by it.
+    const KINDS: &'static [&'static str];
+    fn read(s: &str) -> Option<Self>;
+    fn order(&self, other: &Self) -> Ordering;
+    /// Whether the version has a local label, which only a build outside the registry carries.
+    fn local(&self) -> bool;
 }
 
-/// SemVer precedence, build metadata disregarded (semver.org, item 11).
-pub fn compare(a: &Version, b: &Version) -> Ordering {
-    a.cmp_precedence(b)
+/// SemVer 2.0, strictly: three numbers, no leading `v`, no `=`, no spaces. The parser is the
+/// `semver` crate's; precedence disregards build metadata (semver.org, item 11).
+impl Scheme for semver::Version {
+    const NAME: &'static str = "SemVer";
+    const KINDS: &'static [&'static str] = &["SEMVER", "ECOSYSTEM"];
+    fn read(s: &str) -> Option<Self> {
+        semver::Version::parse(s).ok()
+    }
+    fn order(&self, other: &Self) -> Ordering {
+        self.cmp_precedence(other)
+    }
+    fn local(&self) -> bool {
+        false
+    }
+}
+
+/// The "Version specifiers" specification (PEP 440), as `pep440_rs` reads and orders it: its
+/// normalisation of case, a leading `v`, separators, spellings and padding is the
+/// specification's own. A range of kind `SEMVER` says nothing in this order.
+impl Scheme for pep440_rs::Version {
+    const NAME: &'static str = "PEP 440";
+    const KINDS: &'static [&'static str] = &["ECOSYSTEM"];
+    fn read(s: &str) -> Option<Self> {
+        s.parse().ok()
+    }
+    fn order(&self, other: &Self) -> Ordering {
+        self.cmp(other)
+    }
+    fn local(&self) -> bool {
+        self.is_local()
+    }
+}
+
+/// A release, in the scheme of its ecosystem.
+pub enum Release {
+    SemVer(semver::Version),
+    Pep440(pep440_rs::Version),
+}
+
+impl Release {
+    /// `judge` in the release's own scheme.
+    pub fn judge(&self, ranges: &Value, versions: &Value) -> Verdict {
+        match self {
+            Release::SemVer(v) => judge(v, ranges, versions),
+            Release::Pep440(v) => judge(v, ranges, versions),
+        }
+    }
+}
+
+/// A release of a package of `ecosystem`, read by the scheme of its versions: SemVer for npm and
+/// crates.io, PEP 440 for PyPI. `Err` says in the program's words why there is none; for an
+/// ecosystem with no scheme here, there is never one, so its answer is "don't know".
+pub fn version(ecosystem: &str, s: &str) -> Result<Release, String> {
+    fn read<R: Scheme>(s: &str) -> Result<R, String> {
+        R::read(s).ok_or_else(|| format!("is not a {} version", R::NAME))
+    }
+    match ecosystem {
+        "npm" | "crates.io" => read(s).map(Release::SemVer),
+        "PyPI" => read(s).map(Release::Pep440),
+        _ => Err(format!(
+            "cannot be ordered: no order of {ecosystem} versions is known"
+        )),
+    }
+}
+
+/// The order of the scheme.
+pub fn compare<R: Scheme>(a: &R, b: &R) -> Ordering {
+    a.order(b)
 }
 
 /// An event's value: `"0"` for `introduced` is before every version.
 #[derive(Clone)]
-enum Bound {
+enum Bound<R> {
     Zero,
-    At(Version),
+    At(R),
 }
 
-impl Bound {
-    fn cmp_to(&self, v: &Version) -> Ordering {
+impl<R: Scheme> Bound<R> {
+    fn cmp_to(&self, v: &R) -> Ordering {
         match self {
             Bound::Zero => Ordering::Less,
             Bound::At(b) => compare(b, v),
         }
     }
 
-    fn order(a: &Bound, b: &Bound) -> Ordering {
+    fn order(a: &Self, b: &Self) -> Ordering {
         match (a, b) {
             (Bound::Zero, Bound::Zero) => Ordering::Equal,
             (Bound::Zero, _) => Ordering::Less,
@@ -179,10 +251,19 @@ pub enum Verdict {
 }
 
 /// The OSV schema's `IsVulnerable` for one release and one affected entry of a record:
-/// `ranges` and `versions` as `advisory_affects` keeps them. A range of SemVer or of the
-/// ecosystem's own versions (npm's and crates.io's are SemVer) is walked over its sorted events;
-/// a range of commits, or of a kind not known, cannot be compared here.
-pub fn judge(v: &Version, ranges: &Value, versions: &Value) -> Verdict {
+/// `ranges` and `versions` as `advisory_affects` keeps them. A range of a kind the release's
+/// scheme orders is walked over its sorted events, each read by that scheme; a range of commits,
+/// or of a kind not known, cannot be compared here. A release with a local label is not one the
+/// registry serves, and a record's version with one cannot be compared: PyPI takes no local
+/// version, and the order and the specifiers disagree about them.
+pub fn judge<R: Scheme>(v: &R, ranges: &Value, versions: &Value) -> Verdict {
+    if v.local() {
+        return Verdict::Unknown(
+            NOT_FROM_REGISTRY,
+            "a release with a local label is not one the registry serves".to_string(),
+        );
+    }
+    let version = |s: &str| R::read(s).filter(|x| !x.local());
     let mut uncomparable: Option<String> = None;
     let mut uncovered: Option<String> = None;
     let mut fixed = false;
@@ -208,15 +289,16 @@ pub fn judge(v: &Version, ranges: &Value, versions: &Value) -> Verdict {
     }
     for range in &ranges {
         let kind = range["type"].as_str().unwrap_or_default();
-        if kind != "SEMVER" && kind != "ECOSYSTEM" {
-            // A range of commits says nothing about a release unless releases are listed.
-            if listed.is_empty() {
+        if !R::KINDS.contains(&kind) {
+            // OSV's `versions` enumerates what a range of commits covers, so with releases
+            // listed such a range says no more. A range of any other kind may hold the release.
+            if kind != "GIT" || listed.is_empty() {
                 uncomparable.get_or_insert(format!("the record gives a range of kind {kind}"));
             }
             continue;
         }
-        let mut events: Vec<(&str, Bound)> = Vec::new();
-        let mut limits: Vec<Option<Version>> = Vec::new();
+        let mut events: Vec<(&str, Bound<R>)> = Vec::new();
+        let mut limits: Vec<Option<R>> = Vec::new();
         let mut bad = None;
         for e in range["events"].as_array().into_iter().flatten() {
             let Some((key, value)) = e
@@ -248,7 +330,15 @@ pub fn judge(v: &Version, ranges: &Value, versions: &Value) -> Verdict {
             uncomparable.get_or_insert(why);
             continue;
         }
-        events.sort_by(|a, b| Bound::order(&a.1, &b.1));
+        // At one version, a `fixed` ends the interval before an `introduced` begins the next,
+        // and a `last_affected`, which ends its interval after its version, comes last. An
+        // `introduced` and a `fixed` at one version so read as affected from there on: loud.
+        let at = |key: &str| match key {
+            "fixed" => 0,
+            "introduced" => 1,
+            _ => 2,
+        };
+        events.sort_by(|a, b| Bound::order(&a.1, &b.1).then(at(a.0).cmp(&at(b.0))));
         let mut vulnerable = false;
         let mut off_by_fix = false;
         for (key, bound) in &events {
@@ -758,16 +848,15 @@ fn answer_one(
                 NOT_COMPARABLE,
                 format!("the lockfile gives no version at {}", e.at),
             ),
-            (None, Some(v)) => match version(v) {
-                None => Verdict::Unknown(
-                    NOT_COMPARABLE,
-                    format!("the release {v} at {} is not a SemVer version", e.at),
-                ),
-                Some(parsed) => {
+            (None, Some(v)) => match version(eco, v) {
+                Err(why) => {
+                    Verdict::Unknown(NOT_COMPARABLE, format!("the release {v} at {} {why}", e.at))
+                }
+                Ok(parsed) => {
                     let verdicts: Vec<Verdict> = n
                         .affects
                         .iter()
-                        .map(|(ranges, versions)| judge(&parsed, ranges, versions))
+                        .map(|(ranges, versions)| parsed.judge(ranges, versions))
                         .collect();
                     if verdicts.contains(&Verdict::Affected) {
                         Verdict::Affected
@@ -2441,8 +2530,263 @@ mod tests {
         assert!(matched.known(&tx, &about).unwrap());
     }
 
-    fn v(s: &str) -> Version {
-        version(s).unwrap_or_else(|| panic!("{s}"))
+    fn v(s: &str) -> semver::Version {
+        match version("npm", s) {
+            Ok(Release::SemVer(x)) => x,
+            _ => panic!("{s}"),
+        }
+    }
+
+    fn p(s: &str) -> pep440_rs::Version {
+        match version("PyPI", s) {
+            Ok(Release::Pep440(x)) => x,
+            _ => panic!("{s}"),
+        }
+    }
+
+    /// The Python string literals of one line of pypa/packaging's tests, read as data: only the
+    /// escapes that file uses are decoded.
+    fn literals(line: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut chars = line.chars();
+        while chars.by_ref().any(|c| c == '"') {
+            let mut s = String::new();
+            while let Some(c) = chars.next() {
+                match c {
+                    '"' => break,
+                    '\\' => match chars.next() {
+                        Some('t') => s.push('\t'),
+                        Some('n') => s.push('\n'),
+                        Some('u') => {
+                            let hex: String = chars.by_ref().take(4).collect();
+                            s.push(char::from_u32(u32::from_str_radix(&hex, 16).unwrap()).unwrap());
+                        }
+                        Some('N') => {
+                            let name: String = chars.by_ref().take_while(|c| *c != '}').collect();
+                            s.push(match name.as_str() {
+                                "{NARROW NO-BREAK SPACE" => '\u{202f}',
+                                "{PARAGRAPH SEPARATOR" => '\u{2029}',
+                                other => panic!("{other}"),
+                            });
+                        }
+                        other => panic!("{other:?}"),
+                    },
+                    c => s.push(c),
+                }
+            }
+            out.push(s);
+        }
+        out
+    }
+
+    /// The rows of the list that begins on the first line after `after` that is `[`, in
+    /// pypa/packaging's tests, each as its literals.
+    fn packaging_list(after: &str) -> Vec<Vec<String>> {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/pep440/test_version.py");
+        let text = std::fs::read_to_string(path).unwrap();
+        text.lines()
+            .skip_while(|l| !l.contains(after))
+            .skip_while(|l| !l.trim_end().ends_with('['))
+            .skip(1)
+            .take_while(|l| !l.trim_start().starts_with(']'))
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .map(literals)
+            .filter(|row| !row.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn python_versions_are_ordered_as_pypa_packaging_orders_its_own_list() {
+        // packaging's VERSIONS is in ascending order: every pair of its 92 versions, 4,186
+        // pairs, compares as it does, both ways, through the order the matcher uses.
+        let versions: Vec<pep440_rs::Version> = packaging_list("VERSIONS = [")
+            .iter()
+            .map(|row| p(&row[0]))
+            .collect();
+        assert_eq!(versions.len(), 92);
+        for (i, a) in versions.iter().enumerate() {
+            for b in &versions[i + 1..] {
+                assert_eq!(compare(a, b), Ordering::Less, "{a} < {b}");
+                assert_eq!(compare(b, a), Ordering::Greater, "{b} > {a}");
+            }
+        }
+        // Strings packaging refuses are not versions here either.
+        let invalid = packaging_list("def test_match_args");
+        assert_eq!(invalid.len(), 20);
+        for row in &invalid {
+            assert!(version("PyPI", &row[0]).is_err(), "{:?}", row[0]);
+        }
+        // Spellings packaging normalises are the same version. Only whitespace outside ASCII,
+        // which packaging trims, is refused by pep440_rs: the safe side, "don't know".
+        let normalized = packaging_list("def test_oversized_version_raises_valueerror");
+        assert_eq!(normalized.len(), 102);
+        for row in &normalized {
+            let (a, b) = (&row[0], &row[1]);
+            if a.trim() != a.trim_ascii() {
+                assert!(version("PyPI", a).is_err(), "{a:?}");
+                continue;
+            }
+            assert_eq!(compare(&p(a), &p(b)), Ordering::Equal, "{a:?} = {b}");
+        }
+        assert_eq!(compare(&p("1.0rc1"), &p("1.0c1")), Ordering::Equal);
+    }
+
+    #[test]
+    fn a_python_release_is_judged_in_pep_440_order_and_what_it_cannot_say_is_never_not_affected() {
+        let eco = |events: Value| json!([{ "type": "ECOSYSTEM", "events": events }]);
+        let edges = eco(json!([{"introduced": "1.0"}, {"fixed": "2.0"}]));
+        let zero = eco(json!([{"introduced": "0"}, {"fixed": "1.0"}]));
+        let local_event = eco(json!([{"introduced": "1.0+x"}]));
+        let semver = json!([{ "type": "SEMVER", "events": [{"introduced": "0"}] }]);
+        let none = json!([]);
+        let not_comparable = || Verdict::Unknown(NOT_COMPARABLE, String::new());
+        for (release, ranges, listed, verdict) in [
+            // An epoch sits above every release without one.
+            (
+                "1!0.5",
+                &edges,
+                json!([]),
+                Verdict::NotAffected { fixed: true },
+            ),
+            ("1.5", &edges, json!([]), Verdict::Affected),
+            // A pre-release and a dev release below `introduced` are outside the range; below
+            // `fixed` they are inside it.
+            (
+                "1.0a1",
+                &edges,
+                json!([]),
+                Verdict::NotAffected { fixed: false },
+            ),
+            (
+                "1.0.dev0",
+                &edges,
+                json!([]),
+                Verdict::NotAffected { fixed: false },
+            ),
+            ("2.0rc1", &edges, json!([]), Verdict::Affected),
+            ("2.0.dev0", &edges, json!([]), Verdict::Affected),
+            (
+                "2.0.post1",
+                &edges,
+                json!([]),
+                Verdict::NotAffected { fixed: true },
+            ),
+            // `introduced: "0"` is below every release, `0.dev0` too.
+            ("0.dev0", &zero, json!([]), Verdict::Affected),
+            // A listed version is equal by the order, padding and spelling aside.
+            ("1.0.0", &none, json!(["1.0"]), Verdict::Affected),
+            ("V1.0-RC1", &none, json!(["1.0rc1"]), Verdict::Affected),
+            // What PEP 440 does not read, or a local label in the record, is not compared.
+            ("2.0", &none, json!(["1.0", "lolwat"]), not_comparable()),
+            ("1.0", &none, json!(["1.0+x"]), not_comparable()),
+            ("1.5", &local_event, json!([]), not_comparable()),
+            // A release with a local label was not served by PyPI.
+            (
+                "1.2+x",
+                &edges,
+                json!([]),
+                Verdict::Unknown(NOT_FROM_REGISTRY, String::new()),
+            ),
+            // A SEMVER range is not in PEP 440 order.
+            ("1.0", &semver, json!([]), not_comparable()),
+        ] {
+            let got = judge(&p(release), ranges, &listed);
+            match (&got, &verdict) {
+                (Verdict::Unknown(g, _), Verdict::Unknown(w, _)) => assert_eq!(g, w, "{release}"),
+                _ => assert_eq!(got, verdict, "{release}"),
+            }
+        }
+        // An ecosystem with no scheme here has no release, so it is never "not affected".
+        assert!(version("Go", "1.0.0").is_err());
+    }
+
+    #[test]
+    fn a_range_of_a_kind_not_ordered_is_passed_over_only_when_it_is_commits_and_releases_are_listed()
+     {
+        // OSV's `versions` enumerates what a range of commits covers, and nothing else: a range
+        // of any other kind not ordered here, a SEMVER range in a PyPI record or a kind OSV adds
+        // later, may hold the release, so it is never passed over for "not affected".
+        let judged = |eco: &str, release: &str, other: &str, listed: Value| {
+            let ranges = json!([
+                { "type": "ECOSYSTEM", "events": [{"introduced": "0"}, {"fixed": "1.1.0"}] },
+                { "type": other, "repo": "https://example.org/x",
+                  "events": [{"introduced": "2.0.0"}, {"fixed": "3.0.0"}] },
+            ]);
+            version(eco, release).unwrap().judge(&ranges, &listed)
+        };
+        let reason = |v: Verdict| match v {
+            Verdict::Unknown(r, _) => r,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            reason(judged("PyPI", "2.5.0", "SEMVER", json!(["1.0.0"]))),
+            NOT_COMPARABLE
+        );
+        for eco in ["npm", "crates.io"] {
+            for listed in [json!(["1.0.0"]), json!([])] {
+                assert_eq!(
+                    reason(judged(eco, "2.5.0", "NEWKIND", listed)),
+                    NOT_COMPARABLE
+                );
+            }
+            // What is found affected is affected, whatever else cannot be compared.
+            assert_eq!(
+                judged(eco, "1.0.0", "NEWKIND", json!([])),
+                Verdict::Affected
+            );
+            assert_eq!(
+                judged(eco, "2.5.0", "GIT", json!(["1.0.0"])),
+                Verdict::NotAffected { fixed: true }
+            );
+            assert_eq!(
+                reason(judged(eco, "2.5.0", "GIT", json!([]))),
+                NOT_COMPARABLE
+            );
+        }
+    }
+
+    #[test]
+    fn at_one_version_an_event_that_ends_an_interval_comes_before_one_that_begins_the_next() {
+        // Two adjacent intervals in either input order, in both schemes: a release at the
+        // version where one ends and the next begins is in the next. A `last_affected` ends its
+        // interval after its version, so it comes after an `introduced` there.
+        let adjacent = |end: &str| {
+            [
+                json!([{"introduced": "1.0.0"}, {"fixed": "2.0.0"}, {"introduced": "0"}, {"fixed": end}]),
+                json!([{"introduced": "0"}, {"fixed": end}, {"introduced": "1.0.0"}, {"fixed": "2.0.0"}]),
+            ]
+        };
+        let one_release = [
+            json!([{"last_affected": "1.0.0"}, {"introduced": "1.0.0"}, {"introduced": "2.0.0"}, {"fixed": "3.0.0"}]),
+            json!([{"introduced": "1.0.0"}, {"last_affected": "1.0.0"}, {"introduced": "2.0.0"}, {"fixed": "3.0.0"}]),
+        ];
+        let range = |events: &Value| json!([{ "type": "ECOSYSTEM", "events": events }]);
+        let none = json!([]);
+        for events in adjacent("1.0") {
+            assert_eq!(
+                judge(&p("1.0.0"), &range(&events), &none),
+                Verdict::Affected
+            );
+            assert_eq!(judge(&p("0.5"), &range(&events), &none), Verdict::Affected);
+        }
+        for events in adjacent("1.0.0") {
+            assert_eq!(
+                judge(&v("1.0.0"), &range(&events), &none),
+                Verdict::Affected
+            );
+        }
+        for events in &one_release {
+            assert_eq!(judge(&v("1.0.0"), &range(events), &none), Verdict::Affected);
+            assert_eq!(
+                judge(&v("1.5.0"), &range(events), &none),
+                Verdict::NotAffected { fixed: false }
+            );
+            assert_eq!(
+                judge(&p("1.5"), &range(events), &none),
+                Verdict::NotAffected { fixed: false }
+            );
+        }
     }
 
     /// node-semver's fixture rows, `[a, b, opt]`, as data. `opt` is loose when it is `true`
@@ -2474,7 +2818,10 @@ mod tests {
         let mut strict = 0;
         for (a, b, loose) in &comparisons {
             if *loose {
-                assert!(version(a).is_none() || version(b).is_none(), "{a} {b}");
+                assert!(
+                    version("npm", a).is_err() || version("npm", b).is_err(),
+                    "{a} {b}"
+                );
                 continue;
             }
             strict += 1;
@@ -2488,7 +2835,10 @@ mod tests {
             // node-semver trims and takes a leading `v` even when strict; this program does
             // neither, which is the safe side: such a version is "don't know".
             if *loose || a.trim() != a || a.starts_with('v') {
-                assert!(version(a).is_none() || version(b).is_none(), "{a} {b}");
+                assert!(
+                    version("npm", a).is_err() || version("npm", b).is_err(),
+                    "{a} {b}"
+                );
                 continue;
             }
             assert_eq!(compare(&v(a), &v(b)), Ordering::Equal, "{a} = {b}");
@@ -2498,7 +2848,7 @@ mod tests {
         let max_length = 256;
         let too_long = format!("{}.0.0", "1".repeat(max_length - 1));
         for s in [too_long.as_str(), "hello, world", "xyz"] {
-            assert!(version(s).is_none(), "{s}");
+            assert!(version("npm", s).is_err(), "{s}");
         }
         assert_eq!(
             compare(&v("90071992547409910.0.0"), &v("9007199254740991.0.0")),
