@@ -1144,7 +1144,6 @@ snapshots:
         let text = "bun-lockfile-format-v0\n";
         for (file, kind) in [
             ("bun.lockb", "bun.lockb"),
-            ("poetry.lock", "poetry.lock"),
             ("pdm.lock", "pdm.lock"),
             ("requirements.txt", "requirements.txt"),
         ] {
@@ -1214,6 +1213,7 @@ snapshots:
             ("uv.lock", &super::uv::tests::sample(), "PyPI"),
             ("pylock.toml", &super::pylock::tests::sample(), "PyPI"),
             ("Pipfile.lock", super::pipfile::tests::PIPFILE, "PyPI"),
+            ("poetry.lock", &super::poetry::tests::lock(), "PyPI"),
         ] {
             let (said, reason) = read_one("own-reader", kind, sample);
             assert_eq!(reason, None, "{kind}");

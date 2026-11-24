@@ -1,7 +1,7 @@
 //! The reader of `uv.lock`.
 
-use super::pypi::{PYPI_INDEX, pypi_file, pypi_name};
-use super::{At, Dep, Parsed, Source};
+use super::pypi::{PYPI_INDEX, Told, pypi_file, pypi_name, toml_lock};
+use super::{Parsed, Source};
 use toml::de::{DeTable, DeValue};
 
 /// The kinds of `source` uv reads (`SourceWire` in uv's `crates/uv-lock/src/lock/mod.rs`).
@@ -31,55 +31,30 @@ pub(super) const READ: Option<super::Reader> = Some(|text, _| uv(text));
 /// version, one whose `source` names no kind or two, and a name not written normalised, as uv
 /// writes it, are left not told, keyed `L<line>`.
 fn uv(text: &str) -> Parsed {
-    let Ok(lock) = DeTable::parse(text) else {
-        return Parsed::Failed;
-    };
-    let lock = lock.get_ref();
-    match lock.get("version").map(|v| v.get_ref()) {
-        Some(DeValue::Integer(n)) => match u64::from_str_radix(n.as_str(), n.radix()) {
-            Ok(1) => {}
-            Ok(n) => return Parsed::NoReader(format!("uv.lock version {n}")),
-            Err(_) => return Parsed::Failed,
-        },
-        _ => return Parsed::Failed,
-    }
-    let packages = match (lock.get("package"), lock.get("distribution")) {
-        (None, None) => &[][..],
-        (Some(p), None) | (None, Some(p)) => match p.get_ref() {
-            DeValue::Array(packages) => &packages[..],
-            _ => return Parsed::Failed,
-        },
-        (Some(_), Some(_)) => return Parsed::Failed,
-    };
-    // Where each line break is, to tell the line of a name from its offset.
-    let breaks: Vec<usize> = text.match_indices('\n').map(|(i, _)| i).collect();
-    let (mut out, mut unknown) = (Vec::new(), Vec::new());
-    for package in packages {
-        let Some((at, told)) = package.get_ref().as_table().and_then(uv_entry) else {
-            return Parsed::Failed;
-        };
-        let line = breaks.partition_point(|&b| b < at) + 1;
-        match told {
-            Some((name, version, source)) => out.push(Dep {
-                at: At::Line(line),
-                name: name.to_string(),
-                version: version.map(str::to_string),
-                source,
-            }),
-            None => unknown.push(format!("L{line}")),
+    let head = |lock: &DeTable| {
+        match lock.get("version").map(|v| v.get_ref()) {
+            Some(DeValue::Integer(n)) => match u64::from_str_radix(n.as_str(), n.radix()) {
+                Ok(1) => {}
+                Ok(n) => return Err(Parsed::NoReader(format!("uv.lock version {n}"))),
+                Err(_) => return Err(Parsed::Failed),
+            },
+            _ => return Err(Parsed::Failed),
         }
-    }
-    Parsed::Deps("PyPI", out, unknown)
+        match (
+            lock.contains_key("package"),
+            lock.contains_key("distribution"),
+        ) {
+            (true, true) => Err(Parsed::Failed),
+            (_, true) => Ok("distribution"),
+            _ => Ok("package"),
+        }
+    };
+    toml_lock(text, head, uv_entry)
 }
 
-/// An entry's name, version and source as `uv` reads them.
-type Told<'a> = Option<(&'a str, Option<&'a str>, Source)>;
-
-/// One `[[package]]`: the offset of its name and what it is, `None` inside when the lockfile
-/// does not tell its package; `None` when uv would refuse it.
-fn uv_entry<'a>(package: &'a DeTable) -> Option<(usize, Told<'a>)> {
-    let (key, name) = package.get_key_value("name")?;
-    let name = name.get_ref().as_str()?;
+/// One `[[package]]` with its name: what it is, `None` inside when the lockfile does not tell
+/// its package; `None` when uv would refuse it.
+fn uv_entry(package: &DeTable, name: &str) -> Option<Told> {
     let version = match package.get("version") {
         None => None,
         Some(v) => Some(v.get_ref().as_str()?),
@@ -98,13 +73,12 @@ fn uv_entry<'a>(package: &'a DeTable) -> Option<(usize, Told<'a>)> {
     let kinds: Vec<_> = (source.iter())
         .filter(|(k, _)| SOURCES.contains(&k.get_ref().as_ref()))
         .collect();
-    let at = key.span().start;
     let [(kind, value)] = kinds[..] else {
-        return Some((at, None));
+        return Some(None);
     };
     let value = value.get_ref().as_str()?;
     if pypi_name(name).as_deref() != Some(name) {
-        return Some((at, None));
+        return Some(None);
     }
     let from = match kind.get_ref().as_ref() {
         "registry" if PYPI_INDEX.contains(&value) => {
@@ -115,7 +89,7 @@ fn uv_entry<'a>(package: &'a DeTable) -> Option<(usize, Told<'a>)> {
                         .all(|f| f.is_some_and(|f| pypi_file(f, name, v)))
             };
             if !version.is_some_and(proved) {
-                return Some((at, None));
+                return Some(None);
             }
             Source::Registry
         }
@@ -124,7 +98,7 @@ fn uv_entry<'a>(package: &'a DeTable) -> Option<(usize, Told<'a>)> {
         "url" => Source::OtherRegistry,
         _ => Source::Path,
     };
-    Some((at, Some((name, version, from))))
+    Some(Some((name.to_string(), version.map(str::to_string), from)))
 }
 
 /// The address of an `sdist` or a wheel, `None` inside for a file with none; `None` when uv

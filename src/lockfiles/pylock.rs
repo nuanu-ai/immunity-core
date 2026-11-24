@@ -1,7 +1,7 @@
 //! The reader of `pylock.toml` and `pylock.<name>.toml` (PEP 751).
 
-use super::pypi::{PYPI_INDEX, pypi_file, pypi_name};
-use super::{At, Dep, Parsed, Source, version_shape};
+use super::pypi::{PYPI_INDEX, Told, pypi_file, pypi_name, text_version, toml_lock};
+use super::{Parsed, Source};
 use toml::de::{DeTable, DeValue};
 
 pub(super) const READ: Option<super::Reader> = Some(|text, _| pylock(text));
@@ -20,45 +20,19 @@ pub(super) const READ: Option<super::Reader> = Some(|text, _| pylock(text));
 /// entry of files that do not prove its name and version, or with no `version`, and a name not
 /// written normalised, as the specification requires, are left not told, keyed `L<line>`.
 fn pylock(text: &str) -> Parsed {
-    let Ok(lock) = DeTable::parse(text) else {
-        return Parsed::Failed;
-    };
-    let lock = lock.get_ref();
-    match lock.get("lock-version").and_then(|v| v.get_ref().as_str()) {
-        Some("1.0") => {}
-        Some(v) if version_shape(v) => return Parsed::NoReader(format!("pylock.toml version {v}")),
-        _ => return Parsed::Failed,
-    }
-    let Some(DeValue::Array(packages)) = lock.get("packages").map(|p| p.get_ref()) else {
-        return Parsed::Failed;
-    };
-    // Where each line break is, to tell the line of a name from its offset.
-    let breaks: Vec<usize> = text.match_indices('\n').map(|(i, _)| i).collect();
-    let (mut out, mut unknown) = (Vec::new(), Vec::new());
-    for package in packages.iter() {
-        let Some((at, told)) = package.get_ref().as_table().and_then(pylock_entry) else {
-            return Parsed::Failed;
-        };
-        let line = breaks.partition_point(|&b| b < at) + 1;
-        match told {
-            Some((name, version, source)) => out.push(Dep {
-                at: At::Line(line),
-                name: name.to_string(),
-                version: version.map(str::to_string),
-                source,
-            }),
-            None => unknown.push(format!("L{line}")),
+    let head = |lock: &DeTable| {
+        text_version(lock.get("lock-version"), "pylock.toml", |v| v == "1.0")?;
+        match lock.get("packages").map(|p| p.get_ref()) {
+            Some(DeValue::Array(_)) => Ok("packages"),
+            _ => Err(Parsed::Failed),
         }
-    }
-    Parsed::Deps("PyPI", out, unknown)
+    };
+    toml_lock(text, head, pylock_entry)
 }
 
-/// An entry's name, version and source as `pylock` reads them.
-type Told<'a> = Option<(&'a str, Option<&'a str>, Source)>;
-
-/// One `[[packages]]`: the offset of its name and what it is, `None` inside when the lockfile
-/// does not tell its package; `None` when it is not of the specification's shape.
-fn pylock_entry<'a>(package: &'a DeTable) -> Option<(usize, Told<'a>)> {
+/// One `[[packages]]` with its name: what it is, `None` inside when the lockfile does not tell
+/// its package; `None` when it is not of the specification's shape.
+fn pylock_entry(package: &DeTable, name: &str) -> Option<Told> {
     let text = |key: &str| match package.get(key) {
         None => Some(None),
         Some(v) => v.get_ref().as_str().map(Some),
@@ -67,8 +41,6 @@ fn pylock_entry<'a>(package: &'a DeTable) -> Option<(usize, Told<'a>)> {
         None => Some(None),
         Some(v) => v.get_ref().as_table().map(Some),
     };
-    let (key, name) = package.get_key_value("name")?;
-    let name = name.get_ref().as_str()?;
     let (version, index) = (text("version")?, text("index")?);
     let (vcs, directory, archive) = (table("vcs")?, table("directory")?, table("archive")?);
     let mut files: Vec<&DeTable> = table("sdist")?.into_iter().collect();
@@ -87,9 +59,8 @@ fn pylock_entry<'a>(package: &'a DeTable) -> Option<(usize, Told<'a>)> {
     if kinds.iter().filter(|k| **k).count() > 1 {
         return None;
     }
-    let at = key.span().start;
     if pypi_name(name).as_deref() != Some(name) {
-        return Some((at, None));
+        return Some(None);
     }
     let from = match archive {
         _ if vcs.is_some() => Source::Git,
@@ -100,12 +71,12 @@ fn pylock_entry<'a>(package: &'a DeTable) -> Option<(usize, Told<'a>)> {
         None => {
             let proved = |v| !files.is_empty() && files.iter().all(|f| pypi_s(f, name, v));
             if !version.is_some_and(proved) {
-                return Some((at, None));
+                return Some(None);
             }
             Source::Registry
         }
     };
-    Some((at, Some((name, version, from))))
+    Some(Some((name.to_string(), version.map(str::to_string), from)))
 }
 
 /// Whether an `sdist` or a wheel is PyPI's file of `name` at `version`: no `path`, an address
