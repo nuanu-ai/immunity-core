@@ -1166,7 +1166,6 @@ snapshots:
             ("pdm.lock", "pdm.lock"),
             ("pylock.toml", "pylock.toml"),
             ("pylock.dev.toml", "pylock.toml"),
-            ("Pipfile.lock", "Pipfile.lock"),
             ("requirements.txt", "requirements.txt"),
         ] {
             let dir = Dir::new("kind-closed", &[("Cargo.lock", CARGO), (file, text)]);
@@ -1232,6 +1231,7 @@ snapshots:
             ("yarn.lock", YARN, "npm"),
             ("bun.lock", BUN, "npm"),
             ("Cargo.lock", CARGO, "crates.io"),
+            ("Pipfile.lock", super::pipfile::tests::PIPFILE, "PyPI"),
         ] {
             let (said, reason) = read_one("own-reader", kind, sample);
             assert_eq!(reason, None, "{kind}");
@@ -1239,7 +1239,7 @@ snapshots:
             assert!(said.iter().any(|s| s.starts_with(&of_it)), "{kind}");
         }
         assert!(has_reader("npm") && has_reader("crates.io"));
-        assert!(!has_reader("PyPI") && !has_reader("RubyGems"));
+        assert!(has_reader("PyPI") && !has_reader("RubyGems"));
     }
 
     #[test]
@@ -1638,13 +1638,13 @@ __metadata:
 
     #[test]
     fn a_lockfile_of_an_ecosystem_with_no_reader_is_named_as_a_kind_wherever_it_is() {
-        // `Pipfile.lock`, `Gemfile.lock` and the rest of the published list are lockfiles: one
+        // `go.sum`, `Gemfile.lock` and the rest of the published list are lockfiles: one
         // beside a `Cargo.lock` is a kind with no reader, by name, whether at the root, deep or
         // set aside. It leaves its own ecosystem unknown and no other: a deep `uv.lock` makes
         // PyPI partial and not npm, and a name of no ecosystem a record can be about leaves none.
         for (tag, path, eco) in [
             ("uv-deep", "a/b/c/d/e/uv.lock", Some("PyPI")),
-            ("pipfile", "Pipfile.lock", Some("PyPI")),
+            ("go-sum", "go.sum", Some("Go")),
             ("gemfile", "api/Gemfile.lock", Some("RubyGems")),
             (
                 "composer-deep",
