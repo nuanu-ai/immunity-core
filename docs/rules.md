@@ -38,7 +38,7 @@ A rule of Immunity Core's own reads an event under SigmaHQ's taxonomy. These are
 | Field | What it holds |
 |---|---|
 | `Image` | the path of the program started |
-| `CommandLine` | its arguments joined by single spaces, the first included, with no quoting |
+| `CommandLine` | its arguments joined by single spaces, the first included, with no quoting; an argument with no characters adds nothing |
 | `ParentImage` | the program the process ran before this start, which after a fork is the parent's program and after an `exec` without a fork is the wrapper |
 
 ### A file created or renamed
