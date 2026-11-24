@@ -90,6 +90,16 @@ ruzstd = { version = "0.9.1", default-features = false, features = ["std"] }
 # brings `toml_parser`, `winnow`, `serde_spanned` and `toml_datetime`, which have no
 # dependencies of their own here. The nesting limit stays on (no `unbounded`).
 toml = { version = "1.2.2", default-features = false, features = ["parse"] }
+# Vulnerability matching orders the versions of Python packages as the "Version specifiers"
+# specification (PEP 440) defines, as OSV's ECOSYSTEM ranges for PyPI are evaluated. Ordering
+# versions is a silent mistake when written by hand, and macOS ships no implementation: `packaging`
+# is not in Python's standard library, and `semver` orders SemVer only. pep440_rs is the
+# implementation in general use in Rust, strict, with tests on part of pypa/packaging's own
+# cases; its README says it is feature-complete and no longer actively maintained, so a test of
+# our own compares every pair of packaging's list of versions. It has no optional feature on
+# and brings `unscanny` and `unicode-width` 0.2. `serde` was compiled in already; `once_cell`,
+# until now only on the tests' path, is linked into the program.
+pep440_rs = "0.7.3"
 
 [dev-dependencies]
 # The test that keeps the committed types equal to what the schema gives generates them again
