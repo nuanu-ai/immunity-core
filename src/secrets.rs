@@ -60,10 +60,12 @@
 //!
 //! The core never validates a secret: nothing here sends anything anywhere.
 
-use aho_corasick::AhoCorasick;
+use aho_corasick::{AhoCorasick, AhoCorasickKind};
 use regex::bytes::{Regex, RegexBuilder};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::sync::OnceLock;
 
 const GITLEAKS: &str = include_str!("../rules/secrets/gitleaks/gitleaks.json");
@@ -112,6 +114,16 @@ pub enum Piece {
 /// brace or space.
 pub fn mark(kind: &str, length: usize) -> String {
     format!("\\cut{{{kind} {length}}}")
+}
+
+fn mark_len(kind: &str, length: usize) -> usize {
+    let mut digits = 1usize;
+    let mut n = length / 10;
+    while n > 0 {
+        digits += 1;
+        n /= 10;
+    }
+    5 + kind.len() + 1 + digits + 1
 }
 
 /// An event's arguments, cut.
@@ -201,34 +213,104 @@ impl Text {
     /// `immunity watch` alike: each mark bare, and in a source's text a backslash and every hidden
     /// character written `\u{…}`, so no text from a source can read as a mark.
     pub fn said(&self) -> String {
-        self.said_within(usize::MAX)
+        let cap: usize = self
+            .0
+            .iter()
+            .map(|p| match p {
+                Piece::Text(t) | Piece::Quoted(t) => t.len(),
+                Piece::Cut { kind, length } => mark_len(kind, *length),
+            })
+            .sum();
+        let mut out = String::with_capacity(cap);
+        for p in &self.0 {
+            match p {
+                Piece::Text(t) | Piece::Quoted(t) => {
+                    let mut plain_start = 0;
+                    for (i, c) in t.char_indices() {
+                        if c == '\\' || crate::icu::hidden(c) {
+                            if i > plain_start {
+                                out.push_str(&t[plain_start..i]);
+                            }
+                            out.extend(c.escape_unicode());
+                            plain_start = i + c.len_utf8();
+                        }
+                    }
+                    if plain_start < t.len() {
+                        out.push_str(&t[plain_start..]);
+                    }
+                }
+                Piece::Cut { kind, length } => {
+                    let _ = write!(out, "\\cut{{{kind} {length}}}");
+                }
+            }
+        }
+        out
     }
 
     /// `said`, at most `cap` characters: past it, what fits and `…`. A mark and a character
     /// written `\u{…}` are whole or left out, never broken.
     pub fn said_within(&self, cap: usize) -> String {
-        let (mut whole, mut count) = (String::new(), 0);
-        units(&self.0, |u| {
-            whole.push_str(u);
-            count += u.chars().count();
-            true
-        });
-        if count <= cap {
-            return whole;
+        if cap == usize::MAX {
+            return self.said();
         }
-        let (mut out, mut room) = (String::new(), cap.saturating_sub(1));
-        units(&self.0, |u| {
-            let n = u.chars().count();
-            let fits = n <= room;
-            if fits {
-                out.push_str(u);
-                room -= n;
+        let fits_limit = cap.saturating_sub(1);
+        let mut out = String::new();
+        let mut total = 0usize;
+        let mut prefix_bytes = 0usize;
+        let mut unit = String::new();
+        for p in &self.0 {
+            match p {
+                Piece::Text(t) | Piece::Quoted(t) => {
+                    for c in t.chars() {
+                        if c == '\\' || crate::icu::hidden(c) {
+                            unit.clear();
+                            unit.extend(c.escape_unicode());
+                            let n = unit.len();
+                            if total.saturating_add(n) > cap {
+                                out.truncate(prefix_bytes);
+                                if cap > 0 {
+                                    out.push('…');
+                                }
+                                return out;
+                            }
+                            out.push_str(&unit);
+                            total += n;
+                            if total <= fits_limit {
+                                prefix_bytes = out.len();
+                            }
+                        } else {
+                            if total >= cap {
+                                out.truncate(prefix_bytes);
+                                if cap > 0 {
+                                    out.push('…');
+                                }
+                                return out;
+                            }
+                            out.push(c);
+                            total += 1;
+                            if total <= fits_limit {
+                                prefix_bytes = out.len();
+                            }
+                        }
+                    }
+                }
+                Piece::Cut { kind, length } => {
+                    let m = mark(kind, *length);
+                    let n = m.chars().count();
+                    if total.saturating_add(n) > cap {
+                        out.truncate(prefix_bytes);
+                        if cap > 0 {
+                            out.push('…');
+                        }
+                        return out;
+                    }
+                    out.push_str(&m);
+                    total += n;
+                    if total <= fits_limit {
+                        prefix_bytes = out.len();
+                    }
+                }
             }
-            fits
-        });
-        // No room even for `…` when the cap is nothing.
-        if cap > 0 {
-            out.push('…');
         }
         out
     }
@@ -313,34 +395,6 @@ fn show(pieces: &[Piece], esc: &impl Fn(&str) -> String) -> String {
             Piece::Cut { kind, length } => mark(kind, *length),
         })
         .collect()
-}
-
-/// The text as `Text::said` writes it, unit by unit, to `take` until it says stop: a mark, or
-/// one character of a source's text, a backslash or a hidden one as `\u{…}`.
-fn units(pieces: &[Piece], mut take: impl FnMut(&str) -> bool) {
-    let mut unit = String::new();
-    for p in pieces {
-        match p {
-            Piece::Text(t) | Piece::Quoted(t) => {
-                for c in t.chars() {
-                    unit.clear();
-                    if c == '\\' || crate::icu::hidden(c) {
-                        unit.extend(c.escape_unicode());
-                    } else {
-                        unit.push(c);
-                    }
-                    if !take(&unit) {
-                        return;
-                    }
-                }
-            }
-            Piece::Cut { kind, length } => {
-                if !take(&mark(kind, *length)) {
-                    return;
-                }
-            }
-        }
-    }
 }
 
 fn text_pieces(s: &str) -> Vec<Piece> {
@@ -446,30 +500,40 @@ fn cut_exempting(set: Option<&Set>, args: Vec<Vec<Piece>>, exempt: bool) -> Vec<
         .flatten()
         .map(|p| match p {
             Piece::Text(t) | Piece::Quoted(t) => t.len(),
-            Piece::Cut { kind, length } => mark(kind, *length).len(),
+            Piece::Cut { kind, length } => mark_len(kind, *length),
         })
         .sum::<usize>()
         + args.len().saturating_sub(1);
     if length > LINE_CAP {
         return whole(&args, TOO_LONG);
     }
-    let args: Vec<Vec<Piece>> = args
-        .into_iter()
-        .map(|pieces| {
-            pieces
-                .into_iter()
-                .flat_map(|p| match p {
-                    Piece::Text(t) if exempt => set.quoted(&t),
-                    other => vec![other],
-                })
-                .collect()
-        })
-        .collect();
+    let has_exempt_hint = exempt
+        && args.iter().flatten().any(|p| match p {
+            Piece::Text(t) => t.contains("\\cut{") || t.contains("\"kind\""),
+            _ => false,
+        });
+    let args: Vec<Vec<Piece>> = if has_exempt_hint {
+        args.into_iter()
+            .map(|pieces| {
+                pieces
+                    .into_iter()
+                    .flat_map(|p| match p {
+                        Piece::Text(t) if t.contains("\\cut{") || t.contains("\"kind\"") => {
+                            set.quoted(&t)
+                        }
+                        other => vec![other],
+                    })
+                    .collect()
+            })
+            .collect()
+    } else {
+        args
+    };
     // The line the patterns read: the arguments joined by single spaces, as `CommandLine` is,
     // with each mark written out. A span is cut only where it covers text.
-    let mut line = String::new();
-    let mut texts: Vec<Placed> = Vec::new();
-    let mut bounds = Vec::new();
+    let mut line = String::with_capacity(length);
+    let mut texts: Vec<Placed> = Vec::with_capacity(args.len());
+    let mut bounds = Vec::with_capacity(args.len());
     let mut marks = Vec::new();
     for (argument, pieces) in args.iter().enumerate() {
         if argument > 0 {
@@ -489,7 +553,7 @@ fn cut_exempting(set: Option<&Set>, args: Vec<Vec<Piece>>, exempt: bool) -> Vec<
                     line.push_str(t);
                 }
                 Piece::Cut { kind, length } => {
-                    line.push_str(&mark(kind, *length));
+                    let _ = write!(line, "\\cut{{{kind} {length}}}");
                     marks.push((at, line.len()));
                 }
                 Piece::Quoted(t) => {
@@ -504,32 +568,39 @@ fn cut_exempting(set: Option<&Set>, args: Vec<Vec<Piece>>, exempt: bool) -> Vec<
     // An exemption, a mark or a kind in a list of cuts, covers only its own bytes: the patterns
     // read every other byte as they would with it inert, a boundary and nothing at all, and the
     // cuts of both readings are taken. Its own text is never read.
-    let mut spans = Vec::new();
-    let mut spaced = line.clone().into_bytes();
-    let mut gone = String::with_capacity(line.len());
-    let mut at = Vec::with_capacity(line.len() + 1);
-    let mut from = 0;
-    for &(s, e) in &marks {
-        spaced[s..e].fill(b' ');
-        gone.push_str(&line[from..s]);
-        at.extend(from..s);
-        from = e;
-    }
-    gone.push_str(&line[from..]);
-    at.extend(from..=line.len());
-    let spaced = String::from_utf8(spaced).expect("only ASCII bytes were replaced");
-    spans.extend(set.spans(&spaced, &words, |i| i, Some(&marks)));
-    if !marks.is_empty() {
+    let mut spans = if marks.is_empty() {
+        set.spans(&line, &words, |i| i, Some(&marks))
+    } else {
+        let mut spaced = line.clone().into_bytes();
+        let mut gone = String::with_capacity(line.len());
+        let mut at = Vec::with_capacity(line.len() + 1);
+        let mut from = 0;
+        for &(s, e) in &marks {
+            spaced[s..e].fill(b' ');
+            gone.push_str(&line[from..s]);
+            at.extend(from..s);
+            from = e;
+        }
+        gone.push_str(&line[from..]);
+        at.extend(from..=line.len());
+        let spaced = String::from_utf8(spaced).expect("only ASCII bytes were replaced");
+        let mut spans = set.spans(&spaced, &words, |i| i, Some(&marks));
         spans.extend(set.spans(&gone, &words, |i| at[i], None));
-    }
+        spans
+    };
     spans.extend(set.flag_values(&words));
-    // A value that is a mark, with only quotes and punctuation around it, is already cut; one
-    // with anything else beside it in its word is cut as it is.
-    spans.retain(|&(s, e, _)| !already_cut(&line, &marks, s, e));
+    if !marks.is_empty() {
+        // A value that is a mark, with only quotes and punctuation around it, is already cut; one
+        // with anything else beside it in its word is cut as it is.
+        spans.retain(|&(s, e, _)| !already_cut(&line, &marks, s, e));
+    }
+    if spans.is_empty() {
+        return args;
+    }
     // Overlapping spans are one cut, of the kind of the one that begins first; of two that begin
     // together, the one found first.
     spans.sort_by_key(|s| s.0);
-    let mut merged: Vec<(usize, usize, String)> = Vec::new();
+    let mut merged: Vec<(usize, usize, String)> = Vec::with_capacity(spans.len());
     for (s, e, kind) in spans {
         match merged.last_mut() {
             Some(last) if s < last.1 => last.1 = last.1.max(e),
@@ -538,12 +609,15 @@ fn cut_exempting(set: Option<&Set>, args: Vec<Vec<Piece>>, exempt: bool) -> Vec<
     }
     // Each span cut out of each piece of text it covers, so a cut never crosses an argument or
     // a mark.
-    let mut out: Vec<Vec<Piece>> = args.clone();
+    let mut out: Vec<Vec<Piece>> = args;
     for t in texts.iter().rev() {
-        let mut pieces = Vec::new();
-        let mut at = t.start;
         // The spans are apart and in order: those that reach into this piece.
         let first = merged.partition_point(|m| m.1 <= t.start);
+        if merged.get(first).is_none_or(|m| m.0 >= t.end) {
+            continue;
+        }
+        let mut pieces = Vec::new();
+        let mut at = t.start;
         for (s, e, kind) in merged[first..].iter().take_while(|m| m.0 < t.end) {
             let (s, e) = ((*s).max(t.start), (*e).min(t.end));
             if s > at {
@@ -593,6 +667,9 @@ struct Allow {
     /// The stopwords, lowercased, as one automaton: `generic-api-key` has 1,445 of them, and
     /// checked one by one for every match they made a line packed with matches slow.
     stopwords: Option<AhoCorasick>,
+    /// When every stopword is ASCII, the automaton is built ASCII case-insensitive so ASCII
+    /// secrets are checked directly without allocating a lowercased copy.
+    stopwords_ascii: bool,
     /// It also names paths or commits, which an `AND` allowlist then never meets.
     other: bool,
 }
@@ -606,8 +683,6 @@ enum Target {
 struct Rule {
     kind: String,
     re: Regex,
-    /// Indexes into the gate's keywords; none means the rule always runs.
-    keywords: Vec<usize>,
     entropy: f64,
     group: usize,
     allows: Vec<Allow>,
@@ -618,33 +693,45 @@ struct Rule {
     value_follows: bool,
 }
 
-/// A word for a flag's name, Datadog's form: `*` stands for any run of characters. Words and
-/// names are compared lowercased, with `-` and `.` read as `_`. A word without `*` is a whole name
-/// or the last `_`-separated part of one, so `token` names `GITHUB_TOKEN` and not
-/// `--token-count`.
-struct Word(String);
+/// A wildcard word for a flag's name, Datadog's form: `*` stands for any run of characters.
+/// Words and names are compared lowercased, with `-` and `.` read as `_`. Exact words and
+/// simple `*needle*` words are indexed directly on `Set`; only general multi-wildcard patterns
+/// live here.
+struct WildcardWord {
+    first: String,
+    middle: Vec<String>,
+    last: String,
+}
 
 /// A name as it is compared with the words.
 fn plain_name(name: &str) -> String {
-    name.to_ascii_lowercase().replace(['-', '.'], "_")
+    let mut out = String::with_capacity(name.len());
+    plain_name_into(name, &mut out);
+    out
 }
 
-impl Word {
+fn plain_name_into(name: &str, out: &mut String) {
+    out.clear();
+    for b in name.bytes() {
+        let c = match b {
+            b'-' | b'.' => b'_',
+            _ => b.to_ascii_lowercase(),
+        };
+        out.push(c as char);
+    }
+}
+
+impl WildcardWord {
     fn matches(&self, name: &str) -> bool {
-        let parts: Vec<&str> = self.0.split('*').collect();
-        if parts.len() == 1 {
-            return name == self.0 || name.rsplit('_').next() == Some(self.0.as_str());
-        }
-        let (first, last) = (parts[0], parts[parts.len() - 1]);
-        if !name.starts_with(first)
-            || !name.ends_with(last)
-            || name.len() < first.len() + last.len()
+        if !name.starts_with(&self.first)
+            || !name.ends_with(&self.last)
+            || name.len() < self.first.len() + self.last.len()
         {
             return false;
         }
-        let mut rest = &name[first.len()..name.len() - last.len()];
-        for part in &parts[1..parts.len() - 1] {
-            match rest.find(part) {
+        let mut rest = &name[self.first.len()..name.len() - self.last.len()];
+        for part in &self.middle {
+            match rest.find(part.as_str()) {
                 Some(at) => rest = &rest[at + part.len()..],
                 None => return false,
             }
@@ -653,12 +740,80 @@ impl Word {
     }
 }
 
+/// Fixed-capacity stack bitset for up to 512 entries (the shipped set has ~220 rules and ~250
+/// keywords), falling back to the heap only if a larger set is loaded.
+enum Bits {
+    Inline([u64; 8]),
+    Heap(Vec<u64>),
+}
+
+impl Bits {
+    fn new(len: usize) -> Bits {
+        let words = len.div_ceil(64);
+        if words <= 8 {
+            Bits::Inline([0; 8])
+        } else {
+            Bits::Heap(vec![0; words])
+        }
+    }
+
+    fn as_slice(&self) -> &[u64] {
+        match self {
+            Bits::Inline(a) => a,
+            Bits::Heap(v) => v,
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u64] {
+        match self {
+            Bits::Inline(a) => a,
+            Bits::Heap(v) => v,
+        }
+    }
+
+    /// Sets bit `i`, returning `true` if it was not already set.
+    fn insert(&mut self, i: usize) -> bool {
+        let slot = &mut self.as_mut_slice()[i / 64];
+        let mask = 1u64 << (i % 64);
+        let fresh = *slot & mask == 0;
+        *slot |= mask;
+        fresh
+    }
+
+    fn set(&mut self, i: usize) {
+        self.as_mut_slice()[i / 64] |= 1u64 << (i % 64);
+    }
+
+    fn for_each(&self, mut f: impl FnMut(usize)) {
+        for (w, &bits) in self.as_slice().iter().enumerate() {
+            let mut b = bits;
+            let base = w * 64;
+            while b != 0 {
+                let tz = b.trailing_zeros() as usize;
+                f(base + tz);
+                b &= b - 1;
+            }
+        }
+    }
+}
+
 /// The patterns, loaded once.
 pub struct Set {
     rules: Vec<Rule>,
+    /// Rules triggered by each gate keyword, indexed by keyword pattern id.
+    by_keyword: Vec<Vec<usize>>,
+    /// Rules with no keywords, which always run.
+    always_rules: Vec<usize>,
+    /// Every kind this set cuts by, for O(1) exemption checks.
+    known_kinds: HashSet<String>,
     global: Vec<Allow>,
     gate: AhoCorasick,
-    words: Vec<Word>,
+    /// Exact flag words (no `*`), checked against the whole name or its last `_`-part.
+    exact_words: HashSet<String>,
+    /// Simple `*needle*` flag words, checked in one pass.
+    contains_words: Option<AhoCorasick>,
+    /// Any other wildcard flag words.
+    wildcard_words: Vec<WildcardWord>,
     /// gitleaks's rules evaluated, and those bound to a file path, which never apply here. The
     /// tests pin both.
     #[allow(dead_code)]
@@ -769,15 +924,16 @@ impl Set {
         let g: Value = serde_json::from_str(gitleaks).map_err(|e| format!("gitleaks.json: {e}"))?;
         keys(&g, &["global", "rules"], "gitleaks.json")?;
         let mut keywords: Vec<String> = Vec::new();
+        let mut keyword_index: HashMap<String, usize> = HashMap::new();
         // The gate ignores case, as gitleaks's lowercased prefilter does.
         let mut keyword = |k: String| -> usize {
-            match keywords.iter().position(|x| *x == k) {
-                Some(i) => i,
-                None => {
-                    keywords.push(k);
-                    keywords.len() - 1
-                }
+            if let Some(&i) = keyword_index.get(&k) {
+                return i;
             }
+            let i = keywords.len();
+            keyword_index.insert(k.clone(), i);
+            keywords.push(k);
+            i
         };
         let mut dropped = 0;
         let mut allow = |v: &Value, what: &str| -> Result<Allow, String> {
@@ -805,6 +961,7 @@ impl Set {
                 .iter()
                 .map(|w| w.to_lowercase())
                 .collect();
+            let stopwords_ascii = stopwords.iter().all(|w| w.is_ascii());
             Ok(Allow {
                 target,
                 and,
@@ -812,15 +969,19 @@ impl Set {
                 stopwords: match stopwords.is_empty() {
                     true => None,
                     false => Some(
-                        AhoCorasick::new(&stopwords)
+                        AhoCorasick::builder()
+                            .ascii_case_insensitive(stopwords_ascii)
+                            .build(&stopwords)
                             .map_err(|e| format!("{what} has stopwords that do not build: {e}"))?,
                     ),
                 },
+                stopwords_ascii,
                 other: !v["paths"].is_null() || !v["commits"].is_null(),
             })
         };
         let global = vec![allow(&g["global"], "the global allowlist")?];
         let mut rules = Vec::new();
+        let mut rule_keywords: Vec<Vec<usize>> = Vec::new();
         let mut file_bound = 0;
         for r in g["rules"].as_array().ok_or("gitleaks.json has no rules")? {
             let id = r["id"].as_str().ok_or("a rule without an id")?;
@@ -850,13 +1011,15 @@ impl Set {
                     .ok_or(format!("{id} has a secretGroup that is not a number"))?
                     as usize,
             };
-            rules.push(Rule {
-                kind: format!("gitleaks:{id}"),
-                re,
-                keywords: strings(&r["keywords"], id)?
+            rule_keywords.push(
+                strings(&r["keywords"], id)?
                     .into_iter()
                     .map(&mut keyword)
                     .collect(),
+            );
+            rules.push(Rule {
+                kind: format!("gitleaks:{id}"),
+                re,
                 entropy,
                 group,
                 allows,
@@ -868,16 +1031,47 @@ impl Set {
         let c: Value =
             serde_json::from_str(command_line).map_err(|e| format!("command-line.json: {e}"))?;
         keys(&c, &["about", "flag_words", "rules"], "command-line.json")?;
-        let mut words = Vec::new();
+        let mut exact_words = HashSet::new();
+        let mut contains_needles = Vec::new();
+        let mut wildcard_words = Vec::new();
         for list in c["flag_words"]
             .as_array()
             .ok_or("command-line.json has no flag_words")?
         {
             keys(list, &["source", "words"], "a list of flag words")?;
             for w in strings(&list["words"], "flag words")? {
-                words.push(Word(plain_name(&w)));
+                let norm = plain_name(&w);
+                let parts: Vec<&str> = norm.split('*').collect();
+                if parts.len() == 1 {
+                    exact_words.insert(norm);
+                } else if parts.len() == 3
+                    && parts[0].is_empty()
+                    && parts[2].is_empty()
+                    && !parts[1].is_empty()
+                {
+                    contains_needles.push(parts[1].to_string());
+                } else {
+                    wildcard_words.push(WildcardWord {
+                        first: parts[0].to_string(),
+                        middle: parts[1..parts.len() - 1]
+                            .iter()
+                            .map(|p| (*p).to_string())
+                            .collect(),
+                        last: parts[parts.len() - 1].to_string(),
+                    });
+                }
             }
         }
+        let contains_words = if contains_needles.is_empty() {
+            None
+        } else {
+            Some(
+                AhoCorasick::builder()
+                    .kind(Some(AhoCorasickKind::DFA))
+                    .build(&contains_needles)
+                    .map_err(|e| format!("flag words: {e}"))?,
+            )
+        };
         for r in c["rules"]
             .as_array()
             .ok_or("command-line.json has no rules")?
@@ -891,13 +1085,15 @@ impl Set {
                     "{kind} has a value_follows that is not true or false"
                 ))?,
             };
-            rules.push(Rule {
-                kind: kind.to_string(),
-                re: compile(rx).map_err(|e| format!("{kind} does not compile: {e}"))?,
-                keywords: strings(&r["keywords"], kind)?
+            rule_keywords.push(
+                strings(&r["keywords"], kind)?
                     .into_iter()
                     .map(&mut keyword)
                     .collect(),
+            );
+            rules.push(Rule {
+                kind: kind.to_string(),
+                re: compile(rx).map_err(|e| format!("{kind} does not compile: {e}"))?,
                 entropy: 0.0,
                 group: 0,
                 allows: Vec::new(),
@@ -905,15 +1101,40 @@ impl Set {
                 value_follows,
             });
         }
+        let mut by_keyword: Vec<Vec<usize>> = vec![Vec::new(); keywords.len()];
+        let mut always_rules = Vec::new();
+        for (rule_idx, kws) in rule_keywords.into_iter().enumerate() {
+            if kws.is_empty() {
+                always_rules.push(rule_idx);
+            } else {
+                for kw in kws {
+                    if by_keyword[kw].last() != Some(&rule_idx) {
+                        by_keyword[kw].push(rule_idx);
+                    }
+                }
+            }
+        }
+        let mut known_kinds: HashSet<String> = [FLAG_VALUE, TOO_LONG, NO_PATTERNS]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for r in &rules {
+            known_kinds.insert(r.kind.clone());
+        }
         let gate = AhoCorasick::builder()
             .ascii_case_insensitive(true)
             .build(&keywords)
             .map_err(|e| format!("the keywords: {e}"))?;
         Ok(Set {
             rules,
+            by_keyword,
+            always_rules,
+            known_kinds,
             global,
             gate,
-            words,
+            exact_words,
+            contains_words,
+            wildcard_words,
             evaluated,
             file_bound,
             allowlists_dropped: dropped,
@@ -938,8 +1159,19 @@ impl Set {
 
     /// Whether this set cuts by `kind`: a pattern's, or one of the core's own.
     fn knows(&self, kind: &str) -> bool {
-        [FLAG_VALUE, TOO_LONG, NO_PATTERNS].contains(&kind)
-            || self.rules.iter().any(|r| r.kind == kind)
+        self.known_kinds.contains(kind)
+    }
+
+    fn matches_word(&self, name: &str) -> bool {
+        self.exact_words.contains(name)
+            || name
+                .rsplit_once('_')
+                .is_some_and(|(_, tail)| self.exact_words.contains(tail))
+            || self
+                .contains_words
+                .as_ref()
+                .is_some_and(|ac| ac.is_match(name))
+            || self.wildcard_words.iter().any(|w| w.matches(name))
     }
 
     /// A source's text as pieces, each exemption apart: a well-formed mark of a kind this set
@@ -948,22 +1180,32 @@ impl Set {
     /// text. A mark of another kind, and a kind in any other place, is text read as any other
     /// text is: its kind could be a secret, and `<kind>=<value>` is a name and its value.
     fn quoted(&self, s: &str) -> Vec<Piece> {
-        let mut exempt: Vec<(usize, usize)> = marks(s)
-            .into_iter()
-            .filter(|(_, _, kind, _)| self.knows(kind))
-            .map(|(start, end, ..)| {
-                let doubled = s[..start].ends_with('\\');
-                (start - usize::from(doubled), end)
-            })
-            .collect();
-        static LISTED: OnceLock<Regex> = OnceLock::new();
-        let listed = LISTED
-            .get_or_init(|| compile(r#""kind"\s*:\s*"([a-z0-9:._-]+)""#).expect("a fixed pattern"));
-        for c in listed.captures_iter(s.as_bytes()) {
-            let kind = c.get(1).expect("the group of the kind");
-            if self.knows(&s[kind.start()..kind.end()]) {
-                exempt.push((kind.start(), kind.end()));
+        let mut exempt: Vec<(usize, usize)> = if s.contains("\\cut{") {
+            marks(s)
+                .into_iter()
+                .filter(|(_, _, kind, _)| self.knows(kind))
+                .map(|(start, end, ..)| {
+                    let doubled = s[..start].ends_with('\\');
+                    (start - usize::from(doubled), end)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if s.contains("\"kind\"") {
+            static LISTED: OnceLock<Regex> = OnceLock::new();
+            let listed = LISTED.get_or_init(|| {
+                compile(r#""kind"\s*:\s*"([a-z0-9:._-]+)""#).expect("a fixed pattern")
+            });
+            for c in listed.captures_iter(s.as_bytes()) {
+                let kind = c.get(1).expect("the group of the kind");
+                if self.knows(&s[kind.start()..kind.end()]) {
+                    exempt.push((kind.start(), kind.end()));
+                }
             }
+        }
+        if exempt.is_empty() {
+            return text_pieces(s);
         }
         exempt.sort_unstable();
         let mut out = Vec::new();
@@ -989,31 +1231,38 @@ impl Set {
     fn spans(
         &self,
         line: &str,
-        words: &Words,
+        words: &Words<'_>,
         at: impl Fn(usize) -> usize,
         inert: Option<&[(usize, usize)]>,
     ) -> Vec<(usize, usize, String)> {
         let place = |s: usize, e: usize| (at(s), at(e));
         let bytes = line.as_bytes();
-        let found: BTreeSet<usize> = self
-            .gate
-            .find_overlapping_iter(bytes)
-            .map(|m| m.pattern().as_usize())
-            .collect();
-        let breaks: Vec<usize> = line
-            .bytes()
-            .enumerate()
-            .filter(|(_, b)| *b == b'\n')
-            .map(|(i, _)| i)
-            .collect();
-        let mut out = Vec::new();
-        for r in &self.rules {
-            if !r.keywords.is_empty() && !r.keywords.iter().any(|k| found.contains(k)) {
-                continue;
+        let mut active = Bits::new(self.rules.len());
+        let mut any_active = false;
+        for &r_idx in &self.always_rules {
+            active.set(r_idx);
+            any_active = true;
+        }
+        let mut seen_kw = Bits::new(self.by_keyword.len());
+        for m in self.gate.find_overlapping_iter(bytes) {
+            let kw = m.pattern().as_usize();
+            if seen_kw.insert(kw) {
+                for &r_idx in &self.by_keyword[kw] {
+                    active.set(r_idx);
+                    any_active = true;
+                }
             }
+        }
+        if !any_active {
+            return Vec::new();
+        }
+        let mut breaks: Option<Vec<usize>> = None;
+        let mut out = Vec::new();
+        active.for_each(|r_idx| {
+            let r = &self.rules[r_idx];
             if r.value_follows {
                 let Some(inert) = inert else {
-                    continue;
+                    return;
                 };
                 // The value begins where the match ends, in the argument it begins in; its key
                 // is the group `key`, or the whole match.
@@ -1033,8 +1282,9 @@ impl Set {
                         out.push((vs, ve, r.kind.clone()));
                     }
                 }
-                continue;
+                return;
             }
+            let mut locs = (r.re.captures_len() >= 2).then(|| r.re.capture_locations());
             for m in r.re.find_iter(bytes) {
                 // gitleaks trims newlines off a match.
                 let raw = &bytes[m.start()..m.end()];
@@ -1051,35 +1301,56 @@ impl Set {
                 let matched = &line[ms..me];
                 // The secret: the rule's secret group, or else its first non-empty group, as
                 // the regular expression gives them over the match alone; else the match.
-                let (ss, se) = match r.re.captures(matched.as_bytes()) {
-                    Some(c) if c.len() >= 2 => {
+                let (ss, se) = if let Some(locs) = locs.as_mut() {
+                    if r.re.captures_read(locs, matched.as_bytes()).is_some() {
                         let g = if r.group > 0 {
-                            c.get(r.group)
+                            locs.get(r.group)
                         } else {
-                            (1..c.len())
-                                .filter_map(|i| c.get(i))
-                                .find(|g| !g.is_empty())
+                            (1..locs.len())
+                                .filter_map(|i| locs.get(i))
+                                .find(|&(s, e)| s < e)
                         };
-                        match g.filter(|g| !g.is_empty()) {
-                            Some(g) => (floor(line, ms + g.start()), ceil(line, ms + g.end())),
+                        match g.filter(|&(s, e)| s < e) {
+                            Some((gs, ge)) => (floor(line, ms + gs), ceil(line, ms + ge)),
                             None => (ms, me),
                         }
+                    } else {
+                        (ms, me)
                     }
-                    _ => (ms, me),
+                } else {
+                    (ms, me)
                 };
                 let secret = &line[ss..se];
                 if r.entropy != 0.0 && entropy(secret) <= r.entropy {
                     continue;
                 }
-                let around = line_of(line, &breaks, ms, me);
-                let allowed = |a: &Allow| allowed(a, secret, matched, around);
-                if (r.gitleaks && self.global.iter().any(allowed)) || r.allows.iter().any(allowed) {
+                let mut around: Option<&str> = None;
+                let mut is_allowed = |a: &Allow| {
+                    let target_line = if matches!(a.target, Target::Line) {
+                        *around.get_or_insert_with(|| {
+                            let br = breaks.get_or_insert_with(|| {
+                                line.bytes()
+                                    .enumerate()
+                                    .filter(|(_, b)| *b == b'\n')
+                                    .map(|(i, _)| i)
+                                    .collect()
+                            });
+                            line_of(line, br, ms, me)
+                        })
+                    } else {
+                        ""
+                    };
+                    allowed(a, secret, matched, target_line)
+                };
+                if (r.gitleaks && self.global.iter().any(&mut is_allowed))
+                    || r.allows.iter().any(&mut is_allowed)
+                {
                     continue;
                 }
                 let (ss, se) = place(ss, se);
                 out.push((ss, se, r.kind.clone()));
             }
-        }
+        });
         out
     }
 
@@ -1092,14 +1363,15 @@ impl Set {
     /// (`find-generic-password`) is never one. After a flag with no `=` or `:`, a word that
     /// begins with `-` is the next flag, never a value; after `=` or `:` the value is taken
     /// whatever it begins with. Where each value ends is `value_end`'s.
-    fn flag_values(&self, words: &Words) -> Vec<(usize, usize, String)> {
+    fn flag_values(&self, words: &Words<'_>) -> Vec<(usize, usize, String)> {
         let mut out = Vec::new();
-        let named = |name: &str| {
+        let mut name_buf = String::new();
+        let mut named = |name: &str| {
             name.bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || b == b'.')
                 && {
-                    let name = plain_name(name);
-                    self.words.iter().any(|w| w.matches(&name))
+                    plain_name_into(name, &mut name_buf);
+                    self.matches_word(&name_buf)
                 }
         };
         // A value is the text after `vs`; `dash` says whether, unquoted, it begins with `-`.
@@ -1113,15 +1385,17 @@ impl Set {
         };
         for (i, list) in words.words.iter().enumerate() {
             for (t, w) in list.iter().enumerate() {
-                let text = w.text.as_str();
+                let text = w.text.as_ref();
                 let bare = text.trim_start_matches('-');
                 let from = text.len() - bare.len();
                 let mut name = from;
+                let mut has_delim = false;
                 for (p, b) in text.bytes().enumerate().skip(from) {
                     match b {
                         b'=' | b':' => {
+                            has_delim = true;
                             if named(&text[name..p]) {
-                                let vs = w.at.get(p).map_or(w.end, |at| at + 1);
+                                let vs = w.at_pos(p).map_or(w.end, |at| at + 1);
                                 value(i, w.start, vs, false);
                             }
                             name = p + 1;
@@ -1130,7 +1404,7 @@ impl Set {
                         _ => {}
                     }
                 }
-                if from > 0 && !bare.contains(['=', ':']) && named(bare) {
+                if from > 0 && !has_delim && named(bare) {
                     match list.get(t + 1) {
                         Some(n) => value(i, w.start, n.start, n.text.starts_with('-')),
                         None => {
@@ -1146,25 +1420,78 @@ impl Set {
     }
 }
 
+enum WordAt {
+    Contiguous,
+    Offsets(Vec<usize>),
+}
+
 /// One word of an argument as a shell reads it: where it begins and ends in the line, its text
 /// with the quotes and escapes taken off, and where in the line each byte of that text is.
-struct Word2 {
+struct Word2<'a> {
     start: usize,
     end: usize,
-    text: String,
-    at: Vec<usize>,
+    text: Cow<'a, str>,
+    at: WordAt,
+}
+
+impl Word2<'_> {
+    fn at_pos(&self, p: usize) -> Option<usize> {
+        match &self.at {
+            WordAt::Contiguous => (p < self.text.len()).then_some(self.start + p),
+            WordAt::Offsets(v) => v.get(p).copied(),
+        }
+    }
+}
+
+enum BuildingWord {
+    Clean(usize),
+    Owned(usize, Vec<u8>, Vec<usize>),
+}
+
+impl BuildingWord {
+    fn start(&self) -> usize {
+        match self {
+            BuildingWord::Clean(s) | BuildingWord::Owned(s, _, _) => *s,
+        }
+    }
+
+    fn make_owned(&mut self, bytes: &[u8], up_to: usize) -> (&mut Vec<u8>, &mut Vec<usize>) {
+        if let BuildingWord::Clean(s) = *self {
+            *self = BuildingWord::Owned(s, bytes[s..up_to].to_vec(), (s..up_to).collect());
+        }
+        match self {
+            BuildingWord::Owned(_, b, at) => (b, at),
+            BuildingWord::Clean(_) => unreachable!(),
+        }
+    }
+
+    fn finish<'a>(self, line: &'a str, end: usize) -> Word2<'a> {
+        match self {
+            BuildingWord::Clean(start) => Word2 {
+                start,
+                end,
+                text: Cow::Borrowed(&line[start..end]),
+                at: WordAt::Contiguous,
+            },
+            BuildingWord::Owned(start, bytes, at) => Word2 {
+                start,
+                end,
+                text: Cow::Owned(String::from_utf8_lossy(&bytes).into_owned()),
+                at: WordAt::Offsets(at),
+            },
+        }
+    }
 }
 
 /// The words of each argument of a line, read once, so that names and values come from the
 /// same reading and where a value ends is the one decision `Words::value_end` makes, for every
 /// form of the core's own, at the cost of a lookup.
-struct Words {
-    bounds: Vec<(usize, usize)>,
+struct Words<'a> {
+    bounds: &'a [(usize, usize)],
     /// The words of each argument.
-    words: Vec<Vec<Word2>>,
-    /// For each byte of the line, where the shell word it is in ends: the end of its argument
-    /// from where the reading stopped following the shell.
-    end: Vec<usize>,
+    words: Vec<Vec<Word2<'a>>>,
+    /// Sorted byte offsets of unquoted whitespace before each argument's `stop` point.
+    boundaries: Vec<usize>,
     /// For each argument, where its first whitespace is, or its end.
     space: Vec<usize>,
 }
@@ -1177,22 +1504,24 @@ struct Words {
 /// ordinary word, a here-document's body is input and no value, and a brace expansion keeps its
 /// spaces quoted or escaped.
 fn unfollowed(rest: &[u8]) -> bool {
-    rest.first() == Some(&b'`')
-        || [b"$(", b"${", b"$[", b"$'", b"<(", b">("]
-            .iter()
-            .any(|s| rest.starts_with(*s))
+    match rest.first() {
+        Some(b'`') => true,
+        Some(b'$') => matches!(rest.get(1), Some(b'(' | b'{' | b'[' | b'\'')),
+        Some(b'<' | b'>') => matches!(rest.get(1), Some(b'(')),
+        _ => false,
+    }
 }
 
-impl Words {
+impl<'a> Words<'a> {
     /// Each argument read from its start as a shell reads a word: quotes and backslash escapes
     /// followed. From the first thing it cannot follow (`unfollowed`), no word ends before the
     /// argument does, and the rest is split at whitespace only, so the names in it are still
     /// found and each of their values runs to the end of the argument. A mark, the core's or one
     /// a source quoted, at `marks`, is one piece of a word that adds nothing to its text: a value
     /// already cut, never part of a name.
-    fn new(line: &str, bounds: &[(usize, usize)], marks: &[(usize, usize)]) -> Words {
+    fn new(line: &'a str, bounds: &'a [(usize, usize)], marks: &[(usize, usize)]) -> Words<'a> {
         let b = line.as_bytes();
-        let mut end = vec![line.len(); line.len() + 1];
+        let mut boundaries = Vec::new();
         let mut space = Vec::with_capacity(bounds.len());
         let mut all = Vec::with_capacity(bounds.len());
         for &(a0, a1) in bounds {
@@ -1202,25 +1531,26 @@ impl Words {
                     .position(u8::is_ascii_whitespace)
                     .map_or(a1, |p| a0 + p),
             );
-            let mut list: Vec<Word2> = Vec::new();
-            // The word being read: its start, its text's bytes and where each is.
-            let mut cur: Option<(usize, Vec<u8>, Vec<usize>)> = None;
-            let mut boundary = vec![false; a1 - a0];
+            let mut list: Vec<Word2<'a>> = Vec::new();
+            let mut cur: Option<BuildingWord> = None;
             let mut quote: Option<u8> = None;
             let mut stop = a1;
             let mut i = a0;
             while i < a1 {
                 let c = b[i];
                 if quote.is_none() && c.is_ascii_whitespace() {
-                    boundary[i - a0] = true;
+                    boundaries.push(i);
                     if let Some(w) = cur.take() {
-                        list.push(word(w, i));
+                        list.push(w.finish(line, i));
                     }
                     i += 1;
                     continue;
                 }
-                let w = cur.get_or_insert_with(|| (i, Vec::new(), Vec::new()));
-                if let Ok(m) = marks.binary_search_by_key(&i, |m| m.0) {
+                let w = cur.get_or_insert(BuildingWord::Clean(i));
+                if !marks.is_empty()
+                    && let Ok(m) = marks.binary_search_by_key(&i, |m| m.0)
+                {
+                    let _ = w.make_owned(b, i);
                     i = marks[m].1;
                     continue;
                 }
@@ -1231,8 +1561,9 @@ impl Words {
                 match (quote, c) {
                     (None | Some(b'"'), b'\\') => match b.get(i + 1).filter(|_| i + 1 < a1) {
                         Some(&n) if n.is_ascii_whitespace() || b"'\"\\$`".contains(&n) => {
-                            w.1.push(n);
-                            w.2.push(i + 1);
+                            let (wb, wat) = w.make_owned(b, i);
+                            wb.push(n);
+                            wat.push(i + 1);
                             i += 1;
                         }
                         _ => {
@@ -1240,11 +1571,19 @@ impl Words {
                             break;
                         }
                     },
-                    (None, b'\'' | b'"') => quote = Some(c),
-                    (Some(q), c) if c == q => quote = None,
+                    (None, b'\'' | b'"') => {
+                        let _ = w.make_owned(b, i);
+                        quote = Some(c);
+                    }
+                    (Some(q), c) if c == q => {
+                        let _ = w.make_owned(b, i);
+                        quote = None;
+                    }
                     _ => {
-                        w.1.push(c);
-                        w.2.push(i);
+                        if let BuildingWord::Owned(_, wb, wat) = w {
+                            wb.push(c);
+                            wat.push(i);
+                        }
                     }
                 }
                 i += 1;
@@ -1253,7 +1592,7 @@ impl Words {
                 // A quote never closed is not followed either: the word it is in is read again
                 // from its start as what follows is.
                 if let Some(w) = cur.take() {
-                    stop = w.0;
+                    stop = w.start();
                 }
             }
             // From `stop`, words are split at whitespace only, the one being read continued, and
@@ -1262,37 +1601,35 @@ impl Words {
             while j < a1 {
                 if b[j].is_ascii_whitespace() {
                     if let Some(w) = cur.take() {
-                        list.push(word(w, j));
+                        list.push(w.finish(line, j));
                     }
                 } else {
-                    let w = cur.get_or_insert_with(|| (j, Vec::new(), Vec::new()));
-                    if let Ok(m) = marks.binary_search_by_key(&j, |m| m.0) {
+                    let w = cur.get_or_insert(BuildingWord::Clean(j));
+                    if !marks.is_empty()
+                        && let Ok(m) = marks.binary_search_by_key(&j, |m| m.0)
+                    {
+                        let _ = w.make_owned(b, j);
                         j = marks[m].1;
                         continue;
                     }
-                    if !b"'\"".contains(&b[j]) {
-                        w.1.push(b[j]);
-                        w.2.push(j);
+                    if b"'\"".contains(&b[j]) {
+                        let _ = w.make_owned(b, j);
+                    } else if let BuildingWord::Owned(_, wb, wat) = w {
+                        wb.push(b[j]);
+                        wat.push(j);
                     }
                 }
                 j += 1;
             }
             if let Some(w) = cur.take() {
-                list.push(word(w, a1));
-            }
-            let mut next = a1;
-            for i in (a0..a1).rev() {
-                if boundary[i - a0] {
-                    next = i;
-                }
-                end[i] = next;
+                list.push(w.finish(line, a1));
             }
             all.push(list);
         }
         Words {
-            bounds: bounds.to_vec(),
+            bounds,
             words: all,
-            end,
+            boundaries,
             space,
         }
     }
@@ -1304,11 +1641,16 @@ impl Words {
     /// value is one shell word, to the end of the argument where its quoting cannot be followed.
     /// When unsure, more is cut.
     fn value_end(&self, arg: usize, key: usize, vs: usize) -> usize {
-        let a1 = self.bounds[arg].1;
-        if key <= self.space[arg] {
+        let (a0, a1) = self.bounds[arg];
+        if key <= self.space[arg] || vs < a0 || vs >= a1 {
             return a1;
         }
-        self.end[vs].min(a1)
+        let idx = self.boundaries.partition_point(|&pos| pos < vs);
+        self.boundaries
+            .get(idx)
+            .copied()
+            .filter(|&pos| pos < a1)
+            .unwrap_or(a1)
     }
 }
 
@@ -1355,42 +1697,35 @@ const PLANTED: &[(&[&str], &str, &str)] = &[
     ),
 ];
 
-/// A word read, ending at `end`. Only ASCII quotes and backslashes are left out of its bytes, so
-/// they stay UTF-8.
-fn word((start, bytes, at): (usize, Vec<u8>, Vec<usize>), end: usize) -> Word2 {
-    Word2 {
-        start,
-        end,
-        text: String::from_utf8_lossy(&bytes).into_owned(),
-        at,
-    }
-}
-
 fn allowed(a: &Allow, secret: &str, matched: &str, line: &str) -> bool {
     let target = match a.target {
         Target::Secret => secret,
         Target::Match => matched,
         Target::Line => line,
     };
-    let by_regex = a.regexes.iter().any(|r| r.is_match(target.as_bytes()));
-    let by_word = a
-        .stopwords
-        .as_ref()
-        .is_some_and(|w| w.is_match(&secret.to_lowercase()));
+    let by_word = |w: &AhoCorasick| {
+        if a.stopwords_ascii && secret.is_ascii() {
+            w.is_match(secret.as_bytes())
+        } else {
+            w.is_match(secret.to_lowercase().as_bytes())
+        }
+    };
     if a.and {
-        let mut checks = Vec::new();
-        if !a.regexes.is_empty() {
-            checks.push(by_regex);
+        if a.other || (a.regexes.is_empty() && a.stopwords.is_none()) {
+            return false;
         }
-        if a.stopwords.is_some() {
-            checks.push(by_word);
+        if !a.regexes.is_empty() && !a.regexes.iter().any(|r| r.is_match(target.as_bytes())) {
+            return false;
         }
-        if a.other {
-            checks.push(false);
+        if let Some(w) = &a.stopwords
+            && !by_word(w)
+        {
+            return false;
         }
-        !checks.is_empty() && checks.iter().all(|c| *c)
+        true
     } else {
-        by_regex || by_word
+        a.regexes.iter().any(|r| r.is_match(target.as_bytes()))
+            || a.stopwords.as_ref().is_some_and(by_word)
     }
 }
 
@@ -1399,11 +1734,25 @@ fn entropy(s: &str) -> f64 {
     if s.is_empty() {
         return 0.0;
     }
+    let n = s.len() as f64;
+    if s.is_ascii() {
+        let mut counts = [0u32; 128];
+        for &b in s.as_bytes() {
+            counts[b as usize] += 1;
+        }
+        let mut sum = 0.0;
+        for c in counts {
+            if c > 0 {
+                let f = c as f64 / n;
+                sum -= f * f.log2();
+            }
+        }
+        return sum;
+    }
     let mut counts: std::collections::BTreeMap<char, usize> = Default::default();
     for c in s.chars() {
         *counts.entry(c).or_default() += 1;
     }
-    let n = s.len() as f64;
     counts
         .values()
         .map(|&c| {

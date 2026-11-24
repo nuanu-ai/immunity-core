@@ -98,7 +98,10 @@
 use crate::sigma::{Match, Meta, Rules, Subject};
 use crate::store::{Cause, Gap, Reading};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use serde::Deserialize;
+use serde::de::{self, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde_json::{Value, json};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
@@ -501,14 +504,14 @@ pub struct Users {
 
 /// How a Sigma field's value is taken from a program start; `None` leaves the field absent,
 /// and an absent field matches nothing.
-pub type Take = fn(&ProcessStart) -> Option<String>;
+pub type Take = for<'a> fn(&'a ProcessStart) -> Option<Cow<'a, str>>;
 
 /// The Sigma fields a program start gives the published rules, and how each is taken. Sigma's
 /// taxonomy names no macOS fields; these are the three of Windows' `process_creation` that
 /// `eslogger` can fill, as `docs/event-level.md` maps them. A field a rule names that
 /// is not here is one this level does not have, and `src/sigma.rs` names such rules.
 pub const SIGMA_FIELDS: [(&str, Take); 3] = [
-    ("Image", |s| Some(s.executable.clone())),
+    ("Image", |s| Some(Cow::Borrowed(s.executable.as_str()))),
     // The arguments joined by single spaces, the first included: Sigma's command lines on
     // other systems hold the program too. An argument with no characters adds nothing. An
     // argument holding a space is not quoted, as `eslogger` gives the arguments apart and no
@@ -523,7 +526,9 @@ pub const SIGMA_FIELDS: [(&str, Take); 3] = [
     // wrapper is not, though `ppid` is its pid. coreSigma's collector takes the parent the same
     // way. So a rule on `ParentImage` can miss a start one wrapper away from the parent it
     // names, and never sees a parent this field does not name.
-    ("ParentImage", |s| s.parent_executable.clone()),
+    ("ParentImage", |s| {
+        s.parent_executable.as_deref().map(Cow::Borrowed)
+    }),
 ];
 
 /// The command line a rule reads, `CommandLine` and `process.command_line` alike: the arguments
@@ -531,14 +536,30 @@ pub const SIGMA_FIELDS: [(&str, Take); 3] = [
 /// so a program run with an empty argument has no space in its line that no argument holds.
 /// An argument that ends in a space, or is only spaces, is kept as it is. This is Immunity
 /// Core's own choice; `process.args` keeps every argument.
-fn command_line(s: &ProcessStart) -> Option<String> {
-    let given: Vec<&str> = s
+fn command_line(s: &ProcessStart) -> Option<Cow<'_, str>> {
+    let mut non_empty = s.args.iter().map(String::as_str).filter(|a| !a.is_empty());
+    let Some(first) = non_empty.next() else {
+        return Some(Cow::Borrowed(""));
+    };
+    let Some(second) = non_empty.next() else {
+        return Some(Cow::Borrowed(first));
+    };
+    let cap: usize = s
         .args
         .iter()
-        .map(String::as_str)
         .filter(|a| !a.is_empty())
-        .collect();
-    Some(given.join(" "))
+        .map(|a| a.len() + 1)
+        .sum::<usize>()
+        .saturating_sub(1);
+    let mut out = String::with_capacity(cap);
+    out.push_str(first);
+    out.push(' ');
+    out.push_str(second);
+    for a in non_empty {
+        out.push(' ');
+        out.push_str(a);
+    }
+    Some(Cow::Owned(out))
 }
 
 /// The last component of a path, as Elastic's `process.name` and `file.name` give it.
@@ -565,11 +586,13 @@ fn extension(name: &str) -> Option<&str> {
 pub const ECS_FIELDS: [(&str, Take); 11] = [
     // What Elastic Defend writes for every program start on macOS, as Elastic's rules ask for
     // it: `event.type == "start" and event.action == "exec"`.
-    ("event.type", |_| Some("start".into())),
-    ("event.action", |_| Some("exec".into())),
-    ("process.executable", |s| Some(s.executable.clone())),
+    ("event.type", |_| Some(Cow::Borrowed("start"))),
+    ("event.action", |_| Some(Cow::Borrowed("exec"))),
+    ("process.executable", |s| {
+        Some(Cow::Borrowed(s.executable.as_str()))
+    }),
     ("process.name", |s| {
-        Some(basename(&s.executable).to_string())
+        Some(Cow::Borrowed(basename(&s.executable)))
     }),
     // Elastic's `process.args` is an array, and a Sigma field holds one value. The arguments
     // are one text here, each preceded by NUL and the last followed by one, so that a
@@ -577,28 +600,36 @@ pub const ECS_FIELDS: [(&str, Take); 11] = [
     // when there are none, as Elasticsearch treats an empty array.
     ("process.args", |s| {
         (!s.args.is_empty()).then(|| {
-            let mut text = String::from("\0");
+            let cap: usize = 1 + s.args.iter().map(|a| a.len() + 1).sum::<usize>();
+            let mut text = String::with_capacity(cap);
+            text.push('\0');
             for a in &s.args {
                 text.push_str(a);
                 text.push('\0');
             }
-            text
+            Cow::Owned(text)
         })
     }),
-    ("process.args_count", |s| Some(s.args.len().to_string())),
+    ("process.args_count", |s| {
+        Some(Cow::Owned(s.args.len().to_string()))
+    }),
     // The arguments joined by single spaces, as `CommandLine` is.
     ("process.command_line", command_line),
     // The image before the `exec`, as `ParentImage` is: the parent's program after a fork or
     // `posix_spawn`, the wrapper after an `exec` without a fork.
-    ("process.parent.executable", |s| s.parent_executable.clone()),
+    ("process.parent.executable", |s| {
+        s.parent_executable.as_deref().map(Cow::Borrowed)
+    }),
     ("process.parent.name", |s| {
         s.parent_executable
             .as_deref()
-            .map(|p| basename(p).to_string())
+            .map(|p| Cow::Borrowed(basename(p)))
     }),
-    ("process.working_directory", |s| s.working_directory.clone()),
+    ("process.working_directory", |s| {
+        s.working_directory.as_deref().map(Cow::Borrowed)
+    }),
     // The effective user id, as text, as Elastic gives it.
-    ("user.id", |s| s.user_id.map(|u| u.to_string())),
+    ("user.id", |s| s.user_id.map(|u| Cow::Owned(u.to_string()))),
 ];
 
 /// One file created or renamed, as the published rules for file events read it and as a
@@ -664,13 +695,13 @@ impl FileEvent {
 }
 
 /// How a Sigma field's value is taken from a file event under one of its names.
-pub type FileTake = fn(&FileEvent, &str) -> Option<String>;
+pub type FileTake = for<'a> fn(&'a FileEvent, &'a str) -> Option<Cow<'a, str>>;
 
 /// The Sigma fields a file event gives the rules for file events, and how each is taken; the
 /// table above `FileEvent` says why.
 pub const FILE_SIGMA_FIELDS: [(&str, FileTake); 2] = [
-    ("TargetFilename", |_, name| Some(name.to_string())),
-    ("Image", |f, _| Some(f.executable.clone())),
+    ("TargetFilename", |_, name| Some(Cow::Borrowed(name))),
+    ("Image", |f, _| Some(Cow::Borrowed(f.executable.as_str()))),
 ];
 
 /// The fields a file event gives the rules translated from Elastic's, as `ECS_FIELDS` does for
@@ -680,39 +711,35 @@ pub const FILE_SIGMA_FIELDS: [(&str, FileTake); 2] = [
 pub const FILE_ECS_FIELDS: [(&str, FileTake); 8] = [
     // What Elastic Defend writes for a file created, and for one renamed.
     ("event.type", |f, _| {
-        Some(
-            if f.action == "rename" {
-                "change"
-            } else {
-                "creation"
-            }
-            .into(),
-        )
+        Some(Cow::Borrowed(if f.action == "rename" {
+            "change"
+        } else {
+            "creation"
+        }))
     }),
     ("event.action", |f, _| {
-        Some(
-            if f.action == "rename" {
-                "rename"
-            } else {
-                "creation"
-            }
-            .into(),
-        )
+        Some(Cow::Borrowed(if f.action == "rename" {
+            "rename"
+        } else {
+            "creation"
+        }))
     }),
-    ("file.path", |_, name| Some(name.to_string())),
-    ("file.name", |_, name| Some(basename(name).to_string())),
+    ("file.path", |_, name| Some(Cow::Borrowed(name))),
+    ("file.name", |_, name| Some(Cow::Borrowed(basename(name)))),
     ("file.extension", |_, name| {
-        extension(basename(name)).map(str::to_string)
+        extension(basename(name)).map(Cow::Borrowed)
     }),
-    ("process.executable", |f, _| Some(f.executable.clone())),
+    ("process.executable", |f, _| {
+        Some(Cow::Borrowed(f.executable.as_str()))
+    }),
     ("process.name", |f, _| {
-        Some(basename(&f.executable).to_string())
+        Some(Cow::Borrowed(basename(&f.executable)))
     }),
     // The signing id of the program that did it, as Endpoint Security gives it: Elastic's
     // `process.code_signature.signing_id`, "the identifier used to sign the process", on a
     // file event. Only a collector that keeps `SIGNATURE` writes it (`ECS_KEPT`).
     ("process.code_signature.signing_id", |f, _| {
-        f.signing_id.clone()
+        f.signing_id.as_deref().map(Cow::Borrowed)
     }),
 ];
 
@@ -742,106 +769,585 @@ pub enum Line {
     Marker,
 }
 
+/// Lenient typed JSON readers for `line`: accept the expected JSON type and skip any other JSON
+/// value without building a `serde_json::Value` tree, so a non-object line still returns
+/// `Line::Unreadable` while a field with a wrong type behaves identically to `Value::as_*`.
+#[derive(Default)]
+struct MaybeU64(Option<u64>);
+
+impl<'de> Deserialize<'de> for MaybeU64 {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = MaybeU64;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(MaybeU64(Some(v)))
+            }
+            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(MaybeU64(u64::try_from(v).ok()))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(MaybeU64(None))
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(MaybeU64(None))
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(MaybeU64(None))
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(MaybeU64(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(MaybeU64(None))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(MaybeU64(None))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+#[derive(Default)]
+struct MaybeI64(Option<i64>);
+
+impl<'de> Deserialize<'de> for MaybeI64 {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = MaybeI64;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_i64<E>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(MaybeI64(Some(v)))
+            }
+            fn visit_u64<E>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(MaybeI64(i64::try_from(v).ok()))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(MaybeI64(None))
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(MaybeI64(None))
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(MaybeI64(None))
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(MaybeI64(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(MaybeI64(None))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(MaybeI64(None))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+#[derive(Default)]
+struct MaybeBool(Option<bool>);
+
+impl<'de> Deserialize<'de> for MaybeBool {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = MaybeBool;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_bool<E>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(MaybeBool(Some(v)))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(MaybeBool(None))
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(MaybeBool(None))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(MaybeBool(None))
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(MaybeBool(None))
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(MaybeBool(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(MaybeBool(None))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(MaybeBool(None))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+#[derive(Default)]
+struct MaybeStr(Option<String>);
+
+impl<'de> Deserialize<'de> for MaybeStr {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = MaybeStr;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(MaybeStr(Some(v.to_string())))
+            }
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E> {
+                Ok(MaybeStr(Some(v)))
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(MaybeStr(None))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(MaybeStr(None))
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(MaybeStr(None))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(MaybeStr(None))
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(MaybeStr(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(MaybeStr(None))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(MaybeStr(None))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+#[derive(Default)]
+struct MaybeStrVec(Option<Vec<String>>);
+
+impl<'de> Deserialize<'de> for MaybeStrVec {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = MaybeStrVec;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(MaybeStrVec(None))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(MaybeStrVec(None))
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(MaybeStrVec(None))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(MaybeStrVec(None))
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(MaybeStrVec(None))
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(MaybeStrVec(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut out = Vec::with_capacity(seq.size_hint().unwrap_or(4));
+                while let Some(item) = seq.next_element::<MaybeStr>()? {
+                    match item.0 {
+                        Some(s) => out.push(s),
+                        None => {
+                            while seq.next_element::<IgnoredAny>()?.is_some() {}
+                            return Ok(MaybeStrVec(None));
+                        }
+                    }
+                }
+                Ok(MaybeStrVec(Some(out)))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(MaybeStrVec(None))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+struct MaybeObj<T>(Option<T>);
+
+impl<T> Default for MaybeObj<T> {
+    fn default() -> Self {
+        MaybeObj(None)
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for MaybeObj<T> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V<T>(std::marker::PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> Visitor<'de> for V<T> {
+            type Value = MaybeObj<T>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(MaybeObj(None))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(MaybeObj(None))
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(MaybeObj(None))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(MaybeObj(None))
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(MaybeObj(None))
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(MaybeObj(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(MaybeObj(None))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+                T::deserialize(de::value::MapAccessDeserializer::new(map))
+                    .map(|v| MaybeObj(Some(v)))
+            }
+        }
+        d.deserialize_any(V(std::marker::PhantomData))
+    }
+}
+
+/// An audit token as an object with named fields or as the eight words of `audit_token_t`:
+/// `[auid, euid, egid, ruid, rgid, pid, asid, pidversion]`.
+#[derive(Default)]
+struct RawToken {
+    pid: Option<i64>,
+    pidversion: Option<i64>,
+    euid: Option<i64>,
+    ruid: Option<i64>,
+    egid: Option<i64>,
+    rgid: Option<i64>,
+}
+
+#[derive(Default)]
+struct MaybeToken(Option<RawToken>);
+
+impl<'de> Deserialize<'de> for MaybeToken {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> Visitor<'de> for V {
+            type Value = MaybeToken;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any JSON value")
+            }
+            fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(MaybeToken(None))
+            }
+            fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(MaybeToken(None))
+            }
+            fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(MaybeToken(None))
+            }
+            fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(MaybeToken(None))
+            }
+            fn visit_str<E>(self, _: &str) -> Result<Self::Value, E> {
+                Ok(MaybeToken(None))
+            }
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(MaybeToken(None))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                let mut words = [None; 8];
+                let mut n = 0usize;
+                while let Some(w) = seq.next_element::<MaybeI64>()? {
+                    if n < 8 {
+                        words[n] = w.0;
+                    }
+                    n += 1;
+                }
+                if n != 8 {
+                    return Ok(MaybeToken(None));
+                }
+                Ok(MaybeToken(Some(RawToken {
+                    euid: words[1],
+                    egid: words[2],
+                    ruid: words[3],
+                    rgid: words[4],
+                    pid: words[5],
+                    pidversion: words[7],
+                })))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut t = RawToken::default();
+                while let Some(key) = map.next_key::<Cow<'de, str>>()? {
+                    match key.as_ref() {
+                        "pid" => t.pid = map.next_value::<MaybeI64>()?.0,
+                        "pidversion" => t.pidversion = map.next_value::<MaybeI64>()?.0,
+                        "euid" => t.euid = map.next_value::<MaybeI64>()?.0,
+                        "ruid" => t.ruid = map.next_value::<MaybeI64>()?.0,
+                        "egid" => t.egid = map.next_value::<MaybeI64>()?.0,
+                        "rgid" => t.rgid = map.next_value::<MaybeI64>()?.0,
+                        _ => {
+                            let _ = map.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(MaybeToken(Some(t)))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+struct Present<T> {
+    present: bool,
+    value: T,
+}
+
+impl<T: Default> Default for Present<T> {
+    fn default() -> Self {
+        Present {
+            present: false,
+            value: T::default(),
+        }
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Present<T> {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Ok(Present {
+            present: true,
+            value: T::deserialize(d)?,
+        })
+    }
+}
+
+#[derive(Default, Deserialize)]
+struct RawPathObj {
+    #[serde(default)]
+    path: MaybeStr,
+}
+
+#[derive(Default, Deserialize)]
+struct RawProcess {
+    #[serde(default)]
+    executable: MaybeObj<RawPathObj>,
+    #[serde(default)]
+    audit_token: MaybeToken,
+    #[serde(default)]
+    parent_audit_token: MaybeToken,
+    #[serde(default)]
+    responsible_audit_token: MaybeToken,
+    #[serde(default)]
+    ppid: MaybeI64,
+    #[serde(default)]
+    group_id: MaybeI64,
+    #[serde(default)]
+    start_time: Present<MaybeStr>,
+    #[serde(default)]
+    signing_id: Present<MaybeStr>,
+    #[serde(default)]
+    team_id: MaybeStr,
+    #[serde(default)]
+    is_platform_binary: MaybeBool,
+    #[serde(default)]
+    codesigning_flags: Present<MaybeI64>,
+}
+
+#[derive(Default, Deserialize)]
+struct RawFileOp {
+    #[serde(default)]
+    destination: MaybeStr,
+    #[serde(default)]
+    source: MaybeStr,
+}
+
+#[derive(Default, Deserialize)]
+struct RawExec {
+    #[serde(default)]
+    target: MaybeObj<RawProcess>,
+    #[serde(default)]
+    args: MaybeStrVec,
+    #[serde(default)]
+    cwd: MaybeObj<RawPathObj>,
+    #[serde(default)]
+    script: Present<MaybeObj<RawPathObj>>,
+}
+
+#[derive(Default, Deserialize)]
+struct RawEvent {
+    #[serde(default)]
+    create: Present<MaybeObj<RawFileOp>>,
+    #[serde(default)]
+    rename: Present<MaybeObj<RawFileOp>>,
+    #[serde(default)]
+    exec: Present<MaybeObj<RawExec>>,
+}
+
+#[derive(Default, Deserialize)]
+struct RawLine {
+    #[serde(default)]
+    unreadable: MaybeBool,
+    #[serde(default)]
+    schema_version: MaybeU64,
+    #[serde(default)]
+    seq_num: MaybeU64,
+    #[serde(default)]
+    version: MaybeU64,
+    #[serde(default)]
+    time: MaybeStr,
+    #[serde(default)]
+    event: Present<MaybeObj<RawEvent>>,
+    #[serde(default)]
+    process: MaybeObj<RawProcess>,
+}
+
 /// Reads one line. `Err` says the format changed: a message without a field this reader
 /// needs, or with a `schema_version` it does not know. That fails the reading.
 pub fn line(bytes: &[u8]) -> Result<Line, String> {
-    let Ok(Value::Object(m)) = serde_json::from_slice::<Value>(bytes) else {
+    let Ok(MaybeObj(Some(raw))) = serde_json::from_slice::<MaybeObj<RawLine>>(bytes) else {
         return Ok(Line::Unreadable);
     };
-    if m.get("unreadable") == Some(&Value::Bool(true)) && !m.contains_key("event") {
+    if raw.unreadable.0 == Some(true) && !raw.event.present {
         return Ok(Line::Marker);
     }
     let changed = |what: &str| {
         format!("a message without {what}: the format of eslogger or of its filter has changed")
     };
-    let schema = m
-        .get("schema_version")
-        .and_then(Value::as_u64)
+    let schema = raw
+        .schema_version
+        .0
         .ok_or_else(|| changed("schema_version"))?;
     if !SCHEMA_VERSIONS.contains(&schema) {
         return Err(format!(
             "eslogger writes schema_version {schema}, which this version does not read"
         ));
     }
-    let event = m
-        .get("event")
-        .and_then(Value::as_object)
-        .ok_or_else(|| changed("an event"))?;
+    let event = raw.event.value.0.ok_or_else(|| changed("an event"))?;
     // A file event without its number is not made out: what was lost around it could not be
     // counted.
-    if let Some(kind) = FILE_KINDS.iter().position(|k| event.contains_key(*k)) {
-        let seq = m.get("seq_num").and_then(Value::as_u64);
+    if event.create.present {
+        let seq = raw.seq_num.0;
         return Ok(Line::File {
-            kind,
+            kind: 0,
             seq,
             event: seq
-                .and_then(|_| file(&m, event, FILE_KINDS[kind]))
+                .and_then(|_| {
+                    file_from(
+                        raw.time.0,
+                        event.create.value.0,
+                        raw.process.0,
+                        FILE_KINDS[0],
+                    )
+                })
                 .map(Box::new),
         });
     }
-    if !event.contains_key("exec") {
+    if event.rename.present {
+        let seq = raw.seq_num.0;
+        return Ok(Line::File {
+            kind: 1,
+            seq,
+            event: seq
+                .and_then(|_| {
+                    file_from(
+                        raw.time.0,
+                        event.rename.value.0,
+                        raw.process.0,
+                        FILE_KINDS[1],
+                    )
+                })
+                .map(Box::new),
+        });
+    }
+    if !event.exec.present {
         return Ok(Line::Other);
     }
-    let seq = m
-        .get("seq_num")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| changed("seq_num"))?;
-    let v = Value::Object(m);
-    let start = start(&v).map_err(changed)?;
+    let seq = raw.seq_num.0.ok_or_else(|| changed("seq_num"))?;
+    let start = start_from(raw.time.0, event.exec.value.0, raw.process.0).map_err(changed)?;
     Ok(Line::Exec {
         seq,
-        version: v.get("version").and_then(Value::as_u64),
+        version: raw.version.0,
         start: Box::new(start),
     })
+}
+
+fn raw_identity(process: &RawProcess) -> Identity {
+    let tok = process.audit_token.0.as_ref();
+    Identity {
+        pid: tok.and_then(|t| t.pid),
+        pid_version: tok.and_then(|t| t.pidversion),
+        started: process.start_time.value.0.clone(),
+        user_id: tok.and_then(|t| t.euid),
+        users: Users {
+            real_user_id: tok.and_then(|t| t.ruid),
+            group_id: tok.and_then(|t| t.egid),
+            real_group_id: tok.and_then(|t| t.rgid),
+        },
+    }
 }
 
 /// The file event a `create` or `rename` line describes, as the filter writes it, or `None`
 /// when a part it needs is missing or is not an absolute path: the filter writes such a line
 /// for an event whose shape it did not know.
-fn file(
-    m: &serde_json::Map<String, Value>,
-    event: &serde_json::Map<String, Value>,
+fn file_from(
+    time: Option<String>,
+    op: Option<RawFileOp>,
+    process: Option<RawProcess>,
     action: &'static str,
 ) -> Option<FileEvent> {
-    let e = event.get(action)?;
-    let path = |v: Option<&Value>| {
-        v.and_then(Value::as_str)
-            .filter(|p| p.starts_with('/'))
-            .map(str::to_string)
+    let op = op?;
+    let abs = |p: Option<String>| p.filter(|s| s.starts_with('/'));
+    let path = abs(op.destination.0)?;
+    let source = match action {
+        "rename" => Some(abs(op.source.0)?),
+        _ => None,
     };
-    let process = m.get("process");
-    let has = |key: &str| process.and_then(|p| p.get(key)).is_some();
+    let proc = process.as_ref();
+    let executable =
+        abs(proc.and_then(|p| p.executable.0.as_ref().and_then(|e| e.path.0.clone())))?;
+    let instigator = proc.map(raw_identity).unwrap_or_default();
+    let has_start = proc.is_some_and(|p| p.start_time.present);
+    let has_signing = proc.is_some_and(|p| p.signing_id.present);
     Some(FileEvent {
-        timestamp: m.get("time")?.as_str()?.to_string(),
+        timestamp: time?,
         action,
-        path: path(e.get("destination"))?,
-        source: match action {
-            "rename" => Some(path(e.get("source"))?),
-            _ => None,
-        },
-        executable: path(process.and_then(|p| p.pointer("/executable/path")))?,
-        instigator: process.map(identity).unwrap_or_default(),
-        signing_id: text(process.and_then(|p| p.get("signing_id"))),
-        team_id: text(process.and_then(|p| p.get("team_id"))),
-        platform_binary: flag(process.and_then(|p| p.get("is_platform_binary"))),
-        codesigning_flags: process
-            .and_then(|p| p.get("codesigning_flags"))
-            .and_then(Value::as_i64),
-        kept: kept(&[
-            (has("start_time"), IDENTITY),
-            (has("signing_id"), SIGNATURE),
-        ]),
+        path,
+        source,
+        executable,
+        instigator,
+        signing_id: proc.and_then(|p| p.signing_id.value.0.clone()),
+        team_id: proc.and_then(|p| p.team_id.0.clone()),
+        platform_binary: proc.and_then(|p| p.is_platform_binary.0),
+        codesigning_flags: proc.and_then(|p| p.codesigning_flags.value.0),
+        kept: kept(&[(has_start, IDENTITY), (has_signing, SIGNATURE)]),
     })
-}
-
-/// A text, or absent for anything else.
-fn text(v: Option<&Value>) -> Option<String> {
-    v.and_then(Value::as_str).map(str::to_string)
-}
-
-/// True or false, or absent for anything else.
-fn flag(v: Option<&Value>) -> Option<bool> {
-    v.and_then(Value::as_bool)
 }
 
 /// Which of `KEEPS` a line's collector kept, from the keys the line holds: the filter that keeps
@@ -876,136 +1382,97 @@ fn second_of(timestamp: &str, now: i64) -> i64 {
     instant(timestamp).map_or(now, |(secs, _)| secs)
 }
 
-/// Who a process eslogger describes is: the pid, pid version, users and groups of its
-/// `audit_token` and its `start_time`, each absent when the line does not give it as eslogger
-/// writes it.
-fn identity(process: &Value) -> Identity {
-    let token = process.get("audit_token");
-    let (pid, pid_version) = other_token(token);
-    let (user_id, users) = users(token);
-    Identity {
-        pid,
-        pid_version,
-        started: text(process.get("start_time")),
-        user_id,
-        users,
-    }
-}
-
-/// The effective user id and the other users and groups of an audit token, in either shape
-/// `token` reads: as an object, by `euid`, `ruid`, `egid` and `rgid`, or as the eight words of
-/// `audit_token_t`, the second to the fifth. Any other shape gives none, and fails nothing.
-fn users(v: Option<&Value>) -> (Option<i64>, Users) {
-    let [user, real_user, group, real_group] = match v {
-        Some(Value::Object(m)) => ["euid", "ruid", "egid", "rgid"].map(|k| m.get(k)),
-        Some(Value::Array(words)) if words.len() == 8 => [1, 3, 2, 4].map(|i| words.get(i)),
-        _ => [None; 4],
-    }
-    .map(|v| v.and_then(Value::as_i64));
-    (
-        user,
-        Users {
-            real_user_id: real_user,
-            group_id: group,
-            real_group_id: real_group,
-        },
-    )
-}
-
-/// The pid and pid version of an audit token that is not the one a program start needs: as an
-/// object, or as the eight words of `audit_token_t` (`token`); any other shape gives neither,
-/// and fails nothing.
-fn other_token(v: Option<&Value>) -> (Option<i64>, Option<i64>) {
-    match v {
-        Some(Value::Object(m)) => (
-            m.get("pid").and_then(Value::as_i64),
-            m.get("pidversion").and_then(Value::as_i64),
-        ),
-        Some(Value::Array(words)) if words.len() == 8 => (words[5].as_i64(), words[7].as_i64()),
-        _ => (None, None),
-    }
-}
-
 /// The program start an `exec` message describes, or the name of a field it needs and lacks.
-fn start(v: &Value) -> Result<ProcessStart, &'static str> {
+fn start_from(
+    time: Option<String>,
+    exec: Option<RawExec>,
+    instigator: Option<RawProcess>,
+) -> Result<ProcessStart, &'static str> {
     const ARGS: &str = "event.exec.args";
     const TOKEN: &str = "event.exec.target.audit_token";
-    let exec = v.pointer("/event/exec").ok_or("event.exec")?;
-    let target = exec.get("target").ok_or("event.exec.target")?;
-    let token = token(target.get("audit_token").ok_or(TOKEN)?).ok_or(TOKEN)?;
-    let instigator = v.get("process");
-    let has = |v: &Value, key: &str| v.get(key).is_some();
-    let (parent_pid, parent_version) = other_token(target.get("parent_audit_token"));
-    let (responsible_pid, responsible_version) = other_token(target.get("responsible_audit_token"));
-    Ok(ProcessStart {
-        timestamp: text(v.get("time")).ok_or("time")?,
-        executable: text(target.pointer("/executable/path"))
-            .ok_or("event.exec.target.executable.path")?,
-        args: exec
-            .get("args")
-            .and_then(Value::as_array)
-            .ok_or(ARGS)?
-            .iter()
-            .map(|a| a.as_str().map(str::to_string))
-            .collect::<Option<_>>()
-            .ok_or(ARGS)?,
-        parent_executable: text(v.pointer("/process/executable/path")),
-        working_directory: text(exec.pointer("/cwd/path")),
-        pid: token.0,
-        parent_pid: target.get("ppid").and_then(Value::as_i64),
-        user_id: token.1,
-        signing_id: text(target.get("signing_id")),
-        team_id: text(target.get("team_id")),
-        platform_binary: flag(target.get("is_platform_binary")),
-        who: Box::new(Who {
-            pid_version: token.2,
-            started: text(target.get("start_time")),
-            parent: Identity {
-                pid: parent_pid,
-                pid_version: parent_version,
-                ..Identity::default()
-            },
-            instigator: instigator.map(identity).unwrap_or_default(),
-            script: text(exec.pointer("/script/path")),
-            codesigning_flags: target.get("codesigning_flags").and_then(Value::as_i64),
-            instigator_codesigning_flags: instigator
-                .and_then(|p| p.get("codesigning_flags"))
-                .and_then(Value::as_i64),
-            instigator_signing_id: text(instigator.and_then(|p| p.get("signing_id"))),
-            instigator_team_id: text(instigator.and_then(|p| p.get("team_id"))),
-            instigator_platform_binary: flag(instigator.and_then(|p| p.get("is_platform_binary"))),
-            users: users(target.get("audit_token")).1,
-            responsible: Identity {
-                pid: responsible_pid,
-                pid_version: responsible_version,
-                ..Identity::default()
-            },
-            process_group: target.get("group_id").and_then(Value::as_i64),
-        }),
-        kept: kept(&[
-            (has(target, "start_time"), IDENTITY),
-            (has(exec, "script"), SCRIPT),
-            (has(target, "codesigning_flags"), SIGNATURE),
-        ]),
-    })
-}
-
-/// The pid, effective user id and pid version of an audit token. `eslogger` writes it as an
-/// object with named fields, and in some builds as the eight words of `audit_token_t`, in the
-/// order OpenBSM's `audit_token_to_*` read them: auid, euid, egid, ruid, rgid, pid, asid,
-/// pidversion. Mullvad's parser accepts both the same way.
-fn token(v: &Value) -> Option<(i64, Option<i64>, Option<i64>)> {
-    match v {
-        Value::Object(m) => Some((
-            m.get("pid")?.as_i64()?,
-            m.get("euid").and_then(Value::as_i64),
-            m.get("pidversion").and_then(Value::as_i64),
-        )),
-        Value::Array(words) if words.len() == 8 => {
-            Some((words[5].as_i64()?, words[1].as_i64(), words[7].as_i64()))
+    let exec = exec.ok_or("event.exec.target")?;
+    let target = exec.target.0.ok_or("event.exec.target")?;
+    let tok = target.audit_token.0.as_ref().ok_or(TOKEN)?;
+    let pid = tok.pid.ok_or(TOKEN)?;
+    let user_id = tok.euid;
+    let pid_version = tok.pidversion;
+    let target_users = Users {
+        real_user_id: tok.ruid,
+        group_id: tok.egid,
+        real_group_id: tok.rgid,
+    };
+    let parent_tok = target.parent_audit_token.0.as_ref();
+    let resp_tok = target.responsible_audit_token.0.as_ref();
+    let kept_bits = kept(&[
+        (target.start_time.present, IDENTITY),
+        (exec.script.present, SCRIPT),
+        (target.codesigning_flags.present, SIGNATURE),
+    ]);
+    let timestamp = time.ok_or("time")?;
+    let executable = target
+        .executable
+        .0
+        .and_then(|e| e.path.0)
+        .ok_or("event.exec.target.executable.path")?;
+    let args = exec.args.0.ok_or(ARGS)?;
+    let (
+        parent_executable,
+        instigator_id,
+        instigator_codesigning_flags,
+        instigator_signing_id,
+        instigator_team_id,
+        instigator_platform_binary,
+    ) = match instigator {
+        Some(p) => {
+            let id = raw_identity(&p);
+            (
+                p.executable.0.and_then(|e| e.path.0),
+                id,
+                p.codesigning_flags.value.0,
+                p.signing_id.value.0,
+                p.team_id.0,
+                p.is_platform_binary.0,
+            )
         }
-        _ => None,
-    }
+        None => (None, Identity::default(), None, None, None, None),
+    };
+    Ok(ProcessStart {
+        timestamp,
+        executable,
+        args,
+        parent_executable,
+        working_directory: exec.cwd.0.and_then(|c| c.path.0),
+        pid,
+        parent_pid: target.ppid.0,
+        user_id,
+        signing_id: target.signing_id.value.0,
+        team_id: target.team_id.0,
+        platform_binary: target.is_platform_binary.0,
+        who: Box::new(Who {
+            pid_version,
+            started: target.start_time.value.0,
+            parent: Identity {
+                pid: parent_tok.and_then(|t| t.pid),
+                pid_version: parent_tok.and_then(|t| t.pidversion),
+                ..Identity::default()
+            },
+            instigator: instigator_id,
+            script: exec.script.value.0.and_then(|s| s.path.0),
+            codesigning_flags: target.codesigning_flags.value.0,
+            instigator_codesigning_flags,
+            instigator_signing_id,
+            instigator_team_id,
+            instigator_platform_binary,
+            users: target_users,
+            responsible: Identity {
+                pid: resp_tok.and_then(|t| t.pid),
+                pid_version: resp_tok.and_then(|t| t.pidversion),
+                ..Identity::default()
+            },
+            process_group: target.group_id.0,
+        }),
+        kept: kept_bits,
+    })
 }
 
 /// What a reading read.
@@ -1238,6 +1705,11 @@ fn look(root: &Path, left: &Left, now: i64, rules: &'static Rules, awake: &Awake
     let now_written = writing(&listed, |f| left.files.get(&f.name).copied());
     for (i, f) in listed.iter().enumerate() {
         let name = &f.name;
+        if f.over && left.files.get(name) == Some(&(f.inode, f.len)) {
+            times.push(f.mtime.0);
+            files.push((name.clone(), f.inode, f.len));
+            continue;
+        }
         let mut into = Into {
             tally: &mut tally,
             file_tally: &mut file_tally,
@@ -1329,29 +1801,52 @@ fn log_cap(root: &Path) -> Result<u64, String> {
     {
         return cap.clone();
     }
-    let out = std::process::Command::new(crate::integrity::PLUTIL)
-        .args(["-extract", "ProgramArguments", "json", "-o", "-"])
-        .arg(&path)
-        .stdin(std::process::Stdio::null())
-        .output();
-    let cap = match out {
+    let cap = match std::fs::read(&path) {
         Err(e) => Err(failed(&e)),
-        Ok(out) if !out.status.success() => Err(failed(&format!(
-            "plutil: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))),
-        Ok(out) => serde_json::from_slice::<Value>(&out.stdout)
-            .ok()
-            .and_then(|v| v.get(3).and_then(Value::as_str).and_then(bytes_of))
-            .ok_or_else(|| {
-                failed(&"its fourth argument is not a cap tidy.sh takes, a whole number of bytes of at least 1 GiB")
-            }),
+        Ok(bytes) => match crate::plist::texts(&bytes, &["ProgramArguments"]) {
+            Ok(pairs) => match pairs
+                .into_iter()
+                .find(|(k, _)| *k == "ProgramArguments")
+                .map(|(_, v)| v)
+            {
+                Some(crate::plist::Text::List(items)) => items
+                    .into_iter()
+                    .nth(3)
+                    .flatten()
+                    .and_then(|s| bytes_of(&s))
+                    .ok_or_else(|| {
+                        failed(&"its fourth argument is not a cap tidy.sh takes, a whole number of bytes of at least 1 GiB")
+                    }),
+                Some(_) => Err(failed(
+                    &"its fourth argument is not a cap tidy.sh takes, a whole number of bytes of at least 1 GiB",
+                )),
+                None => Err(log_cap_plutil_error(&path, &failed)),
+            },
+            Err(_) => Err(log_cap_plutil_error(&path, &failed)),
+        },
     };
-    // A failure is not kept: the next reading runs plutil again.
+    // A failure is not kept: the next reading reads the plist again.
     if let Ok(mut seen) = SEEN.lock() {
         *seen = cap.as_ref().ok().map(|bytes| (key, Ok(*bytes)));
     }
     cap
+}
+
+/// Reports a malformed or missing-key tidy plist with Apple's `plutil` diagnostic on the cold
+/// failure path so error wording stays identical while valid plists never spawn a subprocess.
+fn log_cap_plutil_error(path: &Path, failed: &dyn Fn(&dyn std::fmt::Display) -> String) -> String {
+    match std::process::Command::new(crate::integrity::PLUTIL)
+        .args(["-extract", "ProgramArguments", "json", "-o", "-"])
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .output()
+    {
+        Err(e) => failed(&e),
+        Ok(out) => failed(&format!(
+            "plutil: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+    }
 }
 
 /// A cap as tidy.sh takes one: digits only, so no sign, without a leading zero, at most 16 of
@@ -1434,14 +1929,26 @@ impl Arrival {
     /// What a line of the kind, at `t`, says after what was said before: whether it holds the
     /// key, and whether a value under it. A line without the key starts it again. `quiet` is
     /// the run of lines without a value so far, and `most` how long a run tells it stopped.
+    #[cfg(test)]
     fn after(self, quiet: &mut Quiet, most: u64, has: bool, filled: bool, t: i64) -> Arrival {
+        self.after_with(quiet, most, has, filled, || t)
+    }
+
+    fn after_with(
+        self,
+        quiet: &mut Quiet,
+        most: u64,
+        has: bool,
+        filled: bool,
+        mut t: impl FnMut() -> i64,
+    ) -> Arrival {
         let state = match (has, filled, self) {
             (false, _, _) => Arrival::NotKept,
             (true, true, Arrival::Kept(Some(since))) => Arrival::Kept(Some(since)),
-            (true, true, _) => Arrival::Kept(Some(t)),
+            (true, true, _) => Arrival::Kept(Some(t())),
             (true, false, Arrival::Kept(Some(since))) => {
                 if quiet.lines == 0 {
-                    quiet.from = t;
+                    quiet.from = t();
                 }
                 quiet.lines = quiet.lines.saturating_add(1);
                 if quiet.lines < most {
@@ -1504,10 +2011,24 @@ impl From<[Arrival; 5]> for Arrivals {
 impl Arrivals {
     /// Takes in one line of `kind` at `t`: which of `KEEPS` it holds the key of, and which a
     /// value under.
+    #[cfg(test)]
     fn line(&mut self, kind: crate::sigma::Kind, kept: Keeps, filled: Keeps, t: i64) {
+        self.line_with(kind, kept, filled, || t);
+    }
+
+    fn line_with(
+        &mut self,
+        kind: crate::sigma::Kind,
+        kept: Keeps,
+        filled: Keeps,
+        mut t: impl FnMut() -> i64,
+    ) {
+        let mut cached: Option<i64> = None;
         for ((a, quiet), (k, keep, most)) in self.0.iter_mut().zip(&mut self.1).zip(MARKS) {
             if k == kind {
-                *a = a.after(quiet, most, kept & keep != 0, filled & keep != 0, t);
+                *a = a.after_with(quiet, most, kept & keep != 0, filled & keep != 0, || {
+                    *cached.get_or_insert_with(&mut t)
+                });
             }
         }
     }
@@ -1762,10 +2283,10 @@ struct Upto {
 /// being written, or when the queue is full.
 fn read_from(mut file: std::fs::File, from: u64, into: &mut Into) -> Result<Upto, Stop> {
     file.seek(SeekFrom::Start(from)).map_err(Stop::Io)?;
-    let mut lines = BufReader::new(file);
+    let mut lines = BufReader::with_capacity(128 * 1024, file);
     let mut at = from;
     let mut last = None;
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(4096);
     loop {
         buf.clear();
         let n = lines.read_until(b'\n', &mut buf).map_err(Stop::Io)?;
@@ -1792,11 +2313,12 @@ fn read_from(mut file: std::fs::File, from: u64, into: &mut Into) -> Result<Upto
                 t.starts += 1;
                 *into.version = v.or(*into.version);
                 if let Some(arrivals) = into.arrivals.as_deref_mut() {
-                    arrivals.line(
+                    let now = into.now;
+                    arrivals.line_with(
                         crate::sigma::Kind::Process,
                         start.kept,
                         filled_start(&start),
-                        second_of(&start.timestamp, into.now),
+                        || second_of(&start.timestamp, now),
                     );
                 }
                 if let Some(lacked) = into.lacked.as_deref_mut() {
@@ -1815,11 +2337,12 @@ fn read_from(mut file: std::fs::File, from: u64, into: &mut Into) -> Result<Upto
                     Some(e) => {
                         t.files += 1;
                         if let Some(arrivals) = into.arrivals.as_deref_mut() {
-                            arrivals.line(
+                            let now = into.now;
+                            arrivals.line_with(
                                 crate::sigma::Kind::File,
                                 e.kept,
                                 filled_file(&e),
-                                second_of(&e.timestamp, into.now),
+                                || second_of(&e.timestamp, now),
                             );
                         }
                         if let Some(lacked) = into.lacked.as_deref_mut() {
@@ -2092,8 +2615,10 @@ fn open(root: &Path) -> Result<Opened, Option<String>> {
         });
     }
     files.sort_by_key(|f| f.key);
-    for i in 0..files.len() {
-        files[i].over = files[i + 1..].iter().any(|g| g.mtime >= files[i].mtime);
+    let mut max_mtime: Option<(i64, i64)> = None;
+    for f in files.iter_mut().rev() {
+        f.over = max_mtime.is_some_and(|m| m >= f.mtime);
+        max_mtime = Some(max_mtime.map_or(f.mtime, |m| m.max(f.mtime)));
     }
     Ok(Opened {
         installed_at: daemon.mtime(),
@@ -3293,6 +3818,22 @@ pub fn queue(root: &Path, after: Option<&Place>, limit: usize, now: i64, awake: 
     let mut more = false;
     let mut stopped = files.len();
     for (k, f) in files.iter().enumerate() {
+        let was = held_of.get(&f.key).copied();
+        // Skip reopening files already read through their current length (same inode): avoids
+        // opening every rotated file and avoids triggering rule loading when nothing new arrived.
+        if let Some(prev) = was
+            && prev.inode == f.inode
+            && prev.offset == f.len
+            && (prev.finished || prev.offset > 0)
+        {
+            place.files.push(Kept {
+                key: f.key,
+                inode: f.inode,
+                offset: f.len,
+                finished: f.over,
+            });
+            continue;
+        }
         let mut into = Into {
             tally: &mut tally,
             file_tally: &mut file_tally,
@@ -3312,7 +3853,6 @@ pub fn queue(root: &Path, after: Option<&Place>, limit: usize, now: i64, awake: 
         // The same file is read on from where the place left it. Another of its name, or one
         // shorter than the place read, is another file, read from its start, and the one the
         // place held is replaced.
-        let was = held_of.get(&f.key).copied();
         let mut replaced = false;
         let from = |m: &std::fs::Metadata| match was {
             Some(k) if k.inode == m.ino() && k.offset <= m.len() => k.offset,

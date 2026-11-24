@@ -23,7 +23,9 @@
 #[cfg(test)]
 use serde_json::{Value as Json, json};
 use serde_norway::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::OnceLock;
 
 /// Where SigmaHQ's rules come from, and the commit they were copied at.
 pub const SOURCE: &str = "https://github.com/SigmaHQ/sigma";
@@ -565,34 +567,35 @@ struct Layout {
     names: Vec<String>,
     /// Which of `names` are numbers.
     numbers: Vec<bool>,
+    /// For a folded field, the index of its source base field in `names`; `None` for a base field.
+    folded_from: Vec<Option<usize>>,
     /// Where a file event's fields begin.
     file_at: usize,
-    /// Which texts the rules of this schema need in each field, searched for once per event;
-    /// `None` asks every rule.
-    texts: Option<Texts>,
 }
 
 impl Layout {
     fn new(schema: &'static Schema) -> Layout {
         let mut names = Vec::new();
         let mut numbers = Vec::new();
+        let mut folded_from = Vec::new();
         let mut kind = |base: Vec<&str>| {
-            let texts: Vec<&str> = base
-                .iter()
-                .filter(|n| !schema.numbers.contains(n))
-                .copied()
-                .collect();
-            for n in &base {
-                names.push(n.to_string());
-                numbers.push(schema.numbers.contains(n));
+            let base_start = names.len();
+            let mut texts: Vec<(usize, &str)> = Vec::new();
+            for (offset, n) in base.iter().enumerate() {
+                let is_num = schema.numbers.contains(n);
+                names.push((*n).to_string());
+                numbers.push(is_num);
+                folded_from.push(None);
+                if !is_num {
+                    texts.push((base_start + offset, *n));
+                }
             }
-            for n in schema
-                .folded
-                .into_iter()
-                .flat_map(|p| texts.iter().map(move |n| (p, n)))
-            {
-                names.push(format!("{}{}", n.0, n.1));
-                numbers.push(false);
+            if let Some(prefix) = schema.folded {
+                for (src_idx, n) in texts {
+                    names.push(format!("{prefix}{n}"));
+                    numbers.push(false);
+                    folded_from.push(Some(src_idx));
+                }
             }
             names.len()
         };
@@ -602,8 +605,8 @@ impl Layout {
             schema,
             names,
             numbers,
+            folded_from,
             file_at,
-            texts: None,
         }
     }
 
@@ -630,64 +633,71 @@ impl Layout {
             .map(|i| at + i)
     }
 
-    /// The values of every field, `names` long, the other kind's absent. A file event gives one
-    /// set of values for each name its file has where the schema says so: a rule matches the
-    /// event when it matches any of them.
-    fn forms(&self, subject: Subject) -> Vec<Vec<Option<String>>> {
-        let schema = self.schema;
-        let with_folded = |base: Vec<Option<String>>, numbers: &[bool]| -> Vec<Option<String>> {
-            let mut values = base.clone();
-            if schema.folded.is_some() {
-                values.extend(
-                    base.iter()
-                        .zip(numbers)
-                        .filter(|(_, number)| !**number)
-                        .map(|(v, _)| v.as_deref().map(fold)),
-                );
-            }
-            values
-        };
-        let process_numbers = &self.numbers[..schema.process.len()];
-        let file_numbers = &self.numbers[self.file_at..self.file_at + schema.file.len()];
+    /// Value of a single base field index `idx` for `subject` (with `file_name` for `File`).
+    fn base_value<'e>(
+        &self,
+        subject: Subject<'e>,
+        file_name: &'e str,
+        idx: usize,
+    ) -> Option<Cow<'e, str>> {
         match subject {
-            Subject::Start(s) => {
-                let base = schema.process.iter().map(|(_, take)| take(s)).collect();
-                let mut values = with_folded(base, process_numbers);
-                values.resize(self.names.len(), None);
-                vec![values]
-            }
-            Subject::File(f) => {
-                let names = if schema.links {
-                    f.names()
-                } else {
-                    vec![f.path.as_str()]
-                };
-                names
-                    .into_iter()
-                    .map(|name| {
-                        let mut values = vec![None; self.file_at];
-                        let base = schema.file.iter().map(|(_, take)| take(f, name)).collect();
-                        values.extend(with_folded(base, file_numbers));
-                        values
-                    })
-                    .collect()
-            }
+            Subject::Start(s) => self.schema.process.get(idx).and_then(|(_, take)| take(s)),
+            Subject::File(f) => idx
+                .checked_sub(self.file_at)
+                .and_then(|i| self.schema.file.get(i))
+                .and_then(|(_, take)| take(f, file_name)),
         }
     }
 
-    /// The evaluator's event for one set of values of a kind: a field the event does not give
-    /// stays absent, and an absent field matches nothing. A number is given as one.
-    fn event(&self, kind: Kind, values: &[Option<String>]) -> sigma_rust::Event {
+    /// Value of any field index `idx` (base or folded) for `subject`.
+    fn value_at<'e>(
+        &self,
+        subject: Subject<'e>,
+        file_name: &'e str,
+        idx: usize,
+    ) -> Option<Cow<'e, str>> {
+        match self.folded_from[idx] {
+            Some(src) => self
+                .base_value(subject, file_name, src)
+                .map(|v| Cow::Owned(fold(&v))),
+            None => self.base_value(subject, file_name, idx),
+        }
+    }
+
+    /// Builds `sigma_rust::Event` on demand (called only for the small fraction of events that
+    /// pass the `Texts` prefilter and need full Sigma evaluation).
+    fn build_event<'e>(&self, subject: Subject<'e>, file_name: &'e str) -> sigma_rust::Event {
         let mut event = sigma_rust::Event::new();
-        for i in self.range(kind) {
-            let Some(value) = &values[i] else { continue };
-            let name = self.names[i].as_str();
-            if self.numbers[i]
-                && let Ok(n) = value.parse::<i64>()
+        let base_start = match subject {
+            Subject::Start(_) => 0,
+            Subject::File(_) => self.file_at,
+        };
+        let base_len = match subject {
+            Subject::Start(_) => self.schema.process.len(),
+            Subject::File(_) => self.schema.file.len(),
+        };
+        let mut base_vals: Vec<Option<Cow<'e, str>>> = Vec::with_capacity(base_len);
+        for offset in 0..base_len {
+            let idx = base_start + offset;
+            let val = self.base_value(subject, file_name, idx);
+            if let Some(value) = &val {
+                let name = self.names[idx].as_str();
+                if self.numbers[idx]
+                    && let Ok(n) = value.parse::<i64>()
+                {
+                    event.insert(name, n);
+                } else {
+                    event.insert(name, value.as_ref().to_string());
+                }
+            }
+            base_vals.push(val);
+        }
+        let end = self.range(subject.kind()).end;
+        for idx in (base_start + base_len)..end {
+            if let Some(src) = self.folded_from[idx]
+                && let Some(value) = &base_vals[src - base_start]
             {
-                event.insert(name, n);
-            } else {
-                event.insert(name, value.clone());
+                event.insert(self.names[idx].as_str(), fold(value));
             }
         }
         event
@@ -1007,11 +1017,10 @@ pub struct Loaded {
     pub kind: Option<Kind>,
     /// For an upstream rule not taken, what the translation said of it, as it said it.
     pub detail: Option<&'static str>,
-    rule: Option<sigma_rust::Rule>,
+    /// Embedded YAML text kept for lazy compilation of shipped rules on first `evaluate`.
+    text: Option<&'static str>,
     /// Which of `Rules::layouts` its events are given in: its source's schema.
     layout: usize,
-    /// What an event must hold for the rule to be able to match it.
-    need: Need,
     /// What of `crate::events::KEEPS` the fields it reads need its collector to have kept, and
     /// those fields: it is not asked about a line whose collector did not keep them.
     pub needs: crate::events::Keeps,
@@ -1041,6 +1050,7 @@ impl Loaded {
     }
 
     /// Asked about an event of `kind` whose collector kept `kept`.
+    #[cfg(test)]
     fn asked_about(&self, kind: Kind, kept: crate::events::Keeps) -> bool {
         self.asked_of(kind) && self.needs & !kept == 0
     }
@@ -1076,13 +1086,35 @@ impl Match<'_> {
     }
 }
 
+/// Compiled evaluator state: `sigma_rust::Rule` instances, prefilter needs and automata, and
+/// active rule indices partitioned by `(layout, kind)`. Built eagerly for test rule sets and
+/// lazily on first `evaluate` for `Rules::shipped()`, so metadata-only commands (`status`,
+/// `rules`, `findings`, and idle `matches`) pay no rule or DFA compilation cost.
+struct Compiled {
+    rules: Vec<Option<sigma_rust::Rule>>,
+    needs: Vec<Need>,
+    texts: Vec<Option<Texts>>,
+    /// Active rule indices per layout and kind (`[Kind::Process, Kind::File]`).
+    active: Vec<[Vec<usize>; 2]>,
+}
+
+fn kind_index(kind: Kind) -> usize {
+    match kind {
+        Kind::Process => 0,
+        Kind::File => 1,
+    }
+}
+
 pub struct Rules {
     pub rules: Vec<Loaded>,
     /// One for each schema the rules use, in the order first used.
     layouts: Vec<Layout>,
+    by_id: HashMap<String, usize>,
+    by_name: HashMap<String, usize>,
+    compiled: OnceLock<Compiled>,
 }
 
-static SHIPPED_RULES: std::sync::OnceLock<Rules> = std::sync::OnceLock::new();
+static SHIPPED_RULES: OnceLock<Rules> = OnceLock::new();
 
 /// How many events each rule matched, by its id: in the last day, and in the last week.
 pub type MatchedByRule<'a> = (&'a BTreeMap<String, i64>, &'a BTreeMap<String, i64>);
@@ -1090,11 +1122,14 @@ pub type MatchedByRule<'a> = (&'a BTreeMap<String, i64>, &'a BTreeMap<String, i6
 impl Rules {
     /// Every shipped rule of every set, parsed once per process, not at each reading: the
     /// watcher reads program starts every thirty seconds for as long as it runs.
+    /// Metadata and placement are read eagerly; `sigma_rust::Rule` compilation and prefilter
+    /// automata are built on the first `evaluate` call.
     pub fn shipped() -> &'static Rules {
-        SHIPPED_RULES.get_or_init(|| Rules::of(&SOURCES))
+        SHIPPED_RULES.get_or_init(|| Rules::of_lazy(&SOURCES))
     }
 
     /// Every rule of these sets: their files, then the upstream rules they did not take.
+    #[cfg(test)]
     pub fn of(sources: &[&'static Source]) -> Rules {
         let mut loading = Loading::default();
         for source in sources {
@@ -1106,6 +1141,53 @@ impl Rules {
             }
         }
         loading.done()
+    }
+
+    /// Like `of`, deferring `sigma_rust::Rule` and prefilter compilation until `evaluate`.
+    fn of_lazy(sources: &[&'static Source]) -> Rules {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let mut loading = Loading::default();
+        let workers = std::thread::available_parallelism()
+            .map_or(4, |n| n.get())
+            .min(4);
+        for &source in sources {
+            let n = loading.layout(source.schema);
+            let layout = &loading.layouts[n];
+            if workers > 1 && source.files.len() > 16 {
+                let next = AtomicUsize::new(0);
+                let mut loaded: Vec<(usize, Loaded)> = std::thread::scope(|scope| {
+                    let handles: Vec<_> = (0..workers)
+                        .map(|_| {
+                            scope.spawn(|| {
+                                let mut mine = Vec::new();
+                                loop {
+                                    let i = next.fetch_add(1, Ordering::Relaxed);
+                                    let Some(&(file, text)) = source.files.get(i) else {
+                                        break;
+                                    };
+                                    mine.push((i, load_lazy(source, file, text, n, layout)));
+                                }
+                                mine
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .flat_map(|h| h.join().unwrap_or_default())
+                        .collect()
+                });
+                loaded.sort_unstable_by_key(|(i, _)| *i);
+                loading.rules.extend(loaded.into_iter().map(|(_, l)| l));
+            } else {
+                for &(file, text) in source.files {
+                    loading.rules.push(load_lazy(source, file, text, n, layout));
+                }
+            }
+            for line in source.not_taken.into_iter().flat_map(|t| t.lines().skip(1)) {
+                loading.not_taken(source, line);
+            }
+        }
+        loading.done_lazy()
     }
 
     /// These files, as rules of SigmaHQ's set.
@@ -1126,16 +1208,92 @@ impl Rules {
 
     /// A rule by its id, among those that could be read.
     pub fn by_id(&self, id: &str) -> Option<&Loaded> {
-        self.rules
-            .iter()
-            .find(|l| l.meta.as_ref().is_some_and(|m| m.id == id))
+        self.by_id.get(id).map(|&i| &self.rules[i])
     }
 
     /// A rule by its name, its set and its id.
     pub fn by_name(&self, rule: &str) -> Option<&Loaded> {
-        self.rules
-            .iter()
-            .find(|l| l.meta.as_ref().is_some_and(|m| m.name == rule))
+        self.by_name.get(rule).map(|&i| &self.rules[i])
+    }
+
+    fn compiled(&self) -> &Compiled {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        self.compiled.get_or_init(|| {
+            let todo: Vec<(usize, &'static str)> = self
+                .rules
+                .iter()
+                .enumerate()
+                .filter_map(|(i, l)| l.text.map(|t| (i, t)))
+                .collect();
+            let parse_one = |text: &'static str| -> Option<(sigma_rust::Rule, Value)> {
+                let yaml: Value = serde_norway::from_str(text).ok()?;
+                let rule: sigma_rust::Rule = serde_norway::from_value(yaml.clone()).ok()?;
+                Some((rule, yaml))
+            };
+            let workers = std::thread::available_parallelism()
+                .map_or(4, |n| n.get())
+                .min(4)
+                .min(todo.len());
+            let mut built: Vec<(usize, Option<(sigma_rust::Rule, Value)>)> =
+                if workers > 1 && todo.len() > 16 {
+                    let next = AtomicUsize::new(0);
+                    std::thread::scope(|scope| {
+                        let handles: Vec<_> = (0..workers)
+                            .map(|_| {
+                                scope.spawn(|| {
+                                    let mut mine = Vec::new();
+                                    loop {
+                                        let pos = next.fetch_add(1, Ordering::Relaxed);
+                                        let Some(&(i, text)) = todo.get(pos) else {
+                                            break;
+                                        };
+                                        mine.push((i, parse_one(text)));
+                                    }
+                                    mine
+                                })
+                            })
+                            .collect();
+                        handles
+                            .into_iter()
+                            .flat_map(|h| h.join().unwrap_or_default())
+                            .collect()
+                    })
+                } else {
+                    todo.iter().map(|&(i, text)| (i, parse_one(text))).collect()
+                };
+            built.sort_unstable_by_key(|(i, _)| *i);
+
+            let mut rules: Vec<Option<sigma_rust::Rule>> =
+                (0..self.rules.len()).map(|_| None).collect();
+            let mut needs: Vec<Need> = (0..self.rules.len()).map(|_| Need::Any).collect();
+            let mut wanted: Vec<Wanted> = (0..self.layouts.len()).map(|_| Wanted::new()).collect();
+            let mut active: Vec<[Vec<usize>; 2]> = (0..self.layouts.len())
+                .map(|_| [Vec::new(), Vec::new()])
+                .collect();
+            for (i, pair) in built {
+                let Some((rule, yaml)) = pair else { continue };
+                let l = &self.rules[i];
+                if let Some(kind) = l.kind {
+                    needs[i] = need(&yaml, &self.layouts[l.layout], kind, &mut wanted[l.layout]);
+                    if l.asked_of(kind) {
+                        active[l.layout][kind_index(kind)].push(i);
+                    }
+                }
+                rules[i] = Some(rule);
+            }
+            let texts = self
+                .layouts
+                .iter()
+                .zip(wanted)
+                .map(|(layout, w)| Texts::new(w, layout))
+                .collect();
+            Compiled {
+                rules,
+                needs,
+                texts,
+                active,
+            }
+        })
     }
 
     /// The rules this event matches, in the order they are shipped. Only rules of its kind
@@ -1146,57 +1304,95 @@ impl Rules {
     pub fn evaluate<'e>(&self, subject: impl Into<Subject<'e>>) -> Vec<Match<'_>> {
         let subject = subject.into();
         let kind = subject.kind();
-        let mut hit = vec![false; self.rules.len()];
+        let kidx = kind_index(kind);
+        let kept = subject.kept();
+        let compiled = self.compiled();
+        let mut matched: Vec<usize> = Vec::new();
+        let mut held_buf: Vec<bool> = Vec::new();
         for (n, layout) in self.layouts.iter().enumerate() {
-            for values in layout.forms(subject) {
-                let event = layout.event(kind, &values);
-                for i in self.asked(n, kind, subject.kept(), &values) {
-                    if !hit[i] {
-                        hit[i] = self.rules[i]
-                            .rule
-                            .as_ref()
-                            .is_some_and(|r| r.is_match(&event));
+            let active = &compiled.active[n][kidx];
+            if active.is_empty() {
+                continue;
+            }
+            let texts = compiled.texts[n].as_ref();
+            let mut eval_form = |file_name: &'e str| {
+                let held = texts.map(|t| {
+                    t.held_into(layout, kind, subject, file_name, &mut held_buf);
+                    held_buf.as_slice()
+                });
+                let mut event: Option<sigma_rust::Event> = None;
+                for &i in active {
+                    if matched.contains(&i) {
+                        continue;
+                    }
+                    if self.rules[i].needs & !kept != 0 {
+                        continue;
+                    }
+                    if let Some(h) = held
+                        && !compiled.needs[i].holds(h)
+                    {
+                        continue;
+                    }
+                    let ev = event.get_or_insert_with(|| layout.build_event(subject, file_name));
+                    if compiled.rules[i].as_ref().is_some_and(|r| r.is_match(ev)) {
+                        matched.push(i);
+                    }
+                }
+            };
+            match subject {
+                Subject::Start(_) => eval_form(""),
+                Subject::File(f) => {
+                    if layout.schema.links {
+                        for name in f.names() {
+                            eval_form(name);
+                        }
+                    } else {
+                        eval_form(&f.path);
                     }
                 }
             }
         }
-        self.matched(kind, &hit)
-    }
-
-    /// The rules marked in `hit`, in the order they are shipped.
-    fn matched(&self, _kind: Kind, hit: &[bool]) -> Vec<Match<'_>> {
-        self.rules
-            .iter()
-            .zip(hit)
-            .filter(|(_, hit)| **hit)
-            .filter_map(|(l, _)| {
+        if matched.is_empty() {
+            return Vec::new();
+        }
+        matched.sort_unstable();
+        matched
+            .into_iter()
+            .filter_map(|i| {
+                let l = &self.rules[i];
                 Some(Match {
                     file: l.file,
                     meta: l.meta.as_ref()?,
                     #[cfg(test)]
-                    kind: _kind,
+                    kind,
                 })
             })
             .collect()
     }
 
-    /// The rules to ask about an event of `kind` with these values of layout `n`, as
-    /// `Layout::forms` gives them, by their place: those of its schema and kind evaluated,
-    /// wholly or in part, whose need the values hold.
-    fn asked(
+    /// The rules to ask about an event of `kind`, by their place: those of its schema and kind
+    /// evaluated, wholly or in part, whose need the event holds. Used by tests pinning the
+    /// prefilter's selectivity.
+    #[cfg(test)]
+    fn asked<'e>(
         &self,
         n: usize,
         kind: Kind,
-        kept: crate::events::Keeps,
-        values: &[Option<String>],
+        subject: Subject<'e>,
+        file_name: &'e str,
     ) -> Vec<usize> {
-        let held = self.layouts[n].texts.as_ref().map(|t| t.held(values));
-        self.rules
+        let compiled = self.compiled();
+        let kept = subject.kept();
+        let mut held_buf = Vec::new();
+        let held = compiled.texts[n].as_ref().map(|t| {
+            t.held_into(&self.layouts[n], kind, subject, file_name, &mut held_buf);
+            held_buf.as_slice()
+        });
+        compiled.active[n][kind_index(kind)]
             .iter()
-            .enumerate()
-            .filter(|(_, l)| l.layout == n && l.asked_about(kind, kept))
-            .filter(|(_, l)| held.as_ref().is_none_or(|h| l.need.holds(h)))
-            .map(|(i, _)| i)
+            .copied()
+            .filter(|&i| self.rules[i].needs & !kept == 0)
+            .filter(|&i| held.is_none_or(|h| compiled.needs[i].holds(h)))
             .collect()
     }
 
@@ -1206,18 +1402,44 @@ impl Rules {
     pub fn evaluate_each<'e>(&self, subject: impl Into<Subject<'e>>) -> Vec<Match<'_>> {
         let subject = subject.into();
         let kind = subject.kind();
+        let compiled = self.compiled();
         let mut hit = vec![false; self.rules.len()];
         for (n, layout) in self.layouts.iter().enumerate() {
-            for values in layout.forms(subject) {
-                let event = layout.event(kind, &values);
+            let mut ask_form = |file_name: &'e str| {
+                let event = layout.build_event(subject, file_name);
                 for (i, l) in self.rules.iter().enumerate() {
                     hit[i] |= l.layout == n
                         && l.asked_about(kind, subject.kept())
-                        && l.rule.as_ref().is_some_and(|r| r.is_match(&event));
+                        && compiled.rules[i]
+                            .as_ref()
+                            .is_some_and(|r| r.is_match(&event));
+                }
+            };
+            match subject {
+                Subject::Start(_) => ask_form(""),
+                Subject::File(f) => {
+                    if layout.schema.links {
+                        for name in f.names() {
+                            ask_form(name);
+                        }
+                    } else {
+                        ask_form(&f.path);
+                    }
                 }
             }
         }
-        self.matched(kind, &hit)
+        self.rules
+            .iter()
+            .zip(&hit)
+            .filter(|(_, h)| **h)
+            .filter_map(|(l, _)| {
+                Some(Match {
+                    file: l.file,
+                    meta: l.meta.as_ref()?,
+                    kind,
+                })
+            })
+            .collect()
     }
 
     /// The rules evaluated in full over events of `kind`.
@@ -1448,8 +1670,13 @@ pub fn times(n: i64) -> String {
 #[derive(Default)]
 struct Loading {
     rules: Vec<Loaded>,
+    #[cfg(test)]
+    compiled_rules: Vec<Option<sigma_rust::Rule>>,
+    #[cfg(test)]
+    needs: Vec<Need>,
     layouts: Vec<Layout>,
     /// The texts the rules of each layout need, numbered.
+    #[cfg(test)]
     wanted: Vec<Wanted>,
 }
 
@@ -1464,16 +1691,21 @@ impl Loading {
             Some(n) => n,
             None => {
                 self.layouts.push(Layout::new(schema));
+                #[cfg(test)]
                 self.wanted.push(Wanted::new());
                 self.layouts.len() - 1
             }
         }
     }
 
-    fn add(&mut self, source: &'static Source, file: &'static str, text: &str) {
+    #[cfg(test)]
+    fn add(&mut self, source: &'static Source, file: &'static str, text: &'static str) {
         let n = self.layout(source.schema);
-        let loaded = load(source, file, text, n, &self.layouts[n], &mut self.wanted[n]);
+        let (loaded, compiled_rule, rule_need) =
+            load(source, file, text, n, &self.layouts[n], &mut self.wanted[n]);
         self.rules.push(loaded);
+        self.compiled_rules.push(compiled_rule);
+        self.needs.push(rule_need);
     }
 
     /// An upstream rule its set names as not taken, from its line in `Source::not_taken`. A
@@ -1517,9 +1749,8 @@ impl Loading {
                 placement: Placement::NotEvaluated(reason),
                 kind: None,
                 detail: Some(detail),
-                rule: None,
+                text: None,
                 layout,
-                need: Need::Any,
                 needs: 0,
                 needs_fields: Vec::new(),
             })
@@ -1532,24 +1763,80 @@ impl Loading {
                 placement: Placement::NotEvaluated(Reason::NotParsed(said)),
                 kind: None,
                 detail: None,
-                rule: None,
+                text: None,
                 layout,
-                need: Need::Any,
                 needs: 0,
                 needs_fields: Vec::new(),
             },
         };
         self.rules.push(loaded);
+        #[cfg(test)]
+        if !self.compiled_rules.is_empty() || !self.needs.is_empty() {
+            self.compiled_rules.push(None);
+            self.needs.push(Need::Any);
+        }
     }
 
-    fn done(self) -> Rules {
-        let mut layouts = self.layouts;
-        for (layout, wanted) in layouts.iter_mut().zip(self.wanted) {
-            layout.texts = Texts::new(wanted, layout.names.len());
+    fn build_indexes(rules: &[Loaded]) -> (HashMap<String, usize>, HashMap<String, usize>) {
+        let mut by_id = HashMap::with_capacity(rules.len());
+        let mut by_name = HashMap::with_capacity(rules.len());
+        for (i, l) in rules.iter().enumerate() {
+            if let Some(m) = &l.meta {
+                by_id.entry(m.id.clone()).or_insert(i);
+                by_name.entry(m.name.clone()).or_insert(i);
+            }
         }
+        (by_id, by_name)
+    }
+
+    #[cfg(test)]
+    fn done(self) -> Rules {
+        let (by_id, by_name) = Self::build_indexes(&self.rules);
+        let texts = self
+            .layouts
+            .iter()
+            .zip(self.wanted)
+            .map(|(layout, w)| Texts::new(w, layout))
+            .collect();
+        let mut active: Vec<[Vec<usize>; 2]> = (0..self.layouts.len())
+            .map(|_| [Vec::new(), Vec::new()])
+            .collect();
+        let mut compiled_rules = self.compiled_rules;
+        compiled_rules.resize_with(self.rules.len(), || None);
+        let mut needs = self.needs;
+        needs.resize_with(self.rules.len(), || Need::Any);
+        for (i, l) in self.rules.iter().enumerate() {
+            if compiled_rules[i].is_some()
+                && let Some(kind) = l.kind
+                && l.asked_of(kind)
+            {
+                active[l.layout][kind_index(kind)].push(i);
+            }
+        }
+        let compiled = OnceLock::new();
+        let _ = compiled.set(Compiled {
+            rules: compiled_rules,
+            needs,
+            texts,
+            active,
+        });
         Rules {
             rules: self.rules,
-            layouts,
+            layouts: self.layouts,
+            by_id,
+            by_name,
+            compiled,
+        }
+    }
+
+    fn done_lazy(self) -> Rules {
+        let (by_id, by_name) = Self::build_indexes(&self.rules);
+        Rules {
+            rules: self.rules,
+            layouts: self.layouts,
+            by_id,
+            by_name,
+            compiled: OnceLock::new(),
         }
     }
 }
@@ -1577,29 +1864,34 @@ fn not_taken_reason(code: &str, detail: &str) -> Result<Reason, String> {
     })
 }
 
-/// Reads one rule. The YAML is parsed once; the evaluator builds its rule from it, and the
-/// level, status and shape of the detection, which the evaluator keeps to itself, are read
-/// from it to place the rule.
+/// Reads one rule eagerly: parses YAML, checks shape, compiles `sigma_rust::Rule`, and builds its
+/// prefilter need. Used for `Rules::of` and test sets where invalid detection rules must fail on load.
+#[cfg(test)]
 fn load(
     source: &'static Source,
     file: &'static str,
-    text: &str,
+    text: &'static str,
     n: usize,
     layout: &Layout,
     texts: &mut Wanted,
-) -> Loaded {
-    let not_parsed = |said: String| Loaded {
-        file,
-        source,
-        meta: None,
-        placement: Placement::NotEvaluated(Reason::NotParsed(said)),
-        kind: None,
-        detail: None,
-        rule: None,
-        layout: n,
-        need: Need::Any,
-        needs: 0,
-        needs_fields: Vec::new(),
+) -> (Loaded, Option<sigma_rust::Rule>, Need) {
+    let not_parsed = |said: String| {
+        (
+            Loaded {
+                file,
+                source,
+                meta: None,
+                placement: Placement::NotEvaluated(Reason::NotParsed(said)),
+                kind: None,
+                detail: None,
+                text: None,
+                layout: n,
+                needs: 0,
+                needs_fields: Vec::new(),
+            },
+            None,
+            Need::Any,
+        )
     };
     let yaml: Value = match serde_norway::from_str(text) {
         Ok(v) => v,
@@ -1627,6 +1919,70 @@ fn load(
         None => place(&yaml, layout, Vec::new()),
     };
     let (needs, needs_fields) = kind.map_or((0, Vec::new()), |k| kept_needs(&yaml, source, k));
+    let rule_need = kind.map_or(Need::Any, |kind| need(&yaml, layout, kind, texts));
+    let evaluated = !matches!(placement, Placement::NotEvaluated(_));
+    (
+        Loaded {
+            file,
+            source,
+            meta: Some(meta),
+            placement,
+            kind,
+            detail: None,
+            text: evaluated.then_some(text),
+            layout: n,
+            needs,
+            needs_fields,
+        },
+        Some(rule),
+        rule_need,
+    )
+}
+
+/// Reads metadata and placement of one shipped rule without compiling `sigma_rust::Rule` or
+/// prefilter automata until the first `evaluate` call.
+fn load_lazy(
+    source: &'static Source,
+    file: &'static str,
+    text: &'static str,
+    n: usize,
+    layout: &Layout,
+) -> Loaded {
+    let not_parsed = |said: String| Loaded {
+        file,
+        source,
+        meta: None,
+        placement: Placement::NotEvaluated(Reason::NotParsed(said)),
+        kind: None,
+        detail: None,
+        text: None,
+        layout: n,
+        needs: 0,
+        needs_fields: Vec::new(),
+    };
+    let yaml: Value = match serde_norway::from_str(text) {
+        Ok(v) => v,
+        Err(e) => return not_parsed(e.to_string()),
+    };
+    if let Err(said) = shape(&yaml, source) {
+        return not_parsed(said);
+    }
+    let meta = match meta_from_yaml(&yaml, source) {
+        Ok(m) => m,
+        Err(said) => return not_parsed(said),
+    };
+    let kind = Kind::of(yaml["logsource"]["category"].as_str().unwrap_or_default());
+    let placement = match source
+        .translation
+        .as_ref()
+        .map(|t| left_out(&yaml[t.record]))
+    {
+        Some(Err(said)) => return not_parsed(said),
+        Some(Ok(left)) => place(&yaml, layout, left),
+        None => place(&yaml, layout, Vec::new()),
+    };
+    let (needs, needs_fields) = kind.map_or((0, Vec::new()), |k| kept_needs(&yaml, source, k));
+    let evaluated = !matches!(placement, Placement::NotEvaluated(_));
     Loaded {
         file,
         source,
@@ -1634,9 +1990,8 @@ fn load(
         placement,
         kind,
         detail: None,
-        rule: Some(rule),
+        text: evaluated.then_some(text),
         layout: n,
-        need: kind.map_or(Need::Any, |kind| need(&yaml, layout, kind, texts)),
         needs,
         needs_fields,
     }
@@ -2054,75 +2409,124 @@ fn glob(pattern: &str, name: &str) -> bool {
     }
 }
 
-/// The texts the rules need, per field: one automaton that finds every text wanted within the
-/// field in one pass, and the texts wanted at its start or end, each with its number.
-struct Texts {
-    count: usize,
-    fields: Vec<FieldTexts>,
+struct FieldTexts {
+    field: usize,
+    within: Option<(aho_corasick::AhoCorasick, Vec<usize>, bool)>,
+    ends: Vec<(Place, String, usize, bool)>,
 }
 
-struct FieldTexts {
-    within: Option<(aho_corasick::AhoCorasick, Vec<usize>)>,
-    ends: Vec<(Place, String, usize)>,
+/// The texts the rules need, gathered per field into DFAs and prefix/suffix checks, partitioned
+/// by event kind (`[Kind::Process, Kind::File]`) so `held_into` only touches fields that rules
+/// of that kind actually constrain.
+struct Texts {
+    count: usize,
+    by_kind: [Vec<FieldTexts>; 2],
+}
+
+fn ascii_starts_with_ci(value: &str, needle: &str) -> bool {
+    value.len() >= needle.len()
+        && value.as_bytes()[..needle.len()].eq_ignore_ascii_case(needle.as_bytes())
+}
+
+fn ascii_ends_with_ci(value: &str, needle: &str) -> bool {
+    value.len() >= needle.len()
+        && value.as_bytes()[value.len() - needle.len()..].eq_ignore_ascii_case(needle.as_bytes())
 }
 
 impl Texts {
-    /// For `count` fields; `None` when an automaton cannot be built, and then every rule is
-    /// asked.
-    fn new(texts: Wanted, count: usize) -> Option<Texts> {
-        let mut fields = Vec::new();
-        for field in 0..count {
-            let mine = || texts.iter().filter(move |((f, _, _), _)| *f == field);
-            let (needles, ids): (Vec<&String>, Vec<usize>) = mine()
-                .filter(|((_, place, _), _)| *place == Place::Within)
-                .map(|((_, _, text), id)| (text, *id))
+    /// For `layout`; `None` when an automaton cannot be built, and then every rule is asked.
+    fn new(texts: Wanted, layout: &Layout) -> Option<Texts> {
+        let mut by_field: Vec<Vec<(Place, String, usize)>> = vec![Vec::new(); layout.names.len()];
+        for ((field, place, text), id) in &texts {
+            by_field[*field].push((*place, text.clone(), *id));
+        }
+        let mut by_kind: [Vec<FieldTexts>; 2] = [Vec::new(), Vec::new()];
+        for (field, entries) in by_field.into_iter().enumerate() {
+            if entries.is_empty() {
+                continue;
+            }
+            let (needles, ids): (Vec<&str>, Vec<usize>) = entries
+                .iter()
+                .filter(|(place, _, _)| *place == Place::Within)
+                .map(|(_, text, id)| (text.as_str(), *id))
                 .unzip();
             // A DFA: a few hundred short texts make a small one, and it reads a long command
-            // line several times faster than the default automaton.
+            // line several times faster than the default automaton. When all needles are ASCII,
+            // ASCII case-insensitive matching lets ASCII values skip allocating a folded copy.
             let within = if needles.is_empty() {
                 None
             } else {
+                let ascii_only = needles.iter().all(|s| s.is_ascii());
                 let automaton = aho_corasick::AhoCorasick::builder()
                     .kind(Some(aho_corasick::AhoCorasickKind::DFA))
+                    .ascii_case_insensitive(ascii_only)
                     .build(&needles)
                     .ok()?;
-                Some((automaton, ids))
+                Some((automaton, ids, ascii_only))
             };
-            let ends = mine()
-                .filter(|((_, place, _), _)| *place != Place::Within)
-                .map(|((_, place, text), id)| (*place, text.clone(), *id))
+            let ends = entries
+                .iter()
+                .filter(|(place, _, _)| *place != Place::Within)
+                .map(|(place, text, id)| (*place, text.clone(), *id, text.is_ascii()))
                 .collect();
-            fields.push(FieldTexts { within, ends });
+            let kidx = usize::from(field >= layout.file_at);
+            by_kind[kidx].push(FieldTexts {
+                field,
+                within,
+                ends,
+            });
         }
         Some(Texts {
             count: texts.len(),
-            fields,
+            by_kind,
         })
     }
 
-    /// Which texts the values of a start hold where they must, by their numbers. Every
-    /// occurrence of every text within is reported, those inside another included, so a text
-    /// is missed only if it is not there.
-    fn held(&self, values: &[Option<String>]) -> Vec<bool> {
-        let mut held = vec![false; self.count];
-        for (value, field) in values.iter().zip(&self.fields) {
-            let Some(value) = value else {
+    /// Which texts the values of an event hold where they must, written into `held`. Only fields
+    /// that actually carry patterns for `kind` are extracted, and ASCII values are matched
+    /// directly without allocating a folded copy.
+    fn held_into<'e>(
+        &self,
+        layout: &Layout,
+        kind: Kind,
+        subject: Subject<'e>,
+        file_name: &'e str,
+        held: &mut Vec<bool>,
+    ) {
+        held.clear();
+        held.resize(self.count, false);
+        for field in &self.by_kind[kind_index(kind)] {
+            let Some(value) = layout.value_at(subject, file_name, field.field) else {
                 continue;
             };
-            let folded = fold(value);
-            if let Some((automaton, ids)) = &field.within {
-                for m in automaton.find_overlapping_iter(folded.as_str()) {
+            let val = value.as_ref();
+            let val_ascii = val.is_ascii();
+            let mut folded_cache: Option<String> = None;
+            if let Some((automaton, ids, ascii_only)) = &field.within {
+                let hay: &str = if *ascii_only && val_ascii {
+                    val
+                } else {
+                    folded_cache.get_or_insert_with(|| fold(val)).as_str()
+                };
+                for m in automaton.find_overlapping_iter(hay) {
                     held[ids[m.pattern().as_usize()]] = true;
                 }
             }
-            for (place, text, id) in &field.ends {
-                held[*id] = match place {
-                    Place::Start => folded.starts_with(text.as_str()),
-                    _ => folded.ends_with(text.as_str()),
-                };
+            for (place, text, id, ascii_only) in &field.ends {
+                if *ascii_only && val_ascii {
+                    held[*id] = match place {
+                        Place::Start => ascii_starts_with_ci(val, text),
+                        _ => ascii_ends_with_ci(val, text),
+                    };
+                } else {
+                    let hay = folded_cache.get_or_insert_with(|| fold(val)).as_str();
+                    held[*id] = match place {
+                        Place::Start => hay.starts_with(text.as_str()),
+                        _ => hay.ends_with(text.as_str()),
+                    };
+                }
             }
         }
-        held
     }
 }
 
@@ -2201,6 +2605,47 @@ fn shape(yaml: &Value, source: &Source) -> Result<(), String> {
 /// A rule is evaluated only with an id, so that a match can be named, and with a level, so that
 /// it can be weighed, unless its set states none: then it is evaluated without one. That a file
 /// of such a set states no level is its shape's to hold (`shape`).
+fn meta_from_yaml(yaml: &Value, source: &'static Source) -> Result<Meta, String> {
+    fn one_of<T: Copy>(table: &[(&str, T)], key: &str, yaml: &Value) -> Result<T, String> {
+        let value = yaml[key].as_str();
+        table
+            .iter()
+            .find(|(n, _)| Some(*n) == value)
+            .map(|(_, v)| *v)
+            .ok_or(format!("the rule has no {key}"))
+    }
+    let id = yaml["id"].as_str().ok_or("the rule has no id")?.to_string();
+    let title = yaml["title"]
+        .as_str()
+        .ok_or("the rule has no title")?
+        .to_string();
+    let level = if source.states_levels {
+        Some(one_of(&LEVELS, "level", yaml)?)
+    } else {
+        None
+    };
+    let techniques = yaml["tags"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(|t| t.strip_prefix("attack.t"))
+        .map(|t| format!("T{t}"))
+        .collect();
+    Ok(Meta {
+        name: format!("{}:{id}", source.name),
+        id,
+        title,
+        level,
+        status: one_of(&STATUSES, "status", yaml)?,
+        author: yaml["author"].as_str().map(str::to_string),
+        techniques,
+        description: yaml["description"].as_str().map(str::to_string),
+        source,
+    })
+}
+
+#[cfg(test)]
 fn meta(rule: &sigma_rust::Rule, yaml: &Value, source: &'static Source) -> Result<Meta, String> {
     // The evaluator refuses a level or status that is not Sigma's; it allows none.
     fn one_of<T: Copy>(table: &[(&str, T)], key: &str, yaml: &Value) -> Result<T, String> {
@@ -2394,11 +2839,9 @@ mod tests {
     /// The rules a start makes `evaluate` ask, in every schema, by their files.
     fn asked_of<'a>(rules: &'a Rules, s: &ProcessStart) -> Vec<&'a str> {
         let mut files = Vec::new();
-        for (n, layout) in rules.layouts.iter().enumerate() {
-            for values in layout.forms(Subject::Start(s)) {
-                let asked = rules.asked(n, Kind::Process, s.kept, &values);
-                files.extend(asked.into_iter().map(|i| rules.rules[i].file));
-            }
+        for n in 0..rules.layouts.len() {
+            let asked = rules.asked(n, Kind::Process, Subject::Start(s), "");
+            files.extend(asked.into_iter().map(|i| rules.rules[i].file));
         }
         files
     }
@@ -2777,9 +3220,9 @@ mod tests {
         );
         assert_eq!(rules.rules[0].placement, Placement::Evaluated);
         assert!(
-            matches!(&rules.rules[0].need, Need::All(n) if !n.contains(&Need::Never)),
+            matches!(&rules.compiled().needs[0], Need::All(n) if !n.contains(&Need::Never)),
             "{:?}",
-            rules.rules[0].need
+            rules.compiled().needs[0]
         );
         assert_eq!(
             rules.rules[1].placement,
@@ -2959,12 +3402,19 @@ mod tests {
     fn an_event_is_given_to_elastic_s_rules_under_elastic_s_names() {
         let layout = Layout::new(&ECS);
         let given = |subject: Subject, kind: Kind| -> BTreeMap<String, Option<String>> {
-            let values = layout.forms(subject).remove(0);
+            let file_name = match subject {
+                Subject::Start(_) => "",
+                Subject::File(f) => f.path.as_str(),
+            };
             layout
                 .names(kind)
                 .iter()
                 .cloned()
-                .zip(values[layout.range(kind)].iter().cloned())
+                .zip(layout.range(kind).map(|i| {
+                    layout
+                        .value_at(subject, file_name, i)
+                        .map(|v| v.into_owned())
+                }))
                 .collect()
         };
         let mut s = start("/usr/bin/Curl", &["curl", "-K", "a b"], "/bin/zsh");
@@ -4661,7 +5111,7 @@ mod tests {
     fn asking_only_the_rules_a_start_can_match_gives_the_same_matches() {
         let rules = Rules::shipped();
         assert!(
-            rules.layouts.iter().all(|l| l.texts.is_some()),
+            rules.compiled().texts.iter().all(Option::is_some),
             "the texts' automata were built"
         );
         let (mut base, mut files) = starts_from_rules();
@@ -4977,7 +5427,7 @@ mod tests {
                 )),
             )])
         };
-        let need = |condition: &str| rules(condition).rules[0].need.clone();
+        let need = |condition: &str| rules(condition).compiled().needs[0].clone();
         let a = Need::All(vec![Need::Holds(0), Need::Holds(1)]);
         let b = Need::Holds(2);
         for (condition, needs) in [
@@ -5030,7 +5480,7 @@ mod tests {
         )]);
         let one = start("/bin/one", &["one"], "/bin/sh");
         assert_eq!(named_one.evaluate_each(&one).len(), 1);
-        assert_eq!(named_one.rules[0].need, Need::Any);
+        assert_eq!(named_one.compiled().needs[0], Need::Any);
     }
 
     /// A rule is asked only when its texts stand where they must: a value's first run at the
@@ -5071,7 +5521,7 @@ mod tests {
         }
         let wildcards = load("        CommandLine|contains: '*?'\n");
         assert_eq!(
-            wildcards.layouts[0].texts.as_ref().map(|t| t.count),
+            wildcards.compiled().texts[0].as_ref().map(|t| t.count),
             Some(0)
         );
     }
@@ -5247,5 +5697,40 @@ mod tests {
             .collect();
         one(with(RULE, Some(&no_level)), "not read as a rule of events");
         one(with("notes.txt", Some("x")), "notes.txt: neither");
+    }
+
+    #[test]
+    fn lazy_shipped_rules_match_eager_loading_in_metadata_placement_and_evaluation() {
+        let lazy = Rules::of_lazy(&SOURCES);
+        let eager = Rules::of(&SOURCES);
+        assert_eq!(lazy.rules.len(), eager.rules.len());
+        for (l, e) in lazy.rules.iter().zip(&eager.rules) {
+            assert_eq!(l.file, e.file);
+            assert_eq!(l.layout, e.layout);
+            assert_eq!(l.kind, e.kind);
+            assert_eq!(l.placement, e.placement);
+            assert_eq!(l.needs, e.needs);
+            assert_eq!(l.needs_fields, e.needs_fields);
+            assert_eq!(
+                l.meta
+                    .as_ref()
+                    .map(|m| (&m.id, &m.name, &m.title, &m.level)),
+                e.meta
+                    .as_ref()
+                    .map(|m| (&m.id, &m.name, &m.title, &m.level))
+            );
+            if let Some(m) = &l.meta {
+                assert!(lazy.by_id(&m.id).is_some());
+                assert!(lazy.by_name(&m.name).is_some());
+            }
+        }
+        assert!(
+            lazy.compiled.get().is_none(),
+            "metadata did not compile rules"
+        );
+        for (_, image, args) in DRILL {
+            let s = drill_start(image, args);
+            assert_eq!(fired(&lazy, &s), fired(&eager, &s));
+        }
     }
 }
