@@ -7,12 +7,12 @@ pub(super) const READ: Option<super::Reader> = Some(|text, _| poetry(text));
 
 /// `poetry.lock` of `metadata.lock-version` 2.0 or 2.1, as Poetry 1.3 and later write it: every
 /// table of the array `package`, by its name normalised, at the line of its name. Poetry writes
-/// `[package.source]` only for a package with a source address (`Locker._dump_package`): of
-/// `type` `legacy`, another index, or `url`, it is another registry; `git` is git; `file` and
-/// `directory` are a path. A package with no source was taken from PyPI when the file was
-/// written, and Poetry installs it from the index the project configures, taken here to be PyPI,
-/// checking each file against its hash in `files`. So it is PyPI's when its files are all PyPI's
-/// files of its name and version (`pypi_files`). A file that is not TOML, no `lock-version` as a
+/// `[package.source]` for every package with a source address (`Locker._dump_package`), which
+/// is every package not from PyPI: of `type` `legacy`, another index, or `url`, it is another
+/// registry; `git` is git; `file` and `directory` are a path. So a package with no source was
+/// taken from PyPI when the file was written. Poetry installs it from the index the project
+/// configures, taken here to be PyPI, and checks each file against its hash in `files`. It is
+/// PyPI's when its files are all PyPI's files of its name and version (`pypi_files`). A file that is not TOML, no `lock-version` as a
 /// string, a `package` that is not an array of tables, and a package whose name or version is not
 /// a string or whose source is not a table fail the reading, as they fail Poetry. Another
 /// `lock-version` is a kind with no reader. Left not told: a name that is not valid, a source of

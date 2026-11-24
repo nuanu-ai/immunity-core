@@ -23,7 +23,6 @@ mod bun;
 mod cargo;
 mod commit;
 mod npm;
-mod pdm;
 mod pipfile;
 mod pnpm;
 mod poetry;
@@ -131,7 +130,7 @@ const FORMATS: [(&str, &str, Option<Reader>); 12] = [
     ("Cargo.lock", "crates.io", Some(|text, _| cargo(text))),
     ("uv.lock", "PyPI", uv::READ),
     ("poetry.lock", "PyPI", poetry::READ),
-    ("pdm.lock", "PyPI", pdm::READ),
+    ("pdm.lock", "PyPI", None),
     ("pylock.toml", "PyPI", pylock::READ),
     ("Pipfile.lock", "PyPI", pipfile::READ),
     ("requirements.txt", "PyPI", requirements::READ),
@@ -1155,14 +1154,15 @@ snapshots:
     #[test]
     fn a_lockfile_of_a_kind_with_no_reader_is_never_opened_and_is_listed_with_its_size() {
         // Its size comes from the folder, so one this user may not open is still named as a
-        // kind with no reader, never as a failed reading, and listed with its size. The Python
-        // kinds whose row has no reader yet, and a named `pylock.<name>.toml` is a
-        // `pylock.toml`: each leaves PyPI unknown, and npm and crates.io as they were.
+        // kind with no reader, never as a failed reading, and listed with its size. Each
+        // Python kind whose row has no reader yet, and a named `pylock.<name>.toml`, which is a
+        // `pylock.toml`, leaves PyPI unknown, and npm and crates.io as they were.
         use std::os::unix::fs::PermissionsExt;
         let text = "bun-lockfile-format-v0\n";
         for (file, kind) in [
             ("bun.lockb", "bun.lockb"),
             ("uv.lock", "uv.lock"),
+            ("pdm.lock", "pdm.lock"),
             ("pylock.toml", "pylock.toml"),
             ("pylock.dev.toml", "pylock.toml"),
             ("Pipfile.lock", "Pipfile.lock"),
@@ -1237,8 +1237,8 @@ snapshots:
             let of_it = format!("{ecosystem}/");
             assert!(said.iter().any(|s| s.starts_with(&of_it)), "{kind}");
         }
-        assert!(has_reader("npm") && has_reader("crates.io") && has_reader("PyPI"));
-        assert!(!has_reader("RubyGems"));
+        assert!(has_reader("npm") && has_reader("crates.io"));
+        assert!(!has_reader("PyPI") && !has_reader("RubyGems"));
     }
 
     #[test]
