@@ -38,6 +38,7 @@ use cargo::cargo;
 pub use commit::commit;
 use npm::npm;
 use pnpm::pnpm;
+pub use pypi::pypi_normalized;
 use yarn::yarn;
 
 pub const READER: &str = "lockfiles";

@@ -441,6 +441,7 @@ pub struct Statement {
 }
 
 /// A difference between draft and live for one subject and predicate.
+#[derive(Clone)]
 pub struct Event {
     pub kind: &'static str,
     pub subject: String,

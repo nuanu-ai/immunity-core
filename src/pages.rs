@@ -2151,9 +2151,10 @@ fn vulnerability_gap(conn: &Connection, now: i64) -> rusqlite::Result<Option<Str
     Ok(unread(&lockfiles, latest_run, now, &old))
 }
 
-/// Each feed of vulnerability data that is not current, with why, as `unread` names a gap.
+/// Each matched feed of vulnerability data that is not current, with why, as `unread` names a
+/// gap.
 fn old_feeds(conn: &Connection, now: i64) -> rusqlite::Result<Vec<String>> {
-    Ok(crate::vulnerabilities::freshness(conn, now)?
+    Ok(crate::vulnerabilities::matched_freshness(conn, now)?
         .into_iter()
         .filter_map(|f| {
             f.not_current

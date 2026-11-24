@@ -162,7 +162,9 @@ fn no_vulnerability_data(cmd: &mut Command, home: &Path) {
     cmd.arg("--osv-crates-input")
         .arg(home.join("osv-crates.zip"))
         .arg("--osv-npm-input")
-        .arg(home.join("osv-npm.zip"));
+        .arg(home.join("osv-npm.zip"))
+        .arg("--osv-pypi-input")
+        .arg(home.join("osv-pypi.zip"));
 }
 
 /// npm's vulnerability data as a run reads it: an archive of these public records from
@@ -806,6 +808,8 @@ fn a_program_in_the_current_folder_or_reached_through_a_relative_path_entry_is_n
         .arg(&absent)
         .arg("--osv-npm-input")
         .arg(&absent)
+        .arg("--osv-pypi-input")
+        .arg(&absent)
         .arg("--system-root")
         .arg(&absent)
         .arg("--servers-input")
@@ -1422,6 +1426,8 @@ fn by_default_nothing_is_written_to_the_working_folder_and_the_store_is_in_the_u
             .arg("--osv-crates-input")
             .arg(dir.0.join("no-osv"))
             .arg("--osv-npm-input")
+            .arg(dir.0.join("no-osv"))
+            .arg("--osv-pypi-input")
             .arg(dir.0.join("no-osv"))
             .arg("--system-root")
             .arg(dir.0.join("no-system")))

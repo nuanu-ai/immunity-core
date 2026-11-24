@@ -20,24 +20,30 @@ const CANONICAL: &str = r"^([1-9][0-9]*!)?(0|[1-9][0-9]*)(\.(0|[1-9][0-9]*))*((a
 /// `-` between them, as `^([A-Z0-9]|[A-Z0-9][A-Z0-9._-]*[A-Z0-9])$` ignoring case. That
 /// expression is written out here because a regular expression ignoring case under Unicode also
 /// takes the Kelvin sign for `k`. Normalised is lowercase with each run of `.`, `-` and `_` one
-/// `-`.
+/// `-` (`pypi_normalized`).
 pub(super) fn pypi_name(name: &str) -> Option<String> {
     let edge = |c: Option<&u8>| c.is_some_and(u8::is_ascii_alphanumeric);
     let bytes = name.as_bytes();
     let valid = edge(bytes.first())
         && edge(bytes.last())
         && (bytes.iter()).all(|c| c.is_ascii_alphanumeric() || b"._-".contains(c));
-    valid.then(|| {
-        let mut out = String::new();
-        for c in name.chars() {
-            match c {
-                '.' | '_' | '-' if out.ends_with('-') => {}
-                '.' | '_' | '-' => out.push('-'),
-                c => out.push(c.to_ascii_lowercase()),
-            }
+    valid.then(|| pypi_normalized(name))
+}
+
+/// A name normalised, valid or not: lowercase with each run of `.`, `-` and `_` one `-`. The
+/// vulnerability data's names go through this alone (`osv::normalized`), so a record whose name
+/// is not valid is kept rather than dropped. Its form never equals a valid name's, which holds
+/// only `a-z`, `0-9` and `-` inside, so it matches no lockfile entry.
+pub fn pypi_normalized(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.chars() {
+        match c {
+            '.' | '_' | '-' if out.ends_with('-') => {}
+            '.' | '_' | '-' => out.push('-'),
+            c => out.push(c.to_ascii_lowercase()),
         }
-        out
-    })
+    }
+    out
 }
 
 /// Whether `version` is a public version in canonical form, as `CANONICAL` says.

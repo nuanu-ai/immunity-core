@@ -85,6 +85,8 @@ impl Home {
             .arg(no("osv-crates.zip"))
             .arg("--osv-npm-input")
             .arg(no("osv-npm.zip"))
+            .arg("--osv-pypi-input")
+            .arg(no("osv-pypi.zip"))
             .arg("--system-root")
             .arg(no("no-system"))
             .args(extra)
