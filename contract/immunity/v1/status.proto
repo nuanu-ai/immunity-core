@@ -161,7 +161,7 @@ enum Headline {
 // reader does not know, is read as a reason it cannot name, never as none.
 enum HeadlineBecause {
   HEADLINE_BECAUSE_UNSPECIFIED = 0;
-  // `this_mac.live` is false, or a failure in `watching.failed` stands.
+  // `this_mac.live` is false, `watching` is absent, or a failure in `watching.failed` stands.
   HEADLINE_BECAUSE_WATCHER = 1;
   // `this_mac.state` is `watched_in_part`.
   HEADLINE_BECAUSE_THIS_MAC = 2;

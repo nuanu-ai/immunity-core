@@ -2892,34 +2892,51 @@ mod tests {
         let mut st = crate::status::state(&conn, &dir, now).unwrap();
         st.this_mac.state = "watched";
         st.this_mac.checked_at = Some(now - 1);
-        let band = |st: &crate::status::State, headline: v1::Headline| {
-            let r = v1::Status {
-                this_mac: Some(v1::ThisMac {
-                    fresh: true,
-                    ..Default::default()
-                }),
-                needs_a_look: Some(v1::NeedsALook::default()),
-                headline: headline as i32,
-                ..Default::default()
-            };
+        let draw = |st: &crate::status::State, r: &v1::Status| {
             let mut out = String::new();
-            state(&conn, &mut out, st, &r, now).unwrap();
+            state(&conn, &mut out, st, r, now).unwrap();
             out
         };
+        // A status that is calm by the core's rule: fresh, nothing to look at, this Mac watched
+        // whole by a live watcher.
+        let calm = crate::headline::headed(v1::Status {
+            this_mac: Some(v1::ThisMac {
+                state: v1::ThisMacState::Watched as i32,
+                live: true,
+                checked_at: Some(now - 1),
+                fresh: true,
+                ..Default::default()
+            }),
+            watching: Some(v1::Watcher::default()),
+            needs_a_look: Some(v1::NeedsALook::default()),
+            ..Default::default()
+        });
+        assert_eq!(calm.headline, v1::Headline::Calm as i32);
+        st.this_mac.live = true;
+        let drawn = draw(&st, &calm);
+        assert!(
+            drawn.contains(GLYPH_CALM) && drawn.contains("watched live"),
+            "{drawn}"
+        );
+        // Every other headline, set by hand to pick the glyph, never draws the calm disc.
+        let band = |st: &crate::status::State, headline: v1::Headline| {
+            let mut r = calm.clone();
+            r.headline = headline as i32;
+            draw(st, &r)
+        };
         for (headline, glyph) in [
-            (v1::Headline::Calm, GLYPH_CALM),
             (v1::Headline::InPart, GLYPH_PART),
             (v1::Headline::Stale, GLYPH_STALE),
             (v1::Headline::Unknown, GLYPH_UNKNOWN),
             (v1::Headline::Unspecified, GLYPH_UNKNOWN),
         ] {
             let drawn = band(&st, headline);
-            assert!(drawn.contains(glyph), "{headline:?}: {drawn}");
             assert!(
-                headline == v1::Headline::Calm || !drawn.contains(GLYPH_CALM),
+                drawn.contains(glyph) && !drawn.contains(GLYPH_CALM),
                 "{headline:?}: {drawn}"
             );
         }
+        st.this_mac.live = false;
         let stopped = band(&st, v1::Headline::InPart);
         assert!(stopped.contains("live watching is off"), "{stopped}");
         st.this_mac.live = true;

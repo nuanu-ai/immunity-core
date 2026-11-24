@@ -1055,6 +1055,7 @@ mod tests {
         let mut calm = status();
         calm.needs_a_look = Some(v1::NeedsALook::default());
         calm.this_mac.as_mut().unwrap().live = true;
+        calm.watching = Some(v1::Watcher::default());
         let text = run(&calm, &Screen::pipe());
         assert!(
             text.starts_with("✓ Nothing needs a look   took 12 s\n"),
@@ -1314,6 +1315,7 @@ mod tests {
         let mut calm = s.clone();
         calm.needs_a_look = Some(v1::NeedsALook::default());
         calm.this_mac.as_mut().unwrap().live = true;
+        calm.watching = Some(v1::Watcher::default());
         let text = run(&calm, &Screen::pipe());
         assert!(
             text.starts_with("✓ Nothing needs a look · the first check of this Mac"),

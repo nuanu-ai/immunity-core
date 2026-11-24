@@ -4234,7 +4234,7 @@ impl Headline {
 pub enum HeadlineBecause {
     #[serde(rename = "unspecified")]
     Unspecified = 0,
-    /// `this_mac.live` is false, or a failure in `watching.failed` stands.
+    /// `this_mac.live` is false, `watching` is absent, or a failure in `watching.failed` stands.
     #[serde(rename = "watcher")]
     Watcher = 1,
     /// `this_mac.state` is `watched_in_part`.

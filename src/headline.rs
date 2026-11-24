@@ -54,7 +54,9 @@ pub(crate) fn headline(s: &Status) -> (Headline, Vec<B>) {
     let because: Vec<B> = [
         (
             B::Watcher,
-            !m.live || s.watching.as_ref().is_some_and(|w| !w.failed.is_empty()),
+            // A live watcher the status itself describes: `live` and `watching` are two reads,
+            // and a watcher that left between them leaves `live` alone.
+            !m.live || s.watching.as_ref().is_none_or(|w| !w.failed.is_empty()),
         ),
         (B::ThisMac, in_part),
         (
@@ -124,11 +126,13 @@ mod tests {
     #[test]
     fn calm_only_when_no_section_of_the_status_says_otherwise_and_the_rule_keeps_its_order() {
         assert_eq!(headline(&calm()), (Headline::Calm, vec![]));
-        let alone: [(B, Change); 13] = [
+        let alone: [(B, Change); 14] = [
             (B::Watcher, |s| mac(s).live = false),
             (B::Watcher, |s| {
                 s.watching.as_mut().unwrap().failed = vec![v1::WatcherFailure::default()]
             }),
+            // Live, and no watcher the status describes: it left between the two reads.
+            (B::Watcher, |s| s.watching = None),
             (B::ThisMac, |s| {
                 mac(s).state = ThisMacState::WatchedInPart as i32
             }),
@@ -194,7 +198,7 @@ mod tests {
         }
         // Every reason at once is named in the schema's order.
         let mut all = calm();
-        for (_, change) in &alone[..10] {
+        for (_, change) in &alone[..11] {
             change(&mut all);
         }
         assert_eq!(
