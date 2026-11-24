@@ -18,7 +18,7 @@ An event (`Event`) is something that happened on the Mac and that the collector 
 
 A match (`RuleMatch`) is one rule that matched one event. On its own it claims nothing. There are many, and the app does not list them. `immunity matches` gives every one, of every level, with its event, for a program that judges them.
 
-A finding is what the core decided a person should look at. There are few, and each stays open until the person answers it, except a finding about a state, such as a malicious package in a lockfile, which the core clears when the state goes. `immunity findings` lists them.
+A finding is what the core decided a person should look at. There are few, and each stays open until the person answers it, except a finding about a state, such as a vulnerability attackers use in a lockfile, which the core clears when the state goes. The core never clears a malicious package's finding: it stays until the person answers it. `immunity findings` lists them.
 
 A match of a rule marked below high raises nothing, and its `raised` is `below_high`; so does a match of a rule whose set states no level, with `level_not_stated`. A match of a rule marked high or critical also raises that rule's finding or adds to the one it has, so it is in both answers. Its `raised` is `finding` once the core's own reading has read the line, and `findings` names the finding. Many findings rest on no event at all: a malicious package, or a shell startup file that changed. A `suspicious` verdict raises a finding of its own.
 

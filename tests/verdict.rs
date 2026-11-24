@@ -695,8 +695,8 @@ fn drawn(seed: u64, len: usize) -> Vec<Step> {
 fn the_core_s_findings_are_the_same_whether_or_not_verdicts_are_sent() {
     use Step::*;
     let named: Vec<(&str, Vec<Step>)> = vec![
-        // A malicious package found, gone and cleared; a suspicious verdict about it, seen;
-        // the package comes back: the core raises it again.
+        // A malicious package found and gone, its finding still open; a suspicious verdict
+        // about it, seen; the package comes back.
         (
             "comes-back",
             vec![
@@ -712,7 +712,7 @@ fn the_core_s_findings_are_the_same_whether_or_not_verdicts_are_sent() {
             ],
         ),
         // An urgent suspicious verdict about an open finding, then the package goes, and the
-        // same in the other order: the run clears the core's finding either way.
+        // same in the other order: the run treats the core's finding the same either way.
         (
             "verdict-then-gone",
             vec![
@@ -735,7 +735,7 @@ fn the_core_s_findings_are_the_same_whether_or_not_verdicts_are_sent() {
             ],
         ),
         // A harmless verdict after an urgent one; a mark of expected then a suspicious verdict
-        // and the mark's end; a cleared finding then a suspicious verdict.
+        // and the mark's end; a finding whose package left, then a suspicious verdict.
         (
             "harmless-after-urgent",
             vec![
@@ -762,7 +762,7 @@ fn the_core_s_findings_are_the_same_whether_or_not_verdicts_are_sent() {
             ],
         ),
         (
-            "cleared-then-suspicious",
+            "gone-then-suspicious-again",
             vec![
                 Package(true),
                 Run,
@@ -832,13 +832,13 @@ fn a_suspicious_verdict_raises_one_finding_of_its_rule_and_thing_that_only_the_p
     let other = mac.send(&about_finding(&store, &malicious, "suspicious", "case-2"));
     assert_ne!(other["recorded"]["finding"]["id"], own.as_str());
     assert_eq!(mac.verdict_findings().len(), 2);
-    // A run that no longer finds the package clears the core's finding and not the response
-    // layer's: only the person closes it.
+    // A run that no longer finds the package leaves the response layer's finding open: only the
+    // person closes it. The core's finding of a malicious package stays too, its package gone.
     mac.package(false);
     mac.run();
     let lockfile_own = other["recorded"]["finding"]["id"].as_str().unwrap();
     assert!(mac.shown(lockfile_own).is_some());
-    assert!(mac.shown(&malicious).is_none());
+    assert!(mac.shown(&malicious).is_some());
     // The core's finding names it, and says how many verdicts there are and nothing they said.
     let item = mac.shown(&padding).unwrap();
     assert_eq!(item["verdicts"]["verdict_finding"]["id"], own.as_str());

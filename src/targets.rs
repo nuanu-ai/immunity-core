@@ -11,7 +11,7 @@ use crate::codesign;
 use crate::guarded::{self, Real};
 use crate::look::{Absent, Look};
 use crate::plist::{self, Text};
-use crate::store::{Cause, Gap, Lack, Statement};
+use crate::store::{self, Cause, Gap, Lack, Statement};
 use crate::watched::{self, Content, Entry, Roots};
 use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::{BTreeMap, BTreeSet};
@@ -37,6 +37,7 @@ const IN_BUNDLE: &str = "startup programs inside an app bundle (BundleProgram)";
 const NOT_FILE: &str = "startup programs that are not a regular file (such as an app named whole)";
 const GUARDED: &str = "startup programs in a folder macOS asks permission for";
 const FAILED: &str = "startup programs that could not be opened";
+const CLOSED: &str = "startup programs of other accounts closed to this account";
 const ITEMS: &str = "startup items that could not be read and whose programs are kept as last read";
 const ARGUMENTS: &str = "files that startup items name in their arguments";
 const NOT_THERE: &str = "startup programs watched as another kind and not read there";
@@ -181,13 +182,32 @@ impl Targets {
     }
 }
 
-/// Why a target was not read or not judged, as a cause: what is in a guarded folder was not
-/// given, what could not be opened or told failed, and the rest has no reader in this build.
+/// Why a target was not read or not judged, as a cause: what is in a guarded folder, or closed
+/// by the account that owns it, was not given, what could not be opened or told failed, and
+/// the rest has no reader in this build.
 fn cause(why: &str) -> Cause {
     match why {
-        GUARDED => Cause::NotGiven,
+        GUARDED | CLOSED => Cause::NotGiven,
         FAILED | ITEMS => Cause::Failed,
         _ => Cause::NoReader,
+    }
+}
+
+/// A target there that could not be opened, as its content and the bucket it counts in: one of
+/// another account closed to this one is not given while it was never read here (`read_here`),
+/// else it failed, as any other (`watched::unread_cause`).
+fn not_opened(content: Content, read_here: bool) -> (Content, &'static str) {
+    match content {
+        Content::Unread(cause, why) => {
+            let cause = watched::unread_cause(cause, &why, read_here);
+            let bucket = if cause == Cause::NotGiven {
+                CLOSED
+            } else {
+                FAILED
+            };
+            (Content::Unread(cause, why), bucket)
+        }
+        other => (other, FAILED),
     }
 }
 
@@ -263,6 +283,7 @@ fn named_by(runs: Runs, bytes: &[u8], part: &str) -> Option<(Named, Vec<String>)
 /// the targets the store says it named, and is counted.
 pub fn read(
     tx: &Transaction,
+    run_id: &str,
     machine: &str,
     roots: &Roots,
     items: &[&Look],
@@ -356,9 +377,16 @@ pub fn read(
             (Content::Unread(Cause::NoReader, why.into()), None)
         } else {
             let before = previous(tx, &id)?;
+            let read_here = store::read_before(tx, watched::READER, &id, watched::CONTENT, run_id)?;
             let mut resolve = || guarded::real(&on_disk(roots, &unit.path), &homes);
-            let (content, after, why) =
-                read_target(&mut resolve, roots, &unit.path, &before, &mut look);
+            let (content, after, why) = read_target(
+                &mut resolve,
+                roots,
+                &unit.path,
+                &before,
+                read_here,
+                &mut look,
+            );
             why.into_iter().for_each(|why| t.count(why));
             let link = after.link.clone();
             t.before.insert(unit.clone(), before);
@@ -434,6 +462,7 @@ fn read_target(
     roots: &Roots,
     path: &str,
     before: &Signature,
+    read_here: bool,
     look: &mut Look,
 ) -> (Content, Signature, Option<&'static str>) {
     let not = |content, why| (content, Signature::default(), why);
@@ -468,7 +497,10 @@ fn read_target(
             Err(content @ Content::Unread(Cause::NoReader, _)) => {
                 return not(content, Some(watched::OVER_CAP));
             }
-            Err(content) => return not(content, Some(FAILED)),
+            Err(content) => {
+                let (content, why) = not_opened(content, read_here);
+                return not(content, Some(why));
+            }
         };
         let content = format!("sha256:{}", crate::sha256::hex(&bytes));
         drop(bytes);
@@ -760,9 +792,30 @@ mod tests {
     }
 
     #[test]
+    fn a_program_of_another_account_closed_here_is_not_given_until_read_here_and_then_failed() {
+        // Never read here: not given, and the reading is never full. Read here before: losing
+        // sight of it failed, as for any program that could not be opened.
+        let closed = |cause| Content::Unread(cause, watched::CLOSED.to_string());
+        let read_before = not_opened(closed(Cause::NotGiven), true);
+        assert_eq!(read_before, (closed(Cause::Failed), FAILED));
+        let (never, why) = not_opened(closed(Cause::NotGiven), false);
+        assert_eq!(never, closed(Cause::NotGiven));
+        let mut t = Targets::default();
+        t.count(why);
+        let mut look = Look::default();
+        look.read(Unit::whole("/Library/Example/helper"));
+        t.short_of(&mut look);
+        let (completeness, reason, gap) = t.coverage(&look);
+        assert_eq!(completeness, "partial");
+        let said = format!("not read in full: {CLOSED}: 1; {AT_CHECKS}");
+        assert_eq!(reason.as_deref(), Some(said.as_str()));
+        assert_eq!(gap.cause, Some(Cause::NotGiven));
+    }
+
+    #[test]
     fn the_name_of_what_the_reading_does_not_read_fits_a_list_of_names_as_it_is() {
         let names = [
-            NOT_FULL, IN_BUNDLE, NOT_FILE, GUARDED, FAILED, ITEMS, ARGUMENTS, NOT_THERE,
+            NOT_FULL, IN_BUNDLE, NOT_FILE, GUARDED, FAILED, CLOSED, ITEMS, ARGUMENTS, NOT_THERE,
         ];
         for name in names.into_iter().chain(NOTES).chain([watched::OVER_CAP]) {
             assert!(!name.contains([',', ':']), "{name}");
@@ -803,7 +856,14 @@ mod tests {
             home: dir,
             system: dir,
         };
-        let (content, s, _) = read_target(resolve, &roots, "/runner", before, &mut Look::default());
+        let (content, s, _) = read_target(
+            resolve,
+            &roots,
+            "/runner",
+            before,
+            false,
+            &mut Look::default(),
+        );
         (content, s)
     }
 

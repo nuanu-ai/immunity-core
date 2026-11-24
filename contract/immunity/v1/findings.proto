@@ -137,7 +137,8 @@ message Finding {
   // in `rests_on` are still there.
   Evidence evidence = 14;
   // The journal entries it rests on, oldest first: what a reader saw that raised it, or that it
-  // was found again. The journal only grows, so an entry is never changed after it is written.
+  // was found again, and for a finding about a package the entry that cleared it or said its
+  // package left. The journal only grows, so an entry is never changed after it is written.
   repeated JournalEntry rests_on = 15;
   // As in `Findings`.
   string answers_note = 16;
@@ -379,6 +380,29 @@ message VulnerablePackage {
   repeated PackageRelease releases = 4;
   // The records that say so.
   repeated PackageRecord records = 5;
+  // Why the finding no longer finds what it is about, for a finding the core cleared and for a
+  // malicious package's finding, which the core never clears: it stays open until the person
+  // answers it. It describes and decides nothing. Absent while it is found: `releases` and
+  // `records` are then what the lockfiles and the data hold now. When set, they are what the
+  // finding was about when it was last found, kept at `no_longer_found_at`, and never what the
+  // lockfiles hold now; when nothing of that was kept, the fields above are absent. Absent too
+  // for a finding cleared by a core before 1.31.0, which kept nothing. Since 1.31.0.
+  optional NoLongerFound no_longer_found = 6;
+  // When the core's check found that. Absent when `no_longer_found` is. Since 1.31.0.
+  optional int64 no_longer_found_at = 7;
+}
+
+// Why a finding about a package no longer finds it. `UNSPECIFIED`, or a value the reader does not
+// know, is read as not known why: the finding's `state` alone says whether it needs a look.
+enum NoLongerFound {
+  NO_LONGER_FOUND_UNSPECIFIED = 0;
+  // The project's lockfiles were read in full and no longer declare a release it was about.
+  NO_LONGER_FOUND_NOT_DECLARED = 1;
+  // The project is no longer on the Mac.
+  NO_LONGER_FOUND_PROJECT_GONE = 2;
+  // The project's lockfiles still declare the package and its rule no longer finds it, as when a
+  // record was withdrawn or no longer lists the release.
+  NO_LONGER_FOUND_NOT_NAMED = 3;
 }
 
 message PackageRelease {
