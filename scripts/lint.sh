@@ -93,7 +93,6 @@ src/events.rs
 src/finding_text.rs
 src/findings.rs
 src/lists.rs
-src/lockfiles.rs
 src/main.rs
 src/overview.rs
 src/pages.rs

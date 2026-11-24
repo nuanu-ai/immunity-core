@@ -19,7 +19,7 @@
 //!   between ASCII spaces and tabs, since JavaScript's `trim`, which Yarn uses, and Rust's take
 //!   different characters, and a version Yarn sees could be missed;
 //! - a top-level key whose value is not a block, which Yarn takes as a pointer to another key:
-//!   refused one layer up, where the tree becomes entries (`lockfiles::yarn1`).
+//!   refused one layer up, where the tree becomes entries (`lockfiles::yarn::yarn1`).
 //!
 //! A comment `yarn lockfile v<N>` with N other than 1 stops the reading, as Yarn stops at a
 //! later version; Yarn reads a version 0 on, and here it is a version without a reader.
