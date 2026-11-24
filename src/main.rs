@@ -2669,7 +2669,7 @@ impl Run<'_> {
             let verdict = judge(&e)?;
             match (e.kind, e.predicate.as_str()) {
                 ("removed", "watched_as") => self.settle.departures.push((of(), e.clone())),
-                ("added", "watched_as") if self.placed_at_start(r, &e.subject) => {
+                ("added", "watched_as") if self.placed_at_start(r, &e.subject)? => {
                     let note = Some(watched::HOOK_ALREADY_WATCHED);
                     store::journal_event(self.tx, r, &e, note)?;
                 }
@@ -2685,11 +2685,17 @@ impl Run<'_> {
 
     /// Whether a reading of `r`'s kind placed `subject` when the run began: one of another
     /// scope, as another checkout's reading of a hook, since `r` adds it to its own. Whatever
-    /// comes of that placement in this run, the thing is not new.
-    fn placed_at_start(&self, r: &Reading, subject: &str) -> bool {
-        self.settle
-            .at_start
-            .contains(&[subject, r.kind].map(str::to_string))
+    /// comes of that placement in this run, the thing is not new. Only with the bytes it had
+    /// then: content another reading of this run already found changed is told here.
+    fn placed_at_start(&self, r: &Reading, subject: &str) -> rusqlite::Result<bool> {
+        let placed = (self.settle.at_start).contains(&[subject, r.kind].map(str::to_string));
+        let changed = "SELECT EXISTS (SELECT 1 FROM journal
+             WHERE run_id = ?1 AND subject = ?2 AND predicate = 'has_content')";
+        let changed = || {
+            self.tx
+                .query_row(changed, [self.run_id, subject], |r| r.get(0))
+        };
+        Ok(placed && !changed()?)
     }
 
     /// Decides once, after the run's last reader, what each reading's retraction of a thing's
@@ -4040,7 +4046,7 @@ fn read_watched(
         let folder = git.folder(&c.path, &args.home, &homes, given);
         let (look, elsewhere) = match watched::look_checkout(c, &args.home, homes, folder, given) {
             watched::Hooks::GitFile => elsewhere(Cause::NoReader, watched::GIT_FILE.to_string()),
-            watched::Hooks::Looked(look) => (look, None),
+            watched::Hooks::Looked(look) => (*look, None),
         };
         // Every checkout is read, those with no hooks too: the first hook planted in a
         // checkout the store already held is then new, not the baseline. Hooks kept elsewhere
@@ -4318,7 +4324,7 @@ fn read_watched(
         let mut new = BTreeSet::new();
         for (e, verdict) in events {
             // A hook another checkout's reading placed when this run began is not new here.
-            let elsewhere = run.placed_at_start(&reading, &e.subject);
+            let elsewhere = run.placed_at_start(&reading, &e.subject)?;
             match (verdict, e.kind, e.predicate.as_str()) {
                 (Verdict::Change, "added", "watched_as") => {
                     let path = path_of(&e.subject);

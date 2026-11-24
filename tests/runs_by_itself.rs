@@ -2637,6 +2637,69 @@ fn a_file_watched_in_two_places_and_removed_is_gone_from_each_and_raised_by_the_
 }
 
 #[test]
+fn a_folder_met_and_not_listed_is_no_proof_that_a_hook_inside_it_is_gone() {
+    let e = Estate::new("met-folder-no-proof");
+    let a = e.checkout("dev/a");
+    let tools = a.join("tools/pre-commit");
+    put(&tools.join("pre-receive"), "# still here\n");
+    put(
+        &a.join(".git/config"),
+        &format!("[core]\n hooksPath = {}\n", tools.display()),
+    );
+    e.full();
+    // `tools` now names `dev/a/tools`, where `pre-commit` is a folder, and `.git/tools`,
+    // a link to itself that cannot be followed.
+    put(&a.join(".git/config"), "[core]\n hooksPath = tools\n");
+    link("tools", &a.join(".git/tools"));
+    e.full();
+    let hooks = e.rows("SELECT subject FROM assertion WHERE layer = 'live' AND predicate = 'watched_as' AND object = 'git hook'");
+    let kept = "file:machine:mac/dev/a/tools/pre-commit/pre-receive".to_string();
+    assert!(hooks.contains(&kept), "{hooks:?}");
+}
+
+#[test]
+fn a_hook_whose_bytes_changed_is_raised_by_the_hook_rule_whichever_checkout_is_read_first() {
+    for (tag, from, to) in [
+        ("changed-leaves-first", "dev/a", "dev/b"),
+        ("changed-leaves-last", "dev/b", "dev/a"),
+    ] {
+        let e = Estate::new(tag);
+        let agents = e.home().join("Library/LaunchAgents");
+        put(&agents.join("pre-commit"), "# an agent and a hook\n");
+        let config = |rel: &str| e.checkout(rel).join(".git/config");
+        let shared = format!("[core]\n hooksPath = {}\n", agents.display());
+        put(&config(from), &shared);
+        e.checkout(to);
+        e.full();
+        put(&agents.join("pre-commit"), "# changed\n");
+        put(&config(from), "[core]\n hooksPath = /dev/null\n");
+        put(&config(to), &shared);
+        e.full();
+        let hook = pair("watched.git-hook", "~/Library/LaunchAgents/pre-commit");
+        assert!(e.found().contains(&hook), "{tag}: {:?}", e.found());
+    }
+}
+
+#[test]
+fn a_parent_checkout_not_read_does_not_hide_what_a_reading_of_a_checkout_inside_it_read() {
+    let e = Estate::new("parent-unvisited");
+    e.checkout("dev/a");
+    let b = e.checkout("dev/a/b");
+    put(&b.join(".mcp.json"), SERVER);
+    // A walk does not enter a checkout; an agent's session names the one inside it.
+    session(&e, "b", &b);
+    e.go(None, &e.0.join("sessions"));
+    let servers = "SELECT subject FROM assertion WHERE layer = 'live' AND predicate = 'watched_as' AND subject LIKE '%#/mcpServers/%'";
+    assert_eq!(
+        e.rows(servers),
+        ["file:machine:mac/dev/a/b/.mcp.json#/mcpServers/helper"]
+    );
+    put(&b.join(".mcp.json"), r#"{"mcpServers": {}}"#);
+    e.run_in(&b);
+    assert!(e.rows(servers).is_empty());
+}
+
+#[test]
 fn a_thing_is_gone_only_where_a_reading_looked_and_a_project_not_looked_into_keeps_what_it_held() {
     // A run pointed at `dev` looks into no project outside it; `dev/shop` is gone from it.
     let e = Estate::new("ways-gone-and-kept");

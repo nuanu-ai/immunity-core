@@ -375,7 +375,7 @@ pub fn look_machine(roots: &Roots, kind: &str) -> Look {
 /// How the hooks of one checkout could be looked at.
 pub enum Hooks {
     /// What was read, short of the folder Git's configuration names when it could not be told.
-    Looked(Look),
+    Looked(Box<Look>),
     /// `.git` is a file: the hooks are elsewhere.
     GitFile,
 }
@@ -440,7 +440,7 @@ pub fn look_checkout(
         None if told => look.read(hooks_told(&checkout.rel)),
         None => {}
     }
-    Hooks::Looked(look)
+    Hooks::Looked(Box::new(look))
 }
 
 /// Reads the hooks Git runs by `names` from a configured folder, `path` as written and
@@ -544,7 +544,7 @@ fn look_place(
         }
     };
     look.present += 1;
-    look.read(Unit::whole(shown));
+    look.listed(Unit::whole(shown));
     for name in names {
         let text = name.to_string_lossy();
         if p.scope == Scope::Checkout && text.ends_with(SAMPLE) {

@@ -92,6 +92,9 @@ pub struct Look {
     /// The units found present and not read in full. One read in full is known to be there by
     /// its reading, which is all the store asks of it (`baseline::Judge::facts`).
     seen: Vec<Unit>,
+    /// The units of `read` whose listing was read or that were found absent: what is in them
+    /// is known. A folder met and not listed is no proof of what is inside it.
+    listed: Vec<Unit>,
     /// Whether the reading could not tell every place its units may be (`unplaced`).
     unplaced: bool,
 }
@@ -99,6 +102,12 @@ pub struct Look {
 impl Look {
     /// A unit looked at and not there: read in full, it holds nothing.
     pub fn absent(&mut self, unit: Unit, _: Absent) {
+        self.listed(unit);
+    }
+
+    /// A folder there whose listing was read in full.
+    pub fn listed(&mut self, unit: Unit) {
+        self.listed.push(unit.clone());
         self.read.push(unit);
     }
 
@@ -192,8 +201,18 @@ impl Look {
     }
 
     /// Whether a unit this reading did not read hides `unit`: what was known of it is kept.
+    /// One that merely contains a unit read inside it that `proves` `unit` does not: the
+    /// deepest unit that holds a path decides.
     pub fn hides(&self, unit: &Unit) -> bool {
-        self.hiding().any(|u| u.hides(unit))
+        let within = |h: &Unit| (self.read.iter()).any(|r| h.hides(r) && self.proves(r, unit));
+        self.hiding().any(|h| h.hides(unit) && !within(h))
+    }
+
+    /// Whether `r`, read in full, tells what became of `unit`: it is that unit, its file, or
+    /// the folder that holds it, listed.
+    fn proves(&self, r: &Unit, unit: &Unit) -> bool {
+        let folder = || *r == Unit::whole(baseline::parent(&unit.path)) && self.listed.contains(r);
+        r == unit || *r == Unit::whole(&unit.path) || folder()
     }
 
     /// `hides`, for the unit at `path`, with paths compared as a Mac's volumes compare names
@@ -212,18 +231,14 @@ impl Look {
     /// Whether this reading covers a unit it knew something of, so that it may retract that:
     /// no unit it did not read hides it, and either the reading could tell every place its
     /// units may be, or a unit it read in full is that unit, its file or the folder that holds
-    /// it. What it did not find is then gone, at whatever level: a file, its folder, a checkout
+    /// it, listed. What it did not find is then gone, at whatever level: a file, its folder, a checkout
     /// no longer found or one whose `.git` is gone takes along what was read inside it. What it
     /// cannot place, `None`, only when it read everything it looked at.
     pub fn covers(&self, unit: Option<&Unit>) -> bool {
         let Some(unit) = unit else {
             return self.cause().is_none();
         };
-        let (file, folder) = (
-            Unit::whole(&unit.path),
-            Unit::whole(baseline::parent(&unit.path)),
-        );
-        let proven = || (self.read.iter()).any(|r| [unit, &file, &folder].contains(&r));
+        let proven = || (self.read.iter()).any(|r| self.proves(r, unit));
         !self.hides(unit) && (!self.unplaced || proven())
     }
 
@@ -609,11 +624,13 @@ mod tests {
     #[test]
     fn a_reading_that_cannot_tell_every_place_of_its_units_covers_only_what_it_read_itself() {
         // The hooks of a checkout whose configured folder cannot be told: a hook known in
-        // `.git/hooks` or in a folder read, and no other, may be recorded as gone.
+        // `.git/hooks` or in a folder listed, and no other, may be recorded as gone. A folder
+        // met as an entry and not listed tells nothing of what is inside it.
         let mut look = Look::default();
         assert!(look.covers(None));
-        look.read(Unit::whole("dev/a/.git/hooks"));
+        look.listed(Unit::whole("dev/a/.git/hooks"));
         look.read(Unit::whole("tools/pre-push"));
+        look.read(Unit::whole("tools/pre-commit"));
         look.read_part(&Unit::whole("conf.json"), "/a");
         look.not_looked_at(Unit::whole("shut"), "denied".to_string());
         let covers = |look: &Look, path: &str| look.covers(Some(&Unit::whole(path)));
@@ -625,7 +642,34 @@ mod tests {
         assert!(look.covers(Some(&Unit::part("conf.json", "/a"))));
         assert!(!look.covers(Some(&Unit::part("conf.json", "/b"))));
         assert!(!covers(&look, "old/pre-commit") && !covers(&look, "shut/pre-commit"));
+        assert!(!covers(&look, "tools/pre-commit/pre-receive"));
+        // A folder found absent holds nothing.
+        let gone = Error::from_raw_os_error(2);
+        look.absent(Unit::whole("githooks"), Absent::of(&gone).unwrap());
+        assert!(covers(&look, "githooks/pre-commit"));
         assert!(!look.covers(None));
+    }
+
+    #[test]
+    fn a_unit_not_read_does_not_hide_what_was_read_inside_it_and_tells_what_became_of_a_unit() {
+        // A checkout not looked into holds one that was: what the inner one read is decided.
+        let mut look = Look::default();
+        look.short_of(
+            [Unit::whole("dev/a")],
+            Cause::NotGiven,
+            "not looked into".to_string(),
+        );
+        look.read(Unit::whole("dev/a/b/.mcp.json"));
+        look.read(Unit::whole("dev/a/b/tools"));
+        look.listed(Unit::whole("dev/a/b/hooks"));
+        let covers = |path: &str| look.covers(Some(&Unit::whole(path)));
+        assert!(look.covers(Some(&Unit::part("dev/a/b/.mcp.json", "/mcpServers/x"))));
+        assert!(covers("dev/a/b/hooks/pre-commit"));
+        assert!(!covers("dev/a/b/tools/run") && !covers("dev/a/c/.mcp.json"));
+        assert!(!covers("dev/a/b/hooks/deeper/pre-commit"));
+        // A unit not read inside a folder listed is hidden by itself.
+        look.unread(Unit::whole("dev/a/b/hooks/shut"), "denied".to_string());
+        assert!(!look.covers(Some(&Unit::whole("dev/a/b/hooks/shut"))));
     }
 
     #[test]
