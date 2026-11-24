@@ -2471,6 +2471,7 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
         machine: &machine,
         notes: Vec::new(),
         readers: 0,
+        settle: Settle::default(),
     };
     stage(CheckStage::Packages);
     read_brew(&mut run, args)?;
@@ -2489,7 +2490,7 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
         read_lockfiles(&mut run, args, &found)?;
     }
     stage(CheckStage::Places);
-    let (watched, mut opened) = watch_places(&mut run, args, &found, None, walk_failure)?;
+    let (mut watched, mut opened) = watch_places(&mut run, args, &found, None, walk_failure)?;
     // What was set aside as no longer read, by this run or by a watcher since the last run's
     // line, is said once, here: a watcher's own line is not where a person is told.
     let set_aside = lifecycle::set_aside(run.tx, run.run_id, Some(watched::READER))?;
@@ -2514,6 +2515,7 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     stage(CheckStage::Events);
     opened += read_events(&mut run, args)?;
     read_traces(&mut run, args)?;
+    opened += settled(&mut run, &mut watched)?;
     stage(CheckStage::Saving);
     resolve(&mut run)?;
     read_threats(&run, catalogue)?;
@@ -2562,6 +2564,26 @@ struct Run<'a> {
     notes: Vec<String>,
     /// Readers that had input to read.
     readers: usize,
+    /// What the run decides once, after its last reader.
+    settle: Settle,
+}
+
+/// Every difference a reading made with its verdict, and what it held back (`Run::apply_judged`).
+type Judged = (Vec<(Event, Verdict)>, Vec<lifecycle::Held>);
+
+/// What a run decides once, after its last reader (`Run::settle`), kept in memory for that run
+/// alone: whether a thing a reading no longer places is gone, with what was read inside it.
+#[derive(Default)]
+struct Settle {
+    /// What the watched places reader placed when the run began, as subject and the kind of
+    /// the reading (`lifecycle::placements`).
+    at_start: BTreeSet<[String; 2]>,
+    /// Each thing whose `located_on` a reading retracted, with that reading's reader, scope and
+    /// kind.
+    candidates: Vec<([String; 3], String)>,
+    /// Each `watched_as` a reading retracted, with that reading: journaled once it is known
+    /// whether a reading of its kind still places it.
+    departures: Vec<([String; 3], Event)>,
 }
 
 impl Run<'_> {
@@ -2594,7 +2616,9 @@ impl Run<'_> {
             gap,
             compared: completeness,
         };
-        self.apply_judged(r, &reading, statements, &mut |_| Ok(Verdict::Change))?;
+        self.apply_judged(r, &reading, statements, &|_| true, &mut |_| {
+            Ok(Verdict::Change)
+        })?;
         Ok(())
     }
 
@@ -2610,7 +2634,7 @@ impl Run<'_> {
         let with_basis: Vec<(&str, &Statement)> = statements.iter().map(|s| (basis, s)).collect();
         let (tx, run_id) = (self.tx, r.run_id);
         let prefix = format!("checkout:{}/", self.machine);
-        self.apply_judged(r, reading, &with_basis, &mut |e| match (
+        self.apply_judged(r, reading, &with_basis, &|_| true, &mut |e| match (
             e.kind,
             e.subject.strip_prefix(&prefix),
         ) {
@@ -2621,32 +2645,108 @@ impl Run<'_> {
     }
 
     /// The same, judging each difference before it is journaled (`baseline.rs`): one that is
-    /// not a change is journaled as a first reading. Returns every difference with its verdict.
+    /// not a change is journaled as a first reading. What was there and `may_go` says the
+    /// reading does not cover is held back as it was. Returns every difference with its
+    /// verdict, and what was held back.
     fn apply_judged(
         &mut self,
         r: &Reading,
         a: &Applied,
         statements: &[(&str, &Statement)],
+        may_go: &dyn Fn(&str) -> bool,
         judge: &mut dyn FnMut(&Event) -> rusqlite::Result<Verdict>,
-    ) -> rusqlite::Result<Vec<(Event, Verdict)>> {
+    ) -> rusqlite::Result<Judged> {
         if a.compared != "none" {
             for (basis, s) in statements {
                 store::put_draft(self.tx, r, basis, s)?;
             }
         }
         store::put_coverage(self.tx, r, a.completeness, a.reason, a.gap)?;
+        let of = || [r.reader, r.scope, r.kind].map(str::to_string);
+        let (events, held) = lifecycle::promote(self.tx, r, a.compared, may_go)?;
         let mut out = Vec::new();
-        for e in lifecycle::promote(self.tx, r, a.compared)? {
+        for e in events {
             let verdict = judge(&e)?;
-            // A hook can move between checkouts during one reading. Its departure is
-            // journaled after every checkout has been compared, its arrival by the reading of
-            // the hooks once it knows whether another checkout placed it before.
-            if !watched::hook_departure(r.kind, &e) && !watched::hook_arrival(r.kind, &e) {
-                store::journal_event(self.tx, r, &e, verdict.text())?;
+            match (e.kind, e.predicate.as_str()) {
+                ("removed", "watched_as") => self.settle.departures.push((of(), e.clone())),
+                ("added", "watched_as") if self.placed_at_start(r, &e.subject)? => {
+                    let note = Some(watched::HOOK_ALREADY_WATCHED);
+                    store::journal_event(self.tx, r, &e, note)?;
+                }
+                _ => store::journal_event(self.tx, r, &e, verdict.text())?,
+            }
+            if (e.kind, e.predicate.as_str()) == ("removed", "located_on") {
+                self.settle.candidates.push((of(), e.subject.clone()));
             }
             out.push((e, verdict));
         }
-        Ok(out)
+        Ok((out, held))
+    }
+
+    /// Whether a reading of `r`'s kind placed `subject` when the run began: one of another
+    /// scope, as another checkout's reading of a hook, since `r` adds it to its own. Whatever
+    /// comes of that placement in this run, the thing is not new. Only with the bytes it had
+    /// then: content another reading of this run already found changed is told here.
+    fn placed_at_start(&self, r: &Reading, subject: &str) -> rusqlite::Result<bool> {
+        let placed = (self.settle.at_start).contains(&[subject, r.kind].map(str::to_string));
+        let changed = "SELECT EXISTS (SELECT 1 FROM journal
+             WHERE run_id = ?1 AND subject = ?2 AND predicate = 'has_content')";
+        let changed = || {
+            self.tx
+                .query_row(changed, [self.run_id, subject], |r| r.get(0))
+        };
+        Ok(placed && !changed()?)
+    }
+
+    /// Decides once, after the run's last reader, what each reading's retraction of a thing's
+    /// place means (`lifecycle.rs`): a thing nothing places any more goes, with what was read
+    /// inside it, whatever order the readers came in. A watched entry is gone unless a reading
+    /// of its kind still places it, as another checkout's reading of the same hook. Returns the
+    /// rows of what is gone and what the rules look at.
+    fn settle(&mut self) -> rusqlite::Result<(Rows, Vec<findings::Observed>)> {
+        let settle = std::mem::take(&mut self.settle);
+        let (tx, run_id, at) = (self.tx, self.run_id, self.at);
+        fn of<'a>([reader, scope, kind]: &'a [String; 3], run_id: &'a str, at: i64) -> Reading<'a> {
+            let observed_at = at;
+            Reading {
+                reader,
+                scope,
+                kind,
+                run_id,
+                at,
+                observed_at,
+            }
+        }
+        let reading = |r| of(r, run_id, at);
+        for (of, subject) in &settle.candidates {
+            lifecycle::retract_inside(tx, &reading(of), subject)?;
+        }
+        let (mut rows, mut seen, mut gone) = (Rows::new(), Vec::new(), BTreeSet::new());
+        let prefix = format!("file:{}/", self.machine);
+        for (of, e) in &settle.departures {
+            let r = reading(of);
+            let still = lifecycle::placed(tx, &e.subject, Some(r.kind))?;
+            store::journal_event(tx, &r, e, still.then_some(watched::HOOK_STILL_ACTIVE))?;
+            let place = e.old.clone().unwrap_or_default();
+            if still || !gone.insert((&e.subject, place.clone())) {
+                continue;
+            }
+            watched::content_gone(tx, &r, &e.subject)?;
+            let file = e.subject.clone();
+            seen.push(findings::Observed {
+                change: "gone",
+                place: place.clone(),
+                file,
+            });
+            let path = e.subject.strip_prefix(&prefix).unwrap_or(&e.subject);
+            rows.push(vec![
+                "gone".to_string(),
+                place,
+                path.to_string(),
+                String::new(),
+            ]);
+        }
+        Ok((rows, seen))
     }
 
     /// Saves raw input unless it equals the last saved copy of the same input, and returns
@@ -3687,7 +3787,7 @@ fn read_lockfiles(
 
 /// How one reading is written: its coverage, and how its statements are compared with what is
 /// live. A reading of which entries are there is compared as a whole reading even when some of
-/// its units could not be read, since what it knew of those is made again (`kept`): what is
+/// its units could not be read, since what it knew of those is held back (`may_go`): what is
 /// gone from a unit read in full is then gone.
 struct Applied<'a> {
     completeness: &'a str,
@@ -3710,18 +3810,17 @@ struct Placed {
     elsewhere: Option<String>,
     /// The completeness, reason and cause the reading says, where its reader gives them.
     coverage: Option<(&'static str, Option<String>, Option<Cause>)>,
-    /// What the reading held about checkouts it did not look into, made again as it was.
-    kept: Vec<Statement>,
     /// The checkouts it looks into, by their paths as ids name them: the one whose hooks it
     /// reads, or every checkout for a reading over checkouts.
     checkouts: Vec<String>,
 }
 
 /// The reading of a checkout's hooks that were not looked at where they are, and why: it read
-/// nothing.
+/// nothing, and covers nothing.
 fn elsewhere(cause: Cause, why: String) -> (look::Look, Option<String>) {
     let mut look = look::Look::default();
     look.short(cause, why.clone());
+    look.unplaced();
     (look, Some(why))
 }
 
@@ -3782,69 +3881,6 @@ impl Visited {
             .filter(|rel| known::within(path, rel))
             .max_by_key(|rel| rel.len())
     }
-
-    /// Whether a file, by its path as ids name it, is in a checkout the reading did not look
-    /// into: the deepest checkout whose folder holds it.
-    fn unvisited(&self, path: &str) -> bool {
-        self.held
-            .iter()
-            .chain(&self.looked)
-            .filter(|rel| {
-                path.strip_prefix(rel.as_str())
-                    .is_some_and(|rest| rest.starts_with('/'))
-            })
-            .max_by_key(|rel| rel.len())
-            .is_some_and(|rel| !self.looked.contains(rel))
-    }
-}
-
-/// The entries a reading holds live about what `keep`, given the subject and the file's path
-/// as ids name it, says was not read now: the statements to make again, with what they rested on.
-fn kept(
-    tx: &rusqlite::Transaction,
-    r: &Reading,
-    keep: impl Fn(&str, Option<&Unit>) -> bool,
-) -> rusqlite::Result<Vec<Statement>> {
-    let mut kept = Vec::new();
-    let mut stmt = tx.prepare(
-        "SELECT a.subject, a.predicate, a.object, a.source_ref, u.path, u.part FROM assertion a
-         LEFT JOIN watched_unit u ON (u.kind, u.scope, u.subject) = (a.kind, a.scope, a.subject)
-         WHERE a.layer = 'live' AND a.reader = ?1 AND a.scope = ?2 AND a.kind = ?3",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![r.reader, r.scope, r.kind], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get(2)?,
-            row.get(3)?,
-            row.get::<_, Option<String>>(4)?,
-            row.get::<_, Option<String>>(5)?,
-        ))
-    })?;
-    for row in rows {
-        let (subject, predicate, object, source_ref, path, part) = row?;
-        let predicate = match predicate.as_str() {
-            "watched_as" => "watched_as",
-            "located_on" => "located_on",
-            autorun::HOLDS => autorun::HOLDS,
-            _ => continue,
-        };
-        // Every entry a reading of this format holds was recorded with its unit, in the
-        // transaction that made it, and a unit's row is never taken out.
-        let unit = path.map(|path| Unit {
-            path,
-            part: part.unwrap_or_default(),
-        });
-        if keep(&subject, unit.as_ref()) {
-            kept.push(Statement {
-                subject,
-                predicate,
-                object,
-                source_ref,
-            });
-        }
-    }
-    Ok(kept)
 }
 
 /// Reads the watched places, moves what they hold through the lifecycle and raises what the
@@ -3869,6 +3905,14 @@ fn watch_places(
         run.machine,
     )?);
     Ok((rows, opened))
+}
+
+/// Settles the run (`Run::settle`): the rows of what is gone join `rows`, and the rules raise
+/// what they find in it. Returns how many findings it opened.
+fn settled(run: &mut Run, rows: &mut Rows) -> rusqlite::Result<usize> {
+    let (gone, seen) = run.settle()?;
+    rows.extend(gone);
+    findings::detect(run.tx, run.run_id, run.at, &seen)
 }
 
 /// Reads the watched places of this machine and the hooks of every checkout the run holds.
@@ -3924,6 +3968,9 @@ fn read_watched(
             },
         )?;
     }
+    // Whether a thing is new where a reading of its kind in another scope placed it is told by
+    // what was placed when the run began, whatever order the readings come in.
+    run.settle.at_start = lifecycle::placements(run.tx, watched::READER)?;
     let mut placed = Vec::new();
     for (watched_as, kind) in watched::kinds() {
         if kind == watched::HOOK_KIND || kind == targets::KIND || !wanted(&machine, kind) {
@@ -3936,7 +3983,6 @@ fn read_watched(
             look: watched::look_machine(&roots, kind),
             elsewhere: None,
             coverage: None,
-            kept: Vec::new(),
             checkouts: Vec::new(),
         });
     }
@@ -3960,7 +4006,6 @@ fn read_watched(
             look,
             elsewhere: None,
             coverage: Some((completeness, reason, gap.cause)),
-            kept: Vec::new(),
             checkouts: Vec::new(),
         });
         Some((read, gap))
@@ -4001,7 +4046,7 @@ fn read_watched(
         let folder = git.folder(&c.path, &args.home, &homes, given);
         let (look, elsewhere) = match watched::look_checkout(c, &args.home, homes, folder, given) {
             watched::Hooks::GitFile => elsewhere(Cause::NoReader, watched::GIT_FILE.to_string()),
-            watched::Hooks::Looked(look) => (look, None),
+            watched::Hooks::Looked(look) => (*look, None),
         };
         // Every checkout is read, those with no hooks too: the first hook planted in a
         // checkout the store already held is then new, not the baseline. Hooks kept elsewhere
@@ -4013,7 +4058,6 @@ fn read_watched(
             look,
             elsewhere,
             coverage: None,
-            kept: Vec::new(),
             checkouts: vec![c.rel.clone()],
         });
     }
@@ -4033,7 +4077,6 @@ fn read_watched(
             look,
             elsewhere,
             coverage: None,
-            kept: Vec::new(),
             checkouts: vec![rel],
         });
     }
@@ -4041,46 +4084,33 @@ fn read_watched(
     // folder, as one reading of this machine. Before checkouts were ever looked for on this
     // machine a reading over them would look into none and say that it read every checkout,
     // so it is not made then; and what is held about a checkout not looked into is kept as
-    // it was.
+    // it was: the reading names those checkouts as not looked into (`look::Look::short_of`).
     let visited = Visited::of(run.tx, &machine, checkouts)?;
     for point in autorun::POINTS.iter().filter(|p| p.read_here()) {
         if !wanted(&machine, &point.kind()) {
             continue;
         }
-        let (mut looked, kept, over) = match point.scope {
+        let (mut looked, over) = match point.scope {
             autorun::Scope::Home => (
                 autorun::look_all(point, [(args.home.as_path(), "")].into_iter(), &args.home),
                 Vec::new(),
-                Vec::new(),
             ),
             _ if !visited.looked_for && walk_failure.is_none() => continue,
-            _ => {
-                let reading = Reading {
-                    reader: watched::READER,
-                    scope: &machine,
-                    kind: &point.kind(),
-                    run_id: &run_id,
-                    at: run.at,
-                    observed_at: run.at,
-                };
-                (
-                    autorun::look_all(
-                        point,
-                        checkouts.iter().map(|c| (c.path.as_path(), c.rel.as_str())),
-                        &args.home,
-                    ),
-                    kept(run.tx, &reading, |_, unit| {
-                        unit.is_some_and(|unit| visited.unvisited(&unit.path))
-                    })?,
-                    rels.clone(),
-                )
-            }
+            _ => (
+                autorun::look_all(
+                    point,
+                    checkouts.iter().map(|c| (c.path.as_path(), c.rel.as_str())),
+                    &args.home,
+                ),
+                rels.clone(),
+            ),
         };
         let missed = visited
             .missed(walk_failure)
             .filter(|_| point.scope == autorun::Scope::Checkout);
         if let Some((why, cause)) = missed {
-            looked.look.short(cause, why.to_string());
+            let unvisited = visited.held.difference(&visited.looked).map(Unit::whole);
+            looked.look.short_of(unvisited, cause, why.to_string());
         }
         let (completeness, reason) = looked.coverage(point);
         let cause = looked.look.cause();
@@ -4091,7 +4121,6 @@ fn read_watched(
             coverage: Some((completeness, reason, cause)),
             look: looked.look,
             elsewhere: None,
-            kept,
             checkouts: over,
         });
     }
@@ -4139,7 +4168,6 @@ fn read_watched(
     let first_check = !baseline::checked_before(run.tx, &run_id)?;
     // What was read for the first time, by the place that holds it and what it is watched as.
     let mut first_reads: BTreeMap<(String, &'static str), usize> = BTreeMap::new();
-    let mut hook_departures = Vec::new();
 
     for (p, mine) in placed.iter().zip(&lines) {
         let reading = Reading {
@@ -4172,15 +4200,6 @@ fn read_watched(
             .first()
             .filter(|_| p.kind == watched::HOOK_KIND)
             .map(|c| Unit::whole(format!("{c}/.git/hooks")));
-        // What was read outside `.git/hooks`, in a folder Git's configuration names, is kept
-        // as it was while that folder could not be told, or something outside was not read.
-        let outside = |u: &Unit| {
-            hooks
-                .as_ref()
-                .is_some_and(|h| !baseline::under(&u.path, &h.path))
-        };
-        let keep_outside =
-            hooks.is_some() && p.look.is_short() || p.look.not_read().any(|u| outside(&u.unit));
         // Whether an earlier run told the folder this checkout's hooks are run from.
         let told_before = match p.checkouts.first() {
             Some(c) => judge.part_read_before(&watched::hooks_told(c))?,
@@ -4249,21 +4268,12 @@ fn read_watched(
                 source_ref,
             });
         }
-        statements.extend(p.kept.iter().map(|s| Statement {
-            subject: s.subject.clone(),
-            predicate: s.predicate,
-            object: s.object.clone(),
-            source_ref: s.source_ref.clone(),
-        }));
-        // What the reading may not retract keeps what was known of it (`look::Look::retracts`),
-        // so that the rest of the reading is compared whole: what is gone from a unit read in
-        // full is gone, whatever failed elsewhere. A part of a file that could not be read,
-        // its neighbours read, keeps only its own. Hooks kept elsewhere keep all of theirs.
-        statements.extend(kept(tx, &reading, |_, unit| {
-            p.elsewhere.is_some()
-                || !p.look.retracts(unit)
-                || keep_outside && unit.is_none_or(outside)
-        })?);
+        // What the reading does not cover keeps what was known of it (`look::Look::covers`), so
+        // that the rest of the reading is compared whole: what is gone from a unit read in full
+        // is gone, whatever failed elsewhere. A part of a file that could not be read, its
+        // neighbours read, keeps only its own. Hooks kept elsewhere keep all of theirs.
+        let held = baseline::units_of(tx, &reading)?;
+        let may_go = |subject: &str| p.look.covers(held.get(subject));
         baseline::remember_units(tx, &reading, &units)?;
         let (completeness, reason) = if let Some((completeness, reason, _)) = &p.coverage {
             (*completeness, reason.clone())
@@ -4297,7 +4307,7 @@ fn read_watched(
             compared: "full",
         };
         let mut judged: HashMap<String, Verdict> = HashMap::new();
-        let events = run.apply_judged(&reading, &applied, &with_basis, &mut |e| {
+        let (events, _) = run.apply_judged(&reading, &applied, &with_basis, &may_go, &mut |e| {
             if e.kind != "added" {
                 return Ok(Verdict::Change);
             }
@@ -4313,12 +4323,8 @@ fn read_watched(
         })?;
         let mut new = BTreeSet::new();
         for (e, verdict) in events {
-            // A hook another checkout's reading placed before this run is not new here.
-            let elsewhere = lifecycle::placed(tx, &e.subject, Some(&reading))?;
-            if watched::hook_arrival(&p.kind, &e) {
-                let note = elsewhere.then_some(watched::HOOK_ALREADY_WATCHED);
-                store::journal_event(tx, &reading, &e, note.or(verdict.text()))?;
-            }
+            // A hook another checkout's reading placed when this run began is not new here.
+            let elsewhere = run.placed_at_start(&reading, &e.subject)?;
             match (verdict, e.kind, e.predicate.as_str()) {
                 (Verdict::Change, "added", "watched_as") => {
                     let path = path_of(&e.subject);
@@ -4348,21 +4354,6 @@ fn read_watched(
                     if !elsewhere {
                         new.insert(e.subject);
                     }
-                }
-                (_, "removed", "watched_as") => {
-                    if watched::hook_departure(&p.kind, &e) {
-                        hook_departures.push((p.scope.as_str(), e));
-                        continue;
-                    }
-                    watched::content_gone(run.tx, &reading, &e.subject)?;
-                    let place = e.old.unwrap_or_default();
-                    observe("gone", &place, &e.subject);
-                    rows.push(vec![
-                        "gone".to_string(),
-                        place,
-                        path_of(&e.subject),
-                        String::new(),
-                    ]);
                 }
                 (Verdict::FirstRead, "added", "watched_as") => {
                     // The same as in another checkout of its repository, which the store
@@ -4482,13 +4473,14 @@ fn read_watched(
                 gap: &gap,
                 compared: completeness,
             };
-            let events = run.apply_judged(
+            let (events, _) = run.apply_judged(
                 &reading,
                 &applied,
                 &statements
                     .iter()
                     .map(|s| (watched::BASIS, s))
                     .collect::<Vec<_>>(),
+                &|_| true,
                 &mut |ev| {
                     Ok(match (ev.kind, entry) {
                         ("added", Some(v)) => v,
@@ -4559,36 +4551,6 @@ fn read_watched(
             p.look.read_units(),
             p.look.seen_units(),
         )?;
-    }
-    let mut gone = BTreeSet::new();
-    let file_prefix = format!("file:{machine}/");
-    for (scope, event) in hook_departures {
-        let reading = Reading {
-            reader: watched::READER,
-            scope,
-            kind: watched::HOOK_KIND,
-            run_id: &run_id,
-            at: run.at,
-            observed_at: run.at,
-        };
-        // Gone only once no checkout's reading places it any more.
-        let left = lifecycle::retract_inside(run.tx, &reading, &event.subject)?;
-        let note = (!left).then_some(watched::HOOK_STILL_ACTIVE);
-        store::journal_event(run.tx, &reading, &event, note)?;
-        if left && gone.insert(event.subject.clone()) {
-            watched::content_gone(run.tx, &reading, &event.subject)?;
-            observe("gone", watched::HOOK, &event.subject);
-            rows.push(vec![
-                "gone".to_string(),
-                watched::HOOK.to_string(),
-                event
-                    .subject
-                    .strip_prefix(&file_prefix)
-                    .unwrap_or(&event.subject)
-                    .to_string(),
-                String::new(),
-            ]);
-        }
     }
     // One line per place read for the first time, and one journal entry for each, which the
     // finding that tells them rests on.
@@ -4914,15 +4876,14 @@ fn read_other_autoruns(
         present_kind.kind,
         present_kind.run_id,
     )?;
-    // What is held about a checkout this run did not look into is made again as it was, so
+    // What is held about a checkout this run did not look into is held back as it was, so
     // the rest is compared whole, and the reading says why it is not.
     let visited = Visited::of(run.tx, &machine, found)?;
     let prefix = format!("checkout:{machine}/");
-    statements.extend(kept(run.tx, &present_kind, |subject, _| {
-        subject
-            .strip_prefix(&prefix)
-            .is_some_and(|rel| visited.held.contains(rel) && !visited.looked.contains(rel))
-    })?);
+    let may_go = |subject: &str| {
+        (subject.strip_prefix(&prefix))
+            .is_none_or(|rel| !visited.held.contains(rel) || visited.looked.contains(rel))
+    };
     let missed = visited.missed(walk_failure);
     let gap = Gap::when(missed.map(|(_, cause)| cause));
     let with_basis: Vec<(&str, &Statement)> =
@@ -4936,7 +4897,7 @@ fn read_other_autoruns(
     };
     // The ways a checkout found in this run holds are judged as finding it was.
     let tx = run.tx;
-    run.apply_judged(&present_kind, &applied, &with_basis, &mut |e| {
+    let (_, held) = run.apply_judged(&present_kind, &applied, &with_basis, &may_go, &mut |e| {
         if !read_before {
             return Ok(Verdict::Baseline);
         }
@@ -4945,12 +4906,13 @@ fn read_other_autoruns(
         }
         Ok(baseline::found_as(tx, run_id.as_str(), &e.subject)?.unwrap_or(Verdict::Change))
     })?;
-    // The ways not read that checkouts hold, those kept as they were among them.
+    // The ways not read that checkouts hold, those held back as they were among them.
     let mut present: BTreeMap<String, usize> = BTreeMap::new();
-    for s in statements.iter().filter(|s| s.subject.starts_with(&prefix)) {
-        let way = autorun::ways().find(|(p, _)| p.name() == s.object);
-        if way.is_some_and(|(p, _)| !p.read()) {
-            *present.entry(s.object.clone()).or_default() += 1;
+    let said = statements.iter().map(|s| (&s.subject, &s.object));
+    for (subject, object) in said.chain(held.iter().map(|(s, _, o)| (s, o))) {
+        let way = autorun::ways().find(|(p, _)| p.name() == *object);
+        if subject.starts_with(&prefix) && way.is_some_and(|(p, _)| !p.read()) {
+            *present.entry(object.clone()).or_default() += 1;
         }
     }
     let (completeness, reason, gap) = if present.is_empty() {
@@ -5247,7 +5209,7 @@ fn read_indicators(
     }
     let with_basis: Vec<(&str, &Statement)> =
         statements.iter().map(|s| (indicators::BASIS, s)).collect();
-    run.apply_judged(&match_kind, &applied, &with_basis, &mut |_| {
+    run.apply_judged(&match_kind, &applied, &with_basis, &|_| true, &mut |_| {
         Ok(Verdict::Change)
     })?;
     let lacks = indicators::lacks(&list);
@@ -5831,29 +5793,6 @@ mod tests {
     }
 
     #[test]
-    fn what_is_kept_is_of_the_deepest_checkout_holding_a_file_and_never_of_one_no_longer_held() {
-        // A reading keeps what it did not look into, and only that: a project inside one it
-        // looked into is not, and neither is a project gone from the store whose name begins
-        // as one kept does, or its entries would stay forever.
-        let set = |rels: &[&str]| rels.iter().map(|r| r.to_string()).collect();
-        let v = Visited {
-            held: set(&["dev/shop", "dev/shop/vendor/lib", "Documents/notes"]),
-            looked: set(&["dev/shop"]),
-            looked_for: true,
-        };
-        assert!(v.unvisited("Documents/notes/package.json"));
-        assert!(v.unvisited("dev/shop/vendor/lib/package.json"));
-        assert!(!v.unvisited("dev/shop/package.json"));
-        assert!(!v.unvisited("Documents/notes-old/package.json"));
-        let v = Visited {
-            looked: set(&["dev/shop/vendor/lib"]),
-            ..v
-        };
-        assert!(!v.unvisited("dev/shop/vendor/lib/package.json"));
-        assert!(v.unvisited("dev/shop/package.json"));
-    }
-
-    #[test]
     fn where_sessions_were_read_up_to_is_committed_with_the_run_or_not_at_all() {
         // A position kept apart from the facts read before it would, after a run that failed,
         // stand for lines whose facts were never written.
@@ -5908,6 +5847,7 @@ mod tests {
                 machine: "machine:mac",
                 notes: Vec::new(),
                 readers: 0,
+                settle: Settle::default(),
             };
             read_agent_folders(&mut run, &args, agent_folders::LOOK_LIMIT).unwrap();
             assert_eq!(count(&tx), 1);
@@ -5958,6 +5898,7 @@ mod tests {
             machine: "machine:mac",
             notes: Vec::new(),
             readers: 0,
+            settle: Settle::default(),
         };
 
         read_agent_folders(&mut run, &args, 2).unwrap();
@@ -6031,6 +5972,7 @@ mod tests {
                 machine: "machine:mac",
                 notes: Vec::new(),
                 readers: 0,
+                settle: Settle::default(),
             };
             read_checkouts(&mut run, &args).unwrap();
             read_agent_folders(&mut run, &args, agent_folders::LOOK_LIMIT).unwrap();
@@ -6242,6 +6184,7 @@ mod tests {
             machine: "machine:mac",
             notes: Vec::new(),
             readers: 0,
+            settle: Settle::default(),
         };
         let thing = |subject: &str| integrity::Thing {
             subject: subject.to_string(),

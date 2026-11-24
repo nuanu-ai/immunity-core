@@ -2484,6 +2484,239 @@ fn git_hooks_shared_between_checkouts_are_gone_only_after_the_last_checkout_stop
     assert_eq!(e.status()["watched"]["since_last_reading"]["gone"], 1);
 }
 
+/// What one run leaves of a hook in a folder two checkouts' configurations can name: the
+/// findings, what the status counts as new and gone since the last reading, the entries of the
+/// run journaled of it as entry and note, the checkout that places it and how many digests of
+/// it are still read.
+type Moved = (
+    Vec<(String, String)>,
+    [i64; 2],
+    Vec<String>,
+    Vec<String>,
+    usize,
+);
+
+/// What one run leaves of a hook as it moves from the checkout `from` to the checkout `to`.
+fn a_hook_moved(tag: &str, from: &str, to: &str) -> Moved {
+    let e = Estate::new(tag);
+    let hooks = e.home().join(".shared-hooks");
+    put(&hooks.join("pre-commit"), "# shared\n");
+    let config = |rel: &str| e.checkout(rel).join(".git/config");
+    let shared = format!("[core]\n hooksPath = {}\n", hooks.display());
+    put(&config(from), &shared);
+    e.checkout(to);
+    e.full();
+    let before = e.last_entry();
+    put(&config(from), "[core]\n hooksPath = /dev/null\n");
+    put(&config(to), &shared);
+    e.full();
+    let subject = "file:machine:mac/.shared-hooks/pre-commit";
+    let since = &e.status()["watched"]["since_last_reading"];
+    let journaled = e.rows(&format!(
+        "SELECT entry, text FROM journal WHERE predicate = 'watched_as' AND subject = '{subject}'
+           AND seq > {before} ORDER BY seq"
+    ));
+    let placed = e.rows(&format!(
+        "SELECT object FROM assertion WHERE layer = 'live' AND predicate = 'located_on'
+           AND subject = '{subject}'"
+    ));
+    let content = e.rows(&format!(
+        "SELECT object FROM assertion WHERE layer = 'live' AND predicate = 'has_content'
+           AND subject = '{subject}'"
+    ));
+    let count = |v: &serde_json::Value| v.as_i64().unwrap();
+    let placed = placed.iter().map(|p| p.replace(to, "<to>")).collect();
+    (
+        e.found(),
+        [count(&since["new"]), count(&since["gone"])],
+        journaled,
+        placed,
+        content.len(),
+    )
+}
+
+#[test]
+fn a_hook_that_leaves_one_checkout_and_is_found_in_another_in_the_same_run_is_neither_removed_nor_new()
+ {
+    let (found, since, journaled, placed, content) = a_hook_moved("hook-moves", "dev/a", "dev/b");
+    assert!(found.is_empty(), "{found:?}");
+    assert_eq!(since, [0, 0]);
+    assert_eq!(
+        journaled,
+        [
+            "added|this hook is already watched in another checkout",
+            "removed|this hook is still watched in another checkout"
+        ]
+    );
+    assert_eq!(
+        (placed, content),
+        (vec!["checkout:machine:mac/<to>".to_string()], 1)
+    );
+}
+
+#[test]
+fn what_goes_does_not_depend_on_whether_the_checkout_a_hook_leaves_is_read_first_or_last() {
+    // Checkouts are read in the order of their names: `dev/a` before `dev/b`.
+    assert_eq!(
+        a_hook_moved("hook-leaves-first", "dev/a", "dev/b"),
+        a_hook_moved("hook-leaves-last", "dev/b", "dev/a")
+    );
+}
+
+#[test]
+fn a_hook_is_not_removed_while_its_hooks_folder_could_not_be_read() {
+    let e = Estate::new("hooks-unread");
+    let hooks = e.checkout("dev/tree").join(".git/hooks");
+    put(&hooks.join("pre-commit"), "# kept\n");
+    e.full();
+    std::fs::remove_file(hooks.join("pre-commit")).unwrap();
+    let watched = || {
+        e.rows("SELECT subject FROM assertion WHERE layer = 'live' AND predicate = 'watched_as' AND object = 'git hook'")
+    };
+    let removed = || {
+        e.rows("SELECT subject FROM journal WHERE entry = 'removed' AND predicate = 'watched_as'")
+    };
+    mode(&hooks, 0o000);
+    e.full();
+    mode(&hooks, 0o755);
+    assert_eq!(
+        watched(),
+        ["file:machine:mac/dev/tree/.git/hooks/pre-commit"]
+    );
+    assert!(removed().is_empty());
+    e.full();
+    assert!(watched().is_empty());
+    assert_eq!(
+        removed(),
+        ["file:machine:mac/dev/tree/.git/hooks/pre-commit"]
+    );
+}
+
+#[test]
+fn a_hook_gone_from_a_folder_git_names_is_kept_while_another_folder_it_names_could_not_be_read() {
+    // A relative `core.hooksPath` names a folder in the working tree and one in the Git folder,
+    // which a push runs hooks from: either may hold what was in the other.
+    let e = Estate::new("hooks-other-folder-unread");
+    let tree = e.checkout("dev/tree");
+    put(&tree.join(".git/config"), "[core]\n hooksPath = githooks\n");
+    put(&tree.join("githooks/pre-commit"), "# husky\n");
+    std::fs::create_dir_all(tree.join(".git/githooks")).unwrap();
+    e.full();
+    std::fs::remove_file(tree.join("githooks/pre-commit")).unwrap();
+    mode(&tree.join(".git/githooks"), 0o000);
+    e.full();
+    mode(&tree.join(".git/githooks"), 0o755);
+    let watched = "SELECT subject FROM assertion WHERE layer = 'live' AND predicate = 'watched_as' AND object = 'git hook'";
+    assert_eq!(
+        e.rows(watched),
+        ["file:machine:mac/dev/tree/githooks/pre-commit"]
+    );
+    e.full();
+    assert!(e.rows(watched).is_empty());
+}
+
+#[test]
+fn a_file_watched_in_two_places_and_removed_is_gone_from_each_and_raised_by_the_rule_of_each() {
+    let e = Estate::new("gone-from-two-places");
+    let agents = e.home().join("Library/LaunchAgents");
+    put(&agents.join("pre-commit"), "# an agent and a hook\n");
+    put(
+        &e.checkout("dev/f").join(".git/config"),
+        &format!("[core]\n hooksPath = {}\n", agents.display()),
+    );
+    e.full();
+    std::fs::remove_file(agents.join("pre-commit")).unwrap();
+    e.full();
+    assert_eq!(
+        e.found(),
+        [
+            pair("watched.autostart", "~/Library/LaunchAgents/pre-commit"),
+            pair("watched.git-hook", "~/Library/LaunchAgents/pre-commit"),
+        ]
+    );
+}
+
+#[test]
+fn a_folder_met_and_not_listed_is_no_proof_that_a_hook_inside_it_is_gone() {
+    let e = Estate::new("met-folder-no-proof");
+    let a = e.checkout("dev/a");
+    let tools = a.join("tools/pre-commit");
+    put(&tools.join("pre-receive"), "# still here\n");
+    put(
+        &a.join(".git/config"),
+        &format!("[core]\n hooksPath = {}\n", tools.display()),
+    );
+    e.full();
+    // `tools` now names `dev/a/tools`, where `pre-commit` is a folder, and `.git/tools`,
+    // a link to itself that cannot be followed.
+    put(&a.join(".git/config"), "[core]\n hooksPath = tools\n");
+    link("tools", &a.join(".git/tools"));
+    e.full();
+    let hooks = e.rows("SELECT subject FROM assertion WHERE layer = 'live' AND predicate = 'watched_as' AND object = 'git hook'");
+    let kept = "file:machine:mac/dev/a/tools/pre-commit/pre-receive".to_string();
+    assert!(hooks.contains(&kept), "{hooks:?}");
+}
+
+#[test]
+fn a_hook_whose_bytes_changed_is_raised_by_the_hook_rule_whichever_checkout_is_read_first() {
+    for (tag, from, to) in [
+        ("changed-leaves-first", "dev/a", "dev/b"),
+        ("changed-leaves-last", "dev/b", "dev/a"),
+    ] {
+        let e = Estate::new(tag);
+        let agents = e.home().join("Library/LaunchAgents");
+        put(&agents.join("pre-commit"), "# an agent and a hook\n");
+        let config = |rel: &str| e.checkout(rel).join(".git/config");
+        let shared = format!("[core]\n hooksPath = {}\n", agents.display());
+        put(&config(from), &shared);
+        e.checkout(to);
+        e.full();
+        put(&agents.join("pre-commit"), "# changed\n");
+        put(&config(from), "[core]\n hooksPath = /dev/null\n");
+        put(&config(to), &shared);
+        e.full();
+        let hook = pair("watched.git-hook", "~/Library/LaunchAgents/pre-commit");
+        assert!(e.found().contains(&hook), "{tag}: {:?}", e.found());
+    }
+}
+
+#[test]
+fn a_parent_checkout_not_read_does_not_hide_what_a_reading_of_a_checkout_inside_it_read() {
+    let e = Estate::new("parent-unvisited");
+    e.checkout("dev/a");
+    let b = e.checkout("dev/a/b");
+    put(&b.join(".mcp.json"), SERVER);
+    // A walk does not enter a checkout; an agent's session names the one inside it.
+    session(&e, "b", &b);
+    e.go(None, &e.0.join("sessions"));
+    let servers = "SELECT subject FROM assertion WHERE layer = 'live' AND predicate = 'watched_as' AND subject LIKE '%#/mcpServers/%'";
+    assert_eq!(
+        e.rows(servers),
+        ["file:machine:mac/dev/a/b/.mcp.json#/mcpServers/helper"]
+    );
+    put(&b.join(".mcp.json"), r#"{"mcpServers": {}}"#);
+    e.run_in(&b);
+    assert!(e.rows(servers).is_empty());
+}
+
+#[test]
+fn a_thing_is_gone_only_where_a_reading_looked_and_a_project_not_looked_into_keeps_what_it_held() {
+    // A run pointed at `dev` looks into no project outside it; `dev/shop` is gone from it.
+    let e = Estate::new("ways-gone-and-kept");
+    let gone = e.checkout("dev/shop");
+    let kept = e.checkout("work/notes");
+    for c in [&gone, &kept] {
+        put(&c.join(".mcp.json"), SERVER);
+    }
+    e.full();
+    std::fs::remove_dir_all(&gone).unwrap();
+    e.run_in(&e.home().join("dev"));
+    assert_eq!(
+        e.rows("SELECT subject FROM assertion WHERE layer = 'live' AND predicate = 'watched_as' AND subject LIKE '%#/mcpServers/%'"),
+        ["file:machine:mac/work/notes/.mcp.json#/mcpServers/helper"]
+    );
+}
+
 /// A local configuration whose hook folder cannot be told: Git would read `more.conf` only
 /// in a Git folder that is elsewhere.
 const UNTOLD_CONFIG: &str =
