@@ -1439,6 +1439,17 @@ print(JSON.stringify(out));
     }
 
     #[test]
+    fn a_page_whose_numbers_are_dated_ahead_of_the_clock_says_so_and_gives_them_no_age() {
+        let ahead = page_after(events::RUNNING, Some(running_live()), -301);
+        assert_eq!(
+            ahead["said"]["text"],
+            "updated at a time ahead of this Mac's clock"
+        );
+        let a_little = page_after(events::RUNNING, Some(running_live()), -300);
+        assert_eq!(a_little["said"]["text"], "updated 0 seconds ago");
+    }
+
+    #[test]
     fn a_page_made_while_the_level_ran_never_shows_its_numbers_as_current_once_it_stopped() {
         // No false calm: the numbers of a running level stay on the page only beside the line
         // that says it no longer runs, and are not redrawn as if it did.

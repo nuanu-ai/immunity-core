@@ -434,14 +434,14 @@ pub fn component_place(id: &str) -> &str {
     split_component(id).map_or("", |(place, _, _)| place)
 }
 
-/// The time and how many whole days ago it was.
+/// The time and how many whole days ago it was, or that it is ahead of the clock
+/// (`store::age`).
 fn utc_age(secs: i64, now: i64) -> String {
-    let days = (now - secs).max(0) / 86_400;
-    format!(
-        "{} · {days} {} ago",
-        utc(secs),
-        if days == 1 { "day" } else { "days" }
-    )
+    match crate::store::age(secs, now).map(|age| age / 86_400) {
+        Some(1) => format!("{} · 1 day ago", utc(secs)),
+        Some(days) => format!("{} · {days} days ago", utc(secs)),
+        None => format!("{} · ahead of this Mac's clock", utc(secs)),
+    }
 }
 
 /// The predicate in plain words where there is one.
@@ -506,11 +506,7 @@ fn header(conn: &Connection, out: &mut String, store: &str, now: i64) -> Out {
         [],
         |r| r.get(0),
     )?;
-    let finished: Option<i64> = conn.query_row(
-        "SELECT MAX(at) FROM journal WHERE entry = 'run_finished'",
-        [],
-        |r| r.get(0),
-    )?;
+    let finished = crate::status::latest_finished(conn)?.and_then(|m| m.finished_at);
     write!(
         out,
         "<header>\n<h1>What the store holds</h1>\n<p class=\"meta\">Generated {} · store <span class=\"mono\">{}</span> · format version {} · last run finished {}</p>\n</header>\n",
@@ -2334,6 +2330,43 @@ footer.links { display: flex; flex-wrap: wrap; gap: 8px 24px; margin-top: var(--
 #[cfg(test)]
 mod tests {
     use super::{esc, esc_said, shown, utc};
+
+    #[test]
+    fn the_last_run_finished_is_the_one_the_journal_wrote_last_even_after_the_clock_was_set_back() {
+        let dir = std::env::temp_dir().join(format!("immunity-view-head-{}", std::process::id()));
+        crate::common::remove(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
+        let (ahead, latest) = (1_800_086_400, 1_800_000_000);
+        crate::store::journal_note(&conn, ahead, "run-1", "run_finished", "").unwrap();
+        crate::store::journal_note(&conn, latest, "run-2", "run_finished", "").unwrap();
+        let mut out = String::new();
+        super::header(&conn, &mut out, "store", latest + 60).unwrap();
+        assert!(
+            out.contains(&format!("last run finished {}", utc(latest))),
+            "{out}"
+        );
+        drop(conn);
+        crate::common::remove(&dir);
+    }
+
+    #[test]
+    fn a_time_ahead_of_the_clock_is_said_to_be_ahead_and_never_given_an_age() {
+        let now = 1_800_000_000;
+        let ahead = now + crate::store::AHEAD_ALLOWED + 1;
+        assert_eq!(
+            super::utc_age(ahead, now),
+            format!("{} · ahead of this Mac's clock", utc(ahead))
+        );
+        assert_eq!(
+            super::utc_age(now - 86_400, now),
+            format!("{} · 1 day ago", utc(now - 86_400))
+        );
+        assert_eq!(
+            super::utc_age(now - 3 * 86_400, now),
+            format!("{} · 3 days ago", utc(now - 3 * 86_400))
+        );
+    }
 
     #[test]
     fn a_name_on_a_page_never_reads_as_a_mark_and_a_mark_the_core_made_stays_one() {
