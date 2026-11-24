@@ -407,7 +407,7 @@ INSERT OR IGNORE INTO coverage_kind (name) VALUES
 /// |---|---|---|---|
 /// | `time` | `timestamp` | `@timestamp` | |
 /// | `event.exec.target.executable.path` | `executable` | `process.executable` | `Image` |
-/// | `event.exec.args` | `args` | `process.args` | `CommandLine`, joined by spaces |
+/// | `event.exec.args` | `args` | `process.args` | `CommandLine`, the non-empty ones joined by spaces |
 /// | `process.executable.path` | `parent_executable` | `process.parent.executable` | `ParentImage` |
 /// | `event.exec.cwd.path` | `working_directory` | `process.working_directory` | |
 /// | the pid of `event.exec.target.audit_token` | `pid` | `process.pid` | |
@@ -509,9 +509,10 @@ pub type Take = fn(&ProcessStart) -> Option<String>;
 pub const SIGMA_FIELDS: [(&str, Take); 3] = [
     ("Image", |s| Some(s.executable.clone())),
     // The arguments joined by single spaces, the first included: Sigma's command lines on
-    // other systems hold the program too. An argument holding a space is not quoted, as
-    // `eslogger` gives the arguments apart and no shell's quoting is the right one.
-    ("CommandLine", |s| Some(s.args.join(" "))),
+    // other systems hold the program too. An argument with no characters adds nothing. An
+    // argument holding a space is not quoted, as `eslogger` gives the arguments apart and no
+    // shell's quoting is the right one.
+    ("CommandLine", command_line),
     // `process` in an `exec` message is the process that called `exec`, described as it was
     // before the call: the same pid as the program started, with its old image. After a fork
     // or `posix_spawn`, which is how a shell, a build tool or an agent starts a program, that
@@ -523,6 +524,21 @@ pub const SIGMA_FIELDS: [(&str, Take); 3] = [
     // names, and never sees a parent this field does not name.
     ("ParentImage", |s| s.parent_executable.clone()),
 ];
+
+/// The command line a rule reads, `CommandLine` and `process.command_line` alike: the arguments
+/// joined by single spaces, the first included. An argument with no characters adds nothing,
+/// so a program run with an empty argument has no space in its line that no argument holds.
+/// An argument that ends in a space, or is only spaces, is kept as it is. This is Immunity
+/// Core's own choice; `process.args` keeps every argument.
+fn command_line(s: &ProcessStart) -> Option<String> {
+    let given: Vec<&str> = s
+        .args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.is_empty())
+        .collect();
+    Some(given.join(" "))
+}
 
 /// The last component of a path, as Elastic's `process.name` and `file.name` give it.
 fn basename(p: &str) -> &str {
@@ -570,7 +586,7 @@ pub const ECS_FIELDS: [(&str, Take); 11] = [
     }),
     ("process.args_count", |s| Some(s.args.len().to_string())),
     // The arguments joined by single spaces, as `CommandLine` is.
-    ("process.command_line", |s| Some(s.args.join(" "))),
+    ("process.command_line", command_line),
     // The image before the `exec`, as `ParentImage` is: the parent's program after a fork or
     // `posix_spawn`, the wrapper after an `exec` without a fork.
     ("process.parent.executable", |s| s.parent_executable.clone()),

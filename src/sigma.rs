@@ -2911,6 +2911,41 @@ mod tests {
         assert_eq!(sigma.evaluate(&resolved).len(), 1);
     }
 
+    /// An argument with no characters adds no space to the command line a rule reads, under
+    /// Sigma's name and Elastic's: SigmaHQ's "Space After Filename - macOS" stays silent on a
+    /// program run with an empty argument, last or in the middle, and fires on one whose last
+    /// argument ends in a space or is a space; a rule on `process.command_line` does the same.
+    #[test]
+    fn an_empty_argument_adds_no_space_a_rule_matches() {
+        const SPACE_AFTER_FILENAME: &str = "b6e2a2e3-2d30-43b1-a4ea-071e36595690";
+        let image = "/Users/example/bin/example-tool";
+        let empty = start(image, &["example-tool", "", "--name", ""], "/bin/zsh");
+        let spaced = start(
+            image,
+            &["example-tool", "--name", "report.txt "],
+            "/bin/zsh",
+        );
+        let only_spaces = start(image, &["example-tool", "--name", " "], "/bin/zsh");
+        let sigma = Rules::shipped();
+        assert!(!fires(sigma, SPACE_AFTER_FILENAME, &empty));
+        assert!(fires(sigma, SPACE_AFTER_FILENAME, &spaced));
+        assert!(fires(sigma, SPACE_AFTER_FILENAME, &only_spaces));
+        let elastic = Rules::load_as(
+            &ELASTIC,
+            &[(
+                "space.yml",
+                translated(
+                    "  s1: {\"process.command_line|endswith\": [\" \"]}\n  \
+                     s2: {\"process.command_line|contains\": [\"  \"]}\n  condition: s1 or s2\n",
+                    CATEGORY,
+                    "",
+                ),
+            )],
+        );
+        assert!(elastic.evaluate(&empty).is_empty());
+        assert_eq!(elastic.evaluate(&spaced).len(), 1);
+    }
+
     /// Every part of an event a translated rule reads, under Elastic's name, as the translation
     /// was checked on: the program's name is the last part of its path, the arguments one text
     /// with each between NULs and absent when there are none, their count a number, a file's
