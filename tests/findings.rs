@@ -86,6 +86,8 @@ impl Estate {
             .arg(&none)
             .arg("--osv-npm-input")
             .arg(&none)
+            .arg("--osv-pypi-input")
+            .arg(&none)
             .arg("--tailscale")
             .arg(&none)
             .arg("--threats-input")

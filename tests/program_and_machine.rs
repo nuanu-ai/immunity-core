@@ -135,6 +135,8 @@ impl Estate {
             .arg(at("osv-crates.zip"))
             .arg("--osv-npm-input")
             .arg(at("osv-npm.zip"))
+            .arg("--osv-pypi-input")
+            .arg(at("osv-pypi.zip"))
             .output()
             .unwrap();
         assert!(

@@ -1,6 +1,6 @@
 //! Open vulnerability data of the ecosystems whose lockfiles are read: OSV.dev's export of
-//! each, `crates.io/all.zip` and `npm/all.zip`, fetched whole. The contract is in
-//! docs/threats.md.
+//! each, `crates.io/all.zip`, `npm/all.zip` and `PyPI/all.zip`, fetched whole. The contract is
+//! in docs/threats.md.
 //!
 //! What is asked of the network never depends on the estate: each request is built from the
 //! feed's address and from the feed's own readings (the ETag it sent, when it was last read),
@@ -95,20 +95,22 @@ pub struct Feed {
     pub current_for: i64,
 }
 
-pub const FEEDS: [Feed; 2] = [
+// The time limits of one background check, which has 30 minutes in all: crates.io 120 s, npm
+// 900 s, PyPI 180 s, the catalogue 300 s and a watcher's reading waited out for up to 60 s.
+// That is 1,560 s, and leaves 240 s for the check's readers.
+pub const FEEDS: [Feed; 3] = [
+    // About 4 MB in 2026.
     Feed {
         source: "osv-crates.io",
         ecosystem: "crates.io",
         url: "https://osv-vulnerabilities.storage.googleapis.com/crates.io/all.zip",
         cap: 64 * 1024 * 1024,
-        max_time: 300,
+        max_time: 120,
         every: 0,
         asked: "on every run",
         current_for: 2 * 3600,
     },
-    // About 220 MB in 2026, 93% of it malicious-package reports: asked for once a day. Its
-    // time, with crates.io's and the catalogue's 300 s each and a watcher's reading waited out
-    // for up to 60 s, leaves 240 s inside a background check's 30 minutes for its readers.
+    // About 220 MB in 2026, 93% of it malicious-package reports: asked for once a day.
     Feed {
         source: "osv-npm",
         ecosystem: "npm",
@@ -119,7 +121,30 @@ pub const FEEDS: [Feed; 2] = [
         asked: "once a day",
         current_for: 26 * 3600,
     },
+    // 38.3 MB on 24 November 2026, too much for every run: asked for once a day. The cap is a
+    // little over three times that. No Python lockfile is read yet, so nothing is compared with
+    // it (`lockfiles::has_reader`).
+    Feed {
+        source: "osv-pypi",
+        ecosystem: "PyPI",
+        url: "https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip",
+        cap: 128 * 1024 * 1024,
+        max_time: 180,
+        every: 24 * 3600,
+        asked: "once a day",
+        current_for: 26 * 3600,
+    },
 ];
+
+/// What a feed's own clause says after its counts when its ecosystem is not matched
+/// (`vulnerabilities::matched_feeds`), wherever the clause is printed; nothing when it is.
+pub fn not_compared(ecosystem: &str, matched: bool) -> String {
+    if matched {
+        String::new()
+    } else {
+        format!(", not compared with anything: no lockfile of {ecosystem} packages is read")
+    }
+}
 
 /// The folder next to the store where each feed's archive is kept.
 pub const FOLDER: &str = "feeds";
@@ -877,12 +902,13 @@ fn put_advisory(
 }
 
 /// The name a lockfile's name is compared with: crates.io compares names without case and
-/// with `_` as `-`, as Cargo does; npm compares them exactly.
+/// with `_` as `-`, as Cargo does; PyPI by the rule of "Names and normalization" (PEP 503),
+/// `lockfiles::pypi_normalized`; npm compares them exactly.
 pub fn normalized(ecosystem: &str, name: &str) -> String {
-    if ecosystem == "crates.io" {
-        name.to_ascii_lowercase().replace('_', "-")
-    } else {
-        name.to_string()
+    match ecosystem {
+        "crates.io" => name.to_ascii_lowercase().replace('_', "-"),
+        "PyPI" => crate::lockfiles::pypi_normalized(name),
+        _ => name.to_string(),
     }
 }
 

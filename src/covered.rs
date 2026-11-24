@@ -1288,13 +1288,15 @@ pub fn not_covered(
             )
         });
     }
-    // The vulnerability data, judged as the latest run judged it: current or not, and why not,
-    // feed by feed: why its latest download failed, else why what it holds is not current.
+    // The vulnerability data answers rest on, judged as the latest run judged it: current or
+    // not, and why not, matched feed by matched feed (`vulnerabilities::matched_feeds`): why its
+    // latest download failed, else why what it holds is not current. A feed of an ecosystem not
+    // matched has its failure on the line of downloads alone.
     if let Some(run) = status::latest_finished(conn)?
         && let Some(since) = crate::vulnerabilities::stale(conn, run.started_at)?
     {
         let (mut reasons, mut failures, mut yours) = (Vec::new(), Vec::new(), false);
-        for f in crate::vulnerabilities::freshness(conn, run.started_at)? {
+        for f in crate::vulnerabilities::matched_freshness(conn, run.started_at)? {
             let Some(not_current) = f.not_current else {
                 continue;
             };
