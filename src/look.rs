@@ -8,8 +8,9 @@
 //! - Not read is not absent. A unit is read in full only by `absent`, which takes proof that
 //!   its path is not there, or by `read`, `read_part`; a unit that could not be read is
 //!   recorded with why (`unread`, `not_looked_at`, `not_into`). What was known of a unit is
-//!   retracted only where `retracts` allows it: a unit read in full covers it, and no unit not
-//!   read hides it. Units said together (`short_of`) and units left out by design (`aside`)
+//!   retracted only where the reading `covers` it: no unit not read hides it, and a reading
+//!   that could not tell every place its units may be (`unplaced`) read it, its file or its
+//!   folder in full. Units said together (`short_of`) and units left out by design (`aside`)
 //!   hide what is in them too; only the first make the reading short.
 //! - Losing sight is a change. Every unit that is there and was not read carries its reason,
 //!   and `not_read` hands each one to the store, which judges it as `baseline.rs` says and
@@ -91,6 +92,8 @@ pub struct Look {
     /// The units found present and not read in full. One read in full is known to be there by
     /// its reading, which is all the store asks of it (`baseline::Judge::facts`).
     seen: Vec<Unit>,
+    /// Whether the reading could not tell every place its units may be (`unplaced`).
+    unplaced: bool,
 }
 
 impl Look {
@@ -152,9 +155,10 @@ impl Look {
         self.hidden.push(unit);
     }
 
-    /// Whether the reading did not read something that is no unit of it.
-    pub fn is_short(&self) -> bool {
-        !self.short.is_empty()
+    /// The reading could not tell every place its units may be, as when the folder Git's
+    /// configuration names for hooks could not be told: it covers only what it read itself.
+    pub fn unplaced(&mut self) {
+        self.unplaced = true;
     }
 
     /// A unit there that leads into a guarded folder.
@@ -205,15 +209,22 @@ impl Look {
         self.unread.iter().map(|u| &u.unit).chain(&self.hidden)
     }
 
-    /// Whether this reading may retract what was known of a unit: whenever no unit it did not
-    /// read hides it. What it did not find is gone, at whatever level: a file, its folder, a
-    /// checkout no longer found or one whose `.git` is gone takes along what was read inside
-    /// it. What it cannot place, `None`, only when it read everything it looked at.
-    pub fn retracts(&self, unit: Option<&Unit>) -> bool {
-        match unit {
-            Some(unit) => !self.hides(unit),
-            None => self.cause().is_none(),
-        }
+    /// Whether this reading covers a unit it knew something of, so that it may retract that:
+    /// no unit it did not read hides it, and either the reading could tell every place its
+    /// units may be, or a unit it read in full is that unit, its file or the folder that holds
+    /// it. What it did not find is then gone, at whatever level: a file, its folder, a checkout
+    /// no longer found or one whose `.git` is gone takes along what was read inside it. What it
+    /// cannot place, `None`, only when it read everything it looked at.
+    pub fn covers(&self, unit: Option<&Unit>) -> bool {
+        let Some(unit) = unit else {
+            return self.cause().is_none();
+        };
+        let (file, folder) = (
+            Unit::whole(&unit.path),
+            Unit::whole(baseline::parent(&unit.path)),
+        );
+        let proven = || (self.read.iter()).any(|r| [unit, &file, &folder].contains(&r));
+        !self.hides(unit) && (!self.unplaced || proven())
     }
 
     /// The completeness of the reading of which entries are there, and its reason or note. A
@@ -559,25 +570,25 @@ mod tests {
         let agents = Unit::whole("Library/LaunchAgents");
         let agent = Unit::whole("Library/LaunchAgents/org.example.sync.plist");
         assert!(!place.read_units().contains(&agents));
-        assert!(!place.retracts(Some(&agent)));
+        assert!(!place.covers(Some(&agent)));
         // The system's folder is not there: read in full, and what was known in it may go.
         assert!(
             place
                 .read_units()
                 .contains(&Unit::whole("/Library/LaunchAgents"))
         );
-        assert!(place.retracts(Some(&Unit::whole(
+        assert!(place.covers(Some(&Unit::whole(
             "/Library/LaunchAgents/org.example.gone.plist"
         ))));
 
         let file = Unit::whole("dev/a/.mcp.json");
         assert!(!way.read_units().contains(&file));
-        assert!(!way.retracts(Some(&Unit::part(&file.path, "/mcpServers/x"))));
+        assert!(!way.covers(Some(&Unit::part(&file.path, "/mcpServers/x"))));
         // What cannot be placed is kept while anything was not read. What no unit left unread
         // hides was looked for and not found: a checkout no longer found takes its ways along.
-        assert!(!place.retracts(None) && !way.retracts(None));
+        assert!(!place.covers(None) && !way.covers(None));
         let elsewhere = Unit::whole("dev/b/.mcp.json");
-        assert!(place.retracts(Some(&elsewhere)) && way.retracts(Some(&elsewhere)));
+        assert!(place.covers(Some(&elsewhere)) && way.covers(Some(&elsewhere)));
         // A reading whose only gap is a folder macOS guards has not read everything either.
         let mut guarded = Look::default();
         guarded.not_into(
@@ -585,14 +596,36 @@ mod tests {
             PathBuf::from("/Users/example/Library/Mail"),
             Path::new("/Users/example"),
         );
-        assert!(!guarded.retracts(None));
+        assert!(!guarded.covers(None));
         // Nor has one that did not look into every checkout the store holds.
         let mut short = Look::default();
         short.short(
             Cause::NotGiven,
             "known checkouts were not looked into".into(),
         );
-        assert!(!short.retracts(None));
+        assert!(!short.covers(None));
+    }
+
+    #[test]
+    fn a_reading_that_cannot_tell_every_place_of_its_units_covers_only_what_it_read_itself() {
+        // The hooks of a checkout whose configured folder cannot be told: a hook known in
+        // `.git/hooks` or in a folder read, and no other, may be recorded as gone.
+        let mut look = Look::default();
+        assert!(look.covers(None));
+        look.read(Unit::whole("dev/a/.git/hooks"));
+        look.read(Unit::whole("tools/pre-push"));
+        look.read_part(&Unit::whole("conf.json"), "/a");
+        look.not_looked_at(Unit::whole("shut"), "denied".to_string());
+        let covers = |look: &Look, path: &str| look.covers(Some(&Unit::whole(path)));
+        assert!(covers(&look, "old/pre-commit") && !covers(&look, "shut/pre-commit"));
+        look.unplaced();
+        assert!(covers(&look, "dev/a/.git/hooks/pre-commit"));
+        assert!(covers(&look, "tools/pre-push"));
+        assert!(look.covers(Some(&Unit::part("tools/pre-push", "/k"))));
+        assert!(look.covers(Some(&Unit::part("conf.json", "/a"))));
+        assert!(!look.covers(Some(&Unit::part("conf.json", "/b"))));
+        assert!(!covers(&look, "old/pre-commit") && !covers(&look, "shut/pre-commit"));
+        assert!(!look.covers(None));
     }
 
     #[test]
@@ -609,9 +642,9 @@ mod tests {
         let way = mac.way(".vscode/extensions", Scope::Home).look;
         let folder = Unit::whole(".vscode/extensions");
         assert!(way.read_units().contains(&folder));
-        assert!(!way.retracts(Some(&Unit::whole(".vscode/extensions/example.lost"))));
-        assert!(way.retracts(Some(&Unit::whole(".vscode/extensions/example.gone"))));
-        assert!(way.retracts(None) == way.not_read().next().is_none());
+        assert!(!way.covers(Some(&Unit::whole(".vscode/extensions/example.lost"))));
+        assert!(way.covers(Some(&Unit::whole(".vscode/extensions/example.gone"))));
+        assert!(way.covers(None) == way.not_read().next().is_none());
     }
 
     #[test]
