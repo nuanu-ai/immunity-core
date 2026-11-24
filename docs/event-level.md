@@ -163,7 +163,7 @@ Sigma's taxonomy names no fields for macOS. For SigmaHQ's rules Immunity Core fi
 | Sigma field | From `eslogger` | ECS name in evidence |
 |---|---|---|
 | `Image` | `event.exec.target.executable.path`; for a file event, the program that did it | `process.executable` |
-| `CommandLine` | `event.exec.args` joined by single spaces | `process.args` |
+| `CommandLine` | `event.exec.args` joined by single spaces, an argument with no characters adding nothing | `process.args` |
 | `ParentImage` | `process.executable.path`, the image before the `exec` | `process.parent.executable` |
 | `TargetFilename` | the file created, or a rename's destination | `file.path` |
 
@@ -176,7 +176,7 @@ Elastic's translated rules read the Elastic Common Schema's names, filled from t
 | `process.executable`, `process.name` | the program started, and the last part of its path; for a file event, the program that did it |
 | `process.args` | `event.exec.args` as one text, each argument preceded by NUL and the last followed by one; absent when there are none |
 | `process.args_count` | how many arguments, a number |
-| `process.command_line` | the arguments joined by single spaces, as `CommandLine` |
+| `process.command_line` | the arguments joined by single spaces, an argument with no characters adding nothing, as `CommandLine` |
 | `process.parent.executable`, `process.parent.name` | the image before the `exec`, as `ParentImage`, and the last part of its path |
 | `process.working_directory` | `event.exec.cwd.path` |
 | `user.id` | the effective user id, as text |
@@ -252,7 +252,7 @@ So no further field from these events would open one of the 23. Giving `user.nam
 
 What the 66 translated rules rest on, beyond the checked translation:
 
-- How Elastic Defend fills `process.name` and `process.command_line` on macOS is not documented. Immunity Core takes the last part of the path and the arguments joined by spaces.
+- How Elastic Defend fills `process.name` and `process.command_line` on macOS is not documented. Immunity Core takes the last part of the path and the arguments joined by spaces, where an argument with no characters adds nothing. That is Immunity Core's own choice.
 - The image before an `exec` stands for the parent, as for SigmaHQ's `ParentImage`.
 - 34 of the 60 rules for program starts do not ask for `event.action == "exec"`, and Elastic may also count a fork as a start. The collector records no fork, so such a rule sees only programs started by `exec`. Three translated rules also ask for an event kind the log does not hold: a fork, a file modified and a file overwritten.
 - 15 rules negate a field an event may lack (`process.args`, `process.parent.executable`, `user.id`). They rest on Elasticsearch treating a comparison with a missing field as neither true nor false, so its negation does not hold either: the translation asks for the field to be present wherever it is negated.
