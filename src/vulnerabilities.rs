@@ -1240,6 +1240,42 @@ impl Affecting {
         }
     }
 
+    /// The answer as a finding keeps it in the journal (`ended`), as it reads back (`of_kept`).
+    fn kept(&self) -> Value {
+        json!({
+            "checkout": self.checkout, "ecosystem": self.ecosystem, "package": self.package,
+            "source": self.source, "advisory": self.advisory, "kind": self.kind,
+            "label": self.label, "summary": self.summary, "aliases": self.aliases,
+            "exploited": self.exploited, "entries": self.entries, "fixed": self.fixed,
+        })
+    }
+
+    fn of_kept(v: &Value) -> Affecting {
+        let text = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+        let texts = |k: &str| {
+            let all = v[k].as_array().into_iter().flatten();
+            all.filter_map(Value::as_str).map(str::to_string).collect()
+        };
+        let kind = text("kind");
+        Affecting {
+            checkout: text("checkout"),
+            ecosystem: text("ecosystem"),
+            package: text("package"),
+            source: text("source"),
+            advisory: text("advisory"),
+            modified: String::new(),
+            label: label_of(&kind, v["label"].as_str()),
+            kind,
+            summary: v["summary"].as_str().map(str::to_string),
+            aliases: texts("aliases"),
+            exploited: v["exploited"] == true,
+            entries: v["entries"].clone(),
+            fixed: texts("fixed"),
+            read_at: None,
+            since_at: 0,
+        }
+    }
+
     /// The releases here the record affects, with where each is.
     pub fn affected(&self) -> Vec<(String, String)> {
         self.affected_from(None)
@@ -1298,18 +1334,29 @@ pub fn catalogue_said(compared: &[&str]) -> String {
 
 /// Every "affects me" answer, most severe first by the source's label, then by project.
 pub fn affecting(conn: &Connection) -> rusqlite::Result<Vec<Affecting>> {
+    affecting_in(conn, "vulnerability_answer", "1", &[])
+}
+
+/// The "affects me" answers of `table`, `vulnerability_answer` or `vulnerability_answer_past`,
+/// as `v`, that meet `condition`, ordered as `affecting` orders them.
+fn affecting_in(
+    conn: &Connection,
+    table: &str,
+    condition: &str,
+    values: &[&dyn rusqlite::ToSql],
+) -> rusqlite::Result<Vec<Affecting>> {
     let mut list: Vec<Affecting> = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT v.checkout, v.ecosystem, v.package, v.source, v.advisory, v.modified,
                     a.kind, a.severity, a.summary, a.aliases, v.entries, v.fixed, v.read_at,
                     v.since_at,
                     EXISTS (SELECT 1 FROM vulnerability_linked l
                             WHERE l.source = v.source AND l.advisory = v.advisory)
-             FROM vulnerability_answer v
+             FROM {table} v
              JOIN advisory a ON a.source = v.source AND a.id = v.advisory
-             WHERE v.answer = 'affected'",
-        )?
-        .query_map([], |r| {
+             WHERE v.answer = 'affected' AND {condition}"
+        ))?
+        .query_map(values, |r| {
             let kind: String = r.get(6)?;
             let severity: Option<String> = r.get(7)?;
             let aliases: String = r.get(9)?;
@@ -1348,6 +1395,127 @@ pub fn affecting(conn: &Connection) -> rusqlite::Result<Vec<Affecting>> {
             .then_with(|| a.advisory.cmp(&b.advisory))
     });
     Ok(list)
+}
+
+/// Why a finding about a package is no longer found, in the words of the journal and of the
+/// contract (`NoLongerFound`): its project is gone; its project's lockfiles no longer declare a
+/// release it was about; or they still declare it and its rule no longer finds it, as when a
+/// record was withdrawn. It describes and decides nothing (`findings::hold`).
+pub const NOT_DECLARED: &str = "not_declared";
+pub const PROJECT_GONE: &str = "project_gone";
+pub const NOT_NAMED: &str = "not_named";
+
+/// Why the finding of `rule` about the component `about`, last found by the run `since`, is no
+/// longer found, and what it was about then: the answers about its package in its checkout that
+/// stood at that run, live or archived, and that the rule fires on (`fires`). An answer stood at
+/// a run when it began at or before it and, archived, ended after it; runs are ordered by the
+/// journal, not by their times, which two runs can share. The finding keeps them as what it was
+/// about then (`findings::hold`); they are never read as what the lockfiles hold now. When none
+/// is left, as when its answer was written over, it keeps nothing and the reason is told from its
+/// checkout alone.
+pub fn ended(
+    conn: &Connection,
+    rule: &str,
+    about: &str,
+    since: &str,
+) -> rusqlite::Result<(&'static str, Value)> {
+    let run = |of: &str| format!("(SELECT MIN(seq) FROM journal WHERE run_id = {of})");
+    let began = format!("{} <= {}", run("v.since_run"), run("?1"));
+    let stood = format!("{began} AND {} > {}", run("v.until_run"), run("?1"));
+    let mut was = affecting_in(conn, "vulnerability_answer", &began, &[&since])?;
+    was.extend(affecting_in(
+        conn,
+        "vulnerability_answer_past",
+        &stood,
+        &[&since],
+    )?);
+    was.retain(|a| a.is_about(about) && fires(rule, a, about));
+    // Its own checkout: that of what it was about, else each whose lockfiles held it.
+    let mut checkouts: BTreeSet<String> = was.iter().map(|a| a.checkout.clone()).collect();
+    if checkouts.is_empty() {
+        checkouts = conn
+            .prepare("SELECT DISTINCT scope FROM assertion WHERE subject = ?1 AND reader = ?2")?
+            .query_map(params![about, crate::lockfiles::READER], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+    }
+    // A release declared now in that checkout's lockfiles: one it was about, or any when it
+    // kept none.
+    let declared = |checkout: &str, release: Option<&str>| {
+        conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM assertion WHERE layer = 'live' AND reader = ?1
+                            AND subject = ?2 AND scope = ?3 AND predicate = 'has_version'
+                            AND (?4 IS NULL OR object = ?4))",
+            params![crate::lockfiles::READER, about, checkout, release],
+            |r| r.get::<_, bool>(0),
+        )
+    };
+    let (mut gone, mut still) = (true, false);
+    for c in &checkouts {
+        let query = "SELECT ?1 IN (SELECT id FROM gone_entity)";
+        gone &= conn.query_row(query, [c], |r| r.get::<_, bool>(0))?;
+        if was.is_empty() {
+            still |= declared(c, None)?;
+        }
+    }
+    for a in &was {
+        for (release, _) in a.affected_of(about) {
+            still |= declared(&a.checkout, Some(&release))?;
+        }
+    }
+    let why = match (gone, still) {
+        (true, _) => PROJECT_GONE,
+        (_, true) => NOT_NAMED,
+        _ => NOT_DECLARED,
+    };
+    Ok((why, was.iter().map(Affecting::kept).collect()))
+}
+
+/// Whether the finding of `rule` about `about` rests on the answer `a`, as a run raises it
+/// (`match_dependencies`): a malicious record, naming only npm's placeholder for a removed name
+/// or not; or, for an exploited vulnerability, a record linked to the catalogue.
+fn fires(rule: &str, a: &Affecting, about: &str) -> bool {
+    let placeholder = (a.affected_of(about).iter()).all(|(v, _)| v == "0.0.1-security");
+    match rule {
+        crate::findings::MALICIOUS_PACKAGE => a.kind == "malicious" && !placeholder,
+        crate::findings::MALICIOUS_NAME_REMOVED => a.kind == "malicious" && placeholder,
+        _ => a.exploited,
+    }
+}
+
+/// What a finding about a package ended with, as the journal entry it rests on keeps it.
+pub struct Kept {
+    /// `NOT_DECLARED`, `PROJECT_GONE` or `NOT_NAMED`, as the entry says it.
+    pub why: String,
+    pub at: i64,
+    pub was: Vec<Affecting>,
+}
+
+/// Every finding about a package that the core cleared, or whose package left, by its id, with
+/// the latest entry it rests on that says why (`findings::hold`). A finding cleared by a build
+/// that kept nothing is not here.
+pub fn kept(conn: &Connection) -> rusqlite::Result<BTreeMap<String, Kept>> {
+    let mut out = BTreeMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT b.finding, j.at, j.text FROM finding_basis b
+         JOIN journal j ON j.seq = b.journal JOIN finding f ON f.id = b.finding
+         WHERE j.entry IN ('finding_cleared', 'finding_raised')
+           AND (f.state = 'cleared' OR f.change = 'gone')
+         ORDER BY j.seq",
+    )?;
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    for row in rows {
+        let (id, at, text): (String, i64, Option<String>) = row?;
+        let v: Value = text
+            .and_then(|t| serde_json::from_str(&t).ok())
+            .unwrap_or_default();
+        if let Some(why) = v["why"].as_str() {
+            let was = v["was"].as_array().into_iter().flatten();
+            let was = was.map(Affecting::of_kept).collect();
+            let why = why.to_string();
+            out.insert(id, Kept { why, at, was });
+        }
+    }
+    Ok(out)
 }
 
 /// The totals of the answers the store holds. A record that affects several projects is one
@@ -3064,6 +3232,67 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, "open");
+    }
+
+    #[test]
+    fn what_a_finding_keeps_is_only_what_its_rule_found_when_it_was_last_found() {
+        // Last found by run r1, about quill 1.0.0 and a malicious record. Kept: that record and
+        // that release. Not kept: a malicious record of 2.0.0 that began in r2, after it, nor an
+        // ordinary advisory of 1.0.0 that stood at r1, which its rule does not fire on.
+        let dir = crate::common::Scratch::new("ended-what-stood");
+        let mut conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
+        let tx = conn.transaction().unwrap();
+        let at = "package-lock.json#node_modules/quill";
+        let (first, later, ordinary) = ("MAL-2099-0001", "MAL-2099-0002", "GHSA-0000-0000-0003");
+        let records = [first, later, ordinary].map(|id| (id, LEFT_PAD_RANGES));
+        let releases: &[&str] = &["1.0.0", "2.0.0"];
+        by_hand(
+            &tx,
+            "quill",
+            &[("shop", Source::Registry, releases, at)],
+            &records,
+        );
+        tx.execute(
+            "UPDATE advisory SET kind = 'malicious' WHERE id GLOB 'MAL-*'",
+            [],
+        )
+        .unwrap();
+        for run in ["r1", "r2", "r3"] {
+            let journal = "INSERT INTO journal (at, run_id, entry) VALUES (?1, ?2, 'run_started')";
+            tx.execute(journal, params![NOW, run]).unwrap();
+        }
+        let answer = |table: &str, advisory: &str, release: &str, since: &str, until: &str| {
+            let entries = json!([{"version": release, "at": format!("dev/shop/{at}"),
+                                  "from": Source::Registry.said(), "affected": true}]);
+            let (columns, ends) = match table {
+                "vulnerability_answer" => ("", String::new()),
+                _ => (", until_run, until_at", format!(", '{until}', {NOW}")),
+            };
+            tx.execute(
+                &format!(
+                    "INSERT INTO {table} (checkout, ecosystem, package, source, advisory,
+                         modified, answer, reason, detail, entries, fixed, since_run, since_at,
+                         run_id, at{columns})
+                     VALUES (?1, 'npm', 'quill', 'osv-npm', ?2, '', 'affected', 'affected', '',
+                             ?3, '[]', ?4, ?5, ?4, ?5{ends})"
+                ),
+                params![checkout("shop"), advisory, entries.to_string(), since, NOW],
+            )
+            .unwrap();
+        };
+        answer("vulnerability_answer_past", first, "1.0.0", "r1", "r2");
+        answer("vulnerability_answer_past", later, "2.0.0", "r2", "r3");
+        answer("vulnerability_answer", ordinary, "1.0.0", "r1", "");
+        let about = component("shop", "quill", Source::Registry);
+        let rule = crate::findings::MALICIOUS_PACKAGE;
+        let (why, was) = ended(&tx, rule, &about, "r1").unwrap();
+        let kept: Vec<(&str, &str)> = (was.as_array().unwrap().iter())
+            .map(|a| {
+                let release = a["entries"][0]["version"].as_str().unwrap();
+                (a["advisory"].as_str().unwrap(), release)
+            })
+            .collect();
+        assert_eq!((why, kept), (NOT_NAMED, vec![(first, "1.0.0")]));
     }
 
     fn v(s: &str) -> semver::Version {

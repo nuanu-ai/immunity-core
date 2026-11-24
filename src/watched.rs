@@ -22,10 +22,10 @@ use crate::guarded::{self, Real};
 use crate::look::{Absent, Look};
 use std::fs::{File, FileType, Metadata, OpenOptions};
 use std::io::Read;
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
-use crate::store::Cause;
+use crate::store::{Cause, Gap, Lack};
 
 pub const READER: &str = "watched-places";
 pub const BASIS: &str = "observed";
@@ -734,10 +734,59 @@ fn reason(e: &std::io::Error) -> String {
     }
 }
 
+/// Why a file another account owns was not read when its permissions do not let this account
+/// open it.
+pub const CLOSED: &str = "another account's file, closed to this account";
+
+/// The cause of a file not read, with `why` said of it. A file of another account closed to
+/// this one is not given by its source while its content was never read on this Mac; once it
+/// was (`read_here`, as `store::read_before` tells of its content reading), losing sight of
+/// what was read is a failure. It is still not the person's to fix: its reason stays `CLOSED`,
+/// which the test of permissions they can change (`covered::not_permitted`) does not take.
+pub fn unread_cause(cause: Cause, why: &str, read_here: bool) -> Cause {
+    match cause {
+        Cause::NotGiven if why == CLOSED && read_here => Cause::Failed,
+        _ => cause,
+    }
+}
+
+/// The completeness, the reason and the gap of the reading of a file's content, from what was
+/// found there, reached through a link or not (`linked`): full when read, else `none` with why.
+/// A link whose target is not given is `partial`, as a link into a folder macOS asks
+/// permission for: where it points is read, what it leads to is not, and what was known of
+/// that stays.
+pub fn content_coverage(
+    content: &Content,
+    linked: bool,
+    read_here: bool,
+) -> (&'static str, Option<&str>, Gap) {
+    let Content::Unread(cause, why) = content else {
+        return ("full", None, Gap::default());
+    };
+    let cause = unread_cause(*cause, why, read_here);
+    let mut gap = Gap::of(cause);
+    if cause == Cause::NotGiven && linked {
+        return ("partial", Some(why), gap);
+    }
+    if cause == Cause::NoReader {
+        gap.lacks.push(Lack::new(OVER_CAP, None));
+    }
+    ("none", Some(why), gap)
+}
+
 /// The bytes of what `meta` describes, at most `cap` of them, or what it is instead. Only a
 /// regular file is opened, and without waiting: a file swapped for a named pipe after it was
 /// looked at cannot hold the run, and is told by what was opened.
 pub fn bytes(path: &Path, meta: &Metadata, cap: u64) -> Result<Vec<u8>, Content> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    bytes_as(path, meta, cap, unsafe { libc::geteuid() })
+}
+
+/// `bytes`, read as the account `us`. A file whose permissions do not let `us` open it while
+/// another account owns it, as `meta` tells without opening it, is `CLOSED`: not the person's
+/// to fix, and not given by its source unless it was read here before (`unread_cause`). A
+/// closed file of their own failed, which they can fix.
+fn bytes_as(path: &Path, meta: &Metadata, cap: u64, us: u32) -> Result<Vec<u8>, Content> {
     if !meta.is_file() {
         return Err(Content::Special(kind_of(meta.file_type())));
     }
@@ -751,6 +800,9 @@ pub fn bytes(path: &Path, meta: &Metadata, cap: u64) -> Result<Vec<u8>, Content>
         Ok(Ok(bytes))
     };
     match read() {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && meta.uid() != us => {
+            Err(Content::Unread(Cause::NotGiven, CLOSED.to_string()))
+        }
         Err(e) => Err(Content::Unread(Cause::Failed, reason(&e))),
         Ok(Err(what)) => Err(Content::Special(what)),
         // The file is there and this build does not read a file that large.
@@ -803,6 +855,48 @@ pub fn field(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_closed_file_is_the_persons_to_fix_only_when_it_is_theirs_and_is_never_read() {
+        // A file its permissions keep closed failed when the person owns it, as they can open
+        // it; when another account owns it, it is said as another account's file. Either way
+        // nothing of it is read. Another owner is made by reading as an account that is not ours.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::common::Scratch::new("watched-closed");
+        let path = dir.join("helper");
+        std::fs::write(&path, "invented\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let ours = meta.uid();
+        let said = |us| bytes_as(&path, &meta, CAP, us);
+        let failed = Content::Unread(Cause::Failed, "Permission denied (os error 13)".into());
+        assert_eq!(said(ours), Err(failed));
+        let theirs = Content::Unread(Cause::NotGiven, CLOSED.to_string());
+        assert_eq!(said(ours.wrapping_add(1)), Err(theirs));
+    }
+
+    #[test]
+    fn a_file_of_another_account_closed_here_is_not_given_until_read_here_and_then_failed_also_through_a_link()
+     {
+        // Never read here: not given, `partial` through a link as a link into a folder macOS
+        // protects. Read here before: failed and `none`, with a link or without, as any file
+        // that could not be opened, so losing sight of what was read stays said.
+        let closed = Content::Unread(Cause::NotGiven, CLOSED.to_string());
+        let said = |linked, read_here| {
+            let (completeness, reason, gap) = content_coverage(&closed, linked, read_here);
+            assert_eq!(reason, Some(CLOSED));
+            (completeness, gap.cause)
+        };
+        assert_eq!(said(false, false), ("none", Some(Cause::NotGiven)));
+        assert_eq!(said(true, false), ("partial", Some(Cause::NotGiven)));
+        for linked in [false, true] {
+            assert_eq!(
+                said(linked, true),
+                ("none", Some(Cause::Failed)),
+                "{linked}"
+            );
+        }
+    }
 
     #[test]
     fn a_file_swapped_for_a_named_pipe_after_it_was_looked_at_never_holds_the_run() {
