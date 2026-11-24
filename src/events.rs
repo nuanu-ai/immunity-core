@@ -311,8 +311,9 @@ CREATE TABLE rule_finding (
     matches INTEGER NOT NULL
 );
 -- The latest program starts a finding from a published rule rests on, at most five per
--- finding. The one place arguments enter the store; the environment never does. Field
--- names are the Elastic Common Schema's.
+-- finding. Arguments enter the store here, cut, and in the journal entry `sampled` of a
+-- detached interpreter (`processes.rs`); the environment never does. Field names are the
+-- Elastic Common Schema's.
 CREATE TABLE rule_evidence (
     finding           TEXT NOT NULL REFERENCES finding (id),
     read_at           INTEGER NOT NULL,
