@@ -1154,8 +1154,8 @@ snapshots:
     #[test]
     fn a_lockfile_of_a_kind_with_no_reader_is_never_opened_and_is_listed_with_its_size() {
         // Its size comes from the folder, so one this user may not open is still named as a
-        // kind with no reader, never as a failed reading, and listed with its size. The six
-        // Python kinds have a row with no reader yet, and a named `pylock.<name>.toml` is a
+        // kind with no reader, never as a failed reading, and listed with its size. Python
+        // kinds with a row and no reader yet, and a named `pylock.<name>.toml`, which is a
         // `pylock.toml`: each leaves PyPI unknown, and npm and crates.io as they were.
         use std::os::unix::fs::PermissionsExt;
         let text = "bun-lockfile-format-v0\n";
@@ -1167,7 +1167,6 @@ snapshots:
             ("pylock.toml", "pylock.toml"),
             ("pylock.dev.toml", "pylock.toml"),
             ("Pipfile.lock", "Pipfile.lock"),
-            ("requirements.txt", "requirements.txt"),
         ] {
             let dir = Dir::new("kind-closed", &[("Cargo.lock", CARGO), (file, text)]);
             let path = dir.0.join(file);
@@ -1232,6 +1231,7 @@ snapshots:
             ("yarn.lock", YARN, "npm"),
             ("bun.lock", BUN, "npm"),
             ("Cargo.lock", CARGO, "crates.io"),
+            ("requirements.txt", "widget==1.0 --hash=sha256:00\n", "PyPI"),
         ] {
             let (said, reason) = read_one("own-reader", kind, sample);
             assert_eq!(reason, None, "{kind}");
@@ -1239,7 +1239,7 @@ snapshots:
             assert!(said.iter().any(|s| s.starts_with(&of_it)), "{kind}");
         }
         assert!(has_reader("npm") && has_reader("crates.io"));
-        assert!(!has_reader("PyPI") && !has_reader("RubyGems"));
+        assert!(has_reader("PyPI") && !has_reader("RubyGems"));
     }
 
     #[test]
