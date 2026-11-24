@@ -225,14 +225,14 @@ A command that only reads the store opens it read-only and creates nothing next 
 | 1 | the event log cannot be read: `immunity matches`, `immunity rules --over-log` and `immunity verdict`; `immunity on` or `immunity off` refused or did not finish; the work on the store failed (`command_failed`); `immunity run` committed its check and could not read its answer back (`answer_unreadable`). The failure's `code` says which |
 | 2 | a misuse or an unknown id |
 | 3 | an unreadable store: none, not this build's, or one the system failed to read or write |
-| 4 | a check or another writer holds the store, or another check runs; ask again |
+| 4 | a check or another writer holds the store, or another check runs; ask again. For `immunity run`, also a store held past the check's wait: nothing was committed |
 | 5 | another watcher has the store: `immunity watch` |
 
 Every failure met on the store carries `outcome`, one word of a closed list, decided by SQLite's result codes, the store's own refusal and the locks, never by the words of a message. It says why more exactly than the code, which stays as each command gave it:
 
 | Outcome | Code | Exit | When |
 |---|---|---|---|
-| `store_busy` | `run_in_progress` | 4 | another process held the store past the five seconds, SQLite's `BUSY` |
+| `store_busy` | `run_in_progress` | 4 | another process held the store past the wait, SQLite's `BUSY`: five seconds, and up to 60 seconds at the commit of `immunity run` |
 | `run_lock_held` | `run_in_progress` | 4 | another command held the run lock past its wait |
 | `check_running` | `run_in_progress` | 4 | `immunity run`: another check holds the downloads |
 | `watch_running` | `watch_in_progress` | 5 | `immunity watch`: another watcher has the store |
@@ -240,7 +240,7 @@ Every failure met on the store carries `outcome`, one word of a closed list, dec
 | `hot_journal`, `not_writable`, `moved`, `disk_full`, `io`, `cannot_open`, `folder` | `store_unreadable` | 3 | the system failed the store: a write left unfinished in a folder this process cannot write, a store or folder that cannot be written, a store moved or replaced while it was read, a full disk, a failed read or write, a file that cannot be opened, a folder that cannot be made |
 | `failed` | `command_failed` | 1 | anything else, SQLite's `LOCKED` included |
 
-`immunity owner` without a store keeps its code `no_store`, and `immunity sample` and `immunity run` keep `sample_failed` and `run_failed` for a failure of their work. `immunity run` takes the run lock for its check for up to 60 seconds and, when it cannot, fails with `run_failed`.
+`immunity owner` without a store keeps its code `no_store`, and `immunity sample` and `immunity run` keep `sample_failed` and `run_failed` for a failure of their work. `immunity run` waits up to 60 seconds for the store, once for the run lock and once at its commit for the readings that hold the store to leave. When the wait runs out, or the store is held past five seconds anywhere else in the run, nothing the check read is committed and it ends as a skip, with `run_lock_held` or `store_busy` and exit code 4. A watcher's full check is then tried again within five minutes. While the commit waits, a command that starts to read the store waits its own five seconds and then ends with `store_busy` and exit code 4.
 
 | Command | Does |
 |---|---|

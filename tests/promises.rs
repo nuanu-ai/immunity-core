@@ -10144,7 +10144,7 @@ fn status_answers_while_a_run_is_in_progress_and_never_makes_it_fail() {
     );
     // What is counted is said to come from the run that finished.
     let (_, text, _) = status_out(&w.store(), &["--coverage"]);
-    assert!(text.contains("has not finished: it died"), "{text}");
+    assert!(text.contains("has not finished: it stopped"), "{text}");
     assert!(
         text.lines().any(
             |l| l.trim_start().starts_with("Counted") && l.contains("by the run that finished")
