@@ -5045,6 +5045,25 @@ fn shop_match(e: &Estate, file: &str, text: &str) -> PathBuf {
 }
 
 #[test]
+fn a_task_file_that_links_into_a_folder_macos_asks_permission_for_is_not_opened_and_is_named() {
+    // A cloned project can hold its task file as a link into Documents: matching does not open
+    // it, and says it did not look there.
+    let e = Estate::new("match-task-guarded");
+    let notes = e.home().join("Documents/notes/tasks.json");
+    put(&notes, &ON_ASK.replace("make", "curl a.sample.invalid"));
+    let tasks = e.checkout("dev/shop").join(".vscode/tasks.json");
+    link(notes.to_str().unwrap(), &tasks);
+    e.list(LIST_AB);
+    e.run();
+    assert!(indicator_matches(&e).is_empty());
+    assert_eq!(
+        e.coverage(MATCH_KIND),
+        "partial|not looked into: dev/shop/.vscode/tasks.json: it leads into ~/Documents, which macOS asks permission for"
+    );
+    assert_eq!(match_cause(&e), "not_given");
+}
+
+#[test]
 fn a_match_in_a_folder_of_a_project_that_could_not_be_listed_is_kept_and_the_reading_names_the_folder()
  {
     let e = Estate::new("match-unlisted");
