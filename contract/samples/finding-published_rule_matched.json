@@ -1,5 +1,5 @@
 {
-  "advice": "Look at the program, its arguments and what started it, shown here. If you or a tool you use ran it, mark it expected; if nobody knows it, ask your agent to look into it.",
+  "advice": "Look at the program, its arguments and what started it, shown here. The finding keeps a few starts, and immunity matches lists every match the log still holds with its start. If you or a tool you use ran it, mark it expected; if nobody knows it, ask your agent to look into it.",
   "answer": null,
   "answered_at": 1795518143,
   "answered_together": [],

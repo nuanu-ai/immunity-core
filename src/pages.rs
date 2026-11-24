@@ -924,7 +924,11 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
             if let Some(n) = p.matches {
                 facts.push(("Matched", word(&counted(n as i64, "time", "times"))));
             }
-            for e in &p.events {
+            for (i, e) in p.events.iter().enumerate() {
+                // Beside the latest, the first is the event that raised the finding.
+                if i == 0 && p.events.len() > crate::events::EVIDENCE {
+                    facts.push(("Raised by", "the event below".to_string()));
+                }
                 facts.extend(event_facts(e, now));
             }
             voices.push(Voice {
@@ -2880,6 +2884,33 @@ pub fn technical() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_published_rule_s_event_that_raised_its_finding_is_named_so_only_beside_the_latest() {
+        // The message holds the event that raised the finding first only when it holds more
+        // than the latest: then, and only then, the page says which it is.
+        let raised = |n: usize| {
+            let start = v1::Event {
+                body: Some(v1::event::Body::ProgramStart(v1::ProgramStart::default())),
+            };
+            let f = v1::Finding {
+                evidence: Some(v1::Evidence {
+                    body: Some(v1::evidence::Body::PublishedRuleMatched(
+                        v1::PublishedRuleMatched {
+                            events: vec![start; n],
+                            ..Default::default()
+                        },
+                    )),
+                }),
+                ..Default::default()
+            };
+            let (mut facts, mut voices) = (Vec::new(), Vec::new());
+            evidence(&f, &mut facts, &mut voices, 0);
+            facts.iter().position(|(k, _)| *k == "Raised by")
+        };
+        assert_eq!(raised(crate::events::EVIDENCE), None);
+        assert_eq!(raised(crate::events::EVIDENCE + 1), Some(0));
+    }
 
     /// The band's glyph is the status's headline: the calm disc only for `calm`, the ring for
     /// `in_part`, the clock for `stale`, and the question mark for a headline not known. The line

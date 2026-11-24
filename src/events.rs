@@ -310,8 +310,8 @@ CREATE TABLE rule_finding (
     finding TEXT PRIMARY KEY REFERENCES finding (id),
     matches INTEGER NOT NULL
 );
--- The latest program starts a finding from a published rule rests on, at most five per
--- finding. The one place arguments enter the store; the environment never does. Field
+-- The program starts a finding from a published rule rests on: the first, which raised it,
+-- and the latest five. The one place arguments enter the store; the environment never does. Field
 -- names are the Elastic Common Schema's.
 CREATE TABLE rule_evidence (
     finding           TEXT NOT NULL REFERENCES finding (id),
@@ -358,8 +358,8 @@ CREATE TABLE event_file_count (
     unknown_gaps INTEGER NOT NULL,  -- times their numbering started again
     unreadable   INTEGER NOT NULL   -- file events that could not be made out
 );
--- The latest file events a finding from a published rule rests on, at most five per finding:
--- the file and the program, nothing more.
+-- The file events a finding from a published rule rests on, the first, which raised it, and
+-- the latest five: the file and the program, nothing more.
 CREATE TABLE rule_file_evidence (
     finding    TEXT NOT NULL REFERENCES finding (id),
     read_at    INTEGER NOT NULL,
@@ -1104,7 +1104,7 @@ impl FileTally {
 }
 
 /// What the published rules matched in a reading: per rule, how many events, and for a rule
-/// that raises a finding the latest `EVIDENCE` of them. Nothing else of an event is kept, so a
+/// that raises a finding the first of them and the latest `EVIDENCE`. Nothing else of an event is kept, so a
 /// lower rule's match leaves only its count.
 #[derive(Debug, Default)]
 pub struct Matched {
@@ -1116,6 +1116,8 @@ pub struct Matched {
 pub struct Hits {
     pub meta: &'static Meta,
     pub count: i64,
+    /// The first event it matched in the reading, which raises its finding when none stands.
+    pub first: Option<Evidence>,
     pub latest: VecDeque<Evidence>,
     /// For a rule that raises a finding, where every line it matched is, so that the store keeps
     /// which finding each went to (`rule_line`).
@@ -1136,6 +1138,7 @@ impl Matched {
             let hits = self.rules.entry(m.meta.id.as_str()).or_insert(Hits {
                 meta: m.meta,
                 count: 0,
+                first: None,
                 latest: VecDeque::new(),
                 lines: Vec::new(),
             });
@@ -1145,10 +1148,12 @@ impl Matched {
                 if hits.latest.len() == EVIDENCE {
                     hits.latest.pop_front();
                 }
-                hits.latest.push_back(match subject {
+                let e = match subject {
                     Subject::Start(s) => Evidence::Start(s.clone()),
                     Subject::File(f) => Evidence::File(f.clone()),
-                });
+                };
+                hits.first.get_or_insert_with(|| e.clone());
+                hits.latest.push_back(e);
             }
         }
     }
@@ -2694,27 +2699,33 @@ fn record(
                 finding
             ])?;
         }
-        keep(tx, &finding, now, hits.count, &hits.latest)?;
+        // The first is kept apart only when the latest no longer hold it.
+        let first = hits
+            .first
+            .iter()
+            .filter(|_| hits.count > hits.latest.len() as i64);
+        keep(tx, &finding, now, hits.count, first.chain(&hits.latest))?;
     }
     Ok(opened)
 }
 
-/// Keeps what one occurrence of a rule found with its finding: how many events, and the latest
-/// of them, at most `EVIDENCE`. The core's reading keeps a published rule's here, and a verdict
+/// Keeps what one occurrence of a rule found with its finding: how many events, and `events`,
+/// oldest first. Of all a finding was given, the first stays, the one that raised it, and the
+/// latest `EVIDENCE` beside it. The core's reading keeps a published rule's here, and a verdict
 /// keeps the event it is about (`verdict.rs`).
-pub fn keep(
+pub fn keep<'a>(
     tx: &Transaction,
     finding: &str,
     now: i64,
     count: i64,
-    latest: &VecDeque<Evidence>,
+    events: impl IntoIterator<Item = &'a Evidence>,
 ) -> rusqlite::Result<()> {
     tx.execute(
         "INSERT INTO rule_finding (finding, matches) VALUES (?1, ?2)
          ON CONFLICT (finding) DO UPDATE SET matches = matches + excluded.matches",
         params![finding, count],
     )?;
-    for e in latest {
+    for e in events {
         match e {
             Evidence::Start(s) => tx.execute(
                 "INSERT INTO rule_evidence (finding, read_at, timestamp, executable, args,
@@ -2759,7 +2770,8 @@ pub fn keep(
             &format!(
                 "DELETE FROM {table} WHERE finding = ?1 AND rowid NOT IN
                          (SELECT rowid FROM {table} WHERE finding = ?1
-                          ORDER BY rowid DESC LIMIT ?2)"
+                          ORDER BY rowid DESC LIMIT ?2)
+                     AND rowid > (SELECT MIN(rowid) FROM {table} WHERE finding = ?1)"
             ),
             params![finding, EVIDENCE as i64],
         )?;
@@ -2767,10 +2779,19 @@ pub fn keep(
     Ok(())
 }
 
+/// A finding's kept events, read newest first, in the order a reader is given them: when more
+/// than the latest `EVIDENCE` are kept, the oldest, the one that raised the finding, comes first.
+pub fn raised_first<T>(mut newest_first: Vec<T>) -> Vec<T> {
+    let raised = usize::from(newest_first.len() > EVIDENCE);
+    newest_first.rotate_right(raised);
+    newest_first
+}
+
 /// What a finding from a published rule carries beside its words, each in its own field: the
 /// rule as it describes itself, its authors among them, as the Detection Rule License asks of
 /// a message made from a match; the kind of event it is about, `events`; how many events it
-/// counts since it was raised; and the latest of them, newest first; and where the rule's set
+/// counts since it was raised; the latest of them, newest first, after the one that raised it
+/// when that one is no longer among them (`raised_first`); and where the rule's set
 /// comes from, with its licence, each by its address or identifier and by its name in words.
 /// Text from the rule or from an event is only in `_text` fields.
 pub fn finding_detail(
@@ -2793,7 +2814,7 @@ pub fn finding_detail(
         crate::sigma::Kind::File => file_evidence(conn, finding)?,
     };
     v["matches"] = json!(counted(conn, finding)?);
-    v["evidence"] = json!(evidence);
+    v["evidence"] = json!(raised_first(evidence));
     Ok(v)
 }
 
@@ -5610,6 +5631,72 @@ mod tests {
             text.len() as u64 / n,
             rules.groups().0.len() + rules.groups().1.len()
         );
+    }
+
+    #[test]
+    fn after_more_matches_than_are_kept_a_finding_still_holds_the_event_that_raised_it_and_the_latest_five()
+     {
+        // A rule matches once from an unknown program, then again and again from the person's
+        // own: the start and the file event that raised each finding stay beside the latest
+        // five, whether they were pushed out within the reading that raised it or by a later one.
+        let dir = crate::common::Scratch::at(
+            std::env::temp_dir().join(format!("immunity-events-first-{}", std::process::id())),
+        );
+        let log = dir.join("root").join(LOG);
+        std::fs::create_dir_all(&log).unwrap();
+        let plist = dir.join("root").join(PLIST);
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        std::fs::write(&plist, "<plist/>").unwrap();
+        let grep = |seq: u64, pid: u64| {
+            exec(seq, &format!(r#"{{"pid":{pid},"euid":501}}"#))
+                .replace(
+                    r#"["git","status","--short"]"#,
+                    r#"["grep","-r","password","."]"#,
+                )
+                .replace("/usr/bin/git", "/usr/bin/grep")
+        };
+        let helper = |seq: u64, by: &str| {
+            created(seq, "/Users/example/.helper").replace("/usr/bin/curl", by)
+        };
+        let mut conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
+        let mut text = format!("{}\n{}\n", grep(1, 777), helper(1, "/private/tmp/curl"));
+        for seq in 2..=14 {
+            text.push_str(&format!(
+                "{}\n{}\n",
+                grep(seq, 400 + seq),
+                helper(seq, "/usr/bin/curl")
+            ));
+            if seq == 7 || seq == 14 {
+                std::fs::write(log.join("exec-20261004T00.jsonl"), &text).unwrap();
+                let tx = conn.transaction().unwrap();
+                crate::store::put_entity(&tx, "machine:mac").unwrap();
+                read(
+                    &tx,
+                    "events-1",
+                    "machine:mac",
+                    &dir.join("root"),
+                    1_791_000_000,
+                )
+                .unwrap();
+                tx.commit().unwrap();
+            }
+        }
+        let column = |sql: &str| -> Vec<String> {
+            conn.prepare(sql)
+                .unwrap()
+                .query_map([], |r| r.get(0))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap()
+        };
+        let starts = column("SELECT CAST(pid AS TEXT) FROM rule_evidence ORDER BY rowid");
+        let files = column("SELECT executable FROM rule_file_evidence ORDER BY rowid");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(starts, ["777", "410", "411", "412", "413", "414"]);
+        assert_eq!(files[0], "/private/tmp/curl");
+        assert_eq!(files.len(), EVIDENCE + 1, "{files:?}");
+        assert!(files[1..].iter().all(|f| f == "/usr/bin/curl"), "{files:?}");
     }
 
     #[test]

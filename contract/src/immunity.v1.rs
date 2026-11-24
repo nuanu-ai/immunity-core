@@ -2077,7 +2077,9 @@ pub struct PublishedRuleMatched {
     /// count for it.
     #[prost(uint64, optional, tag = "2")]
     pub matches: ::core::option::Option<u64>,
-    /// The latest events it matched, newest first, at most five: the store keeps no more.
+    /// The events it matched that the store keeps: the latest five at most, newest first, and
+    /// before them the event that raised the finding when the latest no longer hold it. When it
+    /// holds six, the first is that event. Since 1.29.0.
     #[prost(message, repeated, tag = "3")]
     pub events: ::prost::alloc::vec::Vec<Event>,
     /// Where the rule's set comes from, its repository, and the licence its files carry, by its
@@ -2095,8 +2097,8 @@ pub struct VerdictGiven {
     /// The rule its verdicts are about: the match's rule, or the rule of the finding they named.
     #[prost(string, tag = "1")]
     pub rule: ::prost::alloc::string::String,
-    /// For verdicts about matches, the events at those lines, newest first, at most five, as
-    /// `immunity matches` gives an event.
+    /// For verdicts about matches, the events at those lines, newest first, at most six: the
+    /// first one kept and the latest five, as `immunity matches` gives an event. Since 1.29.0.
     #[prost(message, repeated, tag = "2")]
     pub events: ::prost::alloc::vec::Vec<Event>,
 }

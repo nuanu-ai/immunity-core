@@ -694,7 +694,7 @@
   "needs_a_look": {
     "items": [
       {
-        "advice": "If you did not, open the file and look at its last lines.",
+        "advice": "If you did not, read the whole file and compare it with what you expect it to hold, since a line can be added anywhere. A tool's installer adding a line is the usual cause.",
         "change": "changed",
         "evidence": {
           "place_changed": {
