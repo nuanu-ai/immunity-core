@@ -331,13 +331,39 @@ message IndicatorMatched {
   optional string indicators_text = 1;
 }
 
-// A process a sample saw, as the latest entry `sampled` names it. Its program is the finding's
-// `about_text`. Its command line is never kept.
+// A process a sample saw, as the latest entry `sampled` names it, read when the sample raised the
+// finding, so it holds after the process has ended. Its program is the finding's `about_text`.
+// Its environment is never kept.
 message DetachedProcess {
   // Its pid, and when it started, in microseconds since the epoch: together they name one
   // process. Absent when the journal entry does not give them.
   optional int64 pid = 1;
   optional int64 start_micros = 2;
+  // Its arguments, the first included, each in its own string and whole but for what `cuts`
+  // lists, as `ProgramStart.args_text` and `ProgramStart.cuts` give a program start's. Empty
+  // when the entry does not hold them, as one written before 1.29.0: the rule fires only on a
+  // process whose arguments were read. Since 1.29.0.
+  repeated string args_text = 3;
+  repeated Cut cuts = 4;
+  // The folder it ran in, as the kernel gave it. Absent when it could not be read. Since 1.29.0.
+  optional string working_directory_text = 5;
+  // The leaders of its session and of its process group, what it belongs to once its parent is
+  // gone. Each is absent when the leader is the process itself, launchd, or no longer running.
+  // Since 1.29.0.
+  ProcessLeader session_leader = 6;
+  ProcessLeader process_group_leader = 7;
+}
+
+// A process that leads the session or the process group of another, as a sample saw it. Since
+// 1.29.0.
+message ProcessLeader {
+  int64 pid = 1;
+  // Its program, the path of its executable. Whole.
+  string executable_text = 2;
+  // Who signed it, as the predicate `signed_by` says it: `apple`, `developer id, team <id>` and
+  // so on. Absent when it was not looked up, as for a program inside a folder macOS asks
+  // permission for, or when the system gave nothing.
+  optional string signed_by_text = 3;
 }
 
 // A package a project depends on, as the answers that stand now name it. A finding that is
@@ -387,7 +413,7 @@ message PublishedRuleMatched {
   optional uint64 matches = 2;
   // The events it matched that the store keeps: the latest five at most, newest first, and
   // before them the event that raised the finding when the latest no longer hold it. When it
-  // holds six, the first is that event. Since 1.29.0.
+  // holds six, the first is that event. Since 1.30.0.
   repeated Event events = 3;
   // Where the rule's set comes from, its repository, and the licence its files carry, by its
   // SPDX identifier.
@@ -400,7 +426,7 @@ message VerdictGiven {
   // The rule its verdicts are about: the match's rule, or the rule of the finding they named.
   string rule = 1;
   // For verdicts about matches, the events at those lines, newest first, at most six: the
-  // first one kept and the latest five, as `immunity matches` gives an event. Since 1.29.0.
+  // first one kept and the latest five, as `immunity matches` gives an event. Since 1.30.0.
   repeated Event events = 2;
 }
 

@@ -1994,11 +1994,12 @@ pub struct IndicatorMatched {
     #[prost(string, optional, tag = "1")]
     pub indicators_text: ::core::option::Option<::prost::alloc::string::String>,
 }
-/// A process a sample saw, as the latest entry `sampled` names it. Its program is the finding's
-/// `about_text`. Its command line is never kept.
+/// A process a sample saw, as the latest entry `sampled` names it, read when the sample raised the
+/// finding, so it holds after the process has ended. Its program is the finding's `about_text`.
+/// Its environment is never kept.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DetachedProcess {
     /// Its pid, and when it started, in microseconds since the epoch: together they name one
     /// process. Absent when the journal entry does not give them.
@@ -2006,6 +2007,41 @@ pub struct DetachedProcess {
     pub pid: ::core::option::Option<i64>,
     #[prost(int64, optional, tag = "2")]
     pub start_micros: ::core::option::Option<i64>,
+    /// Its arguments, the first included, each in its own string and whole but for what `cuts`
+    /// lists, as `ProgramStart.args_text` and `ProgramStart.cuts` give a program start's. Empty
+    /// when the entry does not hold them, as one written before 1.29.0: the rule fires only on a
+    /// process whose arguments were read. Since 1.29.0.
+    #[prost(string, repeated, tag = "3")]
+    pub args_text: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "4")]
+    pub cuts: ::prost::alloc::vec::Vec<Cut>,
+    /// The folder it ran in, as the kernel gave it. Absent when it could not be read. Since 1.29.0.
+    #[prost(string, optional, tag = "5")]
+    pub working_directory_text: ::core::option::Option<::prost::alloc::string::String>,
+    /// The leaders of its session and of its process group, what it belongs to once its parent is
+    /// gone. Each is absent when the leader is the process itself, launchd, or no longer running.
+    /// Since 1.29.0.
+    #[prost(message, optional, tag = "6")]
+    pub session_leader: ::core::option::Option<ProcessLeader>,
+    #[prost(message, optional, tag = "7")]
+    pub process_group_leader: ::core::option::Option<ProcessLeader>,
+}
+/// A process that leads the session or the process group of another, as a sample saw it. Since
+/// 1.29.0.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ProcessLeader {
+    #[prost(int64, tag = "1")]
+    pub pid: i64,
+    /// Its program, the path of its executable. Whole.
+    #[prost(string, tag = "2")]
+    pub executable_text: ::prost::alloc::string::String,
+    /// Who signed it, as the predicate `signed_by` says it: `apple`, `developer id, team <id>` and
+    /// so on. Absent when it was not looked up, as for a program inside a folder macOS asks
+    /// permission for, or when the system gave nothing.
+    #[prost(string, optional, tag = "3")]
+    pub signed_by_text: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// A package a project depends on, as the answers that stand now name it. A finding that is
 /// cleared, or one no answer names any more, has every field absent or empty: the finding's
@@ -2079,7 +2115,7 @@ pub struct PublishedRuleMatched {
     pub matches: ::core::option::Option<u64>,
     /// The events it matched that the store keeps: the latest five at most, newest first, and
     /// before them the event that raised the finding when the latest no longer hold it. When it
-    /// holds six, the first is that event. Since 1.29.0.
+    /// holds six, the first is that event. Since 1.30.0.
     #[prost(message, repeated, tag = "3")]
     pub events: ::prost::alloc::vec::Vec<Event>,
     /// Where the rule's set comes from, its repository, and the licence its files carry, by its
@@ -2098,7 +2134,7 @@ pub struct VerdictGiven {
     #[prost(string, tag = "1")]
     pub rule: ::prost::alloc::string::String,
     /// For verdicts about matches, the events at those lines, newest first, at most six: the
-    /// first one kept and the latest five, as `immunity matches` gives an event. Since 1.29.0.
+    /// first one kept and the latest five, as `immunity matches` gives an event. Since 1.30.0.
     #[prost(message, repeated, tag = "2")]
     pub events: ::prost::alloc::vec::Vec<Event>,
 }

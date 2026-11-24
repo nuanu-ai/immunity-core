@@ -760,6 +760,15 @@ fn data(s: &str) -> String {
     format!("<span class=\"mono\">{}</span>", esc(s))
 }
 
+/// Arguments as they come cut, each apart.
+fn arguments(args: &[String]) -> String {
+    let args: Vec<String> = args
+        .iter()
+        .map(|a| format!("<span class=\"arg\">{}</span>", esc_said(a)))
+        .collect();
+    format!("<span class=\"mono\">{}</span>", args.join(" "))
+}
+
 /// One event a rule matched: for a program start its program, each argument apart, its folder
 /// and the program that started it; for a file event the file, what was done, from where and by
 /// which program. Arguments come cut, as `immunity finding` prints them (`matches::event_cut`).
@@ -775,15 +784,7 @@ fn event_facts(e: &v1::Event, now: i64) -> Vec<(&'static str, String)> {
                 facts.push(("Program", data(&p.executable_text)));
             }
             if !s.args_text.is_empty() {
-                let args: Vec<String> = s
-                    .args_text
-                    .iter()
-                    .map(|a| format!("<span class=\"arg\">{}</span>", esc_said(a)))
-                    .collect();
-                facts.push((
-                    "Arguments",
-                    format!("<span class=\"mono\">{}</span>", args.join(" ")),
-                ));
+                facts.push(("Arguments", arguments(&s.args_text)));
             }
             if let Some(wd) = &s.working_directory_text {
                 facts.push(("Folder", data(wd)));
@@ -896,6 +897,27 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
             }
             if let Some(start) = p.start_micros {
                 facts.push(("Started", view::when(start.div_euclid(1_000_000), now)));
+            }
+            if !p.args_text.is_empty() {
+                facts.push(("Arguments", arguments(&p.args_text)));
+            }
+            if let Some(wd) = &p.working_directory_text {
+                facts.push(("Folder", data(wd)));
+            }
+            for (label, l) in [
+                ("Session led by", &p.session_leader),
+                ("Group led by", &p.process_group_leader),
+            ] {
+                if let Some(l) = l {
+                    let signed = l
+                        .signed_by_text
+                        .as_deref()
+                        .map_or("signer not known".to_string(), |s| {
+                            format!("signed by {}", data(s))
+                        });
+                    let said = format!("{}, pid {}, {signed}", data(&l.executable_text), l.pid);
+                    facts.push((label, said));
+                }
             }
         }
         Some(Body::VulnerablePackage(p)) => {
