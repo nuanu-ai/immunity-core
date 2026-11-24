@@ -1150,15 +1150,21 @@ impl Watcher<'_> {
             emit(&problem("heartbeat_failed", &why.to_string()));
             return false;
         }
-        if let Some(checks) = &mut self.checks
-            && let Some(result) = checks.tick(crate::now_secs(), Instant::now())
-        {
+        let Some(checks) = &mut self.checks else {
+            return true;
+        };
+        if let Some(result) = checks.tick(crate::now_secs(), Instant::now()) {
             if let Err(why) = &result
                 && !emit(&problem("full_check_failed", why))
             {
                 return false;
             }
             self.check_result = Some(result);
+        }
+        // The reason of a failure said already, come after it: its row is written again with
+        // it, and no second problem line says the check failed again.
+        if let Some(why) = checks.late_reason(Instant::now()) {
+            self.check_result = Some(Err(why));
         }
         true
     }
