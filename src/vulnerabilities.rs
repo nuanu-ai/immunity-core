@@ -2768,9 +2768,12 @@ mod tests {
                 params![crate::lockfiles::READER, NOW, scope, crate::lockfiles::KIND],
             )
             .unwrap();
-            let facts = std::iter::once(("part_of", scope.as_str()))
-                .chain(releases.iter().map(|r| ("has_version", *r)));
-            for (predicate, object) in facts {
+            // The lockfile the reader found, which gives the checkout its place for npm.
+            let found = (&scope, crate::lockfiles::HAS_LOCKFILE, "package-lock.json");
+            let facts = [found, (&subject, "part_of", scope.as_str())]
+                .into_iter()
+                .chain(releases.iter().map(|r| (&subject, "has_version", *r)));
+            for (subject, predicate, object) in facts {
                 tx.execute(
                     "INSERT INTO assertion (layer, subject, predicate, object, reader, scope,
                                             kind, source_ref, basis, observed_at, run_id)
