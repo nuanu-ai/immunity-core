@@ -93,7 +93,7 @@ fn about(what: &str) -> &'static str {
             "Code that applications not made by Apple keep in your Library folder, outside the application itself."
         }
         covered::DEPENDENCIES => {
-            "Packages your projects list in package-lock.json, npm-shrinkwrap.json, pnpm-lock.yaml, yarn.lock, bun.lock and Cargo.lock, compared at every check with the known vulnerabilities and malicious packages of npm and crates.io."
+            "Packages your projects list in their npm and crates.io lockfiles, compared at every check with the known vulnerabilities and malicious packages of those ecosystems."
         }
         _ => crate::autorun::about(what),
     }
@@ -3269,6 +3269,25 @@ mod tests {
                 .unwrap_or_else(|| panic!("{}", watched_as));
             assert!(about(what).ends_with('.'), "{what}");
             assert_eq!(covered::rules_about(what).len(), 1, "{what}");
+        }
+    }
+
+    #[test]
+    fn every_ecosystem_that_is_matched_is_named_in_each_sentence_that_says_what_is_compared() {
+        // These sentences are written by hand; a lockfile reader for a new ecosystem fails this
+        // until each names it, so none says less is compared than is.
+        let sentences = [
+            about(covered::DEPENDENCIES),
+            covered::NOT_COMPARED.meaning,
+            (covered::LIMITS.iter())
+                .find(|(_, c)| c.id == covered::NOT_COMPARED.id)
+                .unwrap()
+                .0,
+        ];
+        for feed in crate::vulnerabilities::matched_feeds() {
+            for said in sentences {
+                assert!(said.contains(feed.ecosystem), "{}: {said}", feed.ecosystem);
+            }
         }
     }
 

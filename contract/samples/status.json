@@ -1424,7 +1424,7 @@
       "holds_on": "every_mac",
       "id": "vulnerabilities-not-compared",
       "kind": "vulnerabilities not yet compared with installed software and servers",
-      "meaning": "The packages your projects list in package-lock.json, npm-shrinkwrap.json, pnpm-lock.yaml, yarn.lock, bun.lock and Cargo.lock are compared. Applications, Homebrew packages, what your servers run, and projects in other languages are not yet, so this version does not tell you which vulnerabilities affect them.",
+      "meaning": "The packages your projects list in their npm and crates.io lockfiles are compared. Applications, Homebrew packages, what your servers run, and projects in other languages are not yet, so this version does not tell you which vulnerabilities affect them.",
       "scope": "threats",
       "since_at": null,
       "title": "Known vulnerabilities are not yet compared with your installed software, your servers or projects of other kinds.",
