@@ -468,7 +468,7 @@ fn faults(s: &v1::Status, screen: &Screen, with_causes: bool) -> Vec<Fault> {
 /// and no failure.
 fn watcher_faults(s: &v1::Status, screen: &Screen) -> Vec<Fault> {
     let now = s.answered_at;
-    let out: Vec<Fault> = s
+    let mut out: Vec<Fault> = s
         .watching
         .iter()
         .flat_map(|w| &w.failed)
@@ -486,13 +486,18 @@ fn watcher_faults(s: &v1::Status, screen: &Screen) -> Vec<Fault> {
         })
         .collect();
     let live = s.this_mac.as_ref().is_some_and(|m| m.live) && s.watching.is_some();
+    // A restart is said whatever else the message says: its parts can be read at other moments.
+    if s.watcher_restarting_since_at.is_some() {
+        out.push(Fault {
+            not_live: !live && out.is_empty(),
+            ..Fault::new(sentence(crate::watch::RESTARTING_WORDS))
+        });
+    }
     if live || !out.is_empty() {
         return out;
     }
     let fault = if s.watching.is_some() {
         Fault::new(sentence(crate::watch::STARTING_WORDS))
-    } else if s.watcher_restarting_since_at.is_some() {
-        Fault::new(sentence(crate::watch::RESTARTING_WORDS))
     } else if let Some(on) = off_not_by_command(s) {
         Fault::new(format!(
             "Immunity Core is off: its job, turned on {}, is gone, and immunity off did not turn it off",
@@ -628,7 +633,9 @@ fn cause_fault(u: &v1::Uncovered) -> Fault {
     let reason = |i: usize| u.examples.get(i).and_then(|e| e.reason_text.as_deref());
     let with_reasons = (0..u.examples_text.len()).any(|i| reason(i).is_some());
     let place = ["this_mac", "projects"].contains(&u.scope.as_str());
-    let mut fault = if !u.examples_text.is_empty() && (place || with_reasons) {
+    let mut fault = if u.examples_text.is_empty() {
+        Fault::new(unstopped(&u.title)).said(u.value_text.as_deref(), Cut::End)
+    } else {
         let names: Vec<String> = u
             .examples_text
             .iter()
@@ -639,11 +646,15 @@ fn cause_fault(u: &v1::Uncovered) -> Fault {
                 (false, _) => name_in(n, ','),
             })
             .collect();
-        let names = names.join(if with_reasons { "; " } else { ", " });
-        let words = if place {
-            "Could not read"
-        } else {
-            unstopped(&u.title)
+        // A place by its names alone; anything else by its title, and its names with what the
+        // source said of the whole, as the full account gives them, where none has a reason.
+        let (words, names) = match (place, with_reasons) {
+            (true, _) => (
+                "Could not read",
+                names.join(if with_reasons { "; " } else { ", " }),
+            ),
+            (false, true) => (unstopped(&u.title), names.join("; ")),
+            (false, false) => (unstopped(&u.title), examples(u)),
         };
         let mut fault = Fault::new(words).said(Some(&names), Cut::Middle);
         let more = u.count.saturating_sub(u.examples_text.len() as u64);
@@ -651,8 +662,6 @@ fn cause_fault(u: &v1::Uncovered) -> Fault {
             fault.tail = format!(", and {} more", grouped(more));
         }
         fault
-    } else {
-        Fault::new(unstopped(&u.title)).said(u.value_text.as_deref(), Cut::End)
     };
     fault.advice = (u.who == "you" && !u.advice.is_empty()).then(|| u.advice.clone());
     fault
@@ -814,7 +823,6 @@ pub(crate) fn answer(
     use v1::Headline as H;
     let now = s.answered_at;
     let mut faults = faults(s, screen, true);
-    let not_live = faults.iter().position(|f| f.not_live);
     let look = s.needs_a_look.as_ref();
     let checking = |at: Option<String>| match (at, s.running) {
         (Some(at), true) => Some(format!("{at} · checking now")),
@@ -822,103 +830,130 @@ pub(crate) fn answer(
         (at, false) => at,
     };
     let headline = H::try_from(s.headline);
-    let off = off_by_command(s).filter(|_| headline != Ok(H::NeedsALook));
+    let m = s.this_mac.as_ref();
+    let fresh = m.is_some_and(|m| m.fresh);
+    let finished = m.and_then(|m| m.checked_at).is_some();
+    let findings = headline == Ok(H::NeedsALook) || look.is_some_and(|n| n.total > 0);
+    // Off is the headline only when it hides neither a finding nor a check that runs; otherwise
+    // its own fault line says it.
+    let off = off_by_command(s).filter(|_| !findings && !s.running);
+    // An answer that is not fresh is said beside what was found, by the reason the message gives.
+    if findings && !fresh {
+        let no_watcher = s.watching.is_none() && s.watcher_restarting_since_at.is_none();
+        let reason = m.and_then(|m| m.stale_reason.as_deref());
+        faults.insert(
+            0,
+            Fault::new("This answer is not fresh")
+                .said(reason, Cut::End)
+                .run(if no_watcher {
+                    "immunity on"
+                } else {
+                    "immunity run"
+                }),
+        );
+    }
     // The state under the headline: its words and command, or a fault taken to say it.
     let mut state: Option<(String, Option<&'static str>)> = None;
     let take_not_live = |faults: &mut Vec<Fault>| {
-        not_live.map(|i| {
+        faults.iter().position(|f| f.not_live).map(|i| {
             let f = faults.remove(i);
             (f.words, f.command)
         })
     };
-    let (said, style, own_right) = match (off, headline) {
-        (Some(at), _) => {
-            take_not_live(&mut faults);
-            state = Some((
-                "Nothing is watched or checked until it is turned on".to_string(),
-                Some("immunity on"),
-            ));
-            (
-                "○ Immunity Core is off".to_string(),
-                BOLD,
-                Some(format!("turned off {}", screen.time(at, now))),
-            )
-        }
-        (None, Ok(H::NeedsALook)) => {
-            let n = look.cloned().unwrap_or_default();
-            let urgent = match n.urgent_total {
-                0 => String::new(),
-                u => format!(" · {} urgent", grouped(u)),
-            };
-            let style = if n.urgent_total > 0 { RED } else { YELLOW };
-            (
-                format!(
-                    "● {}{urgent}",
-                    count(n.total, "thing needs a look", "things need a look")
-                ),
-                style.bold(),
-                checking(checked(screen, s)),
-            )
-        }
-        (None, Ok(H::NotChecked)) if s.running => {
-            state = stage(s, screen).map(|said| (sentence(&said), None));
-            (
-                "… The first check is running".to_string(),
-                YELLOW.bold(),
-                s.last_run
-                    .as_ref()
-                    .map(|l| format!("started {}", screen.time(l.started_at, now))),
-            )
-        }
-        (None, Ok(H::NotChecked)) => {
-            state = Some(("Check this Mac now".to_string(), Some("immunity run")));
-            (
-                "? No check has finished yet".to_string(),
-                YELLOW.bold(),
-                None,
-            )
-        }
-        (None, Ok(H::Stale)) => {
-            let m = s.this_mac.clone().unwrap_or_default();
-            // No watcher is why no check ran; otherwise the core's own reason.
-            state = take_not_live(&mut faults).or_else(|| {
-                let why = m
-                    .stale_reason
-                    .as_deref()
-                    .unwrap_or("the core does not say why");
-                Some((sentence(why), Some("immunity run")))
-            });
-            let since = m
-                .checked_at
-                .map_or_else(String::new, |at| format!(" {}", screen.since(at, now)));
-            (
-                format!("? Not checked{since}"),
-                YELLOW.bold(),
-                checking(None),
-            )
-        }
-        (None, Ok(H::InPart | H::Calm)) => (
+    // One order of precedence, each form claiming only what the message shows: a finding; off;
+    // the first check running; no run of this build that looked; no finished check; not fresh;
+    // nothing to look at, by the headline; and what is not known.
+    let (said, style, own_right) = if findings {
+        let n = look.cloned().unwrap_or_default();
+        let urgent = match n.urgent_total {
+            0 => String::new(),
+            u => format!(" · {} urgent", grouped(u)),
+        };
+        let style = if n.urgent_total > 0 { RED } else { YELLOW };
+        (
+            format!(
+                "● {}{urgent}",
+                count(n.total, "thing needs a look", "things need a look")
+            ),
+            style.bold(),
+            checking(checked(screen, s)),
+        )
+    } else if let Some(at) = off {
+        take_not_live(&mut faults);
+        state = Some((
+            "Nothing is watched or checked until it is turned on".to_string(),
+            Some("immunity on"),
+        ));
+        (
+            "○ Immunity Core is off".to_string(),
+            BOLD,
+            Some(format!("turned off {}", screen.time(at, now))),
+        )
+    } else if s.running && !finished {
+        state = stage(s, screen).map(|said| (sentence(&said), None));
+        (
+            "… The first check is running".to_string(),
+            YELLOW.bold(),
+            s.last_run
+                .as_ref()
+                .map(|l| format!("started {}", screen.time(l.started_at, now))),
+        )
+    } else if look.is_none() {
+        state = Some(("Check this Mac now".to_string(), Some("immunity run")));
+        (
+            "? No run of this build has looked for findings yet".to_string(),
+            YELLOW.bold(),
+            None,
+        )
+    } else if !finished {
+        state = Some(("Check this Mac now".to_string(), Some("immunity run")));
+        (
+            "? No check has finished yet".to_string(),
+            YELLOW.bold(),
+            None,
+        )
+    } else if !fresh {
+        // No watcher is why no check ran; otherwise the core's own reason.
+        let m = m.cloned().unwrap_or_default();
+        state = take_not_live(&mut faults).or_else(|| {
+            let why = m
+                .stale_reason
+                .as_deref()
+                .unwrap_or("the core does not say why");
+            Some((sentence(why), Some("immunity run")))
+        });
+        let since = m
+            .checked_at
+            .map_or_else(String::new, |at| format!(" {}", screen.since(at, now)));
+        (
+            format!("? Not checked{since}"),
+            YELLOW.bold(),
+            checking(None),
+        )
+    } else if matches!(headline, Ok(H::InPart | H::Calm)) {
+        (
             "✓ Nothing needs a look".to_string(),
             GREEN.bold(),
             checking(checked(screen, s)),
-        ),
-        (None, _) if look.is_none() => {
-            state = Some(("Check this Mac now".to_string(), Some("immunity run")));
-            (
-                "? No run of this build has looked for findings yet".to_string(),
-                YELLOW.bold(),
-                None,
-            )
-        }
-        (None, _) => (
+        )
+    } else {
+        (
             "? Whether this Mac is watched is not known".to_string(),
             YELLOW.bold(),
             None,
-        ),
+        )
     };
+    // In part never shows a bare ✓: a fault line says what was not read in full, or this one does
+    // where none says it and the message does not show that only a limit the design accepts
+    // holds it.
+    if said.starts_with('✓') && headline == Ok(H::InPart) && faults.is_empty() && !accepted_limit(s)
+    {
+        faults.push(Fault::new("Something was not read in full").run("immunity status --coverage"));
+    }
     // A watcher watching live says so under a headline that says what was found.
-    let live = s.this_mac.as_ref().is_some_and(|m| m.live) && s.watching.is_some();
-    if state.is_none() && live && matches!(headline, Ok(H::NeedsALook | H::InPart | H::Calm)) {
+    let live = m.is_some_and(|m| m.live) && s.watching.is_some();
+    let calm = said.starts_with('✓');
+    if state.is_none() && live && (findings || calm) {
         let projects = s.estate.as_ref().map_or(0, |e| e.checkouts);
         let what = match projects {
             0 => "this Mac".to_string(),
@@ -931,9 +966,7 @@ pub(crate) fn answer(
         style,
         right.or(own_right).as_deref(),
     );
-    if headline == Ok(H::NeedsALook)
-        && let Some(n) = look
-    {
+    if findings && let Some(n) = look {
         out.extend(needing_lines(screen, n));
     }
     if let Some((words, command)) = &state {
@@ -948,6 +981,23 @@ pub(crate) fn answer(
         out.extend(fault_lines(screen, 2, f));
     }
     out
+}
+
+/// That the message shows an answer held in part only by one of the two limits the design
+/// accepts, decided from its fields: machines beyond this Mac not reached and no reading failed,
+/// the reason `coverage` alone; or log files of the event level the size cap deleted since the
+/// check, none of them unread, the reason `this_mac` alone. Any other reason, or one this build
+/// does not know, is not explained by them.
+fn accepted_limit(s: &v1::Status) -> bool {
+    use v1::HeadlineBecause as B;
+    let only = |b: B| s.headline_because == [b as i32];
+    let c = s.coverage.clone().unwrap_or_default();
+    // A file deleted unread since the check is a fault line of its own, so it never reaches here.
+    let capped = s
+        .event_level
+        .as_ref()
+        .is_some_and(|l| l.files_removed_by_cap.is_some_and(|c| c.since_check > 0));
+    (only(B::Coverage) && c.unreached_total > 0 && c.failed == 0) || (only(B::ThisMac) && capped)
 }
 
 /// What needs a look, by rule as the message orders them, each on two lines: its level and what
@@ -3521,6 +3571,7 @@ mod tests {
         s.this_mac.as_mut().unwrap().fresh = false;
         assert!(status(&s, &Screen::pipe(), false).starts_with("○ Immunity Core is off"));
         // With something to look at, the finding leads and being off is a fault line.
+        s.this_mac.as_mut().unwrap().fresh = true;
         s.needs_a_look = Some(v1::NeedsALook {
             total: 1,
             by_rule: vec![group("watched.git-hook", v1::Level::Medium, 1, 0)],
@@ -3534,6 +3585,210 @@ mod tests {
                 "! Immunity Core is off: turned off {} with immunity off   immunity on",
                 view::utc(NOW - 7200)
             )]
+        );
+    }
+
+    #[test]
+    fn off_never_hides_a_finding_or_a_check_that_runs() {
+        let mut s = calm_status();
+        s.watching = None;
+        s.this_mac.as_mut().unwrap().live = false;
+        (s.turned_off_at, s.turned_on_latest) = (Some(NOW - 7200), Some(false));
+        s.login_job_installed = Some(false);
+        let off = format!(
+            "! Immunity Core is off: turned off {} with immunity off   immunity on",
+            view::utc(NOW - 7200)
+        );
+        // A check running after one finished: what was found leads, checking now, and off is a
+        // fault line.
+        s.running = true;
+        s.last_run = Some(v1::CheckMark {
+            id: "run-2".to_string(),
+            started_at: NOW - 60,
+            ..Default::default()
+        });
+        let text = status(&s, &Screen::pipe(), false);
+        assert!(
+            text.starts_with("✓ Nothing needs a look   checked ")
+                && text.lines().next().unwrap().ends_with(" · checking now"),
+            "{text}"
+        );
+        assert_eq!(fault_lines_of(&text), std::slice::from_ref(&off));
+        // The first check running: its own form, and off a fault line.
+        s.this_mac.as_mut().unwrap().checked_at = None;
+        let text = status(&s, &Screen::pipe(), false);
+        assert!(text.starts_with("… The first check is running"), "{text}");
+        assert!(fault_lines_of(&text).contains(&off), "{text}");
+    }
+
+    #[test]
+    fn a_restart_of_the_watcher_is_said_whatever_else_the_message_says() {
+        // Live, with a watcher on the store, and restarting: read at other moments, all said.
+        let mut s = calm_status();
+        s.watcher_restarting_since_at = Some(NOW - 30);
+        let text = super::status(&s, &Screen::pipe(), false);
+        assert_eq!(
+            fault_lines_of(&text),
+            ["! The watcher is restarting on a new core"],
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn nothing_to_look_at_is_said_only_of_a_fresh_answer_that_looked_whatever_the_headline() {
+        // The message says calm; its own fields do not hold it up.
+        let mut s = calm_status();
+        s.headline = v1::Headline::Calm as i32;
+        let text = |s: &v1::Status| super::status(s, &Screen::pipe(), false);
+        assert!(text(&s).starts_with("✓ Nothing needs a look"));
+        s.this_mac.as_mut().unwrap().fresh = false;
+        assert!(text(&s).starts_with("? Not checked since "), "{}", text(&s));
+        s.this_mac.as_mut().unwrap().checked_at = None;
+        assert!(
+            text(&s).starts_with("? No check has finished yet"),
+            "{}",
+            text(&s)
+        );
+        s.needs_a_look = None;
+        assert!(
+            text(&s).starts_with("? No run of this build has looked for findings yet"),
+            "{}",
+            text(&s)
+        );
+        // No this Mac in the message: no finished check is known.
+        let mut s = calm_status();
+        s.headline = v1::Headline::InPart as i32;
+        s.this_mac = None;
+        assert!(
+            text(&s).starts_with("? No check has finished yet"),
+            "{}",
+            text(&s)
+        );
+    }
+
+    #[test]
+    fn an_answer_that_is_not_fresh_is_said_beside_a_finding_with_why_and_the_command_that_fits() {
+        let mut s = calm_status();
+        s.needs_a_look = Some(v1::NeedsALook {
+            total: 1,
+            by_rule: vec![group("watched.git-hook", v1::Level::Medium, 1, 0)],
+            ..Default::default()
+        });
+        let m = s.this_mac.as_mut().unwrap();
+        m.fresh = false;
+        m.stale_reason = Some("the latest full check finished more than 2 hours ago".to_string());
+        let text = status(&s, &Screen::pipe(), false);
+        assert!(text.starts_with("● 1 thing needs a look"), "{text}");
+        assert_eq!(
+            fault_lines_of(&text)[0],
+            "! This answer is not fresh: the latest full check finished more than 2 hours ago   immunity run"
+        );
+        // No watcher runs: the command that starts one.
+        s.watching = None;
+        s.this_mac.as_mut().unwrap().live = false;
+        let text = status(&s, &Screen::pipe(), false);
+        assert!(
+            fault_lines_of(&text)[0].starts_with("! This answer is not fresh: ")
+                && fault_lines_of(&text)[0].ends_with("   immunity on"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn in_part_never_shows_a_bare_check_mark_unless_only_a_limit_the_design_accepts_holds_it() {
+        let line = ["! Something was not read in full   immunity status --coverage"];
+        let pipe = |s: &v1::Status| super::status(s, &Screen::pipe(), false);
+        // A reading failed with no cause to say it; this Mac watched in part with nothing else.
+        let mut failed = calm_status();
+        failed.coverage.as_mut().unwrap().failed = 1;
+        let mut in_part = calm_status();
+        in_part.this_mac.as_mut().unwrap().state = v1::ThisMacState::WatchedInPart as i32;
+        for s in [failed, in_part] {
+            let s = crate::headline::headed(s);
+            assert_eq!(s.headline, v1::Headline::InPart as i32);
+            assert!(pipe(&s).starts_with("✓ Nothing needs a look"));
+            assert_eq!(fault_lines_of(&pipe(&s)), line, "{}", pipe(&s));
+        }
+        // A reason, or a state of this Mac, this build does not know.
+        let mut s = calm_status();
+        s.headline = v1::Headline::InPart as i32;
+        s.headline_because = vec![99];
+        assert_eq!(fault_lines_of(&pipe(&s)), line);
+        s.headline_because = vec![v1::HeadlineBecause::ThisMac as i32];
+        s.this_mac.as_mut().unwrap().state = 99;
+        assert_eq!(fault_lines_of(&pipe(&s)), line);
+        // Machines beyond this Mac not reached, nothing failed: the reason alone, no line.
+        let mut s = calm_status();
+        s.coverage.as_mut().unwrap().unreached_total = 2;
+        let s = crate::headline::headed(s);
+        assert_eq!(s.headline, v1::Headline::InPart as i32);
+        assert!(fault_lines_of(&pipe(&s)).is_empty(), "{}", pipe(&s));
+        // With a reading failed as well, or a reason this build does not know beside it, the
+        // line again.
+        let mut unknown = s.clone();
+        unknown.headline_because.push(99);
+        assert_eq!(fault_lines_of(&pipe(&unknown)), line);
+        let mut s = s;
+        s.coverage.as_mut().unwrap().failed = 1;
+        assert_eq!(fault_lines_of(&pipe(&s)), line);
+        // Deleted unread as well as by the cap: said as its own fault, not as unexplained.
+        let mut s = calm_status();
+        s.headline = v1::Headline::InPart as i32;
+        s.headline_because = vec![v1::HeadlineBecause::ThisMac as i32];
+        let span = Some(v1::Span {
+            since_check: 1,
+            last_day: 1,
+        });
+        s.event_level = Some(v1::EventLevel {
+            state: v1::CollectorState::Running as i32,
+            files_removed_by_cap: span,
+            files_removed_unread: span,
+            ..Default::default()
+        });
+        assert_eq!(
+            fault_lines_of(&pipe(&s)),
+            [
+                "! 1 file of the event log was deleted before it was read since the latest check   immunity run"
+            ]
+        );
+        // Log files the cap deleted since the check, none unread, this Mac the reason alone.
+        let mut s = calm_status();
+        s.headline = v1::Headline::InPart as i32;
+        s.headline_because = vec![v1::HeadlineBecause::ThisMac as i32];
+        s.event_level = Some(v1::EventLevel {
+            state: v1::CollectorState::Running as i32,
+            files_removed_by_cap: Some(v1::Span {
+                since_check: 3,
+                last_day: 3,
+            }),
+            ..Default::default()
+        });
+        assert!(fault_lines_of(&pipe(&s)).is_empty(), "{}", pipe(&s));
+        // Another reason beside it: the line.
+        s.headline_because
+            .push(v1::HeadlineBecause::Coverage as i32);
+        assert_eq!(fault_lines_of(&pipe(&s)), line);
+    }
+
+    #[test]
+    fn a_cause_that_names_what_failed_without_reasons_still_names_it() {
+        let mut s = calm_status();
+        s.not_covered.push(v1::Uncovered {
+            scope: "servers".to_string(),
+            count: 3,
+            ..uncovered(
+                "servers-not-checked",
+                "you",
+                false,
+                "3 of your servers were not checked last time.",
+                &[("staging-api", None), ("db-2", None)],
+            )
+        });
+        assert_eq!(
+            faults_in(&s),
+            [
+                "! 3 of your servers were not checked last time: \"staging-api\"; \"db-2\", and 1 more"
+            ]
         );
     }
 
@@ -4018,8 +4273,11 @@ mod tests {
         for screen in screens() {
             let text = visible(&status(&s, &screen, false)).to_lowercase();
             for word in ["coverage", "reading", "store", "estate"] {
-                // The one source text here that holds a word of them is a watcher's failure.
-                let said = text.replace("the watcher's latest write to the store failed", "");
+                // The source texts here that hold a word of them: a watcher's failure, and why the
+                // answer is not fresh, given as the message gives it.
+                let said = text
+                    .replace("the watcher's latest write to the store failed", "")
+                    .replace("no full check has finished on this store", "");
                 assert!(!said.contains(word), "{word}\n{text}");
             }
         }
