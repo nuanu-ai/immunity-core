@@ -75,6 +75,41 @@ const STRONG_HASHES: [&str; 3] = ["sha256", "sha384", "sha512"];
 /// The key of what the file leaves out when it is not a lock: what pip resolves anew.
 const UNLISTED: &str = "dependencies it does not list";
 
+/// What the file says of the index pip takes a pinned package from, read as `handle_option_line`
+/// of `req_file.py` sets its finder line by line: `-i` with a value replaces the index,
+/// `--no-index` drops every index for good, and `--extra-index-url` and `-f` add places beside
+/// it. `Unnamed` while no line names one: pip then takes the index it is set up with outside the
+/// file. `Open` once the file adds a place beside one index, or holds a line that could name one
+/// which this reader does not read: `-r`, `-c`, or a line holding `${NAME}`. pip drops an extra
+/// index named before a later `-i`; here it stays open, which only leaves the index unrecorded.
+#[derive(PartialEq)]
+enum Index {
+    Unnamed,
+    Named(String),
+    Open,
+}
+
+impl Index {
+    /// The index after an option line, as pip's finder has it.
+    fn after(self, o: &Opts) -> Index {
+        match o.index.iter().rev().find(|i| !i.is_empty()) {
+            _ if self == Index::Open || o.elsewhere => Index::Open,
+            Some(named) => Index::Named(named.clone()),
+            None => self,
+        }
+    }
+
+    /// Where a pinned package comes from: the registry's or another's only when the file names
+    /// that one index, and an unrecorded index otherwise.
+    fn source(&self) -> Source {
+        match self {
+            Index::Named(i) if PYPI_INDEX.contains(&i.as_str()) => Source::Registry,
+            Index::Named(_) => Source::OtherRegistry,
+            Index::Unnamed | Index::Open => Source::UnrecordedIndex,
+        }
+    }
+}
+
 /// What the options of one line say.
 #[derive(Default)]
 struct Opts {
@@ -88,15 +123,16 @@ struct Opts {
 
 /// `requirements.txt`. It is a lock only in pip's hash-checking mode with every requirement
 /// pinned: each requirement line is `name==version` with a canonical version and a `--hash`, and
-/// no line says `--no-require-hashes`. Then each is PyPI's package at that version, unless an
-/// option line names an index that is not PyPI's, an extra index, `-f` or `--no-index`; then
-/// each is from another registry. Otherwise every pinned line is still recorded, and the file is
-/// read in part: the dependencies it does not list are not told. Not told too, each by its line:
-/// a requirement not pinned, `-e`, an address or a path with no name, a line holding an
-/// environment variable, which pip expands and this reader does not, and `-r` or `-c`, whose file
-/// is not opened. `name @ address` is git for `git+`, a path for `file:` or no `://`, and
-/// another registry otherwise. Extras are dropped and markers decide nothing. A file pip would
-/// refuse fails the reading, as the head of this file says.
+/// no line says `--no-require-hashes`. Each pinned line is PyPI's package at that version only
+/// when the file names PyPI's index as its one index (`Index`), another registry's when it names
+/// one other, and from an unrecorded index otherwise. Without a lock every pinned line is still
+/// recorded, and the file is read in part: the dependencies it does not list are not told. Not
+/// told too, each by its line: a requirement not pinned, `-e`, an address or a path with no name,
+/// a line holding an environment variable, which pip expands and this reader does not, and `-r`
+/// or `-c`, whose file is not opened. `name @ address` is git for `git+`, a path for `file:` or
+/// no `://`, the scheme in any case, and another registry otherwise. Extras are dropped and
+/// markers decide nothing. A file pip would refuse fails the reading, as the head of this file
+/// says.
 fn requirements(text: &str) -> Parsed {
     read(text).map_or(Parsed::Failed, |(deps, unknown)| {
         Parsed::Deps("PyPI", deps, unknown)
@@ -116,11 +152,12 @@ fn read(text: &str) -> Option<(Vec<Dep>, Vec<String>)> {
         return None;
     }
     let (mut deps, mut unknown) = (Vec::new(), Vec::new());
-    let (mut elsewhere, mut lock, mut any) = (false, true, false);
+    let (mut index, mut lock, mut any) = (Index::Unnamed, true, false);
     for (n, line) in lines(text) {
         let not_told = |why: &str| format!("line {n} ({why})");
         if env_var(&line) {
             unknown.push(not_told("an environment variable"));
+            index = Index::Open;
             continue;
         }
         let (args, options) = break_args_options(&line);
@@ -129,9 +166,12 @@ fn read(text: &str) -> Option<(Vec<Dep>, Vec<String>)> {
         // file only that file; on a requirement line only `--hash` and `--config-settings` count.
         if args.is_empty() && !o.editable {
             match o.include {
-                Some(option) => unknown.push(not_told(option)),
+                Some(option) => {
+                    unknown.push(not_told(option));
+                    index = Index::Open;
+                }
                 None => {
-                    elsewhere |= o.elsewhere || o.index.iter().any(|i| !PYPI_INDEX.contains(&&**i));
+                    index = index.after(&o);
                     lock &= !o.no_require_hashes;
                 }
             }
@@ -154,11 +194,10 @@ fn read(text: &str) -> Option<(Vec<Dep>, Vec<String>)> {
             Err(why) => unknown.push(not_told(why)),
         }
     }
-    for dep in deps
-        .iter_mut()
-        .filter(|d| elsewhere && d.source == Source::Registry)
-    {
-        dep.source = Source::OtherRegistry;
+    // Every pinned package comes from the index pip ends with, whatever line names it.
+    let source = index.source();
+    for dep in deps.iter_mut().filter(|d| d.source == Source::Registry) {
+        dep.source = source;
     }
     if any && !lock {
         unknown.push(UNLISTED.to_string());
@@ -178,16 +217,18 @@ fn requirement(args: &str) -> Option<Found> {
         && let Some((name, specs)) = specifiers(name)
         && specs.is_empty()
     {
-        let url = url.trim_matches([' ', '\t']);
+        // pip reads a scheme in any case.
+        let url = url.trim_matches([' ', '\t']).to_ascii_lowercase();
         let source = match url {
-            "" => return None,
+            _ if url.is_empty() => return None,
             _ if url.starts_with("git+") => Source::Git,
             _ if url.starts_with("file:") || !url.contains("://") => Source::Path,
             _ => Source::OtherRegistry,
         };
         return Some(Ok((name, None, source)));
     }
-    if spec.contains('/') || spec.starts_with('.') || spec.starts_with("file:") {
+    if spec.contains('/') || spec.starts_with('.') || spec.to_ascii_lowercase().starts_with("file:")
+    {
         return Some(Err("an address or a path"));
     }
     let (name, specs) = specifiers(spec)?;
@@ -441,12 +482,14 @@ mod tests {
         deps.iter().map(entry).chain(unknown).collect()
     }
 
-    /// Two pinned and hashed lines, the second joined to the next with extras and a marker.
+    /// PyPI's index, and two pinned and hashed lines, the second joined to the next with extras
+    /// and a marker.
     fn lock() -> String {
         format!(
-            "# a lock\nwidget==1.2.0 {H}\nMy_Gadget[extra]==2.0rc1 ; python_version < \"3.9\" \\\n\t{H} {H384}\n"
+            "-i {PYPI}\nwidget==1.2.0 {H}\nMy_Gadget[extra]==2.0rc1 ; python_version < \"3.9\" \\\n\t{H} {H384}\n"
         )
     }
+    const PYPI: &str = "https://pypi.org/simple";
 
     fn check(rows: &[(&str, String, &[&str])]) {
         for (case, text, expected) in rows {
@@ -463,30 +506,66 @@ mod tests {
             "widget 1.2.0 OtherRegistry 2",
             "my-gadget 2.0rc1 OtherRegistry 3",
         ];
+        let free = [
+            "widget 1.2.0 UnrecordedIndex 2",
+            "my-gadget 2.0rc1 UnrecordedIndex 3",
+        ];
         let mirror = "https://mirror.example.invalid/simple";
         let unlisted = "? dependencies it does not list";
+        let named = |index: &str| lock.replacen(&format!("-i {PYPI}"), index, 1);
         check(&[
+            // The index is the registry's or another's only where the file names that one alone.
             ("lock", lock.clone(), &pypi),
             ("crlf", lock.replace('\n', "\r\n"), &pypi),
-            ("pypi", format!("{lock}-i https://pypi.org/simple"), &pypi),
             (
                 "pypi /",
-                format!("{lock}--index-url=https://pypi.org/simple/"),
+                named("--index-url=https://pypi.org/simple/"),
                 &pypi,
+            ),
+            (
+                "pypi's other name",
+                named(&format!("--pypi-url {PYPI}")),
+                &pypi,
+            ),
+            ("no index named", named("# a lock"), &free),
+            (
+                "not pypi's address",
+                named("-i https://pypi.org/simple//"),
+                &other,
             ),
             ("mirror", format!("{lock}-i {mirror}"), &other),
             (
                 "mirror, then pypi",
-                format!("{lock}-i {mirror}\n-i https://pypi.org/simple"),
+                named(&format!("-i {mirror} -i {PYPI}")),
+                &pypi,
+            ),
+            (
+                "pypi, then mirror",
+                format!("{lock}-i {PYPI}\n-i {mirror}"),
                 &other,
             ),
             (
-                "extra",
-                format!("{lock}--extra-index-url https://pypi.org/simple"),
-                &other,
+                "an empty index, which pip skips",
+                format!("{lock}-i ''"),
+                &pypi,
             ),
-            ("find links", format!("{lock}-f ./wheels"), &other),
-            ("no index", format!("{lock}--no-index"), &other),
+            ("extra", format!("{lock}--extra-index-url {PYPI}"), &free),
+            ("find links", format!("{lock}-f ./wheels"), &free),
+            ("no index", format!("{lock}--no-index"), &free),
+            // pip drops an extra index at a later `-i`; it is kept open here.
+            (
+                "extra, then an index",
+                format!("--extra-index-url {mirror}\n{lock}"),
+                &[
+                    "widget 1.2.0 UnrecordedIndex 3",
+                    "my-gadget 2.0rc1 UnrecordedIndex 4",
+                ],
+            ),
+            (
+                "index from the environment",
+                format!("{lock}-i ${{INDEX}}"),
+                &[free[0], free[1], "? line 5 (an environment variable)"],
+            ),
             // pip takes only `--hash` and `--config-settings` from a requirement line, and only
             // the included file from a line that includes one.
             (
@@ -497,7 +576,12 @@ mod tests {
             (
                 "index beside -r",
                 format!("{lock}-r base.txt -i {mirror}"),
-                &[pypi[0], pypi[1], "? line 5 (-r)"],
+                &[free[0], free[1], "? line 5 (-r)"],
+            ),
+            (
+                "-c",
+                format!("{lock}-c constraints.txt"),
+                &[free[0], free[1], "? line 5 (-c)"],
             ),
             (
                 "options that change no package",
@@ -523,9 +607,9 @@ mod tests {
                 "brackets",
                 format!("gizmo (== 1.0) {H}\ngizmo[] == 1.1 {H}\ngizmo==1!2.0 {H}"),
                 &[
-                    "gizmo 1.0 Registry 1",
-                    "gizmo 1.1 Registry 2",
-                    "gizmo 1!2.0 Registry 3",
+                    "gizmo 1.0 UnrecordedIndex 1",
+                    "gizmo 1.1 UnrecordedIndex 2",
+                    "gizmo 1!2.0 UnrecordedIndex 3",
                 ],
             ),
             ("empty", "# Comment ".to_string(), &[]),
@@ -573,7 +657,7 @@ mod tests {
             (
                 "lines 966 and 999",
                 "\u{feff}Django==1.4.2".to_string(),
-                &["django 1.4.2 Registry 1", unlisted],
+                &["django 1.4.2 UnrecordedIndex 1", unlisted],
             ),
         ]);
         for spec in [
@@ -617,7 +701,12 @@ mod tests {
                 "tool@git+https://example.invalid/tool.git@v1",
                 one("tool - Git 5"),
             ),
-            ("file", "tool[cli] @ file:///src/tool", one("tool - Path 5")),
+            (
+                "git in capitals",
+                "tool @ GIT+https://example.invalid/tool.git",
+                one("tool - Git 5"),
+            ),
+            ("file", "tool[cli] @ File:///src/tool", one("tool - Path 5")),
             ("path", "tool @ ../tool", one("tool - Path 5")),
             (
                 "line 326",
@@ -647,7 +736,7 @@ mod tests {
             ("here", ".", vec![pypi[0], pypi[1], path, unlisted]),
             (
                 "file url",
-                "file:tool.zip",
+                "FILE:tool.zip",
                 vec![pypi[0], pypi[1], path, unlisted],
             ),
         ] {
@@ -696,7 +785,7 @@ mod tests {
             // Not a variable pip replaces: the line is read as it is.
             (
                 "lowercase",
-                "--extra-index-url ${lower}\nwidget==1.0",
+                "-i ${lower}\nwidget==1.0",
                 &[
                     "widget 1.0 OtherRegistry 2",
                     "? dependencies it does not list",
