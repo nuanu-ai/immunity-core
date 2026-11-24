@@ -68,7 +68,7 @@ An entity is something the user has. Its id is built only from its type and a na
 
 `repository`, `service`, `account`, `domain`, `key` and `party` are reserved and not used yet.
 
-Ecosystem names follow the vulnerability databases, so matching needs no translation table. Where the databases have no name, Immunity Core's are `brew` for a Homebrew formula, `brew-cask` for a cask and `macos-app` for an application bundle (named by its bundle identifier). A lockfile entry is named by the package it really is, not by an alias it was installed under. Only an entry from the ecosystem's public registry has a bare name; one from git, a path or another registry carries its source in brackets, such as `(git)`, so it is never compared with the registry's package of the same name.
+Ecosystem names follow the vulnerability databases, so matching needs no translation table. Where the databases have no name, Immunity Core's are `brew` for a Homebrew formula, `brew-cask` for a cask and `macos-app` for an application bundle (named by its bundle identifier). A lockfile entry is named by the package it really is, not by an alias it was installed under. Only an entry from the ecosystem's public registry has a bare name; any other carries its source in brackets, such as `(git)`. One from git, a path or another registry is never compared with the registry's package of the same name. One whose lockfile does not record the index it comes from, `(unrecorded index)`, is compared under its plain name, and for a record that does not hold its release the answer is "don't know".
 
 ## Facts and their basis
 

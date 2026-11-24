@@ -1,6 +1,4 @@
 //! What ties an entry of a Python lockfile to PyPI's own package of a name and a version.
-// No reader calls these yet: the change that adds the first Python reader removes this line.
-#![allow(dead_code)]
 
 use super::{At, Dep, Parsed, Source};
 use std::sync::OnceLock;
@@ -335,37 +333,33 @@ mod tests {
     }
 }
 
-/// What `poetry.lock` and `pdm.lock` share: TOML, their format's version as the string
-/// `metadata.<version_key>`, and the array of tables `package`, each with a string `name`. A
-/// version `known` refuses is named as the kind `<kind> version <n>` with no reader. `entry` tells
-/// from a table and its name, normalised (`None` for a name `pypi_name` refuses), where it comes
-/// from and its version: `Err` fails the reading, and `Ok(None)` leaves the entry not told, as
-/// does a name refused. An entry not told is keyed `L<line of its name>`. A file that is not TOML,
-/// a version missing or not a string, and a `package` that is not an array of tables fail too.
+/// What one entry of a Python lockfile in TOML is: its name, its version and its source; `None`
+/// when the lockfile does not tell its package.
+pub(super) type Told = Option<(String, Option<String>, Source)>;
+
+/// What the Python lockfiles in TOML share: the file is parsed whole by the `toml` crate, `head`
+/// checks the format's version and gives the key of the array of entries, and each entry is a
+/// table with a string `name`, at whose line it is recorded. `head` gives `Err` with what the
+/// reading is instead: a kind with no reader, or failed. `entry` tells from a table and its
+/// name what the entry is (`Told`), and gives `None` when the tool would refuse it, which fails
+/// the reading. An entry not told is keyed `L<line of its name>`. A file that is not TOML, an
+/// array of entries that is not an array of tables, and an entry with no string `name` fail too;
+/// no array is no entry.
 pub(super) fn toml_lock(
     text: &str,
-    kind: &str,
-    version_key: &str,
-    known: fn(&str) -> bool,
-    entry: impl Fn(&toml::de::DeTable, Option<&str>) -> Result<Option<(Source, Option<String>)>, ()>,
+    head: impl Fn(&toml::de::DeTable) -> Result<&'static str, Parsed>,
+    entry: impl Fn(&toml::de::DeTable, &str) -> Option<Told>,
 ) -> Parsed {
     use toml::de::{DeTable, DeValue};
     let Ok(lock) = DeTable::parse(text) else {
         return Parsed::Failed;
     };
     let lock = lock.get_ref();
-    let metadata = lock.get("metadata").map(|m| m.get_ref());
-    match metadata
-        .and_then(|m| m.get(version_key))
-        .map(|v| v.get_ref().as_str())
-    {
-        Some(Some(v)) if known(v) => {}
-        Some(Some(v)) if super::version_shape(v) => {
-            return Parsed::NoReader(format!("{kind} version {v}"));
-        }
-        _ => return Parsed::Failed,
-    }
-    let packages = match lock.get("package").map(|p| p.get_ref()) {
+    let key = match head(lock) {
+        Ok(key) => key,
+        Err(parsed) => return parsed,
+    };
+    let packages = match lock.get(key).map(|p| p.get_ref()) {
         None => &[][..],
         Some(DeValue::Array(packages)) => &packages[..],
         Some(_) => return Parsed::Failed,
@@ -377,25 +371,41 @@ pub(super) fn toml_lock(
         let Some(package) = package.get_ref().as_table() else {
             return Parsed::Failed;
         };
-        let Some((key, Some(name))) =
+        let Some((at, Some(name))) =
             (package.get_key_value("name")).map(|(k, v)| (k.span().start, v.get_ref().as_str()))
         else {
             return Parsed::Failed;
         };
-        let line = breaks.partition_point(|&b| b < key) + 1;
-        let name = pypi_name(name);
-        match (entry(package, name.as_deref()), name) {
-            (Err(()), _) => return Parsed::Failed,
-            (Ok(Some((source, version))), Some(name)) => out.push(Dep {
+        let line = breaks.partition_point(|&b| b < at) + 1;
+        match entry(package, name) {
+            None => return Parsed::Failed,
+            Some(Some((name, version, source))) => out.push(Dep {
                 at: At::Line(line),
                 name,
                 version,
                 source,
             }),
-            (Ok(_), _) => unknown.push(format!("L{line}")),
+            Some(None) => unknown.push(format!("L{line}")),
         }
     }
     Parsed::Deps("PyPI", out, unknown)
+}
+
+/// A format's version written as a string: `Ok` when `known` takes it, the kind `<kind> version
+/// <v>` with no reader for another of a version's shape, and a failed reading for none or any
+/// other value.
+pub(super) fn text_version(
+    version: Option<&toml::Spanned<toml::de::DeValue>>,
+    kind: &str,
+    known: fn(&str) -> bool,
+) -> Result<(), Parsed> {
+    match version.map(|v| v.get_ref().as_str()) {
+        Some(Some(v)) if known(v) => Ok(()),
+        Some(Some(v)) if super::version_shape(v) => {
+            Err(Parsed::NoReader(format!("{kind} version {v}")))
+        }
+        _ => Err(Parsed::Failed),
+    }
 }
 
 /// Whether the array `files` of a `poetry.lock` or `pdm.lock` entry lists only PyPI's files of

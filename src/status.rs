@@ -47,9 +47,9 @@ pub const CANNOT_JUDGE: &[&str] = &[
     PERSISTENCE_UNREAD,
     // A watched file that starts by itself is read; what it runs in turn is not (`autorun.rs`).
     RUN_IN_TURN_UNREAD,
-    // Lockfiles of npm and crates.io are matched (`vulnerabilities`); the rest is planned in
+    // Lockfiles of crates.io, npm and PyPI are matched (`vulnerabilities`); the rest is planned in
     // docs/threats.md.
-    "no vulnerability is matched against installed software, servers' packages or ecosystems other than npm and crates.io yet",
+    "no vulnerability is matched against installed software, servers' packages or ecosystems other than crates.io, npm and PyPI yet",
     // Homebrew and npm are read; other package managers are named only when looked for, and
     // every tool is looked for at its installers' default places only (`managers`, `tools`).
     OTHER_MANAGERS,
@@ -1971,8 +1971,9 @@ mod tests {
     }
 
     #[test]
-    fn a_feed_is_said_matched_only_when_some_kind_of_lockfile_of_its_ecosystem_is_read() {
-        // PyPI's data is downloaded while no Python lockfile is read: it is not matched.
+    fn a_feed_is_said_matched_when_some_kind_of_lockfile_of_its_ecosystem_is_read() {
+        // Every feed of this build has a reader; the rule for one without is held on
+        // `vulnerabilities::matched_of`.
         let state = |feed| crate::osv::State {
             feed,
             latest: None,
@@ -1988,7 +1989,7 @@ mod tests {
             .collect();
         assert_eq!(
             matched,
-            [("crates.io", true), ("npm", true), ("PyPI", false)]
+            [("crates.io", true), ("npm", true), ("PyPI", true)]
         );
     }
 }

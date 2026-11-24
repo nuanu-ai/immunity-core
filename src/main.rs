@@ -6,8 +6,8 @@
 //! `watch` answers with one message of the contract: text for a person, `--json` or `--proto`.
 //!
 //! The program never connects to a server and never runs ssh. Its requests to the network
-//! are the threat list and the vulnerability data of npm and crates.io, each fetched whole
-//! with the system curl.
+//! are the threat list and the vulnerability data of each ecosystem in `osv::FEEDS`, each
+//! fetched whole with the system curl.
 
 mod after_run;
 mod agent_folders;
