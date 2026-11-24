@@ -4,7 +4,7 @@
 use crate::outcome::{Code, Outcome};
 use crate::resolver;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::{File, TryLockError};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -539,6 +539,7 @@ fn make(path: &Path) -> Res<()> {
             [FORMAT_VERSION],
         )?;
         give_id(&tx)?;
+        seed_vocabulary(&tx)?;
         tx.commit()?;
         conn.close().map_err(|(_, e)| e)?;
         match std::fs::hard_link(&making, path) {
@@ -572,15 +573,52 @@ fn opened(path: &Path) -> Res<Connection> {
     if !exists(path)? {
         return Err(absent(path).into());
     }
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     conn.pragma_update(None, "cache_spill", false)?;
     conn.pragma_update(None, "foreign_keys", true)?;
+    conn.busy_timeout(Duration::from_secs(15))?;
     check(&conn, path)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.pragma_update(None, "cache_size", -32768)?;
+    ensure_vocabulary(&mut conn)?;
+    Ok(conn)
+}
+
+fn seed_vocabulary(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(VOCABULARY)?;
     conn.execute_batch(crate::processes::KINDS)?;
-    crate::autorun::add_kinds(&conn)?;
-    crate::watched::add_kinds(&conn)?;
-    Ok(conn)
+    crate::autorun::add_kinds(conn)?;
+    crate::watched::add_kinds(conn)?;
+    Ok(())
+}
+
+/// Ensures every row of this build's vocabulary exists in `conn`, writing only when one is
+/// missing so an already-seeded store takes no write lock on open.
+fn ensure_vocabulary(conn: &mut Connection) -> rusqlite::Result<()> {
+    let want = &expected_meta().vocabulary;
+    let mut present = 0usize;
+    {
+        let mut stmt = conn.prepare(
+            "SELECT 'e', name FROM entity_type
+             UNION ALL SELECT 'p', name FROM predicate
+             UNION ALL SELECT 'b', name FROM basis_kind
+             UNION ALL SELECT 'c', name FROM coverage_kind",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let tag = r.get_ref(0)?.as_str()?;
+            let name = r.get_ref(1)?.as_str()?;
+            if want.get(tag).is_some_and(|names| names.contains(name)) {
+                present += 1;
+            }
+        }
+    }
+    if present < expected_meta().vocabulary_count {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        seed_vocabulary(&tx)?;
+        tx.commit()?;
+    }
+    Ok(())
 }
 
 /// The store's own id, as every message of the contract carries it (`store_id`): a finding's id
@@ -649,6 +687,8 @@ pub fn open_read_only(path: &Path) -> Result<Connection, Outcome> {
 fn read_only(path: &Path) -> Res<Connection> {
     let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     check(&conn, path)?;
+    conn.pragma_update(None, "temp_store", "MEMORY")?;
+    conn.pragma_update(None, "cache_size", -16384)?;
     Ok(conn)
 }
 
@@ -747,26 +787,34 @@ fn check(conn: &Connection, path: &Path) -> Res<()> {
             },
         ));
     }
-    let one = |key: &str| -> rusqlite::Result<Option<String>> {
-        // A table `meta` without the columns `key` and `value` holds no value; any other
-        // failure, such as a journal to roll back first, is returned as it is.
-        let readable: bool = conn.query_row(
-            "SELECT COUNT(*) = 2 FROM pragma_table_info('meta') WHERE name IN ('key', 'value')",
-            [],
-            |r| r.get(0),
+    // A table `meta` without the columns `key` and `value` holds no value; any other
+    // failure, such as a journal to roll back first, is returned as it is.
+    let readable: bool = conn.query_row(
+        "SELECT COUNT(*) = 2 FROM pragma_table_info('meta') WHERE name IN ('key', 'value')",
+        [],
+        |r| r.get(0),
+    )?;
+    let (mut version, mut store_id): (Option<String>, Option<String>) = (None, None);
+    if readable {
+        let mut stmt = conn.prepare(
+            "SELECT key, COUNT(*), MAX(CASE WHEN typeof(value) = 'text' THEN value END)
+             FROM meta WHERE key IN ('format_version', 'store_id') GROUP BY key",
         )?;
-        if !readable {
-            return Ok(None);
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let key: String = r.get(0)?;
+            let count: i64 = r.get(1)?;
+            let val: Option<String> = r.get(2)?;
+            if count == 1 {
+                match key.as_str() {
+                    "format_version" => version = val,
+                    "store_id" => store_id = val,
+                    _ => {}
+                }
+            }
         }
-        let (rows, value): (i64, Option<String>) = conn.query_row(
-            "SELECT COUNT(*), MAX(CASE WHEN typeof(value) = 'text' THEN value END)
-             FROM meta WHERE key = ?1",
-            [key],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )?;
-        Ok(value.filter(|_| rows == 1))
-    };
-    let Some(version) = one("format_version")? else {
+    }
+    let Some(version) = version else {
         return Err(refused(
             Code::UnknownFormat,
             format!(
@@ -812,10 +860,12 @@ fn check(conn: &Connection, path: &Path) -> Res<()> {
         }
         Some(_) => {}
     }
-    if let Some(why) = differs(expected(), &shape(conn)?) {
+    if !matches_expected(conn)?
+        && let Some(why) = differs(expected(), &shape(conn)?)
+    {
         return Err(refused(Code::Damaged, damaged(path, &why)));
     }
-    if !one("store_id")?.is_some_and(|id| is_id(&id)) {
+    if !store_id.is_some_and(|id| is_id(&id)) {
         let why = "it has no id of the form Immunity Core gives one";
         return Err(refused(Code::Damaged, damaged(path, why)));
     }
@@ -835,16 +885,122 @@ fn damaged(path: &Path, why: &str) -> String {
     )
 }
 
+struct Expected {
+    shape: Shape,
+    /// `type -> name -> (index, tbl_name, normal(sql))` for zero-allocation schema verification.
+    by_type: HashMap<String, HashMap<String, (usize, String, String)>>,
+    object_count: usize,
+    /// Expected rows of the four vocabulary tables, keyed by tag (`"e"`, `"p"`, `"b"`, `"c"`).
+    vocabulary: HashMap<&'static str, HashSet<String>>,
+    vocabulary_count: usize,
+    /// Seeded predicates and whether their `object_kind` is `'entity'`.
+    entity_predicates: HashMap<String, bool>,
+}
+
 /// What a store of this format holds, made once in each process from `schema` in a store in
 /// memory, so that the check and the making of a store can never disagree.
-fn expected() -> &'static Shape {
-    static SHAPE: std::sync::OnceLock<Shape> = std::sync::OnceLock::new();
-    SHAPE.get_or_init(|| {
+fn expected_meta() -> &'static Expected {
+    static META: std::sync::OnceLock<Expected> = std::sync::OnceLock::new();
+    META.get_or_init(|| {
         let conn = Connection::open_in_memory().expect("SQLite opens a store in memory");
         conn.execute_batch(&schema())
             .expect("the schema of this format makes a store");
-        shape(&conn).expect("SQLite describes a store it made")
+        let shape = shape(&conn).expect("SQLite describes a store it made");
+        let mut by_type: HashMap<String, HashMap<String, (usize, String, String)>> = HashMap::new();
+        let mut object_count = 0usize;
+        {
+            let mut stmt = conn
+                .prepare("SELECT type, name, tbl_name, sql FROM sqlite_master")
+                .expect("sqlite_master is readable");
+            let mut rows = stmt.query([]).expect("sqlite_master query runs");
+            while let Some(r) = rows.next().expect("sqlite_master row reads") {
+                let kind: String = r.get(0).expect("type");
+                let name: String = r.get(1).expect("name");
+                let table: String = r.get(2).expect("tbl_name");
+                let sql: Option<String> = r.get(3).expect("sql");
+                let norm = normal(sql.as_deref().unwrap_or_default());
+                let idx = object_count;
+                object_count += 1;
+                by_type
+                    .entry(kind)
+                    .or_default()
+                    .insert(name, (idx, table, norm));
+            }
+        }
+        seed_vocabulary(&conn).expect("the vocabulary seeds cleanly");
+        let mut vocabulary: HashMap<&'static str, HashSet<String>> = HashMap::new();
+        let mut vocabulary_count = 0usize;
+        for (tag, sql) in [
+            ("e", "SELECT name FROM entity_type"),
+            ("p", "SELECT name FROM predicate"),
+            ("b", "SELECT name FROM basis_kind"),
+            ("c", "SELECT name FROM coverage_kind"),
+        ] {
+            let names: HashSet<String> = conn
+                .prepare(sql)
+                .expect("vocabulary query")
+                .query_map([], |r| r.get(0))
+                .expect("vocabulary rows")
+                .collect::<rusqlite::Result<_>>()
+                .expect("vocabulary names");
+            vocabulary_count += names.len();
+            vocabulary.insert(tag, names);
+        }
+        let entity_predicates: HashMap<String, bool> = conn
+            .prepare("SELECT name, COALESCE(object_kind = 'entity', 0) FROM predicate")
+            .expect("predicate query")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .expect("predicate rows")
+            .collect::<rusqlite::Result<_>>()
+            .expect("predicates");
+        Expected {
+            shape,
+            by_type,
+            object_count,
+            vocabulary,
+            vocabulary_count,
+            entity_predicates,
+        }
     })
+}
+
+fn expected() -> &'static Shape {
+    &expected_meta().shape
+}
+
+/// Fast check that every row of `sqlite_master` matches `expected_meta()` with no per-row map or
+/// formatted string allocations. On any mismatch, `check` falls back to `differs` for the exact
+/// wording of what changed.
+fn matches_expected(conn: &Connection) -> rusqlite::Result<bool> {
+    let want = expected_meta();
+    let mut seen = vec![false; want.object_count];
+    let mut matched = 0usize;
+    let mut norm = String::with_capacity(512);
+    let mut stmt = conn.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master")?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        let kind = r.get_ref(0)?.as_str()?;
+        let name = r.get_ref(1)?.as_str()?;
+        let table = r.get_ref(2)?.as_str()?;
+        let sql = match r.get_ref(3)? {
+            rusqlite::types::ValueRef::Null => "",
+            v => v.as_str()?,
+        };
+        let Some((idx, want_table, want_sql)) = want.by_type.get(kind).and_then(|m| m.get(name))
+        else {
+            return Ok(false);
+        };
+        if seen[*idx] || table != want_table.as_str() {
+            return Ok(false);
+        }
+        normal_into(sql, &mut norm);
+        if norm != want_sql.as_str() {
+            return Ok(false);
+        }
+        seen[*idx] = true;
+        matched += 1;
+    }
+    Ok(matched == want.object_count)
 }
 
 /// A store's schema as the check compares it: every object `sqlite_master` holds, SQLite's own
@@ -873,16 +1029,30 @@ fn shape(conn: &Connection) -> rusqlite::Result<Shape> {
 /// every run of blank space made one space. The schema's source holds no `--` and no run of
 /// blank space inside a quoted string, which a test pins, so this changes no string.
 fn normal(sql: &str) -> String {
-    sql.lines()
-        .map(|line| line.split_once("--").map_or(line, |(code, _)| code))
-        .flat_map(str::split_whitespace)
-        .collect::<Vec<_>>()
-        .join(" ")
+    let mut out = String::with_capacity(sql.len());
+    normal_into(sql, &mut out);
+    out
+}
+
+fn normal_into(sql: &str, out: &mut String) {
+    out.clear();
+    for line in sql.lines() {
+        let code = line.split_once("--").map_or(line, |(code, _)| code);
+        for word in code.split_whitespace() {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(word);
+        }
+    }
 }
 
 /// The first way a store's schema is not the one this format makes, in words; `None` when it
 /// is the same.
 fn differs(want: &Shape, got: &Shape) -> Option<String> {
+    if want == got {
+        return None;
+    }
     // A missing table is said before what went with it.
     let mut objects: Vec<(&String, &String)> = want.iter().collect();
     objects.sort_by_key(|(object, _)| !object.starts_with("table "));
@@ -1003,6 +1173,18 @@ pub fn put_entity(tx: &Transaction, id: &str) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Whether `predicate` points at an entity in the vocabulary, cached for seeded predicates.
+pub fn predicate_is_entity(tx: &Transaction, predicate: &str) -> rusqlite::Result<bool> {
+    if let Some(&is_entity) = expected_meta().entity_predicates.get(predicate) {
+        return Ok(is_entity);
+    }
+    tx.query_row(
+        "SELECT object_kind = 'entity' FROM predicate WHERE name = ?1",
+        [predicate],
+        |row| row.get(0),
+    )
+}
+
 /// Writes one draft assertion, and the entities it names: the subject, and the object
 /// when the vocabulary says the predicate points at an entity.
 pub fn put_draft(
@@ -1012,12 +1194,7 @@ pub fn put_draft(
     s: &Statement,
 ) -> rusqlite::Result<()> {
     put_entity(tx, &s.subject)?;
-    let points_at_entity: bool = tx.query_row(
-        "SELECT object_kind = 'entity' FROM predicate WHERE name = ?1",
-        [s.predicate],
-        |row| row.get(0),
-    )?;
-    if points_at_entity {
+    if predicate_is_entity(tx, s.predicate)? {
         put_entity(tx, &s.object)?;
     }
     tx.execute(
@@ -1075,11 +1252,12 @@ pub fn put_coverage(
         ],
     )?;
     let id = tx.last_insert_rowid();
-    for lack in &gap.lacks {
-        tx.execute(
-            "INSERT INTO coverage_lack (coverage, what, name) VALUES (?1, ?2, ?3)",
-            params![id, lack.what, lack.name],
-        )?;
+    if !gap.lacks.is_empty() {
+        let mut lack_stmt =
+            tx.prepare("INSERT INTO coverage_lack (coverage, what, name) VALUES (?1, ?2, ?3)")?;
+        for lack in &gap.lacks {
+            lack_stmt.execute(params![id, lack.what, lack.name])?;
+        }
     }
     Ok(())
 }
@@ -2839,5 +3017,27 @@ mod tests {
         let missing = dir.join("store.db");
         assert!(roll_back(&missing).is_err());
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn opening_to_write_adds_a_missing_vocabulary_row() {
+        let dir = crate::common::Scratch::new("vocab-reseed");
+        let path = dir.join("store.db");
+        let conn = open_or_make(&path).unwrap();
+        let removed = conn
+            .execute("DELETE FROM coverage_kind WHERE name = 'brew packages'", [])
+            .unwrap();
+        assert_eq!(removed, 1);
+        drop(conn);
+
+        let conn = open(&path).unwrap();
+        let restored: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM coverage_kind WHERE name = 'brew packages')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(restored);
     }
 }

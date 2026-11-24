@@ -7,6 +7,7 @@
 //! Every constant is copied from `unicode/uchar.h` and `unicode/umachine.h` in the macOS SDK.
 
 use std::ffi::c_int;
+use std::sync::OnceLock;
 
 /// `UChar32`, a code point.
 type UChar32 = i32;
@@ -42,7 +43,15 @@ unsafe extern "C" {
 /// the character before it, two for one Unicode's East Asian Width gives as wide or full width,
 /// one for every other, the ambiguous ones included, as a terminal outside East Asia draws them.
 pub fn columns(c: char) -> usize {
-    let c = c as UChar32;
+    if c.is_ascii() {
+        static ASCII: OnceLock<[u8; 128]> = OnceLock::new();
+        let table = ASCII.get_or_init(|| std::array::from_fn(|i| columns_icu(i as UChar32) as u8));
+        return table[c as usize] as usize;
+    }
+    columns_icu(c as UChar32)
+}
+
+fn columns_icu(c: UChar32) -> usize {
     // SAFETY: both functions take any code point and only read ICU's built-in data.
     if matches!(
         unsafe { u_charType(c) },
@@ -60,11 +69,33 @@ pub fn columns(c: char) -> usize {
 /// a format character, a line or paragraph separator, or a default-ignorable code point,
 /// which a renderer draws as nothing.
 pub fn hidden(c: char) -> bool {
-    let c = c as UChar32;
+    if c.is_ascii() {
+        static ASCII: OnceLock<[bool; 128]> = OnceLock::new();
+        let table = ASCII.get_or_init(|| std::array::from_fn(|i| hidden_icu(i as UChar32)));
+        return table[c as usize];
+    }
+    hidden_icu(c as UChar32)
+}
+
+fn hidden_icu(c: UChar32) -> bool {
     // SAFETY: both functions take any code point and only read ICU's built-in data.
     let category = unsafe { u_charType(c) };
     matches!(
         category,
         U_CONTROL_CHAR | U_FORMAT_CHAR | U_LINE_SEPARATOR | U_PARAGRAPH_SEPARATOR
     ) || unsafe { u_hasBinaryProperty(c, UCHAR_DEFAULT_IGNORABLE_CODE_POINT) } != 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ascii_cache_matches_icu_for_every_ascii_character() {
+        for byte in 0u8..128 {
+            let c = char::from(byte);
+            assert_eq!(hidden(c), hidden_icu(c as UChar32), "hidden({byte})");
+            assert_eq!(columns(c), columns_icu(c as UChar32), "columns({byte})");
+        }
+    }
 }

@@ -299,7 +299,7 @@ pub fn say(
     let kept = crate::secrets::Text::source(reason);
     let reason = kept.store();
     let reason = reason.as_str();
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let replaced = withdraw_in(
         &tx,
         machine,
@@ -337,7 +337,7 @@ pub fn withdraw(
     at: i64,
     run_id: &str,
 ) -> rusqlite::Result<Vec<(String, String)>> {
-    let tx = conn.transaction()?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let n = withdraw_in(&tx, machine, at, run_id, "withdrawn by the owner", via)?;
     tx.commit()?;
     Ok(n)

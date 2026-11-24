@@ -2204,8 +2204,14 @@ fn owner_cmd(args: &OwnerArgs) -> ExitCode {
         });
     };
     let run_id = format!("owner-{}-{:09}", now.as_secs(), now.subsec_nanos());
-    let mut conn = match store::open(store_path) {
-        Ok(c) => c,
+    if matches!(
+        std::fs::symlink_metadata(store_path),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound
+    ) {
+        return failed(&store::absent(store_path));
+    }
+    let (_lock, mut conn) = match verdict::writing(store_path) {
+        Ok(held) => held,
         Err(e) => return failed(&e),
     };
     let (entity, machine) = match owner::find(&conn, name) {

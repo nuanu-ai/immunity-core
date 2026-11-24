@@ -61,7 +61,7 @@ impl Hasher {
         let mut digest = [0u8; 32];
         // SAFETY: `digest` is valid for the 32 bytes the call writes.
         unsafe { CC_SHA256_Final(digest.as_mut_ptr(), &mut self.0) };
-        digest.iter().map(|b| format!("{b:02x}")).collect()
+        to_hex(&digest)
     }
 }
 
@@ -73,7 +73,18 @@ pub fn hex(data: &[u8]) -> String {
     let mut digest = [0u8; 32];
     // SAFETY: `data` is valid for `len` bytes and `digest` for the 32 bytes the call writes.
     unsafe { CC_SHA256(data.as_ptr().cast(), len, digest.as_mut_ptr()) };
-    digest.iter().map(|b| format!("{b:02x}")).collect()
+    to_hex(&digest)
+}
+
+fn to_hex(digest: &[u8; 32]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0u8; 64];
+    for (i, &b) in digest.iter().enumerate() {
+        out[i * 2] = DIGITS[(b >> 4) as usize];
+        out[i * 2 + 1] = DIGITS[(b & 0x0f) as usize];
+    }
+    // SAFETY: every byte in `out` is an ASCII hex digit.
+    String::from_utf8(out.to_vec()).expect("ASCII hex digits are valid UTF-8")
 }
 
 #[cfg(test)]

@@ -406,11 +406,12 @@ fn presence<'a>(
 ) -> rusqlite::Result<(v1::Presence, BTreeSet<ReadingKey>)> {
     let mut held = with_parts;
     let mut owners: BTreeSet<ReadingKey> = BTreeSet::new();
-    let mut live = conn
-        .prepare("SELECT EXISTS (SELECT 1 FROM assertion WHERE layer = 'live' AND subject = ?1)")?;
+    let mut live = conn.prepare(
+        "SELECT EXISTS (SELECT 1 FROM assertion WHERE +layer = 'live' AND subject = ?1)",
+    )?;
     let mut owning = conn.prepare(
         "SELECT DISTINCT reader, scope, kind FROM assertion
-         WHERE subject = ?1 AND layer IN ('live', 'retracted')",
+         WHERE subject = ?1 AND +layer IN ('live', 'retracted')",
     )?;
     for unit in units {
         held = held || live.query_row([unit], |r| r.get::<_, bool>(0))?;
@@ -608,7 +609,7 @@ fn parts(
         Some((machine, rel)) => conn
             .prepare(
                 "SELECT DISTINCT a.subject, e.type FROM assertion a JOIN entity e ON e.id = a.subject
-                 WHERE a.layer = 'live' AND a.subject > ?1 AND a.subject < ?2",
+                 WHERE +a.layer = 'live' AND a.subject > ?1 AND a.subject < ?2",
             )?
             .query_map(
                 [format!("file:{machine}/{rel}/"), format!("file:{machine}/{rel}0")],
@@ -658,7 +659,7 @@ fn facts<'a>(
 ) -> rusqlite::Result<Vec<v1::Fact>> {
     let mut q = conn.prepare(
         "SELECT predicate, object, reader, basis, source_ref, observed_at, scope, kind
-         FROM assertion WHERE layer = 'live' AND subject = ?1
+         FROM assertion WHERE +layer = 'live' AND subject = ?1
          ORDER BY predicate, object, reader, id",
     )?;
     let mut out: Vec<v1::Fact> = Vec::new();
