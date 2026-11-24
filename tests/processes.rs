@@ -103,6 +103,15 @@ fn findings(dir: &Dir) -> Vec<Value> {
         .collect()
 }
 
+/// The pid and start of the process a finding of the rule names.
+fn identity(f: &Value) -> (i64, i64) {
+    let p = &f["evidence"]["detached_process"];
+    (
+        p["pid"].as_i64().unwrap(),
+        p["start_micros"].as_i64().unwrap(),
+    )
+}
+
 /// A process as a reading gives it.
 fn process(pid: i64, start: i64, parent: i64, exe: &str, args: &[&str], terminal: bool) -> Value {
     json!({ "pid": pid, "start": start, "parent": parent, "executable": exe,
@@ -110,7 +119,7 @@ fn process(pid: i64, start: i64, parent: i64, exe: &str, args: &[&str], terminal
 }
 
 const T: i64 = 1_800_000_000;
-/// Something a command line holds that must never be kept: it stands for code and secrets.
+/// Something a command line holds: it stands for the code a process was given.
 const MARKER: &str = "inline-code-TOKEN-5f1c";
 
 /// The one that must fire, a node given code with its parent gone, and those that must not.
@@ -188,11 +197,11 @@ fn a_detached_interpreter_given_code_is_a_finding_once_two_samples_a_minute_apar
     );
     assert_eq!(f["finding"]["state"], "open");
     assert_eq!(f["where_text"], "/opt/tools/bin/node");
-    // The process by its pid and start, which name it; never its command line.
-    assert_eq!(
-        f["evidence"],
-        json!({ "detached_process": { "pid": 4242, "start_micros": 7 } })
-    );
+    // The process by its pid and start, which name it, and the command line it was given.
+    let p = &f["evidence"]["detached_process"];
+    assert_eq!((&p["pid"], &p["start_micros"]), (&json!(4242), &json!(7)));
+    let code = format!("require('net').connect(80, '{MARKER}')");
+    assert_eq!(p["args_text"], json!(["node", "-e", code]));
 
     // It stays one finding while the process lives.
     let fourth = sample(&dir, T + 120, &table(T + 120));
@@ -324,10 +333,7 @@ fn after_the_owner_has_seen_it_the_same_process_raises_nothing_and_another_one_d
         .collect();
     assert_eq!(open.len(), 1);
     // The new finding names the process that raised it, not the one already seen.
-    assert_eq!(
-        open[0]["evidence"],
-        json!({ "detached_process": { "pid": 11, "start_micros": 7 } })
-    );
+    assert_eq!(identity(&open[0]), (11, 7));
 }
 
 #[test]
@@ -351,10 +357,7 @@ fn a_finding_still_open_names_the_latest_process_of_its_program_a_sample_saw() {
     sample(&dir, T + 180, &one(11));
     let found = findings(&dir);
     assert_eq!(found.len(), 1);
-    assert_eq!(
-        found[0]["evidence"],
-        json!({ "detached_process": { "pid": 11, "start_micros": 7 } })
-    );
+    assert_eq!(identity(&found[0]), (11, 7));
     let id = found[0]["finding"]["id"].as_str().unwrap();
     let out = immunity(&dir, &["findings"]);
     assert!(out.status.success());
@@ -370,26 +373,216 @@ fn a_finding_still_open_names_the_latest_process_of_its_program_a_sample_saw() {
     );
 }
 
-#[test]
-fn a_command_line_is_never_kept_in_the_store_nor_printed() {
-    let dir = Dir::new("secret");
-    sample(&dir, T, &table(T));
-    let said = sample(&dir, T + 60, &table(T + 60));
-    assert!(!said.to_string().contains(MARKER));
-    let input = dir.0.join(format!("reading-{}.json", T + 60));
-    let text = immunity(&dir, &["sample", "--sample-input", input.to_str().unwrap()]);
-    assert!(text.status.success());
-    assert!(!String::from_utf8_lossy(&text.stdout).contains(MARKER));
-    assert!(!String::from_utf8_lossy(&text.stderr).contains(MARKER));
-    for name in ["store.db", "store.db-wal", "store.db-journal"] {
-        if let Ok(bytes) = std::fs::read(dir.0.join(name)) {
-            let found = bytes.windows(MARKER.len()).any(|w| w == MARKER.as_bytes());
-            assert!(!found, "{name}");
+/// The invented secrets of each kind the cut knows, as the tests of `src/secrets.rs` plant them,
+/// given to one shell as arguments: the arguments and the secrets.
+fn planted() -> (Vec<&'static str>, [&'static str; 5]) {
+    // Split, so that no scanner takes this source for one that holds a token.
+    let token = concat!("gh", "p_Fk7Qz2Lm9Xw4Rt8Yp3Vn6Bc1Hd5Js0Ga7Ke2");
+    let args = vec![
+        "zsh",
+        "-c",
+        "sleep 60",
+        "tool",
+        token,
+        "--password",
+        "Fake-Pa55word",
+        "https://someone:FakePassw0rd@example.invalid/r",
+        "-H",
+        "Authorization: Bearer FAKEexample0opaque1token2",
+        "mysql",
+        "-u",
+        "root",
+        "-pFakePassw0rdExample",
+    ];
+    let secrets = [
+        token,
+        "Fake-Pa55word",
+        "FakePassw0rd",
+        "FAKEexample0opaque1token2",
+        "FakePassw0rdExample",
+    ];
+    (args, secrets)
+}
+
+/// What `immunity <args>` printed on standard output, which must succeed.
+fn printed(dir: &Dir, args: &[&str]) -> Vec<u8> {
+    let out = immunity(dir, args);
+    assert!(out.status.success(), "{args:?}: {out:?}");
+    out.stdout
+}
+
+/// Every page `immunity view` writes, one after the other.
+fn pages(dir: &Dir) -> String {
+    String::from_utf8(printed(dir, &["view", "--no-open"]))
+        .unwrap()
+        .lines()
+        .map(|p| std::fs::read_to_string(p).unwrap())
+        .collect()
+}
+
+/// Every file under `folder` but the readings a test fed, which hold what it gave.
+fn kept_files(folder: &std::path::Path, out: &mut Vec<(String, Vec<u8>)>) {
+    for entry in std::fs::read_dir(folder).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.display().to_string();
+        if path.is_dir() {
+            kept_files(&path, out);
+        } else if !name.contains("/reading-") {
+            out.push((name, std::fs::read(&path).unwrap()));
         }
     }
-    // What the rule derived is kept instead.
-    let views = findings(&dir);
-    assert!(!views.iter().any(|f| f.to_string().contains(MARKER)));
+}
+
+fn holds(bytes: &[u8], text: &str) -> bool {
+    bytes.windows(text.len()).any(|w| w == text.as_bytes())
+}
+
+/// The id of the one finding there is.
+fn the_finding(dir: &Dir) -> String {
+    let all = findings(dir);
+    assert_eq!(all.len(), 1, "{all:?}");
+    all[0]["finding"]["id"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn a_secret_on_the_command_line_of_a_detached_process_reaches_no_file_and_no_output() {
+    // The command line of the process the rule fires on is kept and printed, every secret in it
+    // cut, in the store, the journal, every form of the finding and the pages. That of a process
+    // it does not fire on is kept nowhere.
+    let dir = Dir::new("secret");
+    let (args, secrets) = planted();
+    let other = format!("print {MARKER}");
+    let table = vec![
+        process(500, 1, 1, "/opt/tools/bin/tool", &["tool"], false),
+        process(4242, 7, 1, "/bin/zsh", &args, false),
+        process(4301, 7, 500, "/bin/sh", &["sh", "-c", &other], false),
+    ];
+    sample(&dir, T, &table);
+    let said = sample(&dir, T + 60, &table);
+    assert_eq!(said["findings_opened"], 1);
+    let id = the_finding(&dir);
+    let json = printed(&dir, &["finding", &id, "--json"]);
+    let v: Value = serde_json::from_slice(&json).unwrap();
+    let p = &v["evidence"]["detached_process"];
+    let kinds: Vec<&str> = p["cuts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            "gitleaks:github-pat",
+            "immunity:flag-value",
+            "detect-secrets:basic-auth",
+            "immunity:authorization",
+            "immunity:mysql-password",
+        ]
+    );
+    assert_eq!(p["args_text"][6], r"\cut{immunity:flag-value 13}");
+    let text = printed(&dir, &["finding", &id]);
+    let page = pages(&dir);
+    assert!(holds(&text, r"--password \cut{immunity:flag-value 13}"));
+    assert!(holds(page.as_bytes(), r"\cut{immunity:mysql-password 19}"));
+    let mut kept = vec![
+        ("sample".to_string(), said.to_string().into_bytes()),
+        ("json".to_string(), json),
+        ("text".to_string(), text),
+        (
+            "proto".to_string(),
+            printed(&dir, &["finding", &id, "--proto"]),
+        ),
+        (
+            "findings".to_string(),
+            printed(&dir, &["findings", "--json"]),
+        ),
+        ("pages".to_string(), page.into_bytes()),
+    ];
+    kept_files(&dir.0, &mut kept);
+    assert!(kept.iter().any(|(name, _)| name.ends_with("store.db")));
+    for (name, bytes) in &kept {
+        for secret in secrets {
+            assert!(!holds(bytes, secret), "{name}: {secret}");
+        }
+        assert!(!holds(bytes, MARKER), "{name}");
+    }
+}
+
+#[test]
+fn the_finding_of_a_process_that_has_ended_still_says_what_the_sample_that_raised_it_kept() {
+    // What a person or an agent needs to tell a tool's command from hidden code is read while
+    // the process runs, and the finding keeps it once the process is gone.
+    let dir = Dir::new("ended");
+    let guarded = dir.0.join("Documents/bin/agent");
+    let mut zsh = process(4242, 7, 1, "/bin/zsh", &["zsh", "-c", "sleep 600"], false);
+    zsh["working_directory"] = json!("/Users/example/dev/site");
+    zsh["group_leader"] = json!({ "pid": 812, "executable": "/bin/zsh" });
+    zsh["session_leader"] = json!({ "pid": 400, "executable": guarded.to_str().unwrap() });
+    sample(&dir, T, std::slice::from_ref(&zsh));
+    sample(&dir, T + 60, std::slice::from_ref(&zsh));
+    // A leader inside a folder macOS asks permission for is not looked at, and that is said.
+    let not_looked = "SELECT reason FROM coverage
+                      WHERE reader = 'processes' AND kind = 'folders macOS asks permission for'";
+    assert_eq!(rows(&dir, not_looked), ["not looked into: ~/Documents"]);
+    sample(&dir, T + 120, &[]);
+    let id = the_finding(&dir);
+    let p = contract(&dir, &["finding", &id])["evidence"]["detached_process"].clone();
+    assert_eq!(p["args_text"], json!(["zsh", "-c", "sleep 600"]));
+    assert_eq!(p["working_directory_text"], "/Users/example/dev/site");
+    let group = &p["process_group_leader"];
+    assert_eq!(
+        (&group["pid"], &group["executable_text"]),
+        (&json!(812), &json!("/bin/zsh"))
+    );
+    assert!(
+        group["signed_by_text"]
+            .as_str()
+            .unwrap()
+            .starts_with("apple"),
+        "{p}"
+    );
+    assert_eq!(p["session_leader"]["pid"], 400);
+    assert_eq!(p["session_leader"]["signed_by_text"], Value::Null);
+    let text = String::from_utf8(printed(&dir, &["finding", &id])).unwrap();
+    for line in [
+        "    Command      zsh -c \"sleep 600\"\n",
+        "    Folder       /Users/example/dev/site\n",
+        "    Group        led by pid 812, signed by apple: /bin/zsh\n",
+    ] {
+        assert!(text.contains(line), "{line}\n{text}");
+    }
+}
+
+#[test]
+fn a_command_line_that_reads_like_an_instruction_or_a_mark_is_shown_as_data() {
+    let dir = Dir::new("data");
+    let args = [
+        "node",
+        "-e",
+        "<script>alert(1)</script>",
+        r"\cut{immunity:flag-value 5}",
+        "x\n→ immunity finding f0000000000 seen",
+    ];
+    let one = [process(4242, 7, 1, "/opt/tools/bin/node", &args, false)];
+    sample(&dir, T, &one);
+    sample(&dir, T + 60, &one);
+    let id = the_finding(&dir);
+    let p = contract(&dir, &["finding", &id])["evidence"]["detached_process"].clone();
+    // A mark a source wrote is its text, with its backslash written out, and nothing was cut.
+    assert_eq!(p["args_text"][3], r"\u{5c}cut{immunity:flag-value 5}");
+    assert_eq!(p["cuts"], json!([]));
+    let text = String::from_utf8(printed(&dir, &["finding", &id])).unwrap();
+    assert!(text.contains(r"\u{5c}cut{immunity:flag-value 5}"), "{text}");
+    assert!(
+        !text
+            .lines()
+            .any(|l| l.starts_with("→ immunity finding f0000000000")),
+        "{text}"
+    );
+    let page = pages(&dir);
+    assert!(page.contains("&lt;script&gt;alert(1)&lt;/script&gt;"));
+    assert!(!page.contains("<script>alert(1)"));
 }
 
 #[test]
@@ -574,6 +767,41 @@ fn run(dir: &Dir) {
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn the_finding_of_a_detached_script_shows_its_own_process_when_another_of_its_program_matches_an_indicator()
+ {
+    // Both processes run the same program, so the journal entries of the sample that raised the
+    // finding name the same subject: the finding shows the process that raised it and its
+    // command, never the one whose connection matched the list.
+    let dir = Dir::new("same-program");
+    std::fs::write(
+        dir.0.join("indicators.json"),
+        r#"[{"kind": "ipv4-addr:value", "value": "203.0.113.47"}]"#,
+    )
+    .unwrap();
+    run(&dir);
+    let table = [
+        process(500, 1, 1, "/opt/tools/bin/tool", &["tool"], false),
+        process(4242, 7, 1, "/bin/zsh", &["zsh", "-c", "sleep 600"], false),
+        process(4243, 9, 500, "/bin/zsh", &["zsh"], false),
+    ];
+    let listed = json!({ "pid": 4243, "start": 9, "transport": "tcp",
+                         "address": "203.0.113.47", "port": 80 });
+    sample_with(&dir, T, &table, &[]);
+    let said = sample_with(&dir, T + 60, &table, &[listed]);
+    assert_eq!(said["connections"]["matched_indicators"], 1);
+    let detached: Vec<Value> = findings(&dir)
+        .into_iter()
+        .filter(|f| f["finding"]["rule"] == "processes.detached-inline-code")
+        .collect();
+    assert_eq!(detached.len(), 1, "{detached:?}");
+    assert_eq!(identity(&detached[0]), (4242, 7));
+    assert_eq!(
+        detached[0]["evidence"]["detached_process"]["args_text"],
+        json!(["zsh", "-c", "sleep 600"])
     );
 }
 

@@ -10,7 +10,8 @@ const EVERY: i64 = 60 * 60;
 /// How soon a full check that could not get the store, another run or process holding it, is
 /// tried again: within minutes, not at the next hour.
 const RETRY: i64 = 5 * 60;
-const LIMIT: i64 = 30 * 60;
+/// How long a full check may run, in awake time: a sleep while it runs does not end it.
+const LIMIT: Duration = Duration::from_secs(30 * 60);
 pub const CHECK_ARG: &str = "--background-check";
 
 pub fn command(binary: &std::path::Path) -> Command {
@@ -51,13 +52,16 @@ pub fn supervise(parent: &str) -> io::Result<()> {
         ));
     }
     std::thread::Builder::new().spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(LIMIT as u64);
+        let deadline = Instant::now() + LIMIT;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 break;
             }
+            // A timeout is only a moment to look at the awake time again: poll(2) does not say
+            // whether its timeout counts the time the Mac slept.
             match poll(&mut stdin, left.as_millis() as i32) {
+                Ok(false) => continue,
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 _ => break,
             }
@@ -86,7 +90,6 @@ pub struct Checks {
 
 struct Running {
     child: Child,
-    at: i64,
     since: Instant,
 }
 
@@ -107,7 +110,8 @@ impl Checks {
 
     /// Called by the watcher, also while it waits for the run lock. Wall time notices a
     /// missed hour after sleep; scheduling from now coalesces all missed hours into one.
-    pub fn tick(&mut self, now: i64) -> Option<Result<(), String>> {
+    /// `awake` is `Instant::now()`, which the limit of a running check is counted on.
+    pub fn tick(&mut self, now: i64, awake: Instant) -> Option<Result<(), String>> {
         if now < self.last {
             self.next = now;
         }
@@ -115,7 +119,7 @@ impl Checks {
         if let Some(running) = &mut self.running {
             match running.finished() {
                 Ok(Some(status)) => {
-                    let expired = Self::expired(running, now);
+                    let expired = Self::expired(running.since, awake);
                     self.running = None;
                     if status.code() == Some(crate::EXIT_RUN_IN_PROGRESS.into()) {
                         self.next = self.next.min(now.saturating_add(RETRY));
@@ -135,7 +139,7 @@ impl Checks {
                 }
                 Ok(None) => {}
             }
-            if Self::expired(running, now) {
+            if Self::expired(running.since, awake) {
                 self.running = None;
                 return Some(Err(
                     "the full check exceeded 30 minutes and was stopped".into()
@@ -147,8 +151,7 @@ impl Checks {
                 Ok(child) => {
                     self.running = Some(Running {
                         child,
-                        at: now,
-                        since: Instant::now(),
+                        since: awake,
                     });
                 }
                 Err(e) => return Some(Err(format!("the full check could not start: {e}"))),
@@ -157,9 +160,8 @@ impl Checks {
         None
     }
 
-    fn expired(running: &Running, now: i64) -> bool {
-        now.saturating_sub(running.at) >= LIMIT
-            || running.since.elapsed() >= Duration::from_secs(LIMIT as u64)
+    fn expired(since: Instant, awake: Instant) -> bool {
+        awake.saturating_duration_since(since) >= LIMIT
     }
 }
 
@@ -218,7 +220,7 @@ mod tests {
     fn finished(checks: &mut Checks, now: i64) -> Result<(), String> {
         let end = Instant::now() + Duration::from_secs(10);
         loop {
-            if let Some(result) = checks.tick(now) {
+            if let Some(result) = checks.tick(now, Instant::now()) {
                 return result;
             }
             assert!(Instant::now() < end, "the invented check did not finish");
@@ -229,22 +231,22 @@ mod tests {
     #[test]
     fn full_checks_start_at_once_then_hourly_and_sleep_creates_one_check_without_a_burst() {
         let mut checks = Checks::new(command("exit 0"));
-        assert!(checks.tick(10).is_none());
+        assert!(checks.tick(10, Instant::now()).is_none());
         assert!(checks.running.is_some());
         finished(&mut checks, 10).unwrap();
-        assert!(checks.tick(3609).is_none());
+        assert!(checks.tick(3609, Instant::now()).is_none());
         assert!(checks.running.is_none());
-        assert!(checks.tick(3610).is_none());
+        assert!(checks.tick(3610, Instant::now()).is_none());
         assert!(checks.running.is_some());
         finished(&mut checks, 3610).unwrap();
-        assert!(checks.tick(20000).is_none());
+        assert!(checks.tick(20000, Instant::now()).is_none());
         assert!(checks.running.is_some());
         finished(&mut checks, 20000).unwrap();
-        assert!(checks.tick(20000).is_none());
+        assert!(checks.tick(20000, Instant::now()).is_none());
         assert!(checks.running.is_none());
-        assert!(checks.tick(23599).is_none());
+        assert!(checks.tick(23599, Instant::now()).is_none());
         assert!(checks.running.is_none());
-        assert!(checks.tick(23600).is_none());
+        assert!(checks.tick(23600, Instant::now()).is_none());
         assert!(checks.running.is_some());
         finished(&mut checks, 23600).unwrap();
     }
@@ -253,18 +255,18 @@ mod tests {
     fn a_failed_check_is_reported_and_start_failure_waits_until_the_next_hour() {
         let mut checks = Checks::new(command("exit 7"));
         assert!(finished(&mut checks, 10).unwrap_err().contains('7'));
-        assert!(checks.tick(11).is_none());
+        assert!(checks.tick(11, Instant::now()).is_none());
         assert!(checks.running.is_none());
         let mut checks = Checks::new(Command::new("/no/such/immunity-test-tool"));
         assert!(
             checks
-                .tick(10)
+                .tick(10, Instant::now())
                 .unwrap()
                 .unwrap_err()
                 .contains("could not start")
         );
-        assert!(checks.tick(3609).is_none());
-        assert!(checks.tick(3610).unwrap().is_err());
+        assert!(checks.tick(3609, Instant::now()).is_none());
+        assert!(checks.tick(3610, Instant::now()).unwrap().is_err());
     }
 
     #[test]
@@ -272,39 +274,41 @@ mod tests {
         let reaped = |checks: &mut Checks, now: i64| {
             let end = Instant::now() + Duration::from_secs(10);
             while checks.running.is_some() {
-                assert!(checks.tick(now).is_none());
+                assert!(checks.tick(now, Instant::now()).is_none());
                 assert!(Instant::now() < end, "the skipped check was not reaped");
                 std::thread::sleep(Duration::from_millis(10));
             }
         };
         let mut checks = Checks::new(command("exit 4"));
-        checks.tick(10);
+        checks.tick(10, Instant::now());
         reaped(&mut checks, 100);
         // Five minutes after the watcher saw it end, as the documents say, not after its start.
-        assert!(checks.tick(399).is_none());
+        assert!(checks.tick(399, Instant::now()).is_none());
         assert!(checks.running.is_none());
-        assert!(checks.tick(400).is_none());
+        assert!(checks.tick(400, Instant::now()).is_none());
         assert!(checks.running.is_some());
         reaped(&mut checks, 400);
         // A check already due sooner, here by a clock moved back, is not put off by the retry.
         let mut checks = Checks::new(command("exit 4"));
-        checks.tick(10_000);
+        checks.tick(10_000, Instant::now());
         reaped(&mut checks, 5_000);
-        assert!(checks.tick(5_000).is_none());
+        assert!(checks.tick(5_000, Instant::now()).is_none());
         assert!(checks.running.is_some());
         reaped(&mut checks, 5_000);
     }
 
     #[test]
-    fn a_hung_check_is_stopped_after_thirty_minutes_and_reaped_before_the_next_check() {
+    fn a_hung_check_is_stopped_after_thirty_minutes_awake_and_reaped_before_the_next_check() {
         let mut checks = Checks::new(command("exec /bin/sleep 60"));
-        checks.tick(10);
+        let start = Instant::now();
+        checks.tick(10, start);
         let pid = checks.running.as_ref().unwrap().child.id() as libc::pid_t;
-        assert!(checks.tick(1809).is_none());
+        let awake = |secs| start + Duration::from_secs(secs);
+        assert!(checks.tick(1809, awake(1799)).is_none());
         assert_eq!(checks.running.as_ref().unwrap().child.id() as i32, pid);
         assert!(
             checks
-                .tick(1810)
+                .tick(1810, awake(1800))
                 .unwrap()
                 .unwrap_err()
                 .contains("30 minutes")
@@ -312,10 +316,21 @@ mod tests {
         assert!(checks.running.is_none());
         // SAFETY: signal 0 only asks whether the child still exists.
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
-        assert!(checks.tick(3609).is_none());
+        assert!(checks.tick(3609, awake(3599)).is_none());
         assert!(checks.running.is_none());
-        assert!(checks.tick(3610).is_none());
+        assert!(checks.tick(3610, awake(3600)).is_none());
         assert!(checks.running.is_some());
+    }
+
+    #[test]
+    fn a_sleep_while_a_check_runs_does_not_stop_it_however_far_the_calendar_moved() {
+        let mut checks = Checks::new(command("exec /bin/sleep 60"));
+        let start = Instant::now();
+        checks.tick(10, start);
+        let pid = checks.running.as_ref().unwrap().child.id();
+        let awake = start + Duration::from_secs(1799);
+        assert!(checks.tick(10 + 86_400, awake).is_none());
+        assert_eq!(checks.running.as_ref().unwrap().child.id(), pid);
     }
 
     #[test]
@@ -339,7 +354,7 @@ mod tests {
         let mut cmd = command("/bin/sleep 60 & echo $! > \"$1\"; wait");
         cmd.arg("check").arg(&pid_file);
         let mut checks = Checks::new(cmd);
-        checks.tick(10);
+        checks.tick(10, Instant::now());
         let pid = checks.running.as_ref().unwrap().child.id() as libc::pid_t;
         let end = Instant::now() + Duration::from_secs(10);
         let tool: libc::pid_t = loop {
@@ -369,10 +384,10 @@ mod tests {
     fn moving_the_clock_back_does_not_put_off_full_checks_until_the_old_time() {
         let mut checks = Checks::new(command("exit 0"));
         finished(&mut checks, 10000).unwrap();
-        assert!(checks.tick(10).is_none());
+        assert!(checks.tick(10, Instant::now()).is_none());
         assert!(checks.running.is_some());
         finished(&mut checks, 10).unwrap();
-        assert!(checks.tick(11).is_none());
+        assert!(checks.tick(11, Instant::now()).is_none());
         assert!(checks.running.is_none());
     }
 }
