@@ -987,7 +987,10 @@ impl Watcher<'_> {
                 if again.is_err() || recovered {
                     match self.lock() {
                         Ok(Some(_lock)) => {
-                            self.mark_held(RESUBSCRIBE, again.as_ref().err().cloned());
+                            self.mark_held(
+                                RESUBSCRIBE,
+                                again.as_ref().err().map(|e| e.to_string()),
+                            );
                         }
                         Ok(None) => {}
                         // A failed look that cannot be recorded; a look that succeeded has
@@ -1013,7 +1016,7 @@ impl Watcher<'_> {
                     }
                     Err(e) => {
                         self.standing.insert(RESUBSCRIBE);
-                        if !emit(&problem("resubscribe_failed", &e)) {
+                        if !emit(&problem("resubscribe_failed", &e.to_string())) {
                             return;
                         }
                     }
@@ -1039,8 +1042,8 @@ impl Watcher<'_> {
     /// unwatched changed, which this look tells whether or not the stream is started again. What
     /// a change in each path reads is taken anew every time, and when that changed, a reading of
     /// every place is owed (`owed`).
-    fn again(&mut self) -> Result<(bool, Vec<Value>), String> {
-        let (wanted, targets, left) = self.derive().map_err(|e| e.to_string())?;
+    fn again(&mut self) -> Result<(bool, Vec<Value>), Box<dyn Error>> {
+        let (wanted, targets, left) = self.derive()?;
         // Where a watched path now leads to the place of another reading, as when a link on
         // the way to it, outside every watched place, was turned, nothing watched need have
         // been written: every place is owed, and read at this look.
@@ -1058,10 +1061,21 @@ impl Watcher<'_> {
     /// was stopped, or orphaned, while it waited for the run lock. The counts are of this
     /// reading, the baseline counting as nothing new.
     fn read(&mut self, changed: &Where) -> Result<Option<Value>, Box<dyn Error>> {
-        let mut only = to_read(&self.targets, changed, self.read_everything);
+        let only = to_read(&self.targets, changed, self.read_everything);
         let Some(_lock) = self.lock_for(READ)? else {
             return Ok(None);
         };
+        let read = self.read_locked(only);
+        self.mark_reading(READ, to_mark(&read, |_| None));
+        read
+    }
+
+    /// The reading of `read` under its run lock, from the look at what to watch to the reading
+    /// itself. Whatever ends it is the reading's own end, marked once by `read`.
+    fn read_locked(
+        &mut self,
+        mut only: Option<BTreeSet<Reading>>,
+    ) -> Result<Option<Value>, Box<dyn Error>> {
         // A config change can activate a new folder. Start watching it before the read
         // so a write between re-reading the config and hashing the hooks is seen too.
         // The startup read uses the subscriptions just opened by `subscribe`. Checkouts
@@ -1083,7 +1097,6 @@ impl Watcher<'_> {
             self.mark_pending();
         }
         let read = read_held(self.args, &self.folder, only.as_ref());
-        self.mark_reading(READ, to_mark(&read, |_| None));
         // The first reading is of every place (`to_read`), and one that failed is tried again as
         // one of every place (`run`): after any reading, every place was read or is read next,
         // and after one of some places, every place is owed.
@@ -2275,6 +2288,98 @@ mod tests {
     fn told(conn: &Connection, dir: &Path) -> Vec<(String, String)> {
         let failed = failures(conn, dir).unwrap().into_iter();
         failed.map(|f| (f.what, f.detail)).collect()
+    }
+
+    /// The arguments of a watcher of an empty Mac with a store in `dir`.
+    fn args_in(dir: &Path) -> WatchArgs {
+        let (home, sys) = (dir.join("home"), dir.join("sys"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&sys).unwrap();
+        let store = dir.join("store.db");
+        drop(store::open_or_make(&store).unwrap());
+        WatchArgs {
+            store,
+            system_root: sys,
+            home,
+            sample_input: None,
+            sample_every: SAMPLE,
+            events_every: EVENTS_EVERY,
+            alive_every: ALIVE,
+            standalone: false,
+            background: false,
+        }
+    }
+
+    /// A watcher past its first reading, ready, watching what it would watch now, whose next
+    /// reading of watched places looks again at what to watch first.
+    fn ready<'a>(args: &'a WatchArgs, lock: &'a std::fs::File) -> Watcher<'a> {
+        let mut heartbeat = Heartbeat::start(lock, crate::now_secs(), STALLED).unwrap();
+        heartbeat.read().unwrap();
+        let mut w = Watcher {
+            args,
+            folder: crate::home(&args.store),
+            tx: mpsc::channel().0,
+            streams: Vec::new(),
+            wanted: Vec::new(),
+            targets: Vec::new(),
+            read_everything: true,
+            owed: false,
+            paths: Vec::new(),
+            // SAFETY: getppid(2) takes nothing and cannot fail.
+            parent: unsafe { libc::getppid() },
+            signers: crate::processes::Signers::default(),
+            standing: BTreeSet::new(),
+            checks: None,
+            check_result: None,
+            left_out: BTreeMap::new(),
+            unwatched: None,
+            heartbeat,
+            core: None,
+            left: false,
+        };
+        (w.wanted, w.targets, _) = w.derive().unwrap();
+        w
+    }
+
+    #[test]
+    fn two_readings_of_watched_places_in_a_row_whose_look_met_a_busy_store_say_it_was_busy_and_not_live()
+     {
+        let (dir, lock) = held("watch-look-busy");
+        let args = args_in(&dir);
+        let mut w = ready(&args, &lock);
+        let conn = Connection::open(&args.store).unwrap();
+        assert!(watching_live(&dir));
+        conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        // The look at what to watch reads the store: each waits out the five seconds.
+        for _ in 0..2 {
+            assert!(is_skip(&*w.read(&Where::Anywhere).unwrap_err()));
+        }
+        conn.execute_batch("ROLLBACK").unwrap();
+        assert!(!watching_live(&dir));
+        let busy = Code::StoreBusy.words().to_string();
+        assert_eq!(told(&conn, &dir), [(STORE.to_string(), busy)]);
+        drop(w);
+    }
+
+    #[test]
+    fn a_look_that_failed_otherwise_is_the_failure_of_the_reading_of_watched_places_until_one_reads()
+     {
+        let (dir, lock) = held("watch-look-failed");
+        let args = args_in(&dir);
+        let mut w = ready(&args, &lock);
+        // A file that is not a store in place of the store: the look refuses it, and the
+        // store cannot take the failure either, so the lock file says it.
+        let kept = dir.join("kept.db");
+        std::fs::rename(&args.store, &kept).unwrap();
+        std::fs::write(&args.store, "invented notes, not a store\n").unwrap();
+        assert!(!is_skip(&*w.read(&Where::Anywhere).unwrap_err()));
+        assert!(w.standing.contains(READ) && w.heartbeat.unrecorded.contains_key(READ));
+        assert!(!watching_live(&dir));
+        std::fs::rename(&kept, &args.store).unwrap();
+        assert!(w.read(&Where::Anywhere).unwrap().is_some());
+        assert!(!w.standing.contains(READ));
+        assert!(watching_live(&dir));
+        drop(w);
     }
 
     #[test]
