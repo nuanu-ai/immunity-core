@@ -90,12 +90,14 @@ enum Index {
 }
 
 impl Index {
-    /// The index after an option line, as pip's finder has it.
+    /// The index after an option line, as pip's finder has it. `-i` is optparse's `store`, so of
+    /// several on one line the last is the line's value, and an empty one leaves the index as it
+    /// was. The other options that take a value append, or check each value as it comes.
     fn after(self, o: &Opts) -> Index {
-        match o.index.iter().rev().find(|i| !i.is_empty()) {
+        match o.index.last() {
             _ if self == Index::Open || o.elsewhere => Index::Open,
-            Some(named) => Index::Named(named.clone()),
-            None => self,
+            Some(named) if !named.is_empty() => Index::Named(named.clone()),
+            _ => self,
         }
     }
 
@@ -548,6 +550,20 @@ mod tests {
                 "an empty index, which pip skips",
                 format!("{lock}-i ''"),
                 &pypi,
+            ),
+            // Of two on one line optparse keeps the last, and an empty one changes nothing.
+            (
+                "pypi, then empty, on one line",
+                named(&format!("-i {mirror}\n-i {PYPI} -i ''")),
+                &[
+                    "widget 1.2.0 OtherRegistry 3",
+                    "my-gadget 2.0rc1 OtherRegistry 4",
+                ],
+            ),
+            (
+                "empty, then pypi, on one line",
+                named(&format!("-i {mirror}\n-i '' -i {PYPI}")),
+                &["widget 1.2.0 Registry 3", "my-gadget 2.0rc1 Registry 4"],
             ),
             ("extra", format!("{lock}--extra-index-url {PYPI}"), &free),
             ("find links", format!("{lock}-f ./wheels"), &free),
