@@ -1643,6 +1643,12 @@ fn plain_lack(what: &str, name: Option<&str>) -> String {
         crate::lockfiles::LINKED => {
             return format!("{} that is a link", name.unwrap_or("a lockfile"));
         }
+        crate::lockfiles::NOT_TOLD => {
+            return format!(
+                "entries of {} whose package cannot be told",
+                name.unwrap_or("lockfiles")
+            );
+        }
         crate::agent_folders::OTHER_AGENT => {
             return format!("sessions of {}", name.unwrap_or("other coding agents"));
         }
@@ -1814,19 +1820,21 @@ mod tests {
         );
         // A lockfile not opened is a kind this version reads, so it is never named bare, as if
         // the kind were not understood.
-        use crate::lockfiles::{DEEPER, LINKED, NOT_LOOKED, SET_ASIDE};
+        use crate::lockfiles::{DEEPER, LINKED, NOT_LOOKED, NOT_TOLD, SET_ASIDE};
         assert_eq!(
             [
                 plain_lack(DEEPER, Some("Cargo.lock")),
                 plain_lack(SET_ASIDE, Some("package-lock.json")),
                 plain_lack(NOT_LOOKED, None),
                 plain_lack(LINKED, Some("pnpm-lock.yaml")),
+                plain_lack(NOT_TOLD, Some("yarn.lock")),
             ],
             [
                 "Cargo.lock deeper than four folders in a project",
                 "package-lock.json in vendor or hidden folders",
                 "folders of very large projects not looked through for lockfiles",
                 "pnpm-lock.yaml that is a link",
+                "entries of yarn.lock whose package cannot be told",
             ]
         );
     }
