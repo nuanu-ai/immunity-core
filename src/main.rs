@@ -1262,24 +1262,29 @@ fn run_cmd(args: &Args) -> ExitCode {
                 answer::fail("run", args.form, error, exit)
             }
         },
-        Err(e) => match e.downcast_ref::<Outcome>() {
-            Some(o) => {
-                let error = o.error("run", "immunity run --json");
-                answer::fail("run", args.form, error, o.exit())
-            }
-            None => answer::fail(
-                "run",
-                args.form,
-                answer::error(
-                    "run_failed",
-                    "the run failed and nothing it read was committed to the store",
-                    "immunity run --json",
-                    &e.to_string(),
-                ),
-                1,
-            ),
-        },
+        Err(e) => {
+            let (error, exit) = not_run(&*e);
+            answer::fail("run", args.form, error, exit)
+        }
     }
+}
+
+/// The failure of `immunity run` whose check did not commit. An outcome the run made itself, and
+/// a skip wherever in the run it was met (`outcome::of`), its commit included, are said as that
+/// outcome with its exit code, so a store held past the check's wait is asked again soon and
+/// never said as a failed check. Anything else is a failed run.
+fn not_run(e: &(dyn Error + 'static)) -> (contract::v1::Error, u8) {
+    let o = outcome::of(e);
+    if e.is::<Outcome>() || o.kind == outcome::Kind::Skip {
+        return (o.error("run", "immunity run --json"), o.exit());
+    }
+    let error = answer::error(
+        "run_failed",
+        "the run failed and nothing it read was committed to the store",
+        "immunity run --json",
+        &e.to_string(),
+    );
+    (error, 1)
 }
 
 /// The failure of `immunity run` whose check committed and whose answer could not be read back
@@ -2385,11 +2390,22 @@ fn last_reading(dir: &Path, names: &[&str]) -> (String, bool) {
 }
 
 /// The run lock for a full check, waiting up to `wait` for a reading or a command that holds the
-/// store. The check holds the downloads, so no other full check is running: one that cannot take
-/// the store is a failed run (`run_failed`), never another run in progress.
+/// store. The check holds the downloads, so whoever still holds the lock after the wait is a
+/// reading or a command: the skip `run_lock_held`, asked again soon.
 fn take_store(home: &Path, wait: std::time::Duration) -> Result<std::fs::File, Box<dyn Error>> {
-    Ok(store::lock_run_for_check(home, wait)?
-        .ok_or("the store was held by a reading or a command longer than a check waits")?)
+    Ok(store::lock_run_for_check(home, wait)?.ok_or(Outcome::new(Code::RunLockHeld, ""))?)
+}
+
+/// The run's commit, which waits up to `wait` for the readings that hold the store to leave,
+/// through SQLite's busy timeout on the run's connection, as long as the check waits for the run
+/// lock. The connection's own timeout is set back after it, so what follows waits as before. A
+/// transaction whose commit fails is rolled back when it is dropped.
+fn commit(tx: rusqlite::Transaction, wait: std::time::Duration) -> rusqlite::Result<()> {
+    let own: i64 = tx.query_row("PRAGMA busy_timeout", [], |r| r.get(0))?;
+    tx.busy_timeout(wait)?;
+    let committed = tx.execute_batch("COMMIT");
+    let set_back = tx.busy_timeout(std::time::Duration::from_millis(own as u64));
+    committed.and(set_back)
 }
 
 /// Runs every reader and returns the report line, and the watched places that changed or
@@ -2517,7 +2533,7 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     store::journal_note(&tx, at, &run_id, "report", &line)?;
     // The time the run finished, so that its start and its end are both in the journal.
     store::journal_note(&tx, now_secs(), &run_id, "run_finished", "")?;
-    tx.commit()?;
+    commit(tx, store::CHECK_WAIT)?;
     // The readings no page or answer asks for one by one any more are folded, under the run
     // lock still held; what the run did is committed, whatever comes of that.
     store::tidy(&conn);
@@ -5643,10 +5659,11 @@ mod tests {
     }
 
     #[test]
-    fn a_check_waits_out_whoever_holds_the_store_past_two_seconds_and_else_fails_as_a_run() {
+    fn a_check_waits_out_whoever_holds_the_store_past_two_seconds_and_else_is_the_skip_run_lock_held()
+     {
         // A reading or a verdict holds the run lock, no watcher among them. The check waits for
-        // it longer than a command waits; when it still cannot take the store, it is a failed
-        // run, never `run_in_progress`, which says another check is running when none is.
+        // it longer than a command waits; when it still cannot take the store, it is the skip
+        // that says a check or a command writes, never a failed check.
         let dir = std::env::temp_dir().join(format!(
             "immunity-take-store-{}-{}",
             std::process::id(),
@@ -5658,8 +5675,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let held = std::fs::File::open(&dir).unwrap();
         held.lock().unwrap();
-        let failed = take_store(&dir, std::time::Duration::ZERO).unwrap_err();
-        assert!(failed.downcast_ref::<Outcome>().is_none(), "{failed}");
+        let held_long = take_store(&dir, std::time::Duration::ZERO).unwrap_err();
+        let (error, exit) = not_run(&*held_long);
+        assert_eq!(exit, 4);
+        assert_eq!(error.outcome.as_deref(), Some("run_lock_held"));
         std::thread::scope(|s| {
             s.spawn(|| {
                 std::thread::sleep(std::time::Duration::from_secs(3));
@@ -5668,6 +5687,74 @@ mod tests {
             assert!(take_store(&dir, std::time::Duration::from_secs(10)).is_ok());
         });
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_run_whose_commit_meets_a_store_held_past_its_wait_is_a_skip_and_commits_nothing() {
+        let dir = crate::common::Scratch::new("commit-busy");
+        let path = dir.join("store.db");
+        let mut conn = store::open_or_make(&path).unwrap();
+        let tx = conn.transaction().unwrap();
+        store::journal_note(&tx, 1, "held-run", "run_finished", "").unwrap();
+        // A reading in its read transaction, as `immunity findings` holds the store.
+        let reader = rusqlite::Connection::open(&path).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT COUNT(*) FROM journal;")
+            .unwrap();
+        let busy = commit(tx, std::time::Duration::from_millis(100)).unwrap_err();
+        let (error, exit) = not_run(&busy);
+        assert_eq!((exit, error.code.as_str()), (4, "run_in_progress"));
+        assert_eq!(error.outcome.as_deref(), Some("store_busy"));
+        reader.execute_batch("COMMIT").unwrap();
+        let kept: i64 = reader
+            .query_row(
+                "SELECT COUNT(*) FROM journal WHERE run_id = 'held-run'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(kept, 0);
+    }
+
+    #[test]
+    fn what_follows_a_run_s_commit_waits_for_the_store_as_long_as_before_it() {
+        // `store::tidy` runs under the run lock after the commit: it does not keep the check's
+        // long wait, whether the commit went through or not.
+        let dir = crate::common::Scratch::new("commit-wait-back");
+        let mut conn = store::open_or_make(&dir.join("store.db")).unwrap();
+        let waits = |c: &rusqlite::Connection| -> i64 {
+            c.query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+                .unwrap()
+        };
+        let before = waits(&conn);
+        commit(conn.transaction().unwrap(), store::CHECK_WAIT).unwrap();
+        assert_eq!(waits(&conn), before);
+        let reader = rusqlite::Connection::open(dir.join("store.db")).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT COUNT(*) FROM meta;")
+            .unwrap();
+        let tx = conn.transaction().unwrap();
+        store::journal_note(&tx, 1, "held-run", "run_finished", "").unwrap();
+        let wait = std::time::Duration::from_millis(100);
+        assert!(commit(tx, wait).is_err());
+        assert_eq!(waits(&conn), before);
+    }
+
+    #[test]
+    fn a_run_that_fails_for_any_reason_but_a_skip_is_still_a_failed_run() {
+        // `SQLITE_LOCKED` is a conflict waiting does not end; a word of the work is no outcome.
+        let locked = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+            None,
+        );
+        let work: Box<dyn Error> = "another process held the store".into();
+        for e in [&locked as &(dyn Error + 'static), &*work] {
+            let (error, exit) = not_run(e);
+            assert_eq!((exit, error.code.as_str()), (1, "run_failed"), "{e}");
+        }
+        // An outcome the run made itself is said as it is, a refusal among them.
+        let (error, exit) = not_run(&Outcome::new(Code::NotWritable, "x"));
+        assert_eq!((exit, error.outcome.as_deref()), (3, Some("not_writable")));
     }
 
     #[test]

@@ -947,13 +947,14 @@ fn not_fresh(s: &v1::Status, screen: &Screen) -> Option<String> {
 }
 
 /// The line of a check that started and has not finished: it runs, with the stage it noted and
-/// for how long, or it died. The stage is said only beside `running`, which alone says it runs.
+/// for how long, or it stopped: it died, or it met a store held past its wait and is asked again.
+/// The stage is said only beside `running`, which alone says it runs.
 fn unfinished(s: &v1::Status, screen: &Screen, started_at: i64) -> (String, Style) {
     use v1::CheckStage as C;
     let started = screen.time(started_at, s.answered_at);
     if !s.running {
         let said = format!(
-            "started {started} and has not finished: it died, and nothing it read is in the store"
+            "started {started} and has not finished: it stopped, and nothing it read is in the store"
         );
         return (said, RED);
     }
@@ -2753,7 +2754,7 @@ mod tests {
                 let text = status(&s, &Screen::pipe(), coverage);
                 let said = match running {
                     true => "has not finished: it is running\n",
-                    false => "has not finished: it died",
+                    false => "has not finished: it stopped",
                 };
                 assert!(
                     text.contains(said) && !text.contains("reading events"),
@@ -2817,7 +2818,7 @@ mod tests {
             "Event level",
             "Not reached",
             "2 things could not be read at the last check",
-            "has not finished: it died",
+            "has not finished: it stopped",
             "Not fresh",
             "1,234,567 readings failed",
         ] {

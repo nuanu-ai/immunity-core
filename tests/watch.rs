@@ -847,6 +847,95 @@ fn a_watcher_started_while_a_full_run_holds_the_store_starts_and_reads_once_the_
 }
 
 #[test]
+fn a_sample_or_a_reading_of_program_starts_that_met_a_busy_store_is_no_failure_and_the_next_reads_what_waited()
+ {
+    // A reading holds the store past SQLite's five seconds while the watcher commits a sample and
+    // then its reading of program starts: nothing was read and nothing failed, and the log was
+    // fine.
+    let mac = Mac::new("events-busy");
+    mac.event_level();
+    mac.run();
+    let mut w = mac
+        .watch_with(&["--events-every", "1", "--sample-every", "1"])
+        .started();
+    // A first start read: the watcher's first sample and readings are behind it.
+    mac.exec(1);
+    w.until("program_starts", |v| v["starts"] == 1);
+    let reader = Connection::open(mac.store()).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT COUNT(*) FROM journal;")
+        .unwrap();
+    mac.exec(2);
+    // A sample waits out the five seconds and meets the store still held, and then a reading
+    // of program starts does.
+    std::thread::sleep(Duration::from_secs(12));
+    reader.execute_batch("COMMIT").unwrap();
+    w.until("program_starts", |v| v["starts"] == 1);
+    assert!(w.lines("problem").is_empty(), "{:?}", w.seen);
+    assert!(mac.rows("SELECT what FROM watcher_failed").is_empty());
+    let status = mac.status();
+    assert_ne!(status["event_level"]["state"], "failed", "{status}");
+    assert_eq!(failing(&mac), (true.into(), vec![]));
+    assert!(w.stop().success());
+}
+
+#[test]
+fn two_readings_in_a_row_that_met_a_busy_store_are_told_until_a_reading_reads() {
+    // A reading that never ends holds the store: the watcher reads nothing, so it is not live.
+    let mac = Mac::new("events-busy-twice");
+    mac.event_level();
+    mac.run();
+    let mut w = mac
+        .watch_with(&["--events-every", "1", "--sample-every", "3600"])
+        .started();
+    // A first start read: the watcher's first sample and readings are behind it.
+    mac.exec(1);
+    w.until("program_starts", |v| v["starts"] == 1);
+    let lock = mac.root.join("store/watch.lock");
+    let says = |word: &str| {
+        let end = Instant::now() + WAIT;
+        while !std::fs::read_to_string(&lock).unwrap().contains(word) {
+            assert!(Instant::now() < end, "the lock file never said {word}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let reader = Connection::open(mac.store()).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT COUNT(*) FROM journal;")
+        .unwrap();
+    // Two readings of program starts, five seconds each.
+    says("\nunrecorded ");
+    reader.execute_batch("COMMIT").unwrap();
+    says("\nready");
+    assert_eq!(failing(&mac), (true.into(), vec![]));
+    assert!(w.stop().success());
+}
+
+#[test]
+fn a_reading_of_watched_places_that_met_a_busy_store_is_no_failure() {
+    let mac = Mac::new("read-busy");
+    mac.put(".zshrc", "0\n");
+    mac.run();
+    let quiet = ["--events-every", "3600", "--sample-every", "3600"];
+    let mut w = mac.watch_with(&[&quiet[..], &["--alive-every", "1"]].concat());
+    w = w.started();
+    // The first sample and reading of program starts are behind it.
+    w.next("alive");
+    let reader = Connection::open(mac.store()).unwrap();
+    reader
+        .execute_batch("BEGIN; SELECT COUNT(*) FROM journal;")
+        .unwrap();
+    mac.put(".zshrc", "1\n");
+    // The reading starts a second after the change and waits out the five seconds.
+    std::thread::sleep(Duration::from_secs(8));
+    reader.execute_batch("COMMIT").unwrap();
+    w.next("alive");
+    assert!(w.lines("problem").is_empty(), "{:?}", w.seen);
+    assert!(mac.rows("SELECT what FROM watcher_failed").is_empty());
+    assert!(w.stop().success());
+}
+
+#[test]
 fn sigterm_and_sigint_stop_it_with_exit_0_and_leave_the_store_consistent() {
     let mac = Mac::new("stop");
     mac.put(".zshrc", "one\n");

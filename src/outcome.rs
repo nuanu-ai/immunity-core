@@ -116,10 +116,10 @@ impl Code {
 
     /// What happened, in the core's own words, with what was done after "; nothing was ". A
     /// failure of the work is worded by its command (`Outcome::error`).
-    fn words(self) -> &'static str {
+    pub(crate) fn words(self) -> &'static str {
         match self {
             Code::StoreBusy => {
-                "another process held the store for longer than five seconds; nothing was done"
+                "another process held the store for longer than it was waited for; nothing was done"
             }
             Code::RunLockHeld => {
                 "another check or command is writing to this store; nothing was done"
