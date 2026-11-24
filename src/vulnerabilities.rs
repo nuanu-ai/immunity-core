@@ -655,6 +655,8 @@ struct Computed {
     reason: &'static str,
     detail: String,
     entries: Value,
+    /// Whether each entry's own verdict is "don't know", in the order of `entries`. Not kept.
+    untold: Vec<bool>,
     fixed: Value,
     reading: Option<(i64, i64)>,
 }
@@ -833,7 +835,7 @@ pub fn match_all(tx: &Transaction, run_id: &str, at: i64) -> rusqlite::Result<Ma
         .filter(|c| c.answer == "unknown")
         .map(|c| (c.checkout.as_str(), c.ecosystem, c.package.as_str()))
         .collect();
-    let untold: HashSet<String> = packages
+    let mut untold: HashSet<String> = packages
         .iter()
         .filter(|((checkout, eco, package), _)| {
             fresh_of(eco).is_none_or(|f| f.not_current.is_some())
@@ -845,26 +847,32 @@ pub fn match_all(tx: &Transaction, run_id: &str, at: i64) -> rusqlite::Result<Ma
         })
         .collect();
 
-    // What the findings rest on: each component with an affected entry, by record kind.
+    // What the findings rest on: each component with an affected entry, by record kind. A
+    // component follows its own entries, whatever the package's answer: with none affected and
+    // one that cannot be told, it is untold.
     let mut affected: BTreeMap<String, Vec<(String, String, Vec<String>)>> = BTreeMap::new();
-    for c in computed.iter().filter(|c| c.answer == "affected") {
+    for c in &computed {
         let entries = &packages[&(c.checkout.clone(), c.ecosystem, c.package.clone())];
-        // `answer_one` shows the entries in their order.
-        let mut versions: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-        for (e, shown) in entries
-            .iter()
-            .zip(c.entries.as_array().into_iter().flatten())
-        {
+        // `answer_one` gives the entries in their order.
+        let mut of: BTreeMap<&str, (Vec<String>, bool)> = BTreeMap::new();
+        let shown = c.entries.as_array().into_iter().flatten();
+        for ((e, shown), untold) in entries.iter().zip(shown).zip(&c.untold) {
+            let (versions, unknown) = of.entry(&e.component).or_default();
             if let (true, Some(v)) = (shown["affected"] == true, &e.version) {
-                versions.entry(&e.component).or_default().push(v.clone());
+                versions.push(v.clone());
             }
+            *unknown |= untold;
         }
-        for (component, versions) in versions {
-            affected.entry(component.to_string()).or_default().push((
-                c.advisory.clone(),
-                c.kind.clone(),
-                versions,
-            ));
+        for (component, (versions, unknown)) in of {
+            if !versions.is_empty() {
+                affected.entry(component.to_string()).or_default().push((
+                    c.advisory.clone(),
+                    c.kind.clone(),
+                    versions,
+                ));
+            } else if unknown {
+                untold.insert(component.to_string());
+            }
         }
     }
     Ok(Matched {
@@ -886,6 +894,7 @@ fn answer_one(
 ) -> Computed {
     let mut reasons: Vec<(&'static str, String)> = Vec::new();
     let mut shown: Vec<Value> = Vec::new();
+    let mut untold = Vec::new();
     let mut any_affected = false;
     let mut all_fixed = true;
     for e in entries {
@@ -937,6 +946,7 @@ fn answer_one(
         };
         let affected = verdict == Verdict::Affected;
         any_affected |= affected;
+        untold.push(matches!(verdict, Verdict::Unknown(..)));
         match verdict {
             Verdict::Unknown(r, d) => reasons.push((r, d)),
             Verdict::NotAffected { fixed } => all_fixed &= fixed,
@@ -1001,6 +1011,7 @@ fn answer_one(
         reason,
         detail,
         entries: Value::Array(shown),
+        untold,
         fixed: json!(fixed),
         reading: feed.and_then(|f| f.reading),
     }
@@ -1179,23 +1190,38 @@ pub struct Affecting {
 }
 
 impl Affecting {
-    /// Whether a finding about the component `about` is about this answer's package: an answer
-    /// is kept under the package's plain name, and a component's id may carry its source.
+    /// Whether a finding about the component `about` rests on this answer: it affects an entry
+    /// of that component (`affected_of`).
     pub fn is_about(&self, about: &str) -> bool {
+        !self.affected_of(about).is_empty()
+    }
+
+    /// The releases of the component `about` the record affects, with where each is. An answer
+    /// is kept under the package's plain name; a component's id may carry its source, and only
+    /// the entries from that source are its own.
+    pub fn affected_of(&self, about: &str) -> Vec<(String, String)> {
         let id = format!(
             "component:{}/{}/{}",
             self.checkout, self.ecosystem, self.package
         );
-        crate::lockfiles::split_name(about).0 == id
+        match crate::lockfiles::split_name(about) {
+            (plain, source) if plain == id => self.affected_from(Some(source.said())),
+            _ => Vec::new(),
+        }
     }
 
     /// The releases here the record affects, with where each is.
     pub fn affected(&self) -> Vec<(String, String)> {
+        self.affected_from(None)
+    }
+
+    /// The releases the record affects of the entries from `from`, or of every entry.
+    fn affected_from(&self, from: Option<&str>) -> Vec<(String, String)> {
         self.entries
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|e| e["affected"] == true)
+            .filter(|e| e["affected"] == true && from.is_none_or(|f| e["from"] == f))
             .map(|e| {
                 (
                     e["version"].as_str().unwrap_or_default().to_string(),
@@ -2463,7 +2489,7 @@ pub fn finding_detail(list: &[Affecting], about: &str) -> Option<(String, String
     let mut at: Vec<String> = Vec::new();
     let mut releases: BTreeSet<String> = BTreeSet::new();
     for a in &mine {
-        for (v, line) in a.affected() {
+        for (v, line) in a.affected_of(about) {
             releases.insert(v);
             let shown = at_shown(&line);
             if !at.contains(&shown) {
@@ -2673,33 +2699,35 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_package_whose_index_is_not_recorded_is_matched_by_name_found_about_its_component_and_never_compared_in_full()
-     {
-        let dir = crate::common::Scratch::new("index-not-recorded");
-        let mut conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
-        let now = 1_800_000_000;
-        let tx = conn.transaction().unwrap();
-        let checkout = |project: &str| format!("checkout:machine:mac/dev/{project}");
-        let component = |project: &str, source| {
-            let name = crate::lockfiles::component_name("left-pad", source);
-            format!("component:{}/npm/{name}", checkout(project))
-        };
-        // A reading of each project's lockfiles in full, built by hand: left-pad at one release,
-        // or at two.
-        for (project, source, releases) in [
-            ("shop", Source::Registry, &["1.3.0"][..]),
-            ("blog", Source::UnrecordedIndex, &["1.3.0"]),
-            ("site", Source::UnrecordedIndex, &["1.2.0", "1.3.0"]),
-        ] {
-            let (scope, subject) = (checkout(project), component(project, source));
+    const NOW: i64 = 1_800_000_000;
+
+    fn checkout(project: &str) -> String {
+        format!("checkout:machine:mac/dev/{project}")
+    }
+
+    fn component(project: &str, package: &str, source: Source) -> String {
+        let name = crate::lockfiles::component_name(package, source);
+        format!("component:{}/npm/{name}", checkout(project))
+    }
+
+    /// A reading of the projects' lockfiles in full in run `r1`, built by hand, and npm's data
+    /// read then: each entry of `package` as its project, source, releases and where it is, and
+    /// each record of it as its id and ranges.
+    fn by_hand(
+        tx: &Transaction,
+        package: &str,
+        entries: &[(&str, Source, &[&str], &str)],
+        records: &[(&str, &str)],
+    ) {
+        for (project, source, releases, at) in entries {
+            let (scope, subject) = (checkout(project), component(project, package, *source));
             for id in [&scope, &subject] {
-                crate::store::put_entity(&tx, id).unwrap();
+                crate::store::put_entity(tx, id).unwrap();
             }
             tx.execute(
                 "INSERT INTO coverage (reader, run_id, observed_at, scope, kind, completeness)
                  VALUES (?1, 'r1', ?2, ?3, ?4, 'full')",
-                params![crate::lockfiles::READER, now, scope, crate::lockfiles::KIND],
+                params![crate::lockfiles::READER, NOW, scope, crate::lockfiles::KIND],
             )
             .unwrap();
             let facts = std::iter::once(("part_of", scope.as_str()))
@@ -2716,25 +2744,58 @@ mod tests {
                         crate::lockfiles::READER,
                         scope,
                         crate::lockfiles::KIND,
-                        format!("dev/{project}/package-lock.json#node_modules/left-pad"),
+                        format!("dev/{project}/{at}"),
                         crate::lockfiles::BASIS,
-                        now
+                        NOW
                     ],
                 )
                 .unwrap();
             }
         }
-        // npm's data, read now, with the record.
-        tx.execute_batch(&format!(
-            "INSERT INTO feed_reading (source, run_id, at, outcome) VALUES ('osv-npm', 'r1', {now}, 'read');
-             INSERT INTO advisory (source, id, modified, kind, cvss, aliases, cwe_ids, first_run,
-                                   first_seen_at, written_run, written_at)
-             VALUES ('osv-npm', '{LEFT_PAD}', '{}', 'vulnerability', '[]', '[]', '[]', 'r1', {now}, 'r1', {now});
-             INSERT INTO advisory_affects (source, advisory, ecosystem, name, normalized, ranges, versions)
-             VALUES ('osv-npm', '{LEFT_PAD}', 'npm', 'left-pad', 'left-pad', '{LEFT_PAD_RANGES}', '[]');",
-            crate::view::iso(now - 3600)
-        ))
+        tx.execute(
+            "INSERT INTO feed_reading (source, run_id, at, outcome)
+             VALUES ('osv-npm', 'r1', ?1, 'read')",
+            [NOW],
+        )
         .unwrap();
+        for (id, ranges) in records {
+            tx.execute(
+                "INSERT INTO advisory (source, id, modified, kind, cvss, aliases, cwe_ids,
+                                       first_run, first_seen_at, written_run, written_at)
+                 VALUES ('osv-npm', ?1, ?2, 'vulnerability', '[]', '[]', '[]', 'r1', ?3, 'r1', ?3)",
+                params![id, crate::view::iso(NOW - 3600), NOW],
+            )
+            .unwrap();
+            tx.execute(
+                "INSERT INTO advisory_affects (source, advisory, ecosystem, name, normalized,
+                                               ranges, versions)
+                 VALUES ('osv-npm', ?1, 'npm', ?2, ?2, ?3, '[]')",
+                params![id, package, ranges],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn a_package_whose_index_is_not_recorded_is_matched_by_name_found_about_its_component_and_never_compared_in_full()
+     {
+        let dir = crate::common::Scratch::new("index-not-recorded");
+        let mut conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
+        let now = NOW;
+        let tx = conn.transaction().unwrap();
+        let component = |project: &str, source| component(project, "left-pad", source);
+        // left-pad at one release, or at two.
+        let at = "package-lock.json#node_modules/left-pad";
+        by_hand(
+            &tx,
+            "left-pad",
+            &[
+                ("shop", Source::Registry, &["1.3.0"], at),
+                ("blog", Source::UnrecordedIndex, &["1.3.0"], at),
+                ("site", Source::UnrecordedIndex, &["1.2.0", "1.3.0"], at),
+            ],
+            &[(LEFT_PAD, LEFT_PAD_RANGES)],
+        );
 
         let matched = match_all(&tx, "r1", now).unwrap();
 
@@ -2824,6 +2885,88 @@ mod tests {
             text.contains("its lockfile does not record which index it comes from"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn a_component_is_told_by_its_own_entries_and_its_finding_shows_only_them() {
+        let dir = crate::common::Scratch::new("component-own-entries");
+        let mut conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
+        let tx = conn.transaction().unwrap();
+        // In each project the registry's quill is affected by both records, so the package is
+        // affected for each. Beside it, the quill whose index is not recorded is outside both
+        // records in `shop`, and affected by the second in `site`.
+        let (registry, unrecorded) = ("package-lock.json#node_modules/quill", "pdm.lock#quill");
+        let (first, second) = (LEFT_PAD, "GHSA-0000-0000-0002");
+        by_hand(
+            &tx,
+            "quill",
+            &[
+                ("shop", Source::Registry, &["1.2.0"], registry),
+                ("shop", Source::UnrecordedIndex, &["2.0.0"], unrecorded),
+                ("site", Source::Registry, &["1.2.0"], registry),
+                ("site", Source::UnrecordedIndex, &["2.2.0"], unrecorded),
+            ],
+            &[
+                (first, LEFT_PAD_RANGES),
+                (
+                    second,
+                    r#"[{"type": "SEMVER", "events": [{"introduced": "1.1.0"}, {"fixed": "1.3.0"},
+                                                      {"introduced": "2.1.0"}, {"fixed": "2.3.0"}]}]"#,
+                ),
+            ],
+        );
+        // A finding raised about the unrecorded quill of `shop` when it stood at an affected
+        // release.
+        let rule = crate::findings::MALICIOUS_PACKAGE;
+        let shop = component("shop", "quill", Source::UnrecordedIndex);
+        let never = |_: &str| Ok(false);
+        crate::findings::hold(&tx, rule, &[(shop.clone(), vec![])], &never, "r0", NOW).unwrap();
+
+        let matched = match_all(&tx, "r1", NOW).unwrap();
+        let now: Vec<(String, Vec<i64>)> = (matched.affected.keys())
+            .map(|c| (c.clone(), vec![]))
+            .collect();
+        let known = |about: &str| matched.known(&tx, about);
+        crate::findings::hold(&tx, rule, &now, &known, "r1", NOW).unwrap();
+
+        // The package is affected, but its unrecorded component cannot be told: its finding
+        // stands.
+        let state: String = tx
+            .query_row("SELECT state FROM finding WHERE about = ?1", [&shop], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(state, "open");
+        // Each finding of `site` shows its own component's release, line and records.
+        let list = affecting(&tx).unwrap();
+        let packages = crate::finding_answer::packages(&tx).unwrap();
+        for (source, at, release, records) in [
+            (Source::Registry, registry, "1.2.0", &[first, second][..]),
+            (Source::UnrecordedIndex, unrecorded, "2.2.0", &[second]),
+        ] {
+            let about = component("site", "quill", source);
+            let at = format!("~/dev/site/{at}");
+            let (place, value) = finding_detail(&list, &about).unwrap();
+            assert_eq!(place, at);
+            let named: Vec<&str> = (value.split("; ").skip(1))
+                .map(|r| r.split(' ').next().unwrap())
+                .collect();
+            assert_eq!(
+                (value.split(';').next().unwrap(), &named[..]),
+                (&*format!("quill {release}"), records)
+            );
+            let releases = BTreeSet::from([release.to_string()]);
+            assert_eq!(packages.of(&about).unwrap().1, releases);
+            let whole = crate::finding_answer::package(&tx, &about).unwrap();
+            let shown: Vec<(&str, &str)> = (whole.releases.iter())
+                .map(|r| (r.version_text.as_str(), r.at_text.as_str()))
+                .collect();
+            let ids: Vec<&str> = whole.records.iter().map(|r| r.id_text.as_str()).collect();
+            assert_eq!(
+                (shown, ids),
+                (vec![(release, at.as_str())], records.to_vec())
+            );
+        }
     }
 
     fn v(s: &str) -> semver::Version {

@@ -145,31 +145,22 @@ pub fn refs(items: &[Item]) -> BTreeMap<String, v1::FindingRef> {
         .collect()
 }
 
-/// The package each finding about a package is about, by the id of the package under its plain
-/// name: its name and the releases a record affects, as `package` gives them for one finding,
-/// each release once.
-pub struct Packages(BTreeMap<String, (String, BTreeSet<String>)>);
+/// Every "affects me" answer, read once for a whole list.
+pub struct Packages(Vec<vulnerabilities::Affecting>);
 
-/// Every package a record affects, read once for a whole list.
 pub fn packages(conn: &Connection) -> rusqlite::Result<Packages> {
-    let mut out: BTreeMap<String, (String, BTreeSet<String>)> = BTreeMap::new();
-    for a in vulnerabilities::affecting(conn)? {
-        let about = format!("component:{}/{}/{}", a.checkout, a.ecosystem, a.package);
-        let entry = out
-            .entry(about)
-            .or_insert_with(|| (a.package.clone(), BTreeSet::new()));
-        entry
-            .1
-            .extend(a.affected().into_iter().map(|(version, _)| version));
-    }
-    Ok(Packages(out))
+    Ok(Packages(vulnerabilities::affecting(conn)?))
 }
 
 impl Packages {
-    /// The package a finding about the component `about` is about, whatever source its id
-    /// carries.
-    pub fn of(&self, about: &str) -> Option<&(String, BTreeSet<String>)> {
-        self.0.get(crate::lockfiles::split_name(about).0)
+    /// The package a finding about the component `about` is about: its name and the releases
+    /// of that component a record affects, as `package` gives them for one finding, each once.
+    pub fn of(&self, about: &str) -> Option<(String, BTreeSet<String>)> {
+        let mine: Vec<&vulnerabilities::Affecting> =
+            self.0.iter().filter(|a| a.is_about(about)).collect();
+        let releases = mine.iter().flat_map(|a| a.affected_of(about));
+        let releases = releases.map(|(version, _)| version).collect();
+        mine.first().map(|a| (a.package.clone(), releases))
     }
 }
 
@@ -190,7 +181,7 @@ pub fn listed(
     v1::ListedFinding {
         short_title: i.words.short.to_string(),
         rule_title_text: rule_title(&i.rule),
-        package_text: package.map(|(name, _)| whole(name)),
+        package_text: package.as_ref().map(|(name, _)| whole(name)),
         releases_text: package
             .map(|(_, releases)| releases.iter().map(|r| whole(r)).collect())
             .unwrap_or_default(),
@@ -409,7 +400,7 @@ fn detached(conn: &Connection, finding: &str) -> rusqlite::Result<v1::DetachedPr
 /// A package a project depends on, from the answers that stand now, as the report reads them
 /// (`vulnerabilities::finding_detail`): every record that affects it, and every release it
 /// affects with where it is declared.
-fn package(conn: &Connection, about: &str) -> rusqlite::Result<v1::VulnerablePackage> {
+pub fn package(conn: &Connection, about: &str) -> rusqlite::Result<v1::VulnerablePackage> {
     let mine: Vec<vulnerabilities::Affecting> = vulnerabilities::affecting(conn)?
         .into_iter()
         .filter(|a| a.is_about(about))
@@ -422,7 +413,8 @@ fn package(conn: &Connection, about: &str) -> rusqlite::Result<v1::VulnerablePac
     out.ecosystem = Some(first.ecosystem.clone());
     out.package_text = Some(whole(&first.package));
     // A release two records affect is given once.
-    let releases: BTreeSet<(String, String)> = mine.iter().flat_map(|a| a.affected()).collect();
+    let releases: BTreeSet<(String, String)> =
+        mine.iter().flat_map(|a| a.affected_of(about)).collect();
     out.releases = releases
         .iter()
         .map(|(version, line)| v1::PackageRelease {
