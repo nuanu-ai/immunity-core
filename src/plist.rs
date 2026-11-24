@@ -32,6 +32,9 @@ struct CFRange {
 const IMMUTABLE: usize = 0;
 /// `kCFPropertyListBinaryFormat_v1_0`.
 const BINARY: CFIndex = 200;
+/// `kCFNumberSInt64Type` and `kCFNumberFloat64Type` (`CFNumber.h`).
+const NUMBER_SINT64: CFIndex = 4;
+const NUMBER_FLOAT64: CFIndex = 6;
 /// How deep into arrays and dictionaries a value is followed. A login hook is one string; a
 /// value nested deeper is not read, and the reading says so, rather than run out of stack on a
 /// file written to do that.
@@ -60,6 +63,11 @@ unsafe extern "C" {
     fn CFStringGetTypeID() -> usize;
     fn CFStringGetLength(string: CFTypeRef) -> CFIndex;
     fn CFStringGetCharacters(string: CFTypeRef, range: CFRange, buffer: *mut u16);
+    fn CFNumberGetTypeID() -> usize;
+    fn CFNumberIsFloatType(number: CFTypeRef) -> u8;
+    fn CFNumberGetValue(number: CFTypeRef, kind: CFIndex, value: *mut c_void) -> u8;
+    fn CFBooleanGetTypeID() -> usize;
+    fn CFBooleanGetValue(boolean: CFTypeRef) -> u8;
     fn CFDataGetTypeID() -> usize;
     fn CFDataCreate(allocator: CFTypeRef, bytes: *const u8, length: CFIndex) -> CFTypeRef;
     fn CFDataGetLength(data: CFTypeRef) -> CFIndex;
@@ -200,6 +208,55 @@ pub fn texts<'k>(bytes: &[u8], keys: &[&'k str]) -> Result<Vec<(&'k str, Text)>,
         out.push((*key, text));
     }
     Ok(out)
+}
+
+/// For each of `keys` at the top of a property-list dictionary, returns its raw scalar text as
+/// `/usr/bin/plutil -extract <key> raw -o -` prints it: a string, number or boolean, or `None`
+/// when the key is missing or holds another type. Returns `None` if `bytes` is not a property
+/// list dictionary.
+pub fn raw_scalars<'k>(bytes: &[u8], keys: &[&'k str]) -> Option<Vec<(&'k str, Option<String>)>> {
+    let list = dictionary(bytes).ok()?;
+    let mut out = Vec::with_capacity(keys.len());
+    for &key in keys {
+        let val = cf_string(key).and_then(|name| {
+            // SAFETY: `list` is a live dictionary and `name` a live string; value is lent.
+            let value = unsafe { CFDictionaryGetValue(list.0, name.0) };
+            if value.is_null() {
+                return None;
+            }
+            scalar_text(value)
+        });
+        out.push((key, val));
+    }
+    Some(out)
+}
+
+fn scalar_text(value: CFTypeRef) -> Option<String> {
+    let mut budget = BYTES;
+    if let Some(s) = string(value, &mut budget) {
+        return s;
+    }
+    // SAFETY: plain type-id checks on a live CoreFoundation object.
+    let tid = unsafe { CFGetTypeID(value) };
+    if tid == unsafe { CFBooleanGetTypeID() } {
+        return Some(if unsafe { CFBooleanGetValue(value) } != 0 {
+            "true".to_string()
+        } else {
+            "false".to_string()
+        });
+    }
+    if tid == unsafe { CFNumberGetTypeID() } {
+        if unsafe { CFNumberIsFloatType(value) } != 0 {
+            let mut f = 0.0f64;
+            let ok =
+                unsafe { CFNumberGetValue(value, NUMBER_FLOAT64, (&raw mut f).cast::<c_void>()) };
+            return (ok != 0).then(|| f.to_string());
+        }
+        let mut n = 0i64;
+        let ok = unsafe { CFNumberGetValue(value, NUMBER_SINT64, (&raw mut n).cast::<c_void>()) };
+        return (ok != 0).then(|| n.to_string());
+    }
+    None
 }
 
 /// A live value as a string: `None` when it is not one, and `Some(None)` when it cannot be
@@ -585,5 +642,56 @@ mod tests {
 
     fn hook_of(bytes: &[u8]) -> Result<Vec<u8>, &'static str> {
         values(bytes, &["LoginHook"]).unwrap().remove(0).1
+    }
+
+    #[test]
+    fn raw_scalars_matches_plutil_extract_raw_for_strings_numbers_and_booleans() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.example.App</string>
+    <key>CFBundleShortVersionString</key>
+    <string>2.4.1</string>
+    <key>CFBundleVersion</key>
+    <integer>420</integer>
+    <key>LSUIElement</key>
+    <true/>
+    <key>Nested</key>
+    <dict><key>a</key><string>b</string></dict>
+</dict>
+</plist>
+"#;
+        let dir = crate::common::Scratch::new("plist-raw-parity");
+        let path = dir.join("Info.plist");
+        std::fs::write(&path, xml).unwrap();
+        let keys = [
+            "CFBundleIdentifier",
+            "CFBundleShortVersionString",
+            "CFBundleVersion",
+            "LSUIElement",
+            "MissingKey",
+            "Nested",
+        ];
+        let got = raw_scalars(xml, &keys).unwrap();
+        for (key, value) in got {
+            let out = std::process::Command::new(crate::integrity::PLUTIL)
+                .args(["-extract", key, "raw", "-o", "-"])
+                .arg(&path)
+                .output()
+                .unwrap();
+            let plutil = if out.status.success() {
+                let s = String::from_utf8(out.stdout).unwrap();
+                Some(s.strip_suffix('\n').unwrap_or(&s).to_string())
+            } else {
+                None
+            };
+            if key == "Nested" {
+                assert_eq!(value, None);
+            } else {
+                assert_eq!(value, plutil, "mismatch for key {key}");
+            }
+        }
     }
 }

@@ -180,6 +180,7 @@ const PRUNED_IN_HOME: [&str; 6] = [
 /// The home folder's Library, where iCloud Drive and other cloud storage keep their files.
 const LIBRARY: &str = "Library";
 
+#[derive(Clone)]
 pub struct Checkout {
     /// Path relative to the home folder, with `/` between parts; the full path when the
     /// checkout is outside the home folder.

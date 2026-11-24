@@ -26,6 +26,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use rusqlite::{Connection, Transaction};
 use serde_json::Value;
 
@@ -258,19 +259,105 @@ pub fn match_hashes(conn: &Connection, list: &List) -> rusqlite::Result<Vec<(Str
     Ok(out)
 }
 
+/// Precompiled multi-pattern matcher for the network indicator kinds (`DOMAIN`, `IPV4`, `URL`).
+/// Scans each text in linear time without lowercasing the input or rescanning per indicator.
+pub struct TextMatcher {
+    items: Vec<Indicator>,
+    domains: Option<(AhoCorasick, Vec<usize>)>,
+    exact: Option<(AhoCorasick, Vec<(usize, bool)>)>,
+}
+
+impl TextMatcher {
+    pub fn new(list: &List) -> TextMatcher {
+        let mut items = Vec::new();
+        let mut domain_patterns = Vec::new();
+        let mut domain_ids = Vec::new();
+        let mut exact_patterns = Vec::new();
+        let mut exact_ids = Vec::new();
+        for i in &list.matched {
+            match i.kind {
+                DOMAIN => {
+                    let idx = items.len();
+                    domain_patterns.push(i.value.as_str());
+                    domain_ids.push(idx);
+                    items.push(i.clone());
+                }
+                IPV4 => {
+                    let idx = items.len();
+                    exact_patterns.push(i.value.as_str());
+                    exact_ids.push((idx, true));
+                    items.push(i.clone());
+                }
+                URL => {
+                    let idx = items.len();
+                    exact_patterns.push(i.value.as_str());
+                    exact_ids.push((idx, false));
+                    items.push(i.clone());
+                }
+                _ => {}
+            }
+        }
+        let domains = (!domain_patterns.is_empty()).then(|| {
+            let ac = AhoCorasickBuilder::new()
+                .ascii_case_insensitive(true)
+                .build(&domain_patterns)
+                .expect("indicator domain patterns build");
+            (ac, domain_ids)
+        });
+        let exact = (!exact_patterns.is_empty()).then(|| {
+            let ac = AhoCorasick::new(&exact_patterns).expect("indicator exact patterns build");
+            (ac, exact_ids)
+        });
+        TextMatcher {
+            items,
+            domains,
+            exact,
+        }
+    }
+
+    /// The indicators of the network kinds found in `text` as whole strings, in `List` order.
+    pub fn find(&self, text: &str) -> Vec<Indicator> {
+        if self.items.is_empty() {
+            return Vec::new();
+        }
+        let bytes = text.as_bytes();
+        let mut seen = vec![false; self.items.len()];
+        if let Some((ac, ids)) = &self.domains {
+            for m in ac.find_overlapping_iter(bytes) {
+                let idx = ids[m.pattern().as_usize()];
+                if !seen[idx] && whole_at(bytes, m.start(), m.end(), domain_char, true) {
+                    seen[idx] = true;
+                }
+            }
+        }
+        if let Some((ac, ids)) = &self.exact {
+            for m in ac.find_overlapping_iter(bytes) {
+                let (idx, is_ipv4) = ids[m.pattern().as_usize()];
+                if !seen[idx] {
+                    let ok = if is_ipv4 {
+                        whole_at(bytes, m.start(), m.end(), |b| b.is_ascii_digit(), true)
+                    } else {
+                        whole_at(bytes, m.start(), m.end(), url_char, false)
+                    };
+                    if ok {
+                        seen[idx] = true;
+                    }
+                }
+            }
+        }
+        self.items
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| seen[*i])
+            .map(|(_, item)| item.clone())
+            .collect()
+    }
+}
+
 /// The indicators of the network kinds found in one text as exact strings.
+#[cfg(test)]
 pub fn match_text(text: &str, list: &List) -> Vec<Indicator> {
-    let lower = text.to_ascii_lowercase();
-    list.matched
-        .iter()
-        .filter(|i| match i.kind {
-            DOMAIN => found(&lower, &i.value, domain_char, true),
-            IPV4 => found(text, &i.value, |b| b.is_ascii_digit(), true),
-            URL => found(text, &i.value, url_char, false),
-            _ => false,
-        })
-        .cloned()
-        .collect()
+    TextMatcher::new(list).find(text)
 }
 
 fn domain_char(b: u8) -> bool {
@@ -283,21 +370,23 @@ fn url_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b"-._~/?#@!$&*+=%:".contains(&b)
 }
 
-/// Whether `needle` is in `hay` as a whole: not continued by a character of its kind on
+/// Whether `bytes[start..end]` is a whole match: not continued by a character of its kind on
 /// either side, a dot followed by one counting as a continuation. A URL is whole on its left
 /// whatever precedes it, since its scheme starts it.
-fn found(hay: &str, needle: &str, part: fn(u8) -> bool, check_left: bool) -> bool {
-    let bytes = hay.as_bytes();
-    hay.match_indices(needle).any(|(at, _)| {
-        let end = at + needle.len();
-        let left = !check_left || at == 0 || !(part(bytes[at - 1]) || bytes[at - 1] == b'.');
-        let right = match bytes.get(end) {
-            None => true,
-            Some(b'.') => !bytes.get(end + 1).is_some_and(|b| part(*b)),
-            Some(b) => !part(*b),
-        };
-        left && right
-    })
+fn whole_at(
+    bytes: &[u8],
+    start: usize,
+    end: usize,
+    part: fn(u8) -> bool,
+    check_left: bool,
+) -> bool {
+    let left = !check_left || start == 0 || !(part(bytes[start - 1]) || bytes[start - 1] == b'.');
+    let right = match bytes.get(end) {
+        None => true,
+        Some(b'.') => !bytes.get(end + 1).is_some_and(|b| part(*b)),
+        Some(b) => !part(*b),
+    };
+    left && right
 }
 
 /// What the kinds in a list are not matched against, by name.
@@ -412,6 +501,30 @@ mod tests {
         assert!(kinds("https://cdn.example/a.js/b x-evil.example 1evil.example").is_empty());
         // A URL starts with its scheme, whatever is before it.
         assert_eq!(kinds("/login?next=https://cdn.example/a.js"), [URL]);
+    }
+
+    #[test]
+    fn overlapping_network_indicators_are_each_matched_independently_as_whole_strings() {
+        let l = list(
+            r#"[{"kind": "domain-name:value", "value": "evil.example"},
+                {"kind": "domain-name:value", "value": "sub.evil.example"},
+                {"kind": "ipv4-addr:value", "value": "10.0.0.1"},
+                {"kind": "ipv4-addr:value", "value": "10.0.0.10"},
+                {"kind": "url:value", "value": "https://cdn.example/a"},
+                {"kind": "url:value", "value": "https://cdn.example/a.js"}]"#,
+        );
+        let matcher = TextMatcher::new(&l);
+        let vals =
+            |t: &str| -> Vec<String> { matcher.find(t).into_iter().map(|i| i.value).collect() };
+        assert_eq!(vals("host SUB.EVIL.example"), ["sub.evil.example"]);
+        assert_eq!(vals("host evil.example"), ["evil.example"]);
+        assert_eq!(vals("ip 10.0.0.10"), ["10.0.0.10"]);
+        assert_eq!(vals("ip 10.0.0.1"), ["10.0.0.1"]);
+        assert_eq!(
+            vals("url https://cdn.example/a.js"),
+            ["https://cdn.example/a.js"]
+        );
+        assert_eq!(vals("url https://cdn.example/a"), ["https://cdn.example/a"]);
     }
 
     #[test]

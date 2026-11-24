@@ -762,6 +762,44 @@ pub fn bytes(path: &Path, meta: &Metadata, cap: u64) -> Result<Vec<u8>, Content>
     }
 }
 
+/// Streams a regular file's SHA-256 hex digest up to `cap` bytes in fixed-size chunks without
+/// holding the whole file in memory. Preserves the exact non-blocking `O_NOFOLLOW` and size-cap
+/// checks of `bytes`.
+pub fn hash_file(path: &Path, meta: &Metadata, cap: u64) -> Result<String, Content> {
+    if !meta.is_file() {
+        return Err(Content::Special(kind_of(meta.file_type())));
+    }
+    let read = || -> std::io::Result<Result<Option<String>, &'static str>> {
+        let mut file = match open_regular(path)? {
+            Ok((file, _)) => file,
+            Err(what) => return Ok(Err(what)),
+        };
+        let mut hasher = crate::sha256::Hasher::new();
+        let mut buf = [0u8; 64 * 1024];
+        let mut total = 0u64;
+        loop {
+            let n = file.read(&mut buf)?;
+            if n == 0 {
+                return Ok(Ok(Some(hasher.hex())));
+            }
+            total = total.saturating_add(n as u64);
+            if total > cap {
+                return Ok(Ok(None));
+            }
+            hasher.update(&buf[..n]);
+        }
+    };
+    match read() {
+        Err(e) => Err(Content::Unread(Cause::Failed, reason(&e))),
+        Ok(Err(what)) => Err(Content::Special(what)),
+        Ok(Ok(None)) => Err(Content::Unread(
+            Cause::NoReader,
+            format!("over the size cap of {} MiB", cap >> 20),
+        )),
+        Ok(Ok(Some(hex))) => Ok(hex),
+    }
+}
+
 /// Opens `path` to read only when it is a regular file: without following a link in its last
 /// part and without waiting, so that a file swapped for a link or a named pipe after it was
 /// looked at is neither followed nor able to hold the reader. A link fails to open; anything

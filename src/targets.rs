@@ -270,6 +270,7 @@ pub fn read(
 ) -> rusqlite::Result<(Look, Targets)> {
     let homes = watched::homes(roots.home);
     let homes = [homes[0].as_path(), homes[1].as_path()];
+    let ids = guarded::Identities::of(&homes);
     let mut t = Targets::default();
     let mut named: BTreeMap<Unit, BTreeSet<String>> = BTreeMap::new();
     let prefix = format!("file:{machine}/");
@@ -306,7 +307,7 @@ pub fn read(
         }
         // A file an argument names is counted, never read, as is one in a guarded folder.
         for a in arguments.iter().filter(|a| plain(a)) {
-            let file = match guarded::real(&on_disk(roots, a), &homes) {
+            let file = match guarded::real_with(&on_disk(roots, a), &homes, &ids) {
                 Real::At(p) => std::fs::metadata(p).is_ok_and(|m| m.is_file()),
                 Real::Guarded(_) => true,
                 Real::Failed(_) => false,
@@ -356,7 +357,7 @@ pub fn read(
             (Content::Unread(Cause::NoReader, why.into()), None)
         } else {
             let before = previous(tx, &id)?;
-            let mut resolve = || guarded::real(&on_disk(roots, &unit.path), &homes);
+            let mut resolve = || guarded::real_with(&on_disk(roots, &unit.path), &homes, &ids);
             let (content, after, why) =
                 read_target(&mut resolve, roots, &unit.path, &before, &mut look);
             why.into_iter().for_each(|why| t.count(why));
@@ -461,8 +462,8 @@ fn read_target(
         let link = (shown != path).then_some(shown);
         let read = std::fs::metadata(&real)
             .map_err(|e| Content::Unread(Cause::Failed, e.to_string()))
-            .and_then(|meta| Ok((watched::bytes(&real, &meta, CAP)?, meta)));
-        let (bytes, meta) = match read {
+            .and_then(|meta| Ok((watched::hash_file(&real, &meta, CAP)?, meta)));
+        let (hex, meta) = match read {
             Ok(read) => read,
             Err(content @ Content::Special(_)) => return not(content, Some(NOT_FILE)),
             Err(content @ Content::Unread(Cause::NoReader, _)) => {
@@ -470,8 +471,7 @@ fn read_target(
             }
             Err(content) => return not(content, Some(FAILED)),
         };
-        let content = format!("sha256:{}", crate::sha256::hex(&bytes));
-        drop(bytes);
+        let content = format!("sha256:{hex}");
         // Carried only for the same content reached the same way; else asked of the code.
         let same = before.content.as_ref() == Some(&content) && before.link == link;
         let (signed_by, seal) = if same && before.seal.is_some() {

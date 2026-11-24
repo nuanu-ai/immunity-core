@@ -259,6 +259,31 @@ pub const VERIFIES: &str = "verifies";
 /// Code on disk, as the framework sees it.
 pub struct Code(Owned);
 
+/// Compiles a fixed Apple requirement string once per thread and lends it while checking a
+/// signature, avoiding repeated requirement parsing across hundreds of bundles and executables.
+fn compile_requirement(text: &str) -> Option<Owned> {
+    let source = cf_string(text)?;
+    let mut requirement: CFTypeRef = std::ptr::null();
+    // SAFETY: `source` is a live string and `requirement` a valid out-parameter. Owned:
+    // the header marks it `CF_RETURNS_RETAINED`; it is set only when the text compiles.
+    unsafe { SecRequirementCreateWithString(source.0, 0, &mut requirement) };
+    Owned::take(requirement)
+}
+
+struct CachedRequirements {
+    apple: Option<Owned>,
+    app_store: Option<Owned>,
+    developer_id: Option<Owned>,
+}
+
+thread_local! {
+    static REQUIREMENTS: CachedRequirements = CachedRequirements {
+        apple: compile_requirement(APPLE),
+        app_store: compile_requirement(APP_STORE),
+        developer_id: compile_requirement(DEVELOPER_ID),
+    };
+}
+
 impl Code {
     /// The code at `path`: a bundle or a single executable. `Err` is the status the
     /// framework returned when it could not make sense of the path at all.
@@ -296,23 +321,15 @@ impl Code {
         }
     }
 
-    /// Whether the signature satisfies a requirement written in Apple's language, without
-    /// validating the executable or the resources again: in every architecture, so that one
-    /// slice cannot carry the class of another.
-    fn satisfies(&self, text: &str) -> bool {
-        let Some(source) = cf_string(text) else {
-            return false;
-        };
-        let mut requirement: CFTypeRef = std::ptr::null();
-        // SAFETY: `source` is a live string and `requirement` a valid out-parameter. Owned:
-        // the header marks it `CF_RETURNS_RETAINED`; it is set only when the text compiles,
-        // so the status adds nothing to it.
-        unsafe { SecRequirementCreateWithString(source.0, 0, &mut requirement) };
-        let Some(requirement) = Owned::take(requirement) else {
+    /// Whether the signature satisfies a precompiled requirement, without validating the
+    /// executable or the resources again: in every architecture, so that one slice cannot carry
+    /// the class of another.
+    fn satisfies_req(&self, requirement: Option<&Owned>) -> bool {
+        let Some(requirement) = requirement else {
             return false;
         };
         let flags = BASIC_VALIDATE_ONLY | CHECK_ALL_ARCHITECTURES | NO_NETWORK_ACCESS;
-        self.check(flags, Some(&requirement)) == 0
+        self.check(flags, Some(requirement)) == 0
     }
 
     /// Who signed the code, as the literal of `signed_by`: `apple`, `app store`, `developer
@@ -350,15 +367,17 @@ impl Code {
             let cdhash = get(&info, unique, data_id).map(hex).unwrap_or_default();
             return Some((format!("ad hoc, cdhash {cdhash}"), identifier));
         }
-        let class = if self.satisfies(APPLE) {
-            "apple"
-        } else if self.satisfies(APP_STORE) {
-            "app store"
-        } else if self.satisfies(DEVELOPER_ID) {
-            "developer id"
-        } else {
-            "other certificate"
-        };
+        let class = REQUIREMENTS.with(|reqs| {
+            if self.satisfies_req(reqs.apple.as_ref()) {
+                "apple"
+            } else if self.satisfies_req(reqs.app_store.as_ref()) {
+                "app store"
+            } else if self.satisfies_req(reqs.developer_id.as_ref()) {
+                "developer id"
+            } else {
+                "other certificate"
+            }
+        });
         let signer = match get(&info, team, string_id).and_then(string) {
             Some(team) => format!("{class}, team {team}"),
             None => class.to_string(),

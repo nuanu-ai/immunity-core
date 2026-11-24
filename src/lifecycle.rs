@@ -16,9 +16,9 @@
 //! closed with a journal entry of their own, `retired`, that says why, and its reading becomes
 //! `none` with no reader. It is done once per scope.
 
-use crate::store::{Cause, Event, Gap, Reading};
+use crate::store::{Cause, Event, Gap, Reading, Statement};
 use rusqlite::{Transaction, params};
-use std::collections::btree_map::Entry;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Objects per (subject, predicate), each with the id of one row that holds it.
@@ -51,87 +51,155 @@ fn joined(objects: &BTreeMap<String, i64>) -> Option<String> {
     Some(objects.keys().cloned().collect::<Vec<_>>().join(", "))
 }
 
+fn joined_strs(objects: &BTreeSet<&str>) -> Option<String> {
+    if objects.is_empty() {
+        return None;
+    }
+    Some(objects.iter().copied().collect::<Vec<_>>().join(", "))
+}
+
 /// What a reading held back as it was, not having read it now: subject, predicate and object.
 pub type Held = (String, String, String);
 
-/// Compares this run's draft with live and returns the differences as events, and what was
-/// held back: all a partial reading did not see, and what `may_go` says a full one does not
-/// cover.
+/// Compares this run's incoming statements directly with live without writing unchanged rows to
+/// the draft layer, and returns the differences as events plus what was held back: all a partial
+/// reading did not see, and what `may_go` says a full one does not cover.
 /// A different set of objects for the same subject and predicate is one
 /// `changed` event, so a new version of a component is not a remove plus an add.
 /// Under partial coverage only growth is seen: `added` and `changed`, never `removed`.
-pub fn promote(
+pub fn promote_statements(
     tx: &Transaction,
     r: &Reading,
     completeness: &str,
+    statements: &[(&str, &Statement)],
     may_go: &dyn Fn(&str) -> bool,
 ) -> rusqlite::Result<(Vec<Event>, Vec<Held>)> {
-    let mut events = (Vec::new(), Vec::new());
-    if completeness != "none" {
-        events = compare(tx, r, completeness == "full", may_go)?;
+    if completeness == "none" {
+        return Ok((Vec::new(), Vec::new()));
     }
-    // What is still draft was already live, repeated within the run, or not read.
-    tx.execute(
-        "DELETE FROM assertion
-         WHERE layer = 'draft' AND reader = ?1 AND scope = ?2 AND kind = ?3",
-        params![r.reader, r.scope, r.kind],
-    )?;
-    Ok(events)
-}
-
-fn compare(
-    tx: &Transaction,
-    r: &Reading,
-    full: bool,
-    may_go: &dyn Fn(&str) -> bool,
-) -> rusqlite::Result<(Vec<Event>, Vec<Held>)> {
-    let draft = load(tx, r, "draft")?;
+    let full = completeness == "full";
     let live = load(tx, r, "live")?;
-    let empty = BTreeMap::new();
-    let keys: BTreeSet<_> = draft.keys().chain(live.keys()).cloned().collect();
+    type Incoming<'a> = BTreeMap<(&'a str, &'a str), BTreeMap<&'a str, (&'a str, &'a Statement)>>;
+    let mut incoming: Incoming<'_> = BTreeMap::new();
+    for &(basis, s) in statements {
+        incoming
+            .entry((s.subject.as_str(), s.predicate))
+            .or_default()
+            .entry(s.object.as_str())
+            .or_insert((basis, s));
+    }
+
+    let empty_old = BTreeMap::new();
+    let empty_inc = BTreeMap::new();
+    let mut insert_entity: Option<rusqlite::Statement<'_>> = None;
+    let mut insert_live: Option<rusqlite::Statement<'_>> = None;
+    let mut retract: Option<rusqlite::Statement<'_>> = None;
     let (mut events, mut held) = (Vec::new(), Vec::new());
 
-    for key in keys {
-        let old = live.get(&key).unwrap_or(&empty);
-        let mut new = draft.get(&key).unwrap_or(&empty).clone();
-        if !(full && may_go(&key.0)) {
+    let mut live_it = live.iter().peekable();
+    let mut inc_it = incoming.iter().peekable();
+    while live_it.peek().is_some() || inc_it.peek().is_some() {
+        let ord = match (live_it.peek(), inc_it.peek()) {
+            (Some(((ls, lp), _)), Some(((is, ip), _))) => {
+                (ls.as_str(), lp.as_str()).cmp(&(*is, *ip))
+            }
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => break,
+        };
+        let (subject, predicate, old, inc) = match ord {
+            Ordering::Equal => {
+                let (_, old) = live_it.next().unwrap();
+                let (&(s, p), inc) = inc_it.next().unwrap();
+                (s, p, old, inc)
+            }
+            Ordering::Less => {
+                let ((s, p), old) = live_it.next().unwrap();
+                (s.as_str(), p.as_str(), old, &empty_inc)
+            }
+            Ordering::Greater => {
+                let (&(s, p), inc) = inc_it.next().unwrap();
+                (s, p, &empty_old, inc)
+            }
+        };
+        if old.len() == inc.len() && old.keys().map(String::as_str).eq(inc.keys().copied()) {
+            continue;
+        }
+        let mut new_objs: BTreeSet<&str> = inc.keys().copied().collect();
+        if !(full && may_go(subject)) {
             // What a partial reading did not see, or a full one does not cover, stays as it was.
-            for (object, id) in old {
-                if let Entry::Vacant(v) = new.entry(object.clone()) {
-                    v.insert(*id);
-                    held.push((key.0.clone(), key.1.clone(), object.clone()));
+            for object in old.keys() {
+                if new_objs.insert(object.as_str()) {
+                    held.push((subject.to_string(), predicate.to_string(), object.clone()));
                 }
             }
         }
-        let new = &new;
-        if new.keys().eq(old.keys()) {
+        if new_objs.len() == old.len()
+            && new_objs.iter().copied().eq(old.keys().map(String::as_str))
+        {
             continue;
         }
-        for (object, id) in new {
+        for &object in &new_objs {
             if !old.contains_key(object) {
-                tx.execute("UPDATE assertion SET layer = 'live' WHERE id = ?1", [id])?;
+                let (basis, s) = inc[object];
+                let entity_stmt = match &mut insert_entity {
+                    Some(stmt) => stmt,
+                    None => insert_entity.insert(
+                        tx.prepare("INSERT OR IGNORE INTO entity (id, type) VALUES (?1, ?2)")?,
+                    ),
+                };
+                let subj_type = s.subject.split(':').next().unwrap_or(&s.subject);
+                entity_stmt.execute(params![s.subject, subj_type])?;
+                if crate::store::predicate_is_entity(tx, s.predicate)? {
+                    let obj_type = s.object.split(':').next().unwrap_or(&s.object);
+                    entity_stmt.execute(params![s.object, obj_type])?;
+                }
+                let live_stmt = match &mut insert_live {
+                    Some(stmt) => stmt,
+                    None => insert_live.insert(tx.prepare(
+                        "INSERT INTO assertion (layer, subject, predicate, object, reader, scope,
+                                                kind, source_ref, basis, observed_at, run_id)
+                         VALUES ('live', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    )?),
+                };
+                live_stmt.execute(params![
+                    s.subject,
+                    s.predicate,
+                    s.object,
+                    r.reader,
+                    r.scope,
+                    r.kind,
+                    s.source_ref,
+                    basis,
+                    r.observed_at,
+                    r.run_id
+                ])?;
             }
         }
         for (object, id) in old {
-            if !new.contains_key(object) {
-                tx.execute(
-                    "UPDATE assertion SET layer = 'retracted', retracted_at = ?1, retracted_by = ?2
-                     WHERE id = ?3",
-                    params![r.at, r.run_id, id],
-                )?;
+            if !new_objs.contains(object.as_str()) {
+                let retract_stmt = match &mut retract {
+                    Some(stmt) => stmt,
+                    None => retract.insert(tx.prepare(
+                        "UPDATE assertion SET layer = 'retracted', retracted_at = ?1,
+                                              retracted_by = ?2
+                         WHERE id = ?3",
+                    )?),
+                };
+                retract_stmt.execute(params![r.at, r.run_id, id])?;
             }
         }
-        let kind = match (old.is_empty(), new.is_empty()) {
+        let kind = match (old.is_empty(), new_objs.is_empty()) {
             (true, _) => "added",
             (_, true) => "removed",
             _ => "changed",
         };
         events.push(Event {
             kind,
-            subject: key.0,
-            predicate: key.1,
+            subject: subject.to_string(),
+            predicate: predicate.to_string(),
             old: joined(old),
-            new: joined(new),
+            new: joined_strs(&new_objs),
         });
     }
     Ok((events, held))
@@ -273,4 +341,109 @@ pub(crate) fn placements(
     )?
     .query_map([reader], |row| Ok([row.get(0)?, row.get(1)?]))?
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store;
+
+    fn stmt(subject: &str, predicate: &'static str, object: &str) -> Statement {
+        Statement {
+            subject: subject.to_string(),
+            predicate,
+            object: object.to_string(),
+            source_ref: "test:1".to_string(),
+        }
+    }
+
+    #[test]
+    fn unchanged_statements_write_no_rows_and_partial_or_excluded_subjects_are_held_back() {
+        let dir = crate::common::Scratch::new("lifecycle-promote");
+        let mut conn = store::open_or_make(&dir.0.join("store.db")).unwrap();
+        let r1 = Reading {
+            reader: "test",
+            scope: "machine:m",
+            kind: crate::integrity::KEGS,
+            run_id: "r1",
+            at: 100,
+            observed_at: 100,
+        };
+        let a = stmt("file:m/a", "has_content", "sha256:1");
+        let b = stmt("file:m/b", "has_content", "sha256:2");
+        let dup_a = Statement {
+            source_ref: "test:99".to_string(),
+            ..stmt("file:m/a", "has_content", "sha256:1")
+        };
+        let tx = conn.transaction().unwrap();
+        store::put_entity(&tx, "machine:m").unwrap();
+        let (events, held) = promote_statements(
+            &tx,
+            &r1,
+            "full",
+            &[("observed", &a), ("observed", &dup_a), ("observed", &b)],
+            &|_| true,
+        )
+        .unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(held.is_empty());
+        let max_id: i64 = tx
+            .query_row("SELECT MAX(id) FROM assertion", [], |r| r.get(0))
+            .unwrap();
+        let drafts: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM assertion WHERE layer = 'draft'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(drafts, 0);
+
+        // Re-promoting identical statements inserts no assertion rows at all.
+        let r2 = Reading {
+            run_id: "r2",
+            at: 200,
+            observed_at: 200,
+            ..r1
+        };
+        let (events, held) = promote_statements(
+            &tx,
+            &r2,
+            "full",
+            &[("observed", &a), ("observed", &b)],
+            &|_| true,
+        )
+        .unwrap();
+        assert!(events.is_empty());
+        assert!(held.is_empty());
+        let max_id_after: i64 = tx
+            .query_row("SELECT MAX(id) FROM assertion", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(max_id_after, max_id);
+
+        // Partial reading holds back missing `b` without retracting it.
+        let (events, held) =
+            promote_statements(&tx, &r2, "partial", &[("observed", &a)], &|_| true).unwrap();
+        assert!(events.is_empty());
+        assert_eq!(
+            held,
+            vec![(
+                "file:m/b".to_string(),
+                "has_content".to_string(),
+                "sha256:2".to_string()
+            )]
+        );
+
+        // Full reading where `may_go` excludes `b` holds back `b`, while retracting `a`.
+        let (events, held) =
+            promote_statements(&tx, &r2, "full", &[], &|s| s != "file:m/b").unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            (events[0].kind, events[0].subject.as_str()),
+            ("removed", "file:m/a")
+        );
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].0, "file:m/b");
+        tx.commit().unwrap();
+    }
 }

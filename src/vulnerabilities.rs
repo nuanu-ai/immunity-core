@@ -737,7 +737,19 @@ impl Matched {
 /// Matches every package the checkouts' lockfiles hold against the data, writes the answers
 /// and the conditions of each place, and links records to the catalogue. Run in the run's
 /// transaction after the feeds are read.
+#[cfg(test)]
 pub fn match_all(tx: &Transaction, run_id: &str, at: i64) -> rusqlite::Result<Matched> {
+    match_all_with(tx, run_id, at, true)
+}
+
+/// Like `match_all`, rebuilding `vulnerability_linked` only when `relink` is set (the catalogue
+/// or an advisory feed changed in this run) or when links have not been built yet.
+pub fn match_all_with(
+    tx: &Transaction,
+    run_id: &str,
+    at: i64,
+    relink: bool,
+) -> rusqlite::Result<Matched> {
     // A place for each checkout and each matched ecosystem alone (`matched_feeds`).
     let fresh = matched_freshness(tx, at)?;
     let fresh_of = |eco: &str| fresh.iter().find(|f| f.feed.ecosystem == eco);
@@ -855,7 +867,9 @@ pub fn match_all(tx: &Transaction, run_id: &str, at: i64) -> rusqlite::Result<Ma
     }
 
     write_answers(tx, &computed, run_id, at)?;
-    link_catalogue(tx)?;
+    if relink || needs_catalogue_link(tx)? {
+        link_catalogue(tx)?;
+    }
 
     // A package that cannot be told is so under its plain name and under each component its
     // entries are read as, such as one whose index the lockfile does not record.
@@ -1134,6 +1148,29 @@ fn write_answers(
         gone.execute(params![key.0, key.1, key.2, key.3, key.4])?;
     }
     Ok(())
+}
+
+/// Whether `vulnerability_linked` has no rows even though live threats and advisories exist.
+fn needs_catalogue_link(tx: &Transaction) -> rusqlite::Result<bool> {
+    let linked: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM vulnerability_linked)",
+        [],
+        |r| r.get(0),
+    )?;
+    if linked {
+        return Ok(false);
+    }
+    let has_threats: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM threat WHERE gone_at IS NULL)",
+        [],
+        |r| r.get(0),
+    )?;
+    let has_advisories: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM advisory WHERE gone_at IS NULL AND withdrawn IS NULL)",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(has_threats && has_advisories)
 }
 
 /// Links records to the catalogue's exploited CVEs through their aliases, and through the

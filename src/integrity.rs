@@ -38,13 +38,12 @@ use crate::codesign;
 use crate::look::{Look, NOT_HERE, Said};
 use crate::store::{Gap, Statement};
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::io::ErrorKind;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -184,18 +183,91 @@ impl Kind {
     }
 }
 
-/// Reads every kind of thing. `conn` holds the last verdicts, carried forward for bundles that
-/// did not move; `machine` is this machine's id.
-pub fn read(conn: &Connection, roots: &Roots, machine: &str) -> rusqlite::Result<Vec<Kind>> {
-    let bundles = bundles(conn, roots, machine)?;
-    let held = held_folders(conn, machine)?;
-    let app_support = app_support(roots, machine, &bundles, &held);
-    Ok(vec![
-        bundles,
-        kegs(roots, machine),
-        npm(roots, machine),
-        app_support,
-    ])
+/// Runs `f` over `items` on up to `max_workers` threads, returning results in the exact order
+/// of `items`.
+fn parallel_map<T: Sync, R: Send>(
+    items: &[T],
+    max_workers: usize,
+    f: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
+    let workers = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(max_workers)
+        .min(items.len());
+    if workers <= 1 {
+        return items.iter().map(f).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let mut pairs: Vec<(usize, R)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut mine = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(i) else { break };
+                        mine.push((i, f(item)));
+                    }
+                    mine
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
+    pairs.sort_unstable_by_key(|(i, _)| *i);
+    pairs.into_iter().map(|(_, r)| r).collect()
+}
+
+/// Reads every kind of thing from disk alone using pre-loaded bundle verdicts and held
+/// Application Support folders, running independent categories concurrently.
+pub fn read_local(
+    roots: &Roots,
+    machine: &str,
+    prev_bundles: &HashMap<String, Previous>,
+    held: &BTreeMap<String, Held>,
+) -> Vec<Kind> {
+    let (bundles, app_support, kegs, npm) = std::thread::scope(|s| {
+        let h_kegs = s.spawn(|| kegs(roots, machine));
+        let h_npm = s.spawn(|| npm(roots, machine));
+        let bundles = bundles(roots, machine, prev_bundles);
+        let app_support = app_support(roots, machine, &bundles, held);
+        (
+            bundles,
+            app_support,
+            h_kegs
+                .join()
+                .unwrap_or_else(|_| Kind::new(KEGS, KEGS_CANNOT)),
+            h_npm.join().unwrap_or_else(|_| Kind::new(NPM, NPM_CANNOT)),
+        )
+    });
+    vec![bundles, kegs, npm, app_support]
+}
+
+/// Formats `\0{ctime}.{ctime_nsec}\n` into a stack buffer with no heap allocation.
+fn write_ctime<'a>(buf: &'a mut [u8; 64], m: &std::fs::Metadata) -> &'a [u8] {
+    use std::io::Write;
+    let mut w = &mut buf[..];
+    let _ = writeln!(w, "\0{}.{}", m.ctime(), m.ctime_nsec());
+    let written = 64 - w.len();
+    &buf[..written]
+}
+
+/// Whether `name` has an extension listed in `CODE`, ignoring case.
+fn is_code_ext(name: &std::ffi::OsStr) -> bool {
+    let b = name.as_bytes();
+    let Some(dot) = b.iter().rposition(|&c| c == b'.') else {
+        return false;
+    };
+    let ext = &b[dot + 1..];
+    if ext.is_ascii() {
+        CODE.iter().any(|c| ext.eq_ignore_ascii_case(c.as_bytes()))
+    } else {
+        let lower = String::from_utf8_lossy(ext).to_lowercase();
+        CODE.contains(&lower.as_str())
+    }
 }
 
 /// What a code walk ran into.
@@ -208,45 +280,66 @@ enum Walked {
 /// The records of every code file under `dir`, by path and change time, as `walk` makes them,
 /// within the caps.
 fn walk_code(
-    dir: &Path,
-    rel: &[u8],
+    dir: &mut PathBuf,
+    rel: &mut Vec<u8>,
     depth: usize,
     out: &mut Vec<u8>,
     files: &mut usize,
 ) -> std::io::Result<Walked> {
-    let mut names = std::fs::read_dir(dir)?
-        .map(|e| e.map(|e| e.file_name()))
-        .collect::<std::io::Result<Vec<OsString>>>()?;
-    names.sort();
-    for name in names {
-        let path = dir.join(&name);
-        let m = std::fs::symlink_metadata(&path)?;
-        let text = name.to_string_lossy().to_lowercase();
-        let mut here = rel.to_vec();
-        here.push(b'/');
-        here.extend_from_slice(name.as_bytes());
-        if m.is_dir() {
-            if text.contains("cache") || NOT_CODE.contains(&text.as_str()) {
-                continue;
+    let mut entries: Vec<(OsString, Option<std::fs::FileType>)> = std::fs::read_dir(&*dir)?
+        .map(|e| e.map(|e| (e.file_name(), e.file_type().ok())))
+        .collect::<std::io::Result<_>>()?;
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let mut time_buf = [0u8; 64];
+    let base_len = rel.len();
+    for (name, ft) in entries {
+        dir.push(&name);
+        let meta = if ft.is_some_and(|t| t.is_dir()) {
+            None
+        } else {
+            match std::fs::symlink_metadata(&*dir) {
+                Ok(m) if !m.is_dir() => Some(m),
+                Ok(_) => None,
+                Err(e) => {
+                    dir.pop();
+                    return Err(e);
+                }
             }
-            if depth == MAX_DEPTH {
-                return Ok(Walked::Capped(format!("deeper than {MAX_DEPTH} folders")));
+        };
+        let res = match meta {
+            None => {
+                let lower = name.to_string_lossy().to_lowercase();
+                if lower.contains("cache") || NOT_CODE.contains(&lower.as_str()) {
+                    Ok(Walked::Done)
+                } else if depth == MAX_DEPTH {
+                    Ok(Walked::Capped(format!("deeper than {MAX_DEPTH} folders")))
+                } else {
+                    rel.push(b'/');
+                    rel.extend_from_slice(name.as_bytes());
+                    let r = walk_code(dir, rel, depth + 1, out, files);
+                    rel.truncate(base_len);
+                    r
+                }
             }
-            if let Walked::Capped(cap) = walk_code(&path, &here, depth + 1, out, files)? {
-                return Ok(Walked::Capped(cap));
+            Some(m) if !is_code_ext(&name) && m.mode() & 0o111 == 0 => Ok(Walked::Done),
+            Some(m) => {
+                *files += 1;
+                if *files > MAX_FILES {
+                    Ok(Walked::Capped(format!("more than {MAX_FILES} code files")))
+                } else {
+                    rel.push(b'/');
+                    rel.extend_from_slice(name.as_bytes());
+                    out.extend_from_slice(rel);
+                    out.extend_from_slice(write_ctime(&mut time_buf, &m));
+                    rel.truncate(base_len);
+                    Ok(Walked::Done)
+                }
             }
-            continue;
+        };
+        dir.pop();
+        if let Walked::Capped(cap) = res? {
+            return Ok(Walked::Capped(cap));
         }
-        let extension = text.rsplit_once('.').map_or("", |(_, e)| e);
-        if !CODE.contains(&extension) && m.mode() & 0o111 == 0 {
-            continue;
-        }
-        *files += 1;
-        if *files > MAX_FILES {
-            return Ok(Walked::Capped(format!("more than {MAX_FILES} code files")));
-        }
-        out.extend_from_slice(&here);
-        out.extend_from_slice(format!("\0{}.{}\n", m.ctime(), m.ctime_nsec()).as_bytes());
     }
     Ok(Walked::Done)
 }
@@ -319,6 +412,7 @@ fn app_support(
     let own = roots.store.parent().map(same_place);
     kind.listed(APP_SUPPORT_PLACE);
     let (mut matched, mut files, mut kept) = (0, 0, Vec::new());
+    let mut candidates = Vec::new();
     for entry in entries {
         let text = entry.to_string_lossy().into_owned();
         let key = crate::spelling::key(&text);
@@ -351,8 +445,19 @@ fn app_support(
         if !unmatched {
             matched += 1;
         }
+        candidates.push((path, shown, versions, unmatched));
+    }
+    let walked = parallel_map(&candidates, 4, |(path, _, _, _)| {
         let (mut records, mut count) = (Vec::new(), 0);
-        match walk_code(&path, b"", 0, &mut records, &mut count) {
+        let mut dir = path.clone();
+        let mut rel = Vec::with_capacity(256);
+        let res = walk_code(&mut dir, &mut rel, 0, &mut records, &mut count);
+        (res, records, count)
+    });
+    for ((_, shown, versions, unmatched), (res, records, count)) in
+        candidates.into_iter().zip(walked)
+    {
+        match res {
             Err(e) => kind.failed(shown, e.to_string()),
             Ok(Walked::Capped(cap)) => kind.not_recorded(shown, Said::OverCap, cap),
             // No application read now matches it and no code is left in it: nothing to hold.
@@ -392,7 +497,7 @@ const NOT_A_FOLDER: &str =
 const KEPT: &str = "still compared, since an earlier reading held them and they are there, though no application read now matches them: ";
 
 /// A folder of code the store holds, or held, on this Mac.
-struct Held {
+pub struct Held {
     /// Its name as the store spells it in its id.
     name: String,
     /// The versions in force for it; none for a folder the store no longer holds.
@@ -408,7 +513,7 @@ struct Held {
 /// a folder by the spelling on disk wrote one for each, and a volume that tells them apart gives
 /// two. The one in force is taken, and with none in force the one retracted last, so that a
 /// folder on disk is never retracted to be added again under a stale spelling.
-fn held_folders(conn: &Connection, machine: &str) -> rusqlite::Result<BTreeMap<String, Held>> {
+pub fn held_folders(conn: &Connection, machine: &str) -> rusqlite::Result<BTreeMap<String, Held>> {
     let mut stmt = conn.prepare(
         "SELECT subject, predicate, object, layer = 'live', retracted_at FROM assertion
          WHERE layer IN ('live', 'retracted') AND reader = ?1 AND scope = ?2 AND kind = ?3
@@ -478,14 +583,28 @@ pub fn raw(kinds: &[Kind]) -> (String, Vec<Vec<usize>>) {
 
 /// The digest of a tree: every entry but folders, in order of path, by metadata alone.
 fn digest(root: &Path) -> Result<String, String> {
-    listing(root).map(|records| stat(&records))
+    let mut hasher = crate::sha256::Hasher::new();
+    let mut path = root.to_path_buf();
+    let mut rel = Vec::with_capacity(256);
+    walk_with(&mut path, &mut rel, &mut |r, t| {
+        hasher.update(r);
+        hasher.update(t);
+    })
+    .map_err(|e| e.to_string())?;
+    Ok(format!("stat:{}", hasher.hex()))
 }
 
 /// The list a tree's digest is made over: for each entry but folders, in order of path, its path
 /// from the tree, a NUL, its change time and a newline.
 fn listing(root: &Path) -> Result<Vec<u8>, String> {
     let mut records = Vec::new();
-    walk(root, b"", &mut records).map_err(|e| e.to_string())?;
+    let mut path = root.to_path_buf();
+    let mut rel = Vec::with_capacity(256);
+    walk_with(&mut path, &mut rel, &mut |r, t| {
+        records.extend_from_slice(r);
+        records.extend_from_slice(t);
+    })
+    .map_err(|e| e.to_string())?;
     Ok(records)
 }
 
@@ -494,25 +613,50 @@ fn stat(records: &[u8]) -> String {
     format!("stat:{}", crate::sha256::hex(records))
 }
 
-fn walk(dir: &Path, rel: &[u8], out: &mut Vec<u8>) -> std::io::Result<()> {
-    let mut names = std::fs::read_dir(dir)?
-        .map(|e| e.map(|e| e.file_name()))
-        .collect::<std::io::Result<Vec<OsString>>>()?;
-    names.sort();
-    for name in names {
-        let path = dir.join(&name);
-        let m = std::fs::symlink_metadata(&path)?;
-        let mut here = rel.to_vec();
-        here.push(b'/');
-        here.extend_from_slice(name.as_bytes());
-        if m.is_dir() {
-            if !SKIPPED.iter().any(|s| name == *s) {
-                walk(&path, &here, out)?;
+fn walk_with(
+    dir: &mut PathBuf,
+    rel: &mut Vec<u8>,
+    emit: &mut impl FnMut(&[u8], &[u8]),
+) -> std::io::Result<()> {
+    let mut entries: Vec<(OsString, Option<std::fs::FileType>)> = std::fs::read_dir(&*dir)?
+        .map(|e| e.map(|e| (e.file_name(), e.file_type().ok())))
+        .collect::<std::io::Result<_>>()?;
+    entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    let mut time_buf = [0u8; 64];
+    let base_len = rel.len();
+    for (name, ft) in entries {
+        dir.push(&name);
+        let meta = if ft.is_some_and(|t| t.is_dir()) {
+            None
+        } else {
+            match std::fs::symlink_metadata(&*dir) {
+                Ok(m) if !m.is_dir() => Some(m),
+                Ok(_) => None,
+                Err(e) => {
+                    dir.pop();
+                    return Err(e);
+                }
             }
-            continue;
-        }
-        out.extend_from_slice(&here);
-        out.extend_from_slice(format!("\0{}.{}\n", m.ctime(), m.ctime_nsec()).as_bytes());
+        };
+        let res = match meta {
+            None if SKIPPED.iter().any(|s| name == *s) => Ok(()),
+            None => {
+                rel.push(b'/');
+                rel.extend_from_slice(name.as_bytes());
+                let r = walk_with(dir, rel, emit);
+                rel.truncate(base_len);
+                r
+            }
+            Some(m) => {
+                rel.push(b'/');
+                rel.extend_from_slice(name.as_bytes());
+                emit(rel, write_ctime(&mut time_buf, &m));
+                rel.truncate(base_len);
+                Ok(())
+            }
+        };
+        dir.pop();
+        res?;
     }
     Ok(())
 }
@@ -559,18 +703,23 @@ fn same_place(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// One value of a property list, asked of the system's tool, or `None` when it has none.
-fn plist_value(plist: &Path, key: &str) -> Option<String> {
-    let out = Command::new(PLUTIL)
-        .args(["-extract", key, "raw", "-o", "-"])
-        .arg(plist)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    let text = String::from_utf8(out.stdout).ok()?;
-    let text = text.strip_suffix('\n').unwrap_or(&text);
-    out.status.success().then(|| text.to_string())
+/// Bundle identifier, short version and build from `Info.plist`, parsed in-process with
+/// CoreFoundation (`plist::raw_scalars`) instead of spawning `plutil`.
+fn bundle_plist(plist: &Path) -> [Option<String>; 3] {
+    let Ok(bytes) = std::fs::read(plist) else {
+        return [None, None, None];
+    };
+    let Some(mut vals) = crate::plist::raw_scalars(
+        &bytes,
+        &[
+            "CFBundleIdentifier",
+            "CFBundleShortVersionString",
+            "CFBundleVersion",
+        ],
+    ) else {
+        return [None, None, None];
+    };
+    [vals[0].1.take(), vals[1].1.take(), vals[2].1.take()]
 }
 
 /// The version as a bundle gives it: the short version, and the build in brackets when it
@@ -691,36 +840,57 @@ fn find_bundles(roots: &Roots, kind: &mut Kind) -> Vec<Found> {
 
 /// What the store holds of a bundle from the last reading: digest and seal, and when
 /// the digest was first seen, which is when its seal was last verified.
-struct Previous {
+pub struct Previous {
     digest: Option<String>,
     seal: Option<String>,
     verified_at: i64,
 }
 
-fn previous(conn: &Connection, subject: &str) -> rusqlite::Result<Previous> {
+/// Every bundle's previous digest and seal on `machine`, loaded in one query.
+pub fn previous_bundles(
+    conn: &Connection,
+    machine: &str,
+) -> rusqlite::Result<HashMap<String, Previous>> {
     let mut stmt = conn.prepare(
-        "SELECT predicate, object, observed_at FROM assertion
-         WHERE layer = 'live' AND reader = ?1 AND subject = ?2
+        "SELECT subject, predicate, object, observed_at FROM assertion
+         WHERE layer = 'live' AND reader = ?1 AND scope = ?2 AND kind = ?3
            AND predicate IN ('has_digest', 'has_seal')",
     )?;
-    let mut values: BTreeMap<String, Vec<(String, i64)>> = BTreeMap::new();
-    for row in stmt.query_map(params![READER, subject], |r| {
-        Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?))
+    type Pair = (Vec<(String, i64)>, Vec<(String, i64)>);
+    let mut by_subject: HashMap<String, Pair> = HashMap::new();
+    for row in stmt.query_map(params![READER, machine, BUNDLES], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)?,
+        ))
     })? {
-        let (predicate, object, at) = row?;
-        values.entry(predicate).or_default().push((object, at));
+        let (subject, predicate, object, at) = row?;
+        let entry = by_subject.entry(subject).or_default();
+        if predicate == "has_digest" {
+            entry.0.push((object, at));
+        } else {
+            entry.1.push((object, at));
+        }
     }
     // Only one value is a value; two, left by a partial reading, are not to be trusted.
-    let one = |p: &str| match values.get(p).map(Vec::as_slice) {
-        Some([(object, at)]) => Some((object.clone(), *at)),
-        _ => None,
+    let one = |v: Vec<(String, i64)>| match <[_; 1]>::try_from(v) {
+        Ok([item]) => Some(item),
+        Err(_) => None,
     };
-    let digest = one("has_digest");
-    Ok(Previous {
-        verified_at: digest.as_ref().map_or(0, |(_, at)| *at),
-        digest: digest.map(|(d, _)| d),
-        seal: one("has_seal").map(|(s, _)| s),
-    })
+    Ok(by_subject
+        .into_iter()
+        .map(|(subject, (digests, seals))| {
+            let digest = one(digests);
+            let prev = Previous {
+                verified_at: digest.as_ref().map_or(0, |(_, at)| *at),
+                digest: digest.map(|(d, _)| d),
+                seal: one(seals).map(|(s, _)| s),
+            };
+            (subject, prev)
+        })
+        .collect())
 }
 
 /// A bundle read up to the point where the framework is asked about it.
@@ -761,38 +931,45 @@ fn examine_all(prepared: &[Prepared]) -> Vec<(Option<String>, Option<String>)> {
     results.into_inner().unwrap_or_else(|e| e.into_inner())
 }
 
-fn bundles(conn: &Connection, roots: &Roots, machine: &str) -> rusqlite::Result<Kind> {
+fn bundles(roots: &Roots, machine: &str, prev_bundles: &HashMap<String, Previous>) -> Kind {
     let mut kind = Kind::new(BUNDLES, BUNDLES_CANNOT);
     let found = find_bundles(roots, &mut kind);
+    let scanned = parallel_map(&found, 4, |f| {
+        let digest = digest(&f.path);
+        let plist = digest
+            .as_ref()
+            .ok()
+            .map(|_| bundle_plist(&f.path.join("Contents/Info.plist")));
+        (digest, plist)
+    });
     let mut names = BTreeSet::new();
     let mut prepared = Vec::new();
-    for f in found {
-        let digest = match digest(&f.path) {
+    for (f, (digest, plist)) in found.into_iter().zip(scanned) {
+        let digest = match digest {
             Ok(d) => d,
             Err(why) => {
                 kind.failed(f.shown, why);
                 continue;
             }
         };
-        let plist = f.path.join("Contents/Info.plist");
+        let [id, short, build] = plist.unwrap_or([None, None, None]);
         let folder = f.path.file_name().unwrap_or_default().to_string_lossy();
-        let name = plist_value(&plist, "CFBundleIdentifier").unwrap_or_else(|| folder.to_string());
+        let name = id.unwrap_or_else(|| folder.to_string());
         if !names.insert(name.clone()) {
             kind.not_recorded(f.shown, Said::SameName, String::new());
             continue;
         }
-        let version = bundle_version(
-            plist_value(&plist, "CFBundleShortVersionString"),
-            plist_value(&plist, "CFBundleVersion"),
-        );
+        let version = bundle_version(short, build);
         let subject = format!("component:{machine}/macos-app/{name}");
-        let before = previous(conn, &subject)?;
         // The Info.plist is in the digest: a new version is a new digest.
-        let unmoved = before.digest.as_ref() == Some(&digest);
-        let carry = before
-            .seal
-            .filter(|_| unmoved)
-            .map(|s| (s, before.verified_at));
+        let carry = prev_bundles.get(&subject).and_then(|before| {
+            let unmoved = before.digest.as_ref() == Some(&digest);
+            before
+                .seal
+                .as_ref()
+                .filter(|_| unmoved)
+                .map(|s| (s.clone(), before.verified_at))
+        });
         prepared.push(Prepared {
             found: f,
             subject,
@@ -849,7 +1026,7 @@ fn bundles(conn: &Connection, roots: &Roots, machine: &str) -> rusqlite::Result<
     if kind.look.present > 0 {
         kind.notes.push(note);
     }
-    Ok(kind)
+    kind
 }
 
 /// Each prefix of Homebrew under the system root, and its path from `/`.
@@ -875,6 +1052,7 @@ fn kegs(roots: &Roots, machine: &str) -> Kind {
             Some(Ok(names)) => names,
         };
         kind.listed(&shown);
+        let mut todo = Vec::new();
         for name in names {
             let formula = cellar.join(&name);
             let here = format!("{shown}/{}", name.to_string_lossy());
@@ -895,19 +1073,23 @@ fn kegs(roots: &Roots, machine: &str) -> Kind {
                 if !real_folder(&keg) {
                     continue;
                 }
-                match listing(&keg) {
-                    Err(why) => kind.failed(shown, why),
-                    Ok(list) => kind.things.push(Thing {
-                        subject: format!("file:{machine}/{shown}"),
-                        facts: vec![
-                            ("located_on", machine.to_string()),
-                            ("has_digest", stat(&list)),
-                        ],
-                        shown,
-                        how: String::new(),
-                        list: Some(list),
-                    }),
-                }
+                todo.push((keg, shown));
+            }
+        }
+        let lists = parallel_map(&todo, 4, |(keg, _)| listing(keg));
+        for ((_, shown), listed) in todo.into_iter().zip(lists) {
+            match listed {
+                Err(why) => kind.failed(shown, why),
+                Ok(list) => kind.things.push(Thing {
+                    subject: format!("file:{machine}/{shown}"),
+                    facts: vec![
+                        ("located_on", machine.to_string()),
+                        ("has_digest", stat(&list)),
+                    ],
+                    shown,
+                    how: String::new(),
+                    list: Some(list),
+                }),
             }
         }
     }
@@ -962,9 +1144,10 @@ fn npm(roots: &Roots, machine: &str) -> Kind {
                 }
             }
         }
-        for (name, path) in packages {
+        let lists = parallel_map(&packages, 4, |(_, path)| listing(path));
+        for ((name, path), listed) in packages.into_iter().zip(lists) {
             let here = format!("{shown}/{name}");
-            let list = match listing(&path) {
+            let list = match listed {
                 Ok(list) => list,
                 Err(why) => {
                     kind.failed(here, why);

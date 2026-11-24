@@ -61,7 +61,7 @@ use crate::look::{Absent, Look, Said};
 use crate::sha256::Hasher;
 use crate::store::{Cause, Lack};
 use rusqlite::{Connection, Transaction, params};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Seek, SeekFrom};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -365,6 +365,7 @@ pub fn sessions(
             .saturating_sub(SETTLE_NS),
         budget,
         limit: budget,
+        fs_kept: HashMap::new(),
         out: Sessions::default(),
     };
     walk.out.look.present = 1;
@@ -384,6 +385,9 @@ struct Walk<'a> {
     /// The folders below the level of the sessions still to be listed, of `limit`.
     budget: usize,
     limit: usize,
+    /// Whether each device (`st_dev`) keeps a kernel-maintained change time, cached across files
+    /// on the same volume to avoid calling `fstatfs` per session file.
+    fs_kept: HashMap<u64, bool>,
     out: Sessions,
 }
 
@@ -448,6 +452,7 @@ impl Walk<'_> {
                 before,
                 self.settled_before,
                 compressed.then_some(DECODED_BYTES),
+                &mut self.fs_kept,
                 &mut self.out,
             );
         }
@@ -556,23 +561,32 @@ fn read_session(
     before: Option<&Held>,
     settled_before: i64,
     compressed: Option<u64>,
+    fs_kept: &mut HashMap<u64, bool>,
     out: &mut Sessions,
 ) {
     let (mut whole, mut last) = (Parsed::of(source), Parsed::of(source));
     let read = crate::watched::open_regular(path).and_then(|opened| {
         let (mut file, meta) = opened.map_err(|what| std::io::Error::other(format!("a {what}")))?;
+        let change_time_kept = *fs_kept
+            .entry(meta.dev())
+            .or_insert_with(|| change_time_kept(&file));
+        let len = meta.len();
         let then = Then {
             stat: Stat::of(&meta),
             before,
             settled_before,
-            change_time_kept: change_time_kept(&file),
+            change_time_kept,
         };
         match compressed {
-            Some(most) => {
-                let len = meta.len();
-                read_compressed(&mut file, &then, len, most, &mut whole, &mut out.cost)
-            }
-            None => read_from(&mut file, &then, &mut whole, &mut last, &mut out.cost),
+            Some(most) => read_compressed(&mut file, &then, len, most, &mut whole, &mut out.cost),
+            None => read_from_sized(
+                &mut file,
+                &then,
+                Some(len),
+                &mut whole,
+                &mut last,
+                &mut out.cost,
+            ),
         }
     });
     let unit = Unit::whole(path.display().to_string());
@@ -671,9 +685,21 @@ fn kept_by(fs_type: &[u8]) -> bool {
 /// whole lines before the new position go to `whole`, together with what the entry before
 /// holds of the bytes not read again; a last line without its line break goes to `last`.
 /// Returns the entry to keep, or `None` when it would hold more than the store keeps.
+#[cfg(test)]
 fn read_from<R: Read + Seek>(
     file: &mut R,
     then: &Then,
+    whole: &mut Parsed,
+    last: &mut Parsed,
+    cost: &mut Cost,
+) -> std::io::Result<Option<Held>> {
+    read_from_sized(file, then, None, whole, last, cost)
+}
+
+fn read_from_sized<R: Read + Seek>(
+    file: &mut R,
+    then: &Then,
+    len: Option<u64>,
     whole: &mut Parsed,
     last: &mut Parsed,
     cost: &mut Cost,
@@ -682,8 +708,14 @@ fn read_from<R: Read + Seek>(
         // Not written to since: only what follows the position, a line still being written.
         cost.unchanged += 1;
         whole.kept(b);
+        if len.is_some_and(|n| b.position >= n) {
+            return Ok(Some(b.clone()));
+        }
         file.seek(SeekFrom::Start(b.position))?;
-        let mut reader = BufReader::with_capacity(1 << 20, file);
+        let cap = len.map_or(1 << 20, |n| {
+            n.saturating_sub(b.position).clamp(4096, 1 << 20) as usize
+        });
+        let mut reader = BufReader::with_capacity(cap, file);
         let mut line = Vec::new();
         while let Some(read) = read_line(&mut reader, &mut line, cost, |_| {})? {
             last.line(&line, read)?;
@@ -704,7 +736,10 @@ fn read_from<R: Read + Seek>(
             file.seek(SeekFrom::Start(0))?;
         }
     }
-    let mut reader = BufReader::with_capacity(1 << 20, file);
+    let cap = len.map_or(1 << 20, |n| {
+        n.saturating_sub(position).clamp(4096, 1 << 20) as usize
+    });
+    let mut reader = BufReader::with_capacity(cap, file);
     let mut line = Vec::new();
     loop {
         // A line is hashed as it is read, and taken back if it turns out to be the last one,

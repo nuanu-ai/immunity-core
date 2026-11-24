@@ -1185,38 +1185,6 @@ pub fn predicate_is_entity(tx: &Transaction, predicate: &str) -> rusqlite::Resul
     )
 }
 
-/// Writes one draft assertion, and the entities it names: the subject, and the object
-/// when the vocabulary says the predicate points at an entity.
-pub fn put_draft(
-    tx: &Transaction,
-    r: &Reading,
-    basis: &str,
-    s: &Statement,
-) -> rusqlite::Result<()> {
-    put_entity(tx, &s.subject)?;
-    if predicate_is_entity(tx, s.predicate)? {
-        put_entity(tx, &s.object)?;
-    }
-    tx.execute(
-        "INSERT INTO assertion (layer, subject, predicate, object, reader, scope, kind,
-                                source_ref, basis, observed_at, run_id)
-         VALUES ('draft', ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![
-            s.subject,
-            s.predicate,
-            s.object,
-            r.reader,
-            r.scope,
-            r.kind,
-            s.source_ref,
-            basis,
-            r.observed_at,
-            r.run_id
-        ],
-    )?;
-    Ok(())
-}
-
 /// Writes one reading's coverage, with why it is incomplete and what this build has no
 /// reader for in it. A full reading has no cause. An incomplete one without a cause is a
 /// mistake in a reader: it is written as `failed`, because unknown is never calm.

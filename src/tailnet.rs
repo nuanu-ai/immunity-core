@@ -246,38 +246,98 @@ fn sockets(processes: &str) -> Vec<String> {
     out
 }
 
+/// How long the default socket probe gets on its own before custom `tailscaled --socket=`
+/// sockets are probed concurrently, so a hung default socket does not stall the check for 10 s.
+const FALLBACK_AFTER: Duration = Duration::from_millis(300);
+
+fn interpret(stdout: &str) -> Found {
+    match parse(stdout) {
+        Ok(Answer::Peers(seen)) => Found::Read(seen),
+        Ok(Answer::State(t)) if t.retry => Found::Failed(t.reason.to_string()),
+        Ok(Answer::State(t)) => Found::Off(t.reason.to_string()),
+        Err(e) => Found::Failed(e),
+    }
+}
+
 fn read_from(cli: Option<&Path>, processes: impl Fn() -> String) -> Found {
+    use std::sync::atomic::{AtomicBool, Ordering};
     let Some(cli) = cli else {
         return Found::Absent(NOT_INSTALLED);
     };
-    let mut tried = Vec::new();
-    let mut ways = vec![None];
-    let mut asked = false;
-    while let Some(socket) = ways.pop() {
-        match run(cli, socket.as_deref()) {
-            Ok((true, stdout, _)) => {
-                return match parse(&stdout) {
-                    Ok(Answer::Peers(seen)) => Found::Read(seen),
-                    Ok(Answer::State(t)) if t.retry => Found::Failed(t.reason.to_string()),
-                    Ok(Answer::State(t)) => Found::Off(t.reason.to_string()),
-                    Err(e) => Found::Failed(e),
-                };
+    let cancel = AtomicBool::new(false);
+    // Start the default socket probe first; if it answers quickly (the usual case), `ps` is
+    // never spawned. If it fails or stalls past `FALLBACK_AFTER`, probe custom `tailscaled`
+    // sockets concurrently and cancel the rest as soon as one succeeds.
+    let (tx, rx) = std::sync::mpsc::channel::<(usize, Result<(bool, String, String), String>)>();
+    let mut custom: Vec<String> = Vec::new();
+    type Probe = Result<(bool, String, String), String>;
+    let mut results: Vec<Option<Probe>> = vec![None];
+    let answer = std::thread::scope(|scope| {
+        let tx0 = tx.clone();
+        let cancel_ref = &cancel;
+        scope.spawn(move || {
+            let res = run(cli, None, cancel_ref);
+            let _ = tx0.send((0, res));
+        });
+        let mut custom_spawned = false;
+        let mut remaining = 1usize;
+        let deadline = Instant::now() + FALLBACK_AFTER;
+        while remaining > 0 {
+            let msg = if !custom_spawned {
+                let wait = deadline.saturating_duration_since(Instant::now());
+                match rx.recv_timeout(wait) {
+                    Ok(m) => Some(m),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            } else {
+                rx.recv().ok()
+            };
+            if let Some((idx, res)) = msg {
+                remaining -= 1;
+                if let Ok((true, ref stdout, _)) = res {
+                    cancel.store(true, Ordering::Relaxed);
+                    return Some(interpret(stdout));
+                }
+                results[idx] = Some(res);
             }
-            Ok((false, _, stderr)) => tried.push((socket, short(&stderr))),
-            Err(e) => tried.push((socket, e)),
+            if !custom_spawned {
+                custom_spawned = true;
+                custom = sockets(&processes());
+                results.resize_with(1 + custom.len(), || None);
+                for (i, sock) in custom.iter().enumerate() {
+                    let idx = i + 1;
+                    let tx_i = tx.clone();
+                    let sock = sock.clone();
+                    remaining += 1;
+                    scope.spawn(move || {
+                        let res = run(cli, Some(sock.as_str()), cancel_ref);
+                        let _ = tx_i.send((idx, res));
+                    });
+                }
+            }
         }
-        if !asked {
-            asked = true;
-            ways = sockets(&processes()).into_iter().rev().map(Some).collect();
+        None
+    });
+    if let Some(found) = answer {
+        return found;
+    }
+    let mut ways = Vec::with_capacity(results.len());
+    for (idx, res) in results.into_iter().enumerate() {
+        let why = match res {
+            Some(Ok((false, _, stderr))) => short(&stderr),
+            Some(Err(e)) => e,
+            _ => "no reason given".to_string(),
+        };
+        if idx == 0 {
+            ways.push(format!("on the default socket ({why})"));
+        } else {
+            ways.push(format!(
+                "on the socket {} of a running tailscaled ({why})",
+                custom[idx - 1]
+            ));
         }
     }
-    let ways: Vec<String> = tried
-        .into_iter()
-        .map(|(socket, why)| match socket {
-            None => format!("on the default socket ({why})"),
-            Some(socket) => format!("on the socket {socket} of a running tailscaled ({why})"),
-        })
-        .collect();
     Found::Failed(format!(
         "tailscale could not reach its daemon {}",
         ways.join("; nor ")
@@ -297,9 +357,13 @@ fn short(stderr: &str) -> String {
     }
 }
 
-/// Runs `status --json`, on the given socket if any, and gives up after the timeout: a
-/// stuck daemon must not stop a run.
-fn run(cli: &Path, socket: Option<&str>) -> Result<(bool, String, String), String> {
+/// Runs `status --json`, on the given socket if any, and gives up after the timeout or once
+/// another socket probe has already answered (`cancel`): a stuck daemon must not stop a run.
+fn run(
+    cli: &Path,
+    socket: Option<&str>,
+    cancel: &std::sync::atomic::AtomicBool,
+) -> Result<(bool, String, String), String> {
     let mut command = Command::new(cli);
     if let Some(socket) = socket {
         command.arg(format!("--socket={socket}"));
@@ -336,8 +400,13 @@ fn run(cli: &Path, socket: Option<&str>) -> Result<(bool, String, String), Strin
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
+            Ok(None) if cancel.load(std::sync::atomic::Ordering::Relaxed) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("cancelled".to_string());
+            }
             Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(25));
             }
             Ok(None) => {
                 let _ = child.kill();

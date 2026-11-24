@@ -2468,17 +2468,128 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
         let conn = store::open_or_make(&args.store)?;
         store::journal_note(&conn, at, &run_id, "run_started", "")?;
     }
-    stage(CheckStage::Downloading);
-    let feeds = get_feeds(read_only.as_ref(), args, &home, at)?;
-    let catalogue = get_catalogue(read_only.as_ref(), args)?;
+    // Snapshot the read-only state needed by downloads and lock-free local readers before any
+    // threads run (`rusqlite::Connection` is `!Sync`). Because `_fetching` serializes full runs
+    // and the watcher writes only `watched`, `processes`, and `events`, none of these tables
+    // change before the run takes the store lock to commit.
+    let pre_machine = match read_only.as_ref() {
+        Some(ro) => match store::held_mac(ro)? {
+            Some((id, _)) => id,
+            None => {
+                covered::this_machine(ro)?.unwrap_or_else(|| format!("machine:{}", args.machine))
+            }
+        },
+        None => format!("machine:{}", args.machine),
+    };
+    let prev_checkouts = match read_only.as_ref() {
+        Some(ro) => store::live_subjects(ro, checkouts::READER)?,
+        None => BTreeSet::new(),
+    };
+    let prev_agent_checkouts = match read_only.as_ref() {
+        Some(ro) => store::live_subjects(ro, agent_folders::READER)?,
+        None => BTreeSet::new(),
+    };
+    let held_sessions = match read_only.as_ref() {
+        Some(ro) => agent_folders::held(ro)?,
+        None => BTreeMap::new(),
+    };
+    let prev_bundles = match read_only.as_ref() {
+        Some(ro) => integrity::previous_bundles(ro, &pre_machine)?,
+        None => HashMap::new(),
+    };
+    let held_app_support = match read_only.as_ref() {
+        Some(ro) => integrity::held_folders(ro, &pre_machine)?,
+        None => BTreeMap::new(),
+    };
+    let feed_plans = plan_feeds(read_only.as_ref(), args, &home, at)?;
+    let threat_etag = match &args.threats_input {
+        Some(_) => None,
+        None => threats::last_etag(read_only.as_ref())?,
+    };
     drop(read_only);
-    // Held until the run returns. Whoever holds it now is a reading or a command, waited out.
+
+    stage(CheckStage::Downloading);
+    let (feeds, catalogue) = get_downloads(feed_plans, threat_etag, args, &home);
+
+    // Collect slow read-only local sources concurrently before taking the store lock, so the
+    // watcher and read/write commands stay responsive throughout the check.
+    stage(CheckStage::Packages);
+    let roots = integrity::Roots {
+        home: &args.home,
+        system: &args.system_root,
+        store: &args.store,
+    };
+    let (
+        collected_brew,
+        collected_checkouts,
+        collected_agents,
+        found,
+        collected_lockfiles,
+        collected_integrity,
+        collected_traces,
+    ) = std::thread::scope(|s| {
+        let h_integrity = s.spawn(|| {
+            integrity::read_local(&roots, &pre_machine, &prev_bundles, &held_app_support)
+        });
+        let h_traces = s.spawn(|| collect_traces(args));
+        let h_checkouts = s.spawn(|| collect_checkouts(args, &pre_machine, &prev_checkouts));
+        let h_agents = s.spawn(|| {
+            collect_agent_folders(
+                args,
+                &pre_machine,
+                &prev_agent_checkouts,
+                &held_sessions,
+                agent_folders::LOOK_LIMIT,
+            )
+        });
+        let collected_brew =
+            brew::read(args.brew_input.as_deref(), args.brew.as_deref(), &args.home);
+        stage(CheckStage::Projects);
+        let collected_checkouts = h_checkouts
+            .join()
+            .unwrap_or_else(|_| collect_checkouts(args, &pre_machine, &prev_checkouts));
+        let collected_agents = h_agents.join().unwrap_or_else(|_| {
+            collect_agent_folders(
+                args,
+                &pre_machine,
+                &prev_agent_checkouts,
+                &held_sessions,
+                agent_folders::LOOK_LIMIT,
+            )
+        });
+        let walked = collected_checkouts.checkouts();
+        let from_agents = collected_agents.checkouts();
+        let any_checkouts = walked.is_some() || !from_agents.is_empty();
+        // One checkout found by both readers is read once.
+        let mut found = walked.unwrap_or_default();
+        let known: BTreeSet<String> = found.iter().map(|c| c.rel.clone()).collect();
+        found.extend(from_agents.into_iter().filter(|c| !known.contains(&c.rel)));
+        stage(CheckStage::Lockfiles);
+        let collected_lockfiles =
+            any_checkouts.then(|| collect_lockfiles(args, &pre_machine, &found));
+        let collected_integrity = h_integrity.join().unwrap_or_else(|_| {
+            integrity::read_local(&roots, &pre_machine, &prev_bundles, &held_app_support)
+        });
+        let collected_traces = h_traces.join().unwrap_or_else(|_| collect_traces(args));
+        (
+            collected_brew,
+            collected_checkouts,
+            collected_agents,
+            found,
+            collected_lockfiles,
+            collected_integrity,
+            collected_traces,
+        )
+    });
+
+    // Held only for committing collected readings and running the fast store-bound steps.
     let _lock = take_store(&home, store::CHECK_WAIT)?;
     let mut conn = store::open_or_make(&args.store)?;
 
     let tx = conn.transaction()?;
     // The store keeps this Mac's id; its name now is kept beside it.
     let machine = store::this_mac(&tx, &args.machine)?;
+    debug_assert_eq!(machine, pre_machine);
     store::put_entity(&tx, &machine)?;
     let mut run = Run {
         tx: &tx,
@@ -2490,21 +2601,13 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
         readers: 0,
         settle: Settle::default(),
     };
-    stage(CheckStage::Packages);
-    read_brew(&mut run, args)?;
+    apply_brew(&mut run, args, collected_brew)?;
     let servers = args.servers_input.clone();
     read_servers(&mut run, servers.as_deref())?;
-    stage(CheckStage::Projects);
-    let (walked, walk_failure, not_told) = read_checkouts(&mut run, args)?;
-    let from_agents = read_agent_folders(&mut run, args, agent_folders::LOOK_LIMIT)?;
-    let any_checkouts = walked.is_some() || !from_agents.is_empty();
-    // One checkout found by both readers is read once.
-    let mut found = walked.unwrap_or_default();
-    let known: BTreeSet<String> = found.iter().map(|c| c.rel.clone()).collect();
-    found.extend(from_agents.into_iter().filter(|c| !known.contains(&c.rel)));
-    stage(CheckStage::Lockfiles);
-    if any_checkouts {
-        read_lockfiles(&mut run, args, &found)?;
+    let (walk_failure, not_told) = apply_checkouts(&mut run, args, collected_checkouts)?;
+    apply_agent_folders(&mut run, args, collected_agents)?;
+    if let Some(lockfiles) = collected_lockfiles {
+        apply_lockfiles(&mut run, args, lockfiles)?;
     }
     stage(CheckStage::Places);
     let mut git_cache = git_hooks::Cache::default();
@@ -2529,7 +2632,7 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     }
     read_other_autoruns(&mut run, &args.home, &found, walk_failure)?;
     stage(CheckStage::Software);
-    let mut changed = read_integrity(&mut run, args)?;
+    let mut changed = apply_integrity(&mut run, args, collected_integrity)?;
     changed.extend(read_indicators(
         &mut run,
         args,
@@ -2540,13 +2643,13 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     opened += findings::detect(run.tx, run.run_id, run.at, &changed)?;
     stage(CheckStage::Events);
     opened += read_events(&mut run, args)?;
-    read_traces(&mut run, args)?;
+    apply_traces(&mut run, args, collected_traces)?;
     opened += settled(&mut run, &mut watched)?;
     stage(CheckStage::Saving);
     resolve(&mut run)?;
-    read_threats(&run, catalogue)?;
-    read_feeds(&run, feeds)?;
-    opened += match_dependencies(&run)?;
+    let threats_changed = read_threats(&run, catalogue)?;
+    let feeds_changed = read_feeds(&run, feeds)?;
+    opened += match_dependencies(&run, threats_changed || feeds_changed)?;
 
     // What the line counts is read back from what the run wrote, by the code `immunity status`
     // reads it with after the run.
@@ -2695,14 +2798,10 @@ impl Run<'_> {
         may_go: &dyn Fn(&str) -> bool,
         judge: &mut dyn FnMut(&Event) -> rusqlite::Result<Verdict>,
     ) -> rusqlite::Result<Judged> {
-        if a.compared != "none" {
-            for (basis, s) in statements {
-                store::put_draft(self.tx, r, basis, s)?;
-            }
-        }
         store::put_coverage(self.tx, r, a.completeness, a.reason, a.gap)?;
         let of = || [r.reader, r.scope, r.kind].map(str::to_string);
-        let (events, held) = lifecycle::promote(self.tx, r, a.compared, may_go)?;
+        let (events, held) =
+            lifecycle::promote_statements(self.tx, r, a.compared, statements, may_go)?;
         let mut out = Vec::new();
         for e in events {
             let verdict = judge(&e)?;
@@ -2807,7 +2906,7 @@ impl Run<'_> {
     }
 }
 
-fn read_brew(run: &mut Run, args: &Args) -> Result<(), Box<dyn Error>> {
+fn apply_brew(run: &mut Run, args: &Args, found: brew::Found) -> Result<(), Box<dyn Error>> {
     let (at, run_id, machine) = (run.at, run.run_id.to_string(), run.machine.to_string());
     let reading = Reading {
         reader: brew::READER,
@@ -2817,7 +2916,7 @@ fn read_brew(run: &mut Run, args: &Args) -> Result<(), Box<dyn Error>> {
         at,
         observed_at: at,
     };
-    match brew::read(args.brew_input.as_deref(), args.brew.as_deref(), &args.home) {
+    match found {
         brew::Found::Output(raw) => {
             run.readers += 1;
             let raw_file = run.keep_raw(brew::READER, brew::RAW, raw.as_bytes())?;
@@ -3058,11 +3157,14 @@ fn unlisted_note(folders: &[String]) -> String {
 /// What the walk for checkouts gives the readings over checkouts: the checkouts it found, a
 /// reason when it failed, and the checkouts the store holds that it could not look at, by
 /// their paths as ids name them.
+#[cfg(test)]
 type CheckoutWalk = (
     Option<Vec<checkouts::Checkout>>,
     Option<&'static str>,
     Vec<String>,
 );
+
+type CheckoutApplied = (Option<&'static str>, Vec<String>);
 
 /// Which checkouts are on this machine, with a reason if the walk failed. When its root is
 /// not a folder its reading failed. A walk closes a checkout the store holds only where it
@@ -3072,44 +3174,46 @@ type CheckoutWalk = (
 /// real path. Its completeness, cause and reason follow from what it read and did not
 /// (`look.rs`): the folders it listed and the checkouts it found are read, a folder it could
 /// not list is a unit not read, and what it did not look at that is no unit is said apart.
-fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Error>> {
+enum CollectedCheckouts {
+    NotDir(PathBuf),
+    Walked(Box<WalkedCheckouts>),
+}
+
+struct WalkedCheckouts {
+    start_home: PathBuf,
+    walk: checkouts::Walk,
+    kept: Vec<String>,
+    unknown: Vec<String>,
+    linked: Vec<String>,
+}
+
+impl CollectedCheckouts {
+    fn checkouts(&self) -> Option<Vec<checkouts::Checkout>> {
+        match self {
+            CollectedCheckouts::NotDir(_) => None,
+            CollectedCheckouts::Walked(w) => Some(w.walk.checkouts.clone()),
+        }
+    }
+}
+
+fn collect_checkouts(
+    args: &Args,
+    machine: &str,
+    prev_subjects: &BTreeSet<String>,
+) -> CollectedCheckouts {
     let start = checkouts::start(args.checkouts_root.as_deref(), &args.home);
     let root = &start.root;
-    let (run_id, machine) = (run.run_id.to_string(), run.machine.to_string());
-    let reading = Reading {
-        reader: checkouts::READER,
-        scope: &machine,
-        kind: checkouts::KIND,
-        run_id: &run_id,
-        at: run.at,
-        observed_at: run.at,
-    };
     if !root.is_dir() {
-        run.notes.push(format!(
-            "Could not look for checkouts in {}: not a folder.",
-            known::whole(&root.display().to_string())
-        ));
-        let reason = format!(
-            "could not look for checkouts in {}: not a folder",
-            root.display()
-        );
-        let gap = Gap::of(Cause::Failed);
-        run.apply(&reading, checkouts::BASIS, "none", Some(&reason), &gap, &[])?;
-        return Ok((
-            None,
-            Some("the checkout walk could not open its root folder"),
-            Vec::new(),
-        ));
+        return CollectedCheckouts::NotDir(root.clone());
     }
-    run.readers += 1;
     let mut walk = checkouts::walk(root, &start.home);
     // A checkout the store holds that the walk did not meet is kept as it was, nothing inside
     // it read, outside the walk's root, and otherwise as looking again says. One the walk met
     // comes back gone, as one the disk names as a checkout the walk met: it is held already.
     let prefix = format!("checkout:{machine}/");
     let (mut kept, mut unknown, mut linked) = (Vec::new(), Vec::new(), Vec::new());
-    for rel in store::live_subjects(run.tx, checkouts::READER)?
-        .into_iter()
+    for rel in prev_subjects
+        .iter()
         .filter_map(|id| id.strip_prefix(&prefix).map(str::to_string))
     {
         let path = start.home.join(&rel);
@@ -3136,6 +3240,59 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
             }
         }
     }
+    CollectedCheckouts::Walked(Box::new(WalkedCheckouts {
+        start_home: start.home,
+        walk,
+        kept,
+        unknown,
+        linked,
+    }))
+}
+
+#[cfg(test)]
+fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Error>> {
+    let prev = store::live_subjects(run.tx, checkouts::READER)?;
+    let collected = collect_checkouts(args, run.machine, &prev);
+    let checkouts = collected.checkouts();
+    let (failure, unknown) = apply_checkouts(run, args, collected)?;
+    Ok((checkouts, failure, unknown))
+}
+
+fn apply_checkouts(
+    run: &mut Run,
+    args: &Args,
+    collected: CollectedCheckouts,
+) -> Result<CheckoutApplied, Box<dyn Error>> {
+    let (run_id, machine) = (run.run_id.to_string(), run.machine.to_string());
+    let reading = Reading {
+        reader: checkouts::READER,
+        scope: &machine,
+        kind: checkouts::KIND,
+        run_id: &run_id,
+        at: run.at,
+        observed_at: run.at,
+    };
+    let (start_home, walk, kept, unknown, linked) = match collected {
+        CollectedCheckouts::NotDir(root) => {
+            run.notes.push(format!(
+                "Could not look for checkouts in {}: not a folder.",
+                known::whole(&root.display().to_string())
+            ));
+            let reason = format!(
+                "could not look for checkouts in {}: not a folder",
+                root.display()
+            );
+            let gap = Gap::of(Cause::Failed);
+            run.apply(&reading, checkouts::BASIS, "none", Some(&reason), &gap, &[])?;
+            return Ok((
+                Some("the checkout walk could not open its root folder"),
+                Vec::new(),
+            ));
+        }
+        CollectedCheckouts::Walked(w) => (w.start_home, w.walk, w.kept, w.unknown, w.linked),
+    };
+    run.readers += 1;
+    let prefix = format!("checkout:{machine}/");
     let mut raw = String::new();
     for c in &walk.checkouts {
         raw.push_str(&format!("checkout\t{}\n", c.rel));
@@ -3160,7 +3317,7 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
             source_ref: format!("{raw_file}:{}", i + 1),
         })
         .collect();
-    not_looked_into(run, checkouts::READER, &walk.guarded, &start.home)?;
+    not_looked_into(run, checkouts::READER, &walk.guarded, &start_home)?;
     // A folder that could not be listed or a known checkout that could not be looked at
     // failed; a walk limited to the folder given read what it was given, which does not hold
     // the rest of the home folder, and a walk does not go into another file system. The worst
@@ -3226,30 +3383,52 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
         &walk.listed.iter().map(Unit::whole).collect::<Vec<_>>(),
         &walk.seen.iter().map(Unit::whole).collect::<Vec<_>>(),
     )?;
-    Ok((Some(walk.checkouts), failure, unknown))
+    Ok((failure, unknown))
 }
 
 /// Checkouts in the folders agents worked in. The candidates are the working folders in the
 /// sessions and the checkouts this reader already holds, each checked on disk, so a checkout
 /// stays while it is there however long ago its session was deleted. Below the level of a
 /// source's sessions at most `look_limit` folders are listed.
-fn read_agent_folders(
-    run: &mut Run,
+enum CollectedAgents {
+    NoneRead {
+        look: look::Look,
+        reason: Option<String>,
+        not_entered: Vec<(Unit, PathBuf)>,
+    },
+    Read {
+        read: bool,
+        held: BTreeMap<PathBuf, agent_folders::Held>,
+        look: look::Look,
+        found: BTreeMap<String, PathBuf>,
+        carried: BTreeSet<String>,
+    },
+}
+
+impl CollectedAgents {
+    fn checkouts(&self) -> Vec<checkouts::Checkout> {
+        match self {
+            CollectedAgents::NoneRead { .. } => Vec::new(),
+            CollectedAgents::Read { found, .. } => found
+                .iter()
+                .map(|(rel, path)| checkouts::Checkout {
+                    rel: rel.clone(),
+                    path: path.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+fn collect_agent_folders(
     args: &Args,
+    machine: &str,
+    prev_subjects: &BTreeSet<String>,
+    held: &BTreeMap<PathBuf, agent_folders::Held>,
     look_limit: usize,
-) -> Result<Vec<checkouts::Checkout>, Box<dyn Error>> {
-    let (run_id, machine) = (run.run_id.to_string(), run.machine.to_string());
-    let reading = Reading {
-        reader: agent_folders::READER,
-        scope: &machine,
-        kind: agent_folders::KIND,
-        run_id: &run_id,
-        at: run.at,
-        observed_at: run.at,
-    };
+) -> CollectedAgents {
     let home = std::fs::canonicalize(&args.home).unwrap_or_else(|_| args.home.clone());
     let homes = [args.home.as_path(), home.as_path()];
-    let held = agent_folders::held(run.tx)?;
     // The folders of sessions, each read, not here, failed or not entered, and what was not
     // read in all of them: completeness, cause and reason follow from it.
     let (mut look, mut sessions, mut not_entered) = (look::Look::default(), None, Vec::new());
@@ -3259,7 +3438,7 @@ fn read_agent_folders(
             _ => args.home.join(source.dir),
         };
         let unit = Unit::whole(dir.display().to_string());
-        match agent_folders::sessions(source, &dir, &homes, &held, SystemTime::now(), look_limit) {
+        match agent_folders::sessions(source, &dir, &homes, held, SystemTime::now(), look_limit) {
             agent_folders::Found::Absent(absent) => look.absent(unit, absent),
             agent_folders::Found::Read(s) => match &mut sessions {
                 None => sessions = Some(*s),
@@ -3281,38 +3460,13 @@ fn read_agent_folders(
         }
     }
     if let (false, ("none", reason)) = (read, look.completeness()) {
-        // No sessions were read: what was known from them stays as it was. A folder of them
-        // that leads into a folder macOS asks permission for was not given.
-        run.readers += 1;
-        let gap = look.gap();
-        run.apply(
-            &reading,
-            agent_folders::BASIS,
-            "none",
-            reason.as_deref(),
-            &gap,
-            &[],
-        )?;
-        if gap.cause == Some(Cause::NotGiven) {
-            let folders: Vec<PathBuf> = not_entered.into_iter().map(|(_, g)| g).collect();
-            not_looked_into(run, agent_folders::READER, &folders, &args.home)?;
-        } else {
-            let failed: Vec<String> = (look.not_read())
-                .filter(|u| u.cause == Cause::Failed)
-                .map(|u| format!("{}: {}", u.unit, u.why))
-                .collect();
-            run.notes
-                .push(not_read_note("Agent sessions", &failed.join("; ")));
-        }
-        return Ok(Vec::new());
+        return CollectedAgents::NoneRead {
+            look,
+            reason,
+            not_entered,
+        };
     }
     let mut s = sessions.unwrap_or_default();
-    if read {
-        run.readers += 1;
-        // Where each file was read up to, in the run's transaction: committed with the facts
-        // derived from it or not at all.
-        agent_folders::keep(run.tx, &s.held)?;
-    }
     // What this version has no reader for: sessions of other agents, named only by the agent.
     // A checkout is dropped only when it is gone from disk, so these alone leave what was
     // found compared in full.
@@ -3351,7 +3505,7 @@ fn read_agent_folders(
     let prefix = format!("checkout:{machine}/");
     // Held checkouts in a guarded folder: kept as they were, nothing inside them read.
     let mut carried = BTreeSet::new();
-    for id in store::live_subjects(run.tx, agent_folders::READER)? {
+    for id in prev_subjects {
         let Some(rel) = id.strip_prefix(&prefix) else {
             continue;
         };
@@ -3384,7 +3538,89 @@ fn read_agent_folders(
             }
         }
     }
+    CollectedAgents::Read {
+        read,
+        held: s.held,
+        look,
+        found,
+        carried,
+    }
+}
 
+#[cfg(test)]
+fn read_agent_folders(
+    run: &mut Run,
+    args: &Args,
+    look_limit: usize,
+) -> Result<Vec<checkouts::Checkout>, Box<dyn Error>> {
+    let prev = store::live_subjects(run.tx, agent_folders::READER)?;
+    let held = agent_folders::held(run.tx)?;
+    let collected = collect_agent_folders(args, run.machine, &prev, &held, look_limit);
+    let checkouts = collected.checkouts();
+    apply_agent_folders(run, args, collected)?;
+    Ok(checkouts)
+}
+
+fn apply_agent_folders(
+    run: &mut Run,
+    args: &Args,
+    collected: CollectedAgents,
+) -> Result<(), Box<dyn Error>> {
+    let (run_id, machine) = (run.run_id.to_string(), run.machine.to_string());
+    let reading = Reading {
+        reader: agent_folders::READER,
+        scope: &machine,
+        kind: agent_folders::KIND,
+        run_id: &run_id,
+        at: run.at,
+        observed_at: run.at,
+    };
+    let (read, held, look, found, carried) = match collected {
+        CollectedAgents::NoneRead {
+            look,
+            reason,
+            not_entered,
+        } => {
+            // No sessions were read: what was known from them stays as it was. A folder of them
+            // that leads into a folder macOS asks permission for was not given.
+            run.readers += 1;
+            let gap = look.gap();
+            run.apply(
+                &reading,
+                agent_folders::BASIS,
+                "none",
+                reason.as_deref(),
+                &gap,
+                &[],
+            )?;
+            if gap.cause == Some(Cause::NotGiven) {
+                let folders: Vec<PathBuf> = not_entered.into_iter().map(|(_, g)| g).collect();
+                not_looked_into(run, agent_folders::READER, &folders, &args.home)?;
+            } else {
+                let failed: Vec<String> = (look.not_read())
+                    .filter(|u| u.cause == Cause::Failed)
+                    .map(|u| format!("{}: {}", u.unit, u.why))
+                    .collect();
+                run.notes
+                    .push(not_read_note("Agent sessions", &failed.join("; ")));
+            }
+            return Ok(());
+        }
+        CollectedAgents::Read {
+            read,
+            held,
+            look,
+            found,
+            carried,
+        } => (read, held, look, found, carried),
+    };
+    if read {
+        run.readers += 1;
+        // Where each file was read up to, in the run's transaction: committed with the facts
+        // derived from it or not at all.
+        agent_folders::keep(run.tx, &held)?;
+    }
+    let prefix = format!("checkout:{machine}/");
     let mut raw = String::new();
     for rel in found.keys() {
         raw.push_str(&format!("checkout\t{rel}\n"));
@@ -3423,10 +3659,7 @@ fn read_agent_folders(
         compared,
     };
     run.apply_found(&reading, agent_folders::BASIS, &applied, &statements)?;
-    Ok(found
-        .into_iter()
-        .map(|(rel, path)| checkouts::Checkout { rel, path })
-        .collect())
+    Ok(())
 }
 
 /// `not_looked_into` for a reader that seldom meets a guarded folder: written when it did,
@@ -3482,9 +3715,9 @@ fn not_looked_into(
     )
 }
 
-/// The three local traces of servers, each its own reading of this machine.
-fn read_traces(run: &mut Run, args: &Args) -> Result<(), Box<dyn Error>> {
-    let traces = [
+/// The three local traces of servers, collected without touching the store.
+fn collect_traces(args: &Args) -> [(&'static str, &'static str, &'static str, traces::Found); 3] {
+    [
         (
             ssh_config::READER,
             ssh_config::KIND,
@@ -3503,7 +3736,15 @@ fn read_traces(run: &mut Run, args: &Args) -> Result<(), Box<dyn Error>> {
             tailnet::BASIS,
             tailnet::read(args.tailscale.as_deref(), &args.home),
         ),
-    ];
+    ]
+}
+
+/// The three local traces of servers, each its own reading of this machine.
+fn apply_traces(
+    run: &mut Run,
+    args: &Args,
+    traces: [(&'static str, &'static str, &'static str, traces::Found); 3],
+) -> Result<(), Box<dyn Error>> {
     let (run_id, machine) = (run.run_id.to_string(), run.machine.to_string());
     for (reader, kind, basis, found) in traces {
         let reading = Reading {
@@ -3693,22 +3934,71 @@ fn server_counts(
     Ok(counts)
 }
 
-fn read_lockfiles(
+type CollectedLockfile = (
+    String,
+    Option<(lockfiles::Outcome, Result<String, PathBuf>)>,
+);
+
+fn collect_lockfiles(
+    args: &Args,
+    machine: &str,
+    found: &[checkouts::Checkout],
+) -> Vec<CollectedLockfile> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let real_home = std::fs::canonicalize(&args.home).unwrap_or_else(|_| args.home.clone());
+    let homes = [args.home.as_path(), real_home.as_path()];
+    let read_one = |checkout: &checkouts::Checkout| -> CollectedLockfile {
+        let id = format!("checkout:{machine}/{}", checkout.rel);
+        let outcome = lockfiles::read(checkout, &id).map(|o| {
+            let commit = lockfiles::commit(&checkout.path, &homes);
+            (o, commit)
+        });
+        (id, outcome)
+    };
+    let workers = std::thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(4)
+        .min(found.len());
+    if workers <= 1 {
+        return found.iter().map(read_one).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let mut pairs: Vec<(usize, CollectedLockfile)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut mine = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(c) = found.get(i) else { break };
+                        mine.push((i, read_one(c)));
+                    }
+                    mine
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
+    pairs.sort_unstable_by_key(|(i, _)| *i);
+    pairs.into_iter().map(|(_, item)| item).collect()
+}
+
+fn apply_lockfiles(
     run: &mut Run,
     args: &Args,
-    found: &[checkouts::Checkout],
+    collected: Vec<CollectedLockfile>,
 ) -> Result<(), Box<dyn Error>> {
     run.readers += 1;
     let run_id = run.run_id.to_string();
-    let real_home = std::fs::canonicalize(&args.home).unwrap_or_else(|_| args.home.clone());
-    let homes = [args.home.as_path(), real_home.as_path()];
     // A git folder in a folder macOS asks permission for is not entered: the commit is not
     // known, and the folder is named.
     let mut guarded = BTreeSet::new();
     // Lockfiles are under version control: the raw input is where they are and at which commit.
     let mut manifest = String::new();
-    for checkout in found {
-        let id = format!("checkout:{}/{}", run.machine, checkout.rel);
+    for (id, outcome) in collected {
         let reading = Reading {
             reader: lockfiles::READER,
             scope: &id,
@@ -3719,7 +4009,7 @@ fn read_lockfiles(
         };
         // A checkout opened with no lockfile in it is read in full with a note, so that it is
         // told from one never opened, and what an earlier reading found in it goes.
-        let Some(o) = lockfiles::read(checkout, &id) else {
+        let Some((o, commit)) = outcome else {
             run.apply(
                 &reading,
                 lockfiles::BASIS,
@@ -3730,7 +4020,7 @@ fn read_lockfiles(
             )?;
             continue;
         };
-        let commit = lockfiles::commit(&checkout.path, &homes).unwrap_or_else(|g| {
+        let commit = commit.unwrap_or_else(|g| {
             guarded.insert(g);
             "unknown".to_string()
         });
@@ -4648,18 +4938,16 @@ fn watched_sentence(w: Option<&status::Watched>) -> String {
 
 // ---- Integrity of what is installed: see src/integrity.rs. ----
 
-/// Reads application bundles, Homebrew kegs, global npm packages and applications' code under
+/// Commits application bundles, Homebrew kegs, global npm packages and applications' code under
 /// Application Support, one reading per kind scoped to this machine. A first reading of a kind
 /// is its baseline, which `immunity status` counts as nothing new. Returns what changed while its
 /// version stayed, for the rules.
-fn read_integrity(run: &mut Run, args: &Args) -> Result<Vec<findings::Observed>, Box<dyn Error>> {
+fn apply_integrity(
+    run: &mut Run,
+    args: &Args,
+    kinds: Vec<integrity::Kind>,
+) -> Result<Vec<findings::Observed>, Box<dyn Error>> {
     let (run_id, machine) = (run.run_id.to_string(), run.machine.to_string());
-    let roots = integrity::Roots {
-        home: &args.home,
-        system: &args.system_root,
-        store: &args.store,
-    };
-    let kinds = integrity::read(run.tx, &roots, &machine)?;
     let (raw, lines) = integrity::raw(&kinds);
     let raw_file = run.keep_raw(integrity::READER, integrity::RAW, raw.as_bytes())?;
     keep_lists(run, kinds.iter().flat_map(|k| &k.things));
@@ -4700,28 +4988,68 @@ fn read_integrity(run: &mut Run, args: &Args) -> Result<Vec<findings::Observed>,
 /// are optional: a thing whose list or changes cannot be kept is skipped, and nothing here fails
 /// or holds up the reading.
 fn keep_lists<'a>(run: &Run, things: impl Iterator<Item = &'a integrity::Thing>) {
+    let live_digests: HashMap<String, String> = run
+        .tx
+        .prepare(
+            "SELECT subject, object FROM assertion
+             WHERE layer = 'live' AND reader = ?1 AND scope = ?2 AND predicate = 'has_digest'",
+        )
+        .and_then(|mut stmt| {
+            stmt.query_map(rusqlite::params![integrity::READER, run.machine], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect()
+        })
+        .unwrap_or_default();
+    let kept_paths: HashMap<String, String> = run
+        .tx
+        .prepare("SELECT input, path FROM raw_input WHERE reader = ?1")
+        .and_then(|mut stmt| {
+            stmt.query_map([integrity::READER], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })?
+            .collect()
+        })
+        .unwrap_or_default();
     for t in things {
         let Some(list) = &t.list else { continue };
         let input = integrity::list_input(&t.subject);
-        let Ok(kept) = store::last_raw(run.tx, integrity::READER, &input) else {
+        let kept = kept_paths.get(&input).cloned();
+        let new_digest = t
+            .facts
+            .iter()
+            .find(|(p, _)| *p == "has_digest")
+            .map(|(_, o)| o.as_str());
+        // Most lists do not move between checks: when the thing's digest matches what is live and
+        // its kept raw copy is present on disk with the expected size, skip reading the file back.
+        if new_digest.is_some()
+            && live_digests.get(&t.subject).map(String::as_str) == new_digest
+            && kept
+                .as_deref()
+                .and_then(|path| integrity::kept_file(run.home, path, &input))
+                .is_some_and(|file| {
+                    std::fs::symlink_metadata(&file).is_ok_and(|m| {
+                        m.is_file()
+                            && m.len() == list.len() as u64
+                            && m.len() <= integrity::LIST_CAP
+                    })
+                })
+        {
             continue;
-        };
+        }
         let before = kept
             .as_deref()
             .and_then(|path| integrity::kept_file(run.home, path, &input))
             .and_then(|file| autorun::read_capped_resolved(&file, integrity::LIST_CAP).ok());
-        // Most lists do not move between checks: this spares `keep_raw` reading each again.
         if before.as_ref() == Some(list) {
             continue;
         }
         replace_raw(run, &input, kept, list);
         if let Some(changes) = before.and_then(|b| integrity::compare(&b, list)) {
             let input = integrity::changes_input(&t.subject);
-            if let (Ok(kept), Ok(bytes)) = (
-                store::last_raw(run.tx, integrity::READER, &input),
-                serde_json::to_vec(&changes),
-            ) {
-                replace_raw(run, &input, kept, &bytes);
+            let kept_changes = kept_paths.get(&input).cloned();
+            if let Ok(bytes) = serde_json::to_vec(&changes) {
+                replace_raw(run, &input, kept_changes, &bytes);
             }
         }
     }
@@ -5028,6 +5356,7 @@ fn read_indicators(
     // leaves out by design, said by nothing. The walk for checkouts that failed and known
     // checkouts not looked into are no place.
     let mut matches = indicators::match_hashes(run.tx, &list)?;
+    let matcher = indicators::TextMatcher::new(&list);
     let (mut read, mut look) = (BTreeSet::new(), look::Look::default());
     let homes = watched::homes(&args.home);
     let homes = [homes[0].as_path(), homes[1].as_path()];
@@ -5062,7 +5391,7 @@ fn read_indicators(
                 Ok(bytes) => {
                     let text = String::from_utf8_lossy(&bytes);
                     let file = format!("file:{machine}/{shown}");
-                    for i in indicators::match_text(&text, &list) {
+                    for i in matcher.find(&text) {
                         matches.push((file.clone(), i));
                     }
                     read.insert(file);
@@ -5221,28 +5550,67 @@ fn read_indicators(
 
 // ---- End of what runs by itself and indicators. ----
 
-/// Asks for the threat catalogue, or takes the file given for it. Run before the run lock is
-/// taken, with the store open only to read, or with no store yet: the ETag to ask with is
-/// read first, and the download touches nothing in the store.
-fn get_catalogue(
+/// Plans all OSV feed requests from the read-only store before spawning download threads.
+fn plan_feeds(
     conn: Option<&rusqlite::Connection>,
     args: &Args,
-) -> Result<threats::Fetched, Box<dyn Error>> {
-    Ok(match &args.threats_input {
-        Some(path) => threats::read_file(path),
-        None => {
-            let curl = args.curl.as_deref().unwrap_or(Path::new(threats::CURL));
-            threats::fetch(curl, threats::last_etag(conn)?.as_deref())
-        }
+    home: &Path,
+    now: i64,
+) -> Result<Vec<osv::Plan>, Box<dyn Error>> {
+    // One input for each feed, in the order of `FEEDS`: a feed added without its input does
+    // not compile, where `zip` would leave it unasked and say nothing.
+    let inputs: [&Option<PathBuf>; osv::FEEDS.len()] = [
+        &args.osv_crates_input,
+        &args.osv_npm_input,
+        &args.osv_pypi_input,
+    ];
+    let mut plans = Vec::with_capacity(osv::FEEDS.len());
+    for (feed, input) in osv::FEEDS.iter().zip(inputs) {
+        plans.push(osv::plan(conn, feed, input.as_deref(), home, now)?);
+    }
+    Ok(plans)
+}
+
+/// Downloads all due OSV feeds and the threat catalogue concurrently, returning feed results in
+/// `osv::FEEDS` order together with the catalogue result.
+fn get_downloads(
+    plans: Vec<osv::Plan>,
+    threat_etag: Option<String>,
+    args: &Args,
+    home: &Path,
+) -> (Vec<osv::Got>, threats::Fetched) {
+    let curl = args.curl.as_deref().unwrap_or(Path::new(threats::CURL));
+    std::thread::scope(|s| {
+        let feed_handles: Vec<_> = osv::FEEDS
+            .iter()
+            .zip(plans)
+            .map(|(feed, plan)| s.spawn(move || osv::fetch(feed, plan, curl, home)))
+            .collect();
+        let cat_handle = s.spawn(|| match &args.threats_input {
+            Some(path) => threats::read_file(path),
+            None => threats::fetch(curl, threat_etag.as_deref()),
+        });
+        let feeds = feed_handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| osv::Got::Failed("download thread panicked".to_string()))
+            })
+            .collect();
+        let catalogue = cat_handle
+            .join()
+            .unwrap_or_else(|_| threats::Fetched::Failed("download thread panicked".to_string()));
+        (feeds, catalogue)
     })
 }
 
-/// Brings the threat list in line with the catalogue got. A catalogue that could not be
-/// fetched or parsed changes nothing: no threat is added or marked gone.
-fn read_threats(run: &Run, fetched: threats::Fetched) -> Result<(), Box<dyn Error>> {
+/// Brings the threat list in line with the catalogue got, returning whether the catalogue changed.
+/// A catalogue that could not be fetched or parsed changes nothing: no threat is added or marked
+/// gone.
+fn read_threats(run: &Run, fetched: threats::Fetched) -> Result<bool, Box<dyn Error>> {
     let (tx, run_id, at) = (run.tx, run.run_id, run.at);
     let last = threats::last_good(tx)?;
-    let failed = |reason: String, sha256, raw_path| -> Result<(), Box<dyn Error>> {
+    let failed = |reason: String, sha256, raw_path| -> Result<bool, Box<dyn Error>> {
         let reading = threats::Reading {
             outcome: "failed",
             reason: Some(reason),
@@ -5251,7 +5619,7 @@ fn read_threats(run: &Run, fetched: threats::Fetched) -> Result<(), Box<dyn Erro
             ..threats::Reading::default()
         };
         threats::put_reading(tx, run_id, at, &reading)?;
-        Ok(())
+        Ok(false)
     };
     match fetched {
         threats::Fetched::Failed(reason) => failed(reason, None, None),
@@ -5264,7 +5632,7 @@ fn read_threats(run: &Run, fetched: threats::Fetched) -> Result<(), Box<dyn Erro
                 ..before
             };
             threats::put_reading(tx, run_id, at, &reading)?;
-            Ok(())
+            Ok(false)
         }
         threats::Fetched::Body { bytes, etag } => {
             let raw_path = run.keep_raw(threats::SOURCE, threats::RAW, &bytes)?;
@@ -5283,48 +5651,30 @@ fn read_threats(run: &Run, fetched: threats::Fetched) -> Result<(), Box<dyn Erro
                 entries: Some(entries.len()),
             };
             threats::put_reading(tx, run_id, at, &reading)?;
-            Ok(())
+            Ok(true)
         }
     }
 }
 
-/// Asks for each feed of vulnerability data, or takes the archive given for it.
-fn get_feeds(
-    conn: Option<&rusqlite::Connection>,
-    args: &Args,
-    home: &Path,
-    now: i64,
-) -> Result<Vec<osv::Got>, Box<dyn Error>> {
-    let curl = args.curl.as_deref().unwrap_or(Path::new(threats::CURL));
-    // One input for each feed, in the order of `FEEDS`: a feed added without its input does
-    // not compile, where `zip` would leave it unasked and say nothing.
-    let inputs: [&Option<PathBuf>; osv::FEEDS.len()] = [
-        &args.osv_crates_input,
-        &args.osv_npm_input,
-        &args.osv_pypi_input,
-    ];
-    let mut got = Vec::new();
-    for (feed, input) in osv::FEEDS.iter().zip(inputs) {
-        got.push(osv::get(conn, feed, input.as_deref(), curl, home, now)?);
-    }
-    Ok(got)
-}
-
-/// Brings the advisories in line with what was got for each feed. A feed that could not be
-/// read changes nothing, and the data read before stays in force.
-fn read_feeds(run: &Run, got: Vec<osv::Got>) -> Result<(), Box<dyn Error>> {
+/// Brings the advisories in line with what was got for each feed, returning whether any feed
+/// changed advisories. A feed that could not be read changes nothing, and the data read before
+/// stays in force.
+fn read_feeds(run: &Run, got: Vec<osv::Got>) -> Result<bool, Box<dyn Error>> {
+    let mut changed = false;
     for (feed, got) in osv::FEEDS.iter().zip(got) {
-        osv::record(run.tx, run.run_id, run.at, run.home, feed, got)?;
+        if osv::record(run.tx, run.run_id, run.at, run.home, feed, got)? {
+            changed = true;
+        }
     }
-    Ok(())
+    Ok(changed)
 }
 
 /// Matches the packages the projects' lockfiles hold against the vulnerability data, and holds
 /// the findings of what is urgent: a malicious package, or a vulnerability attackers are using.
 /// Every other match is an answer in a list and raises nothing. Returns how many findings it
 /// opened.
-fn match_dependencies(run: &Run) -> Result<usize, Box<dyn Error>> {
-    let matched = vulnerabilities::match_all(run.tx, run.run_id, run.at)?;
+fn match_dependencies(run: &Run, relink: bool) -> Result<usize, Box<dyn Error>> {
+    let matched = vulnerabilities::match_all_with(run.tx, run.run_id, run.at, relink)?;
     let linked: BTreeSet<String> = {
         let mut stmt = run
             .tx

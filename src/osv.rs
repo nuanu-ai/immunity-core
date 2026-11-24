@@ -327,42 +327,52 @@ pub fn check_in_progress(home: &Path, run_id: &str) -> std::io::Result<bool> {
     crate::store::held(&check_lock(home, run_id))
 }
 
-/// Asks for a feed, or takes the archive given instead. Run before the run lock is taken, with
-/// the store open only to read, or with no store yet: what it needs of the store, the ETag
-/// and when the feed was last read, is read first, and the download touches nothing in it.
-pub fn get(
+/// Plan for asking a feed, decided from the store before running curl concurrently.
+pub enum Plan {
+    Ready(Got),
+    Fetch(Option<String>),
+}
+
+/// Decides from the store whether `feed` needs a download and with which ETag.
+pub fn plan(
     conn: Option<&Connection>,
     feed: &Feed,
     input: Option<&Path>,
-    curl: &Path,
     home: &Path,
     now: i64,
-) -> rusqlite::Result<Got> {
+) -> rusqlite::Result<Plan> {
     if let Some(path) = input {
-        return Ok(Got::Archive {
+        return Ok(Plan::Ready(Got::Archive {
             path: path.to_path_buf(),
             etag: None,
             downloaded: false,
-        });
+        }));
     }
     if feed.every > 0
         && let Some(conn) = conn
         && let Some((_, at)) = last_good_at(conn, feed.source)?
         && crate::store::age(at, now).is_some_and(|age| age <= feed.every)
     {
-        return Ok(Got::NotDue);
+        return Ok(Plan::Ready(Got::NotDue));
     }
-    // The ETag of the archive held: the one last read, or the one that failed, while it is
-    // still there to be read again.
     let etag = match conn {
         Some(conn) => last_etag(conn, feed.source)?,
         None => None,
     }
     .filter(|(_, failed)| !failed || home.join(kept_failed(feed)).is_file())
     .map(|(etag, _)| etag);
+    Ok(Plan::Fetch(etag))
+}
+
+/// Executes a `Plan`, touching nothing in the store, so feeds can be fetched concurrently.
+pub fn fetch(feed: &Feed, plan: Plan, curl: &Path, home: &Path) -> Got {
+    let etag = match plan {
+        Plan::Ready(got) => return got,
+        Plan::Fetch(etag) => etag,
+    };
     let dir = home.join(FOLDER);
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        return Ok(Got::Failed(format!("cannot make {}: {e}", dir.display())));
+        return Got::Failed(format!("cannot make {}: {e}", dir.display()));
     }
     let part = dir.join(format!("{}.zip.part", feed.source));
     let _ = std::fs::remove_file(&part);
@@ -374,7 +384,7 @@ pub fn get(
         .spawn();
     let mut child = match child {
         Ok(child) => child,
-        Err(e) => return Ok(Got::Failed(format!("cannot run {}: {e}", curl.display()))),
+        Err(e) => return Got::Failed(format!("cannot run {}: {e}", curl.display())),
     };
     let said = said(&mut child);
     let got = match child.wait() {
@@ -392,7 +402,7 @@ pub fn get(
     if !matches!(got, Got::Archive { .. }) {
         let _ = std::fs::remove_file(&part);
     }
-    Ok(got)
+    got
 }
 
 /// What a process wrote to stderr, up to `SAID_CAP` bytes.
@@ -509,8 +519,9 @@ pub fn held(conn: &Connection, source: &str) -> rusqlite::Result<(usize, usize, 
     )
 }
 
-/// Records what was got for a feed, in the run's transaction. A reading that failed changes
-/// no advisory. An archive read whole is kept, with its lines (see `kept`).
+/// Records what was got for a feed, in the run's transaction, and returns whether advisories
+/// changed. A reading that failed changes no advisory. An archive read whole is kept, with its
+/// lines (see `kept`).
 pub fn record(
     tx: &Transaction,
     run_id: &str,
@@ -518,7 +529,7 @@ pub fn record(
     home: &Path,
     feed: &Feed,
     got: Got,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<bool, Box<dyn std::error::Error>> {
     let put = |r: Reading| put_reading(tx, feed.source, run_id, at, &r);
     let failed = |reason: String| Reading {
         outcome: "failed",
@@ -526,10 +537,10 @@ pub fn record(
         ..Reading::default()
     };
     let (path, etag, downloaded) = match got {
-        Got::NotDue => return Ok(()),
+        Got::NotDue => return Ok(false),
         Got::Failed(reason) => {
             put(failed(reason))?;
-            return Ok(());
+            return Ok(false);
         }
         Got::Unchanged => match last_with_etag(tx, feed.source)? {
             // The archive that failed has not changed: it is read again, never taken as good.
@@ -546,7 +557,7 @@ pub fn record(
                     entries: Some(held(tx, feed.source)?.0),
                     ..before
                 })?;
-                return Ok(());
+                return Ok(false);
             }
         },
         Got::Archive {
@@ -567,7 +578,7 @@ pub fn record(
                 etag: None,
                 ..failed(reason)
             })?;
-            return Ok(());
+            return Ok(false);
         }
     };
     // The same bytes as the archive last read: nothing to read again.
@@ -583,7 +594,7 @@ pub fn record(
             entries: Some(held(tx, feed.source)?.0),
             ..before
         })?;
-        return Ok(());
+        return Ok(false);
     }
     match ingest(tx, run_id, at, feed, &path, STREAM_CAP, RECORD_CAP)? {
         Err(reason) => {
@@ -604,7 +615,7 @@ pub fn record(
                 raw_path,
                 entries: None,
             })?;
-            Ok(())
+            Ok(false)
         }
         Ok((counts, lines)) => {
             let keep = home.join(kept(feed));
@@ -641,7 +652,7 @@ pub fn record(
                 raw_path: Some(kept(feed)),
                 entries: Some(counts.records),
             })?;
-            Ok(())
+            Ok(true)
         }
     }
 }
@@ -1466,7 +1477,8 @@ mod tests {
         super::put_reading(&tx, feed.source, "run-2", now - 60, &good).unwrap();
         tx.commit().unwrap();
         let curl = dir.0.join("no-curl");
-        let got = super::get(Some(&conn), feed, None, &curl, &dir.0, now).unwrap();
+        let plan = super::plan(Some(&conn), feed, None, &dir.0, now).unwrap();
+        let got = super::fetch(feed, plan, &curl, &dir.0);
         assert!(matches!(got, super::Got::NotDue));
     }
 
