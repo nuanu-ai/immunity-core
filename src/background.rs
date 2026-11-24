@@ -1,9 +1,10 @@
 //! The core's hourly full checks, alongside its watcher. launchd only supervises the process.
 //! Each check is the same binary's `run` command: the store remains the only seam.
 
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 const EVERY: i64 = 60 * 60;
@@ -13,13 +14,17 @@ const RETRY: i64 = 5 * 60;
 /// How long a full check may run, in awake time: a sleep while it runs does not end it.
 const LIMIT: Duration = Duration::from_secs(30 * 60);
 pub const CHECK_ARG: &str = "--background-check";
+/// The most of a check's output the watcher keeps, to read the `Failure` it prints: the longest
+/// text the cut of secrets reads (`secrets::LINE_CAP`), as a detail longer is withheld whole.
+const SAID_CAP: u64 = crate::secrets::LINE_CAP as u64;
 
 pub fn command(binary: &std::path::Path) -> Command {
     let mut command = Command::new(binary);
     command
         .arg(CHECK_ARG)
         .arg(std::process::id().to_string())
-        .arg("run");
+        .arg("run")
+        .arg("--json");
     command
 }
 
@@ -86,6 +91,11 @@ pub struct Checks {
     running: Option<Running>,
     next: i64,
     last: i64,
+    /// What the latest check printed, up to `SAID_CAP`, sent once its output closes (`kept`).
+    said: Option<Receiver<Vec<u8>>>,
+    /// How the latest check failed and when it started, while its reason may still come: a
+    /// tool that left its group can hold its output open after it ended.
+    late: Option<(ExitStatus, Instant)>,
 }
 
 struct Running {
@@ -97,7 +107,7 @@ impl Checks {
     pub fn new(mut command: Command) -> Self {
         command
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .process_group(0);
         Self {
@@ -105,6 +115,8 @@ impl Checks {
             running: None,
             next: 0,
             last: 0,
+            said: None,
+            late: None,
         }
     }
 
@@ -119,19 +131,22 @@ impl Checks {
         if let Some(running) = &mut self.running {
             match running.finished() {
                 Ok(Some(status)) => {
-                    let expired = Self::expired(running.since, awake);
+                    let (since, expired) = (running.since, Self::expired(running.since, awake));
                     self.running = None;
                     if status.code() == Some(crate::EXIT_RUN_IN_PROGRESS.into()) {
                         self.next = self.next.min(now.saturating_add(RETRY));
                         return None;
                     }
-                    return Some(if status.success() {
-                        Ok(())
-                    } else if expired {
-                        Err("the full check exceeded 30 minutes and was stopped".into())
-                    } else {
-                        Err(format!("the full check ended with {status}"))
-                    });
+                    if status.success() || expired {
+                        return Some(if status.success() {
+                            Ok(())
+                        } else {
+                            Err("the full check exceeded 30 minutes and was stopped".into())
+                        });
+                    }
+                    // Said at once; its reason follows when what it printed comes (`late_reason`).
+                    self.late = Some((status, since));
+                    return Some(Err(format!("the full check ended with {status}")));
                 }
                 Err(e) => {
                     self.running = None;
@@ -148,7 +163,14 @@ impl Checks {
         } else if now >= self.next {
             self.next = now.saturating_add(EVERY);
             match self.command.spawn() {
-                Ok(child) => {
+                Ok(mut child) => {
+                    let (sent, said) = mpsc::channel();
+                    let out = child.stdout.take();
+                    // A reader that cannot start closes the check's output: the check cannot
+                    // print, and is said by how it ended.
+                    let _ = std::thread::Builder::new()
+                        .spawn(move || sent.send(out.map(kept).unwrap_or_default()));
+                    (self.said, self.late) = (Some(said), None);
                     self.running = Some(Running {
                         child,
                         since: awake,
@@ -160,9 +182,45 @@ impl Checks {
         None
     }
 
+    /// The failure the latest check's tick said, in the check's own words once what it printed
+    /// has come: the same failure, its text now with the reason. Asked after every tick, it
+    /// never waits, and stops expecting a reason when the check's time is up.
+    pub fn late_reason(&mut self, awake: Instant) -> Option<String> {
+        let (status, since) = self.late?;
+        let said = match self.said.as_ref()?.try_recv() {
+            Err(TryRecvError::Empty) if !Self::expired(since, awake) => return None,
+            said => said.ok().and_then(|said| reason(&said)),
+        };
+        (self.said, self.late) = (None, None);
+        Some(format!("the full check failed ({status}): {}", said?))
+    }
+
     fn expired(since: Instant, awake: Instant) -> bool {
         awake.saturating_duration_since(since) >= LIMIT
     }
+}
+
+/// The first `SAID_CAP` bytes a check printed, the rest read and dropped to the end, so the check
+/// never waits on a full pipe however much it prints. It runs on a thread of its own.
+fn kept(mut out: impl Read) -> Vec<u8> {
+    let mut said = Vec::new();
+    let _ = (&mut out).take(SAID_CAP).read_to_end(&mut said);
+    let _ = io::copy(&mut out, &mut io::sink());
+    said
+}
+
+/// Why a check failed in its own words: the code of the `Failure` it printed and what that
+/// quoted, at most `TEXT_CAP` characters of it. It is data: nothing is decided by it.
+fn reason(said: &[u8]) -> Option<String> {
+    let failure: crate::contract::v1::Failure = serde_json::from_slice(said).ok()?;
+    let error = failure.errors.first()?;
+    Some(match error.detail_text.as_deref() {
+        Some(detail) => {
+            let detail = crate::status::capped(crate::contract::unescape(detail));
+            format!("{}: {detail}", error.code)
+        }
+        None => error.code.clone(),
+    })
 }
 
 impl Running {
@@ -217,15 +275,28 @@ mod tests {
         cmd
     }
 
+    /// How a check ended, as the watcher records it in the end: a reason that comes after the
+    /// tick that said the failure replaces its text.
     fn finished(checks: &mut Checks, now: i64) -> Result<(), String> {
         let end = Instant::now() + Duration::from_secs(10);
-        loop {
+        let result = loop {
             if let Some(result) = checks.tick(now, Instant::now()) {
-                return result;
+                break result;
             }
             assert!(Instant::now() < end, "the invented check did not finish");
             std::thread::sleep(Duration::from_millis(10));
+        };
+        while checks.late.is_some() {
+            if let Some(why) = checks.late_reason(Instant::now()) {
+                return Err(why);
+            }
+            assert!(
+                Instant::now() < end,
+                "the invented check's output did not close"
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
+        result
     }
 
     #[test]
@@ -267,6 +338,158 @@ mod tests {
         );
         assert!(checks.tick(3609, Instant::now()).is_none());
         assert!(checks.tick(3610, Instant::now()).unwrap().is_err());
+    }
+
+    /// A `Failure` as `immunity run --json` prints it, with `detail` as the check said it, and
+    /// none when it is empty.
+    fn failure_json(detail: &str) -> String {
+        let mut error = crate::answer::error("run_failed", "the run failed", "", "");
+        error.detail_text = (!detail.is_empty()).then(|| crate::secrets::said(detail));
+        serde_json::to_string(&crate::contract::v1::Failure {
+            operation: "run".into(),
+            ok: false,
+            errors: vec![error],
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_full_check_that_fails_and_says_why_leaves_its_code_and_reason_beside_how_it_ended() {
+        let dir = crate::common::Scratch::new("check-says-why");
+        // An invented core: it prints its failure only when asked for the machine form.
+        let core = dir.join("immunity");
+        let script = "#!/bin/sh\ncase \" $* \" in *\" --json \"*) printf '%s\\n' \"$FAILURE\";; esac\nexit 1\n";
+        std::fs::write(&core, script).unwrap();
+        std::fs::set_permissions(&core, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        // The backslash is the check's own, kept once: the status writes it `\u{5c}` once.
+        for (detail, why) in [
+            (r"held at C:\store", r": run_failed: held at C:\store"),
+            ("", ": run_failed"),
+        ] {
+            let mut cmd = super::command(&core);
+            cmd.env("FAILURE", failure_json(detail));
+            let said = finished(&mut Checks::new(cmd), 10).unwrap_err();
+            assert_eq!(said, format!("the full check failed (exit status: 1){why}"));
+        }
+    }
+
+    #[test]
+    fn a_check_that_prints_past_the_cap_is_not_held_up_and_nothing_past_the_cap_is_kept() {
+        let printing = |json: String| {
+            let mut cmd = command("printf '%s\\n' \"$1\"; exit 1");
+            cmd.arg("check").arg(json);
+            Checks::new(cmd)
+        };
+        // A reason longer than status keeps is kept to `TEXT_CAP` characters.
+        let long = "x".repeat(4 * crate::status::TEXT_CAP);
+        let why = finished(&mut printing(failure_json(&long)), 10).unwrap_err();
+        let capped = crate::status::capped(long);
+        assert_eq!(
+            why,
+            format!("the full check failed (exit status: 1): run_failed: {capped}")
+        );
+        // More than a pipe holds and than the watcher reads, a failure after blanks: the check is
+        // not held up, and what went past the cap is not kept.
+        let past = " ".repeat(4 * SAID_CAP as usize) + &failure_json("held");
+        let why = finished(&mut printing(past), 10).unwrap_err();
+        assert_eq!(why, "the full check ended with exit status: 1");
+    }
+
+    #[test]
+    fn a_failed_check_whose_tool_keeps_its_output_open_is_recorded_on_the_tick_it_ended() {
+        let dir = crate::common::Scratch::new("check-output-held");
+        let pid_file = dir.join("tool");
+        // Job control puts the tool in a group of its own, which stopping the check's misses, so
+        // the check's output stays open after it ends: here until the tool prints the check's
+        // failure late, or without end.
+        let late = "(/bin/sleep 0.5; printf '%s\\n' \"$2\")";
+        let mut checks = [late, "/usr/bin/yes"].map(|tool| {
+            let mut cmd = command(&format!("set -m; {tool} & echo $! > \"$1\"; exit 1"));
+            cmd.arg("check").arg(&pid_file).arg(failure_json("held"));
+            Checks::new(cmd)
+        });
+        let (said, why) = mpsc::channel();
+        let turns = std::thread::spawn(move || {
+            let ended = |checks: &mut Checks| {
+                let start = Instant::now();
+                checks.tick(10, start);
+                while checks.running.is_some() {
+                    if let Some(result) = checks.tick(10, Instant::now()) {
+                        return (start, result);
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                panic!("the check ended on no tick")
+            };
+            let [late, endless] = &mut checks;
+            let (_, result) = ended(late);
+            let mut reason = None;
+            while reason.is_none() {
+                reason = late.late_reason(Instant::now());
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let (start, endless_result) = ended(endless);
+            let early = endless.late_reason(Instant::now());
+            let given_up = endless.late_reason(start + LIMIT);
+            let _ = said.send((
+                result,
+                reason,
+                endless_result,
+                early,
+                given_up,
+                endless.late,
+            ));
+        });
+        // A turn that waits on the check's output fails here instead of hanging.
+        let why = why.recv_timeout(Duration::from_secs(10));
+        if let Some(tool) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|p| p.trim().parse().ok())
+        {
+            // SAFETY: the invented tool this test started.
+            unsafe { libc::kill(tool, libc::SIGKILL) };
+        }
+        let (result, reason, endless_result, early, given_up, late) = match why {
+            Ok(why) => why,
+            Err(mpsc::RecvTimeoutError::Timeout) => panic!("a turn waited on the check's output"),
+            Err(_) => std::panic::resume_unwind(turns.join().unwrap_err()),
+        };
+        let ended = Err("the full check ended with exit status: 1".to_string());
+        assert_eq!(result, ended);
+        let failed = "the full check failed (exit status: 1): run_failed: held";
+        assert_eq!(reason.as_deref(), Some(failed));
+        assert_eq!(endless_result, ended);
+        assert_eq!((early, given_up, late), (None, None, None));
+    }
+
+    #[test]
+    fn a_reason_still_expected_is_never_taken_from_the_next_check() {
+        let dir = crate::common::Scratch::new("check-next-said");
+        // The first check fails with its output held open; the next, started at once by a clock
+        // moved back, prints a failure and succeeds.
+        let script = "if [ -f \"$1\" ]; then printf '%s\\n' \"$2\"; exit 0; fi; : > \"$1\"; \
+                      set -m; /bin/sleep 2 & exit 1";
+        let mut cmd = command(script);
+        cmd.arg("check")
+            .arg(dir.join("ran"))
+            .arg(failure_json("held"));
+        let mut checks = Checks::new(cmd);
+        let end = Instant::now() + Duration::from_secs(10);
+        while checks.tick(10_000, Instant::now()).is_none() {
+            assert!(Instant::now() < end, "the invented check did not finish");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(checks.late.is_some());
+        assert_eq!(finished(&mut checks, 10), Ok(()));
+    }
+
+    #[test]
+    fn a_full_check_that_fails_and_prints_nothing_readable_is_said_by_how_it_ended() {
+        for script in ["echo '{\"not\": \"a failure'; exit 3", "echo '{}'; exit 3"] {
+            let why = finished(&mut Checks::new(command(script)), 10).unwrap_err();
+            assert_eq!(why, "the full check ended with exit status: 3");
+        }
     }
 
     #[test]
