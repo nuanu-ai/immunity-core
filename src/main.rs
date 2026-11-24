@@ -3375,9 +3375,9 @@ fn read_agent_folders(
     let gap = look.gap();
     // A checkout is dropped only when it is gone from disk: what this version has no reader
     // for hides none, so a reading short only of that compares what it found in full.
-    let compared = match gap.cause {
-        _ if completeness == "none" => "none",
-        Some(Cause::Failed | Cause::NotGiven) => "partial",
+    let compared = match completeness {
+        "none" => "none",
+        _ if look.short_of_other_than(Cause::NoReader) => "partial",
         _ => "full",
     };
     let applied = Applied {
@@ -5879,18 +5879,25 @@ mod tests {
             rusqlite::params![held, agent_folders::READER, agent_folders::KIND],
         )
         .unwrap();
-        run.run_id = "run-2";
-        read_agent_folders(&mut run, &args, agent_folders::LOOK_LIMIT).unwrap();
-        let said: (String, String, i64) = tx
-            .query_row(
+        let said = |tx: &rusqlite::Transaction| -> (String, String, i64) {
+            tx.query_row(
                 "SELECT completeness, cause, (SELECT COUNT(*) FROM assertion
                                               WHERE layer = 'live' AND subject = ?2)
                  FROM coverage WHERE reader = ?1 ORDER BY id DESC LIMIT 1",
                 [agent_folders::READER, held],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
-            .unwrap();
-        assert_eq!(said, ("partial".into(), "not_given".into(), 1));
+            .unwrap()
+        };
+        run.run_id = "run-2";
+        read_agent_folders(&mut run, &args, agent_folders::LOOK_LIMIT).unwrap();
+        assert_eq!(said(&tx), ("partial".into(), "not_given".into(), 1));
+        // Beside another agent's sessions, which have no reader and are the worse cause, the
+        // folder not entered still keeps what it may name.
+        std::fs::create_dir_all(home.join(".gemini/tmp")).unwrap();
+        run.run_id = "run-2b";
+        read_agent_folders(&mut run, &args, agent_folders::LOOK_LIMIT).unwrap();
+        assert_eq!(said(&tx), ("partial".into(), "no_reader".into(), 1));
 
         // With no folder of sessions entered, nothing was read: the folders alone are named, as
         // the rows of folders macOS asks permission for name them.

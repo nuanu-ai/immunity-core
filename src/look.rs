@@ -478,8 +478,18 @@ impl Look {
     /// when it read everything. What it did not look into because macOS asks permission for it
     /// was not given; the rest failed or, as hooks kept elsewhere, has no reader.
     pub fn cause(&self) -> Option<Cause> {
+        Cause::worst(self.causes())
+    }
+
+    /// Whether anything the reading did not read has a cause other than `cause`, whichever
+    /// cause is the worst: a folder not given beside one with no reader is still not given.
+    pub fn short_of_other_than(&self, cause: Cause) -> bool {
+        self.causes().any(|c| c != cause)
+    }
+
+    fn causes(&self) -> impl Iterator<Item = Cause> + '_ {
         let units = self.unread.iter().map(|u| u.cause);
-        Cause::worst(units.chain(self.short.iter().map(|(cause, _)| *cause)))
+        units.chain(self.short.iter().map(|(cause, _)| *cause))
     }
 
     /// Why the reading is not full, and what this build has no reader for in it.
