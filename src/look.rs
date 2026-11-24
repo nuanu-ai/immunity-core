@@ -204,7 +204,9 @@ impl Look {
     /// One that merely contains a unit read inside it that `proves` `unit` does not: the
     /// deepest unit that holds a path decides.
     pub fn hides(&self, unit: &Unit) -> bool {
-        let within = |h: &Unit| (self.read.iter()).any(|r| h.hides(r) && self.proves(r, unit));
+        // Strictly inside: a unit both read and not read is not read, in whatever order.
+        let within =
+            |h: &Unit| (self.read.iter()).any(|r| r != h && h.hides(r) && self.proves(r, unit));
         self.hiding().any(|h| h.hides(unit) && !within(h))
     }
 
@@ -670,6 +672,26 @@ mod tests {
         // A unit not read inside a folder listed is hidden by itself.
         look.unread(Unit::whole("dev/a/b/hooks/shut"), "denied".to_string());
         assert!(!look.covers(Some(&Unit::whole("dev/a/b/hooks/shut"))));
+    }
+
+    #[test]
+    fn a_unit_both_found_absent_and_not_read_is_not_read_in_whichever_order_the_two_came() {
+        fn absent(look: &mut Look) {
+            let gone = Absent::of(&Error::from_raw_os_error(2)).unwrap();
+            look.absent(Unit::whole("dev/a/.git/hooks"), gone);
+        }
+        fn shut(look: &mut Look) {
+            look.not_looked_at(Unit::whole("dev/a/.git/hooks"), "denied".to_string());
+        }
+        let orders: [[fn(&mut Look); 2]; 2] = [[absent, shut], [shut, absent]];
+        for [first, then] in orders {
+            let mut look = Look::default();
+            first(&mut look);
+            then(&mut look);
+            assert!(!look.covers(Some(&Unit::whole("dev/a/.git/hooks/pre-commit"))));
+            look.unplaced();
+            assert!(!look.covers(Some(&Unit::whole("dev/a/.git/hooks/pre-commit"))));
+        }
     }
 
     #[test]
