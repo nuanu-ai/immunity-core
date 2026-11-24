@@ -397,6 +397,21 @@ pub const READING_FAILED: Cause = Cause {
     advice: "Nothing to do for now: they are tried again at every check. If one stays, your agent can find out why.",
 };
 
+pub const CLOSED_BY_OWNER: Cause = Cause {
+    id: "closed-by-owner",
+    who: NOTHING,
+    class: store::Cause::NotGiven,
+    scope: "this_mac",
+    kind: "files another account keeps closed",
+    title: [
+        "{n} file is closed to this account by the account that owns it.",
+        "{n} files are closed to this account by the accounts that own them.",
+    ],
+    meaning: "Another account owns them, often the system's administrator, and lets no other account open them, so a change in them goes unseen. Where they are is listed with them.",
+    meaning_none: None,
+    advice: "Nothing to do. Only their owner can open them, so what they hold was not judged on this Mac.",
+};
+
 pub const TAILNET_OFF: Cause = Cause {
     id: "tailnet-switched-off",
     who: NOTHING,
@@ -751,11 +766,12 @@ pub const NOT_CHECKED_ON_MACOS: Cause = Cause {
 };
 
 /// Every cause, in the order items are listed: what the owner can fix first.
-pub const CAUSES: [&Cause; 27] = [
+pub const CAUSES: [&Cause; 28] = [
     &SERVERS_NOT_CHECKED,
     &SERVERS_NOT_OPENED,
     &NOT_PERMITTED,
     &READING_FAILED,
+    &CLOSED_BY_OWNER,
     &EVENTS_OFF,
     &EVENTS_REFUSED,
     &EVENTS_FAILING,
@@ -947,7 +963,8 @@ fn scope_of(scope: &str, this: Option<&str>) -> &'static str {
     }
 }
 
-/// Whether a reading failed because of permissions, which the owner can change. Readers keep
+/// Whether a reading that failed did because of permissions, which the owner can change: a file
+/// another account owns and keeps closed is not a failure (`watched::CLOSED`). Readers keep
 /// the system's error as the reason, and Rust writes an error from the system with its
 /// number: EPERM is 1 and EACCES is 13 on macOS and on Linux (errno.h).
 fn not_permitted(reason: Option<&str>) -> bool {
@@ -1032,7 +1049,18 @@ pub fn not_covered(
         .filter(|r| failed(r) && !earlier_probe(r))
         .filter(|r| !(r.reader == servers::READER && away.contains(r.scope.as_str())))
         .partition(|r| not_permitted(r.reason.as_deref()));
-    for (cause, list) in [(&NOT_PERMITTED, closed), (&READING_FAILED, other)] {
+    // Files another account owns and keeps closed: their source does not give them, so the
+    // cause stored is `not_given`, and none of them is among the readings that failed.
+    let theirs: Vec<&Latest> = latest
+        .iter()
+        .filter(|r| r.cause.as_deref() == Some(store::Cause::NotGiven.literal()))
+        .filter(|r| r.reason.as_deref() == Some(watched::CLOSED))
+        .collect();
+    for (cause, list) in [
+        (&NOT_PERMITTED, closed),
+        (&READING_FAILED, other),
+        (&CLOSED_BY_OWNER, theirs),
+    ] {
         if list.is_empty() {
             continue;
         }
@@ -1781,6 +1809,34 @@ mod tests {
             assert_eq!(not_permitted(Some(&said(errno))), closed, "{}", said(errno));
         }
         assert!(!not_permitted(None));
+    }
+
+    #[test]
+    fn a_file_another_account_keeps_closed_is_said_as_not_given_and_never_as_the_persons_to_fix() {
+        // Each as the reading of a watched file's content stores it.
+        let dir = crate::common::Scratch::new("covered-closed");
+        let conn = store::open_or_make(&dir.join("store.db")).unwrap();
+        let reading = |path: &str, reason: &str, cause: &str| Latest {
+            reader: watched::READER.to_string(),
+            scope: format!("file:example-mac/{path}"),
+            kind: watched::CONTENT.to_string(),
+            completeness: "none".to_string(),
+            reason: Some(reason.to_string()),
+            cause: Some(cause.to_string()),
+            at: 1,
+            last_full: None,
+        };
+        let own = "Permission denied (os error 13)";
+        let latest = [
+            reading("Library/Example/helper", watched::CLOSED, "not_given"),
+            reading("Library/Example/other-helper", watched::CLOSED, "not_given"),
+            reading("Users/example/.zprofile", own, "failed"),
+        ];
+        let p = status::problems(&conn, &latest).unwrap();
+        let items = not_covered(&conn, &latest, &p, None).unwrap();
+        // The limits of this version, said on every Mac, come after.
+        let said: Vec<(&str, usize)> = items.iter().map(|u| (u.cause.id, u.count)).collect();
+        assert_eq!(said[..2], [(NOT_PERMITTED.id, 1), (CLOSED_BY_OWNER.id, 2)]);
     }
 
     #[test]

@@ -22,7 +22,7 @@ use crate::guarded::{self, Real};
 use crate::look::{Absent, Look};
 use std::fs::{File, FileType, Metadata, OpenOptions};
 use std::io::Read;
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 
 use crate::store::Cause;
@@ -734,10 +734,22 @@ fn reason(e: &std::io::Error) -> String {
     }
 }
 
+/// Why a file another account owns was not read when its permissions keep it closed to this one.
+pub const CLOSED: &str = "closed to this account by the account that owns it";
+
 /// The bytes of what `meta` describes, at most `cap` of them, or what it is instead. Only a
 /// regular file is opened, and without waiting: a file swapped for a named pipe after it was
 /// looked at cannot hold the run, and is told by what was opened.
 pub fn bytes(path: &Path, meta: &Metadata, cap: u64) -> Result<Vec<u8>, Content> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    bytes_as(path, meta, cap, unsafe { libc::geteuid() })
+}
+
+/// `bytes`, read as the account `us`. A file its permissions keep closed to `us` while another
+/// account owns it, as `meta` tells without opening it, is not given by its source: only its
+/// owner can open it, and the person is not told to. A closed file of their own failed, which
+/// they can fix.
+fn bytes_as(path: &Path, meta: &Metadata, cap: u64, us: u32) -> Result<Vec<u8>, Content> {
     if !meta.is_file() {
         return Err(Content::Special(kind_of(meta.file_type())));
     }
@@ -751,6 +763,9 @@ pub fn bytes(path: &Path, meta: &Metadata, cap: u64) -> Result<Vec<u8>, Content>
         Ok(Ok(bytes))
     };
     match read() {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && meta.uid() != us => {
+            Err(Content::Unread(Cause::NotGiven, CLOSED.to_string()))
+        }
         Err(e) => Err(Content::Unread(Cause::Failed, reason(&e))),
         Ok(Err(what)) => Err(Content::Special(what)),
         // The file is there and this build does not read a file that large.
@@ -803,6 +818,25 @@ pub fn field(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_closed_file_is_the_persons_to_fix_only_when_it_is_theirs_and_is_never_read() {
+        // A file its permissions keep closed failed when the person owns it, as they can open
+        // it; when another account owns it its source does not give it. Either way nothing of
+        // it is read. Another owner is made by reading as an account that is not ours.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::common::Scratch::new("watched-closed");
+        let path = dir.join("helper");
+        std::fs::write(&path, "invented\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let ours = meta.uid();
+        let said = |us| bytes_as(&path, &meta, CAP, us);
+        let failed = Content::Unread(Cause::Failed, "Permission denied (os error 13)".into());
+        assert_eq!(said(ours), Err(failed));
+        let theirs = Content::Unread(Cause::NotGiven, CLOSED.to_string());
+        assert_eq!(said(ours.wrapping_add(1)), Err(theirs));
+    }
 
     #[test]
     fn a_file_swapped_for_a_named_pipe_after_it_was_looked_at_never_holds_the_run() {

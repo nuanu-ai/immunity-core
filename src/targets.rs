@@ -37,6 +37,7 @@ const IN_BUNDLE: &str = "startup programs inside an app bundle (BundleProgram)";
 const NOT_FILE: &str = "startup programs that are not a regular file (such as an app named whole)";
 const GUARDED: &str = "startup programs in a folder macOS asks permission for";
 const FAILED: &str = "startup programs that could not be opened";
+const CLOSED: &str = "startup programs closed to this account by the account that owns them";
 const ITEMS: &str = "startup items that could not be read and whose programs are kept as last read";
 const ARGUMENTS: &str = "files that startup items name in their arguments";
 const NOT_THERE: &str = "startup programs watched as another kind and not read there";
@@ -181,13 +182,22 @@ impl Targets {
     }
 }
 
-/// Why a target was not read or not judged, as a cause: what is in a guarded folder was not
-/// given, what could not be opened or told failed, and the rest has no reader in this build.
+/// Why a target was not read or not judged, as a cause: what is in a guarded folder, or closed
+/// by the account that owns it, was not given, what could not be opened or told failed, and
+/// the rest has no reader in this build.
 fn cause(why: &str) -> Cause {
     match why {
-        GUARDED => Cause::NotGiven,
+        GUARDED | CLOSED => Cause::NotGiven,
         FAILED | ITEMS => Cause::Failed,
         _ => Cause::NoReader,
+    }
+}
+
+/// Why a target there could not be opened: closed by the account that owns it, or failed.
+fn not_opened(content: &Content) -> &'static str {
+    match content {
+        Content::Unread(Cause::NotGiven, _) => CLOSED,
+        _ => FAILED,
     }
 }
 
@@ -468,7 +478,10 @@ fn read_target(
             Err(content @ Content::Unread(Cause::NoReader, _)) => {
                 return not(content, Some(watched::OVER_CAP));
             }
-            Err(content) => return not(content, Some(FAILED)),
+            Err(content) => {
+                let why = not_opened(&content);
+                return not(content, Some(why));
+            }
         };
         let content = format!("sha256:{}", crate::sha256::hex(&bytes));
         drop(bytes);
@@ -760,9 +773,25 @@ mod tests {
     }
 
     #[test]
+    fn a_program_another_account_keeps_closed_leaves_the_reading_partial_and_not_given() {
+        // Not read is never full, and it is no failure the person could fix.
+        let mut t = Targets::default();
+        let closed = Content::Unread(Cause::NotGiven, watched::CLOSED.to_string());
+        t.count(not_opened(&closed));
+        let mut look = Look::default();
+        look.read(Unit::whole("/Library/Example/helper"));
+        t.short_of(&mut look);
+        let (completeness, reason, gap) = t.coverage(&look);
+        assert_eq!(completeness, "partial");
+        let said = format!("not read in full: {CLOSED}: 1; {AT_CHECKS}");
+        assert_eq!(reason.as_deref(), Some(said.as_str()));
+        assert_eq!(gap.cause, Some(Cause::NotGiven));
+    }
+
+    #[test]
     fn the_name_of_what_the_reading_does_not_read_fits_a_list_of_names_as_it_is() {
         let names = [
-            NOT_FULL, IN_BUNDLE, NOT_FILE, GUARDED, FAILED, ITEMS, ARGUMENTS, NOT_THERE,
+            NOT_FULL, IN_BUNDLE, NOT_FILE, GUARDED, FAILED, CLOSED, ITEMS, ARGUMENTS, NOT_THERE,
         ];
         for name in names.into_iter().chain(NOTES).chain([watched::OVER_CAP]) {
             assert!(!name.contains([',', ':']), "{name}");
