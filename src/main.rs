@@ -47,6 +47,7 @@ mod managers;
 mod map;
 mod matches;
 mod osv;
+mod outcome;
 mod overview;
 mod owner;
 mod pages;
@@ -89,6 +90,7 @@ mod common;
 
 use baseline::{Unit, Verdict};
 use contract::v1::CheckStage;
+use outcome::{Code, Outcome};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::path::{Path, PathBuf};
@@ -738,61 +740,6 @@ const EXIT_STORE: u8 = 3;
 /// Another run holds the store.
 const EXIT_RUN_IN_PROGRESS: u8 = 4;
 
-/// A failure an agent can act on, with its own code and exit code.
-#[derive(Debug, Clone)]
-enum Stop {
-    /// The store cannot be opened or read, with what was said.
-    Store(String),
-    /// Another run holds the run lock, or another process held the store past the busy timeout.
-    RunInProgress,
-}
-
-impl Stop {
-    /// A failure met on the store, as the one rule tells it for every command: SQLite's busy or
-    /// locked code, another process holding the store past the busy timeout, is a run in
-    /// progress, asked again; anything else is a store that cannot be read. Told by the code,
-    /// never by the words of the message. A `Stop` already made passes as it is.
-    fn of(e: &(dyn Error + 'static)) -> Stop {
-        use rusqlite::ErrorCode::{DatabaseBusy, DatabaseLocked};
-        if let Some(stop) = e.downcast_ref::<Stop>() {
-            return stop.clone();
-        }
-        let sqlite = e.downcast_ref::<rusqlite::Error>();
-        match sqlite.and_then(rusqlite::Error::sqlite_error_code) {
-            Some(DatabaseBusy | DatabaseLocked) => Stop::RunInProgress,
-            _ => Stop::Store(e.to_string()),
-        }
-    }
-}
-
-impl From<rusqlite::Error> for Stop {
-    fn from(e: rusqlite::Error) -> Stop {
-        Stop::of(&e)
-    }
-}
-
-impl From<Box<dyn Error>> for Stop {
-    fn from(e: Box<dyn Error>) -> Stop {
-        Stop::of(&*e)
-    }
-}
-
-impl std::fmt::Display for Stop {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        match self {
-            Stop::Store(e) => write!(f, "the store cannot be read: {e}"),
-            Stop::RunInProgress => {
-                write!(
-                    f,
-                    "another run is in progress on this store; nothing was done"
-                )
-            }
-        }
-    }
-}
-
-impl Error for Stop {}
-
 /// Prints one machine-readable envelope on stdout, the only thing on stdout in that form.
 fn print_json(v: &serde_json::Value) {
     println!("{v}");
@@ -943,17 +890,19 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            // `immunity servers` and `immunity view` fail in the one form of an error, the store's
-            // two conditions in the one wording every command gives them; what the failure
+            // `immunity servers` and `immunity view` fail in the one form of an error, with the
+            // outcome of an access to the store as every command gives it; what the failure
             // repeats of what it was given is cut.
-            let error = contract::v1::Error {
-                code: "command_failed".to_string(),
-                message: format!("immunity {} could not finish", op.unwrap_or_default()),
-                detail_text: Some(secrets::said(&e.to_string())),
-                ..Default::default()
+            let o = match e.downcast_ref::<Outcome>() {
+                Some(o) => o.clone(),
+                None => Outcome::new(Code::Failed, e.to_string()),
             };
+            let mut error = o.error(op.unwrap_or_default(), "");
+            error.detail_text = error
+                .detail_text
+                .map(|d| secrets::said(&contract::unescape(&d)));
             eprint!("{}", text::error(&error, &screen::Screen::of_stderr()));
-            ExitCode::FAILURE
+            ExitCode::from(o.exit())
         }
     }
 }
@@ -980,9 +929,9 @@ fn store_folder(folder: &Path) -> Result<(), String> {
 fn sample(args: &SampleArgs) -> Result<processes::Report, Box<dyn Error>> {
     let home = home(&args.store);
     store_folder(&home)?;
-    let _lock = store::lock_run(&home)?.ok_or(Stop::RunInProgress)?;
+    let _lock = store::lock_run(&home)?.ok_or(Outcome::new(Code::RunLockHeld, ""))?;
     // `immunity sample` makes the store where there is none; a watcher's sample only opens it.
-    drop(store::open_or_make(&args.store).map_err(Stop::from)?);
+    drop(store::open_or_make(&args.store)?);
     let (report, _) = sample_held(
         &args.store,
         args.input.as_deref(),
@@ -1006,7 +955,7 @@ pub fn sample_held(
         now.as_secs(),
         now.subsec_nanos()
     );
-    let mut conn = store::open(path).map_err(Stop::from)?;
+    let mut conn = store::open(path)?;
     let took = std::time::Instant::now();
     let reading = match input {
         Some(file) => processes::Reading::from_json(&std::fs::read_to_string(file)?)?,
@@ -1041,8 +990,8 @@ fn sample_cmd(args: &SampleArgs) -> ExitCode {
             })
         }
         Err(e) => {
-            let (error, exit) = match e.downcast_ref::<Stop>() {
-                Some(stop) => answer::stopped(stop, "immunity sample --json"),
+            let (error, exit) = match e.downcast_ref::<Outcome>() {
+                Some(o) => (o.error("sample", "immunity sample --json"), o.exit()),
                 None => (
                     answer::error(
                         "sample_failed",
@@ -1093,7 +1042,7 @@ pub fn read_events_held(path: &Path, system_root: &Path) -> Result<EventsRead, B
         now.as_secs(),
         now.subsec_nanos()
     );
-    let mut conn = store::open(path).map_err(Stop::from)?;
+    let mut conn = store::open(path)?;
     let tx = conn.transaction()?;
     let machine = this_machine_or_named(&tx)?;
     store::put_entity(&tx, &machine)?;
@@ -1120,7 +1069,7 @@ fn rules_cmd(args: &RulesArgs) -> ExitCode {
         return replay_cmd(root, args.form);
     }
     let now = now_secs();
-    let read = (|| -> Result<(Option<events::Level>, Option<String>), Stop> {
+    let read = (|| -> Result<(Option<events::Level>, Option<String>), Outcome> {
         if !args.store.exists() {
             return Ok((None, None));
         }
@@ -1129,9 +1078,9 @@ fn rules_cmd(args: &RulesArgs) -> ExitCode {
     })();
     let (level, store_id) = match read {
         Ok(read) => read,
-        Err(e) => {
-            let (error, exit) = answer::stopped(&e, "immunity rules --json");
-            return answer::fail("rules", args.form, error, exit);
+        Err(o) => {
+            let error = o.error("rules", "immunity rules --json");
+            return answer::fail("rules", args.form, error, o.exit());
         }
     };
     let mut m = sigma::Rules::shipped().message(
@@ -1247,24 +1196,24 @@ fn now_secs() -> i64 {
 /// number is of one state of the store: a run that commits meanwhile waits for it, and it never
 /// sees half a run. Without a store it is the answer that there is none; a store that cannot be
 /// read, or that a newer build wrote, is a failure.
-fn status_answer(store: &Path, now: i64) -> Result<contract::v1::Status, Stop> {
+fn status_answer(store: &Path, now: i64) -> Result<contract::v1::Status, Outcome> {
     if !store.exists() {
         // No journal holds a start, so no check of this store is said to be running.
         let path = std::path::absolute(store).unwrap_or_else(|_| store.to_path_buf());
-        return status::message(None, None, false, &path, now).map_err(Stop::from);
+        return Ok(status::message(None, None, false, &path, now)?);
     }
     status_read(store, now).map(|(_, m)| m)
 }
 
 /// What the store holds and the contract's `Status` built from it, of one state of the store.
-fn status_read(store: &Path, now: i64) -> Result<(status::State, contract::v1::Status), Stop> {
+fn status_read(store: &Path, now: i64) -> Result<(status::State, contract::v1::Status), Outcome> {
     let path = std::path::absolute(store).unwrap_or_else(|_| store.to_path_buf());
     let conn = store::open_read_only(store)?;
     let tx = conn.unchecked_transaction()?;
     let st = status::state(&tx, &home(store), now)?;
     // Running is said only of the latest start this state of the store holds, by its own lock.
     let running = match &st.last {
-        Some(l) => osv::check_in_progress(&home(store), &l.id).map_err(|e| Stop::of(&e))?,
+        Some(l) => osv::check_in_progress(&home(store), &l.id).map_err(|e| outcome::of(&e))?,
         None => false,
     };
     let mut m = status::message(Some(&tx), Some(&st), running, &path, now)?;
@@ -1288,9 +1237,9 @@ fn status_cmd(op: &str, store: &Path, form: answer::Form, coverage: bool) -> Exi
         Ok(m) => answer::print(op, form, &m, |m| {
             overview::status(m, &screen::Screen::of_stdout(), coverage)
         }),
-        Err(e) => {
-            let (error, exit) = answer::stopped(&e, "immunity status --json --store <file>");
-            answer::fail(op, form, error, exit)
+        Err(o) => {
+            let error = o.error(op, "immunity status --json --store <file>");
+            answer::fail(op, form, error, o.exit())
         }
     }
 }
@@ -1304,20 +1253,19 @@ fn run_cmd(args: &Args) -> ExitCode {
     let done = run(args);
     drop(running);
     match done {
-        Ok(_) if !text => status_cmd("run", &args.store, args.form, false),
         Ok(_) => match status_answer(&args.store, now_secs()) {
             Ok(m) => answer::print("run", args.form, &m, |m| {
                 after_run::run(m, &screen::Screen::of_stdout())
             }),
-            Err(e) => {
-                let (error, exit) = answer::stopped(&e, "immunity run --json");
+            Err(o) => {
+                let (error, exit) = unread(&o);
                 answer::fail("run", args.form, error, exit)
             }
         },
-        Err(e) => match e.downcast_ref::<Stop>() {
-            Some(stop) => {
-                let (error, exit) = answer::stopped(stop, "immunity run --json");
-                answer::fail("run", args.form, error, exit)
+        Err(e) => match e.downcast_ref::<Outcome>() {
+            Some(o) => {
+                let error = o.error("run", "immunity run --json");
+                answer::fail("run", args.form, error, o.exit())
             }
             None => answer::fail(
                 "run",
@@ -1332,6 +1280,18 @@ fn run_cmd(args: &Args) -> ExitCode {
             ),
         },
     }
+}
+
+/// The failure of `immunity run` whose check committed and whose answer could not be read back
+/// after it: the check stands, so it is neither a skip, which a caller asks again by running a
+/// second check, nor a failure of the check. The outcome says why the read failed.
+fn unread(o: &Outcome) -> (contract::v1::Error, u8) {
+    let mut error = o.error("run", "immunity status --json");
+    error.code = "answer_unreadable".to_string();
+    error.message = "the check finished and what it read was committed, but its answer could not \
+                     be read back; nothing was run again"
+        .to_string();
+    (error, 1)
 }
 
 /// The store's folder: raw input and the view live next to the store.
@@ -1364,15 +1324,20 @@ fn vulnerabilities_cmd(args: &VulnerabilityArgs) -> ExitCode {
         "vulnerabilities"
     };
     let failed = |e: &(dyn Error + 'static)| {
-        let (error, exit) = answer::stopped(&Stop::of(e), "immunity vulnerabilities --json");
-        answer::fail(op, args.form, error, exit)
+        let o = outcome::of(e);
+        answer::fail(
+            op,
+            args.form,
+            o.error(op, "immunity vulnerabilities --json"),
+            o.exit(),
+        )
     };
     let now = now_secs();
     let conn = match args.store.exists() {
         false => None,
         true => match store::open_read_only(&args.store) {
             Ok(conn) => Some(conn),
-            Err(e) => return failed(&*e),
+            Err(e) => return failed(&e),
         },
     };
     match &args.id {
@@ -1423,13 +1388,13 @@ fn finding_cmd(args: &FindingArgs) -> ExitCode {
     let Some(act) = &args.act else {
         return read();
     };
-    let store_failed = |e: &Stop| {
-        let (error, exit) = answer::stopped(e, "immunity finding <id> seen");
-        answer::fail("finding", args.form, error, exit)
+    let store_failed = |o: &Outcome| {
+        let error = o.error("finding", "immunity finding <id> seen");
+        answer::fail("finding", args.form, error, o.exit())
     };
     // No store is told as every command of the contract tells it, with exit code 3.
     if !args.store.is_file() {
-        return store_failed(&Stop::Store(store::absent(&args.store)));
+        return store_failed(&store::absent(&args.store));
     }
     let now = now_secs();
     let nanos = SystemTime::now()
@@ -1438,13 +1403,9 @@ fn finding_cmd(args: &FindingArgs) -> ExitCode {
     let run_id = format!("owner-{now}-{nanos:09}");
     // It writes as `immunity verdict` does: under the run lock, with the write lock from the
     // start of its transaction, and a store another writer holds is asked again.
-    let busy = |r: verdict::Refusal| {
-        let error = answer::error(r.code, r.message, "immunity finding <id> seen", &r.detail);
-        answer::fail("finding", args.form, error, r.exit)
-    };
     let (lock, mut conn) = match verdict::writing(&args.store) {
         Ok(held) => held,
-        Err(r) => return busy(r),
+        Err(o) => return store_failed(&o),
     };
     // Everything that can refuse is decided in the transaction, and the answer printed is read in
     // it too, before the commit: a command that is refused, by a check or by the read, has
@@ -1570,7 +1531,7 @@ fn finding_cmd(args: &FindingArgs) -> ExitCode {
         Ok(Err(refused)) => answer::fail("finding", args.form, refused.error(), EXIT_USAGE),
         Err(e) => match e.downcast::<findings::RefusedError>() {
             Ok(r) => refusal(r.0),
-            Err(e) => store_failed(&Stop::of(&*e)),
+            Err(e) => store_failed(&outcome::of(&*e)),
         },
     }
 }
@@ -2195,18 +2156,25 @@ fn owner_cmd(args: &OwnerArgs) -> ExitCode {
         )
     };
     let failed = |e: &(dyn Error + 'static)| {
-        let (error, exit) = answer::stopped(&Stop::of(e), "immunity owner --json");
-        answer::fail("owner", args.form, error, exit)
+        let o = outcome::of(e);
+        answer::fail(
+            "owner",
+            args.form,
+            o.error("owner", "immunity owner --json"),
+            o.exit(),
+        )
     };
     let store_path = &args.servers.store;
     if !store_path.is_file() {
-        return refused(
+        // A code and a detail of its own, the path alone, with the outcome every command gives.
+        let mut error = answer::error(
             "no_store",
             "there is no store at the path given; `immunity run` makes it",
             "immunity run --json",
             &store_path.display().to_string(),
-            EXIT_STORE,
         );
+        error.outcome = Some(Code::NoStore.literal().to_string());
+        return answer::fail("owner", args.form, error, EXIT_STORE);
     }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -2222,7 +2190,7 @@ fn owner_cmd(args: &OwnerArgs) -> ExitCode {
         });
         let (standing, withdrawn, store_id) = match listed {
             Ok(l) => l,
-            Err(e) => return failed(&*e),
+            Err(e) => return failed(&e),
         };
         let m = v1::Statements {
             format: 1,
@@ -2238,7 +2206,7 @@ fn owner_cmd(args: &OwnerArgs) -> ExitCode {
     let run_id = format!("owner-{}-{:09}", now.as_secs(), now.subsec_nanos());
     let mut conn = match store::open(store_path) {
         Ok(c) => c,
-        Err(e) => return failed(&*e),
+        Err(e) => return failed(&e),
     };
     let (entity, machine) = match owner::find(&conn, name) {
         Ok(owner::Found::One(entity, machine)) => (entity, machine),
@@ -2440,19 +2408,19 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     // read. A second run stops here, at the lock on the downloads, and writes nothing.
     // A store this build cannot use is refused before anything is written next to it.
     let read_only = match args.store.exists() {
-        true => Some(store::open_read_only(&args.store).map_err(Stop::from)?),
+        true => Some(store::open_read_only(&args.store)?),
         false => None,
     };
     let _fetching = osv::lock_fetch(&home)
         .map_err(|e| format!("cannot write in the store's folder {}: {e}", home.display()))?
-        .ok_or(Stop::RunInProgress)?;
+        .ok_or(Outcome::new(Code::CheckRunning, ""))?;
     let mut check = osv::lock_check(&home, &run_id)?;
     let mut stage = |s| check.stage(s, now_secs());
     // The check has started, downloads and all: its start is written now, under the run lock
     // for that write alone, so that a status says from the first minute when it started.
     {
         let _lock = take_store(&home, store::CHECK_WAIT)?;
-        let conn = store::open_or_make(&args.store).map_err(Stop::from)?;
+        let conn = store::open_or_make(&args.store)?;
         store::journal_note(&conn, at, &run_id, "run_started", "")?;
     }
     stage(CheckStage::Downloading);
@@ -2461,7 +2429,7 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     drop(read_only);
     // Held until the run returns. Whoever holds it now is a reading or a command, waited out.
     let _lock = take_store(&home, store::CHECK_WAIT)?;
-    let mut conn = store::open_or_make(&args.store).map_err(Stop::from)?;
+    let mut conn = store::open_or_make(&args.store)?;
 
     let tx = conn.transaction()?;
     // The store keeps this Mac's id; its name now is kept beside it.
@@ -3215,84 +3183,105 @@ fn read_agent_folders(
     let home = std::fs::canonicalize(&args.home).unwrap_or_else(|_| args.home.clone());
     let homes = [args.home.as_path(), home.as_path()];
     let held = agent_folders::held(run.tx)?;
-    let (mut sessions, mut failed, mut not_entered) = (None, Vec::new(), Vec::new());
+    // The folders of sessions, each read, not here, failed or not entered, and what was not
+    // read in all of them: completeness, cause and reason follow from it.
+    let (mut look, mut sessions, mut not_entered) = (look::Look::default(), None, Vec::new());
     for source in &agent_folders::SOURCES {
         let dir = match &args.sessions_root {
             Some(dir) if source.dir == agent_folders::SESSIONS => dir.clone(),
             _ => args.home.join(source.dir),
         };
+        let unit = Unit::whole(dir.display().to_string());
         match agent_folders::sessions(source, &dir, &homes, &held, SystemTime::now(), look_limit) {
-            agent_folders::Found::Absent => {}
+            agent_folders::Found::Absent(absent) => look.absent(unit, absent),
             agent_folders::Found::Read(s) => match &mut sessions {
-                None => sessions = Some(s),
-                Some(all) => agent_folders::Sessions::add(all, s),
+                None => sessions = Some(*s),
+                Some(all) => agent_folders::Sessions::add(all, *s),
             },
-            agent_folders::Found::Failed(reason) => failed.push(reason),
-            agent_folders::Found::Guarded(folder) => not_entered.push(folder),
+            agent_folders::Found::Failed(why) => look.not_looked_at(unit, why),
+            agent_folders::Found::Guarded(folder) => not_entered.push((unit, folder)),
         }
     }
-    if sessions.is_none() && !(failed.is_empty() && not_entered.is_empty()) {
+    let read = sessions.is_some();
+    if !read {
+        for (unit, folder) in &not_entered {
+            look.not_into_as(
+                unit.clone(),
+                folder.clone(),
+                &args.home,
+                look::Said::SourceInto,
+            );
+        }
+    }
+    if let (false, ("none", reason)) = (read, look.completeness()) {
         // No sessions were read: what was known from them stays as it was. A folder of them
         // that leads into a folder macOS asks permission for was not given.
         run.readers += 1;
-        let (reason, gap) = if failed.is_empty() {
-            let shown: Vec<String> = not_entered
-                .iter()
-                .map(|f| guarded::leads_into(f, &args.home))
-                .collect();
-            let reason = format!("{}{}", guarded::NOT_LOOKED_INTO, shown.join(", "));
-            (reason, Gap::of(Cause::NotGiven))
-        } else {
-            (failed.join("; "), Gap::of(Cause::Failed))
-        };
+        let gap = look.gap();
         run.apply(
             &reading,
             agent_folders::BASIS,
             "none",
-            Some(&reason),
+            reason.as_deref(),
             &gap,
             &[],
         )?;
-        if failed.is_empty() {
-            not_looked_into(run, agent_folders::READER, &not_entered, &args.home)?;
+        if gap.cause == Some(Cause::NotGiven) {
+            let folders: Vec<PathBuf> = not_entered.into_iter().map(|(_, g)| g).collect();
+            not_looked_into(run, agent_folders::READER, &folders, &args.home)?;
         } else {
-            run.notes.push(not_read_note("Agent sessions", &reason));
+            let failed: Vec<String> = (look.not_read())
+                .filter(|u| u.cause == Cause::Failed)
+                .map(|u| format!("{}: {}", u.unit, u.why))
+                .collect();
+            run.notes
+                .push(not_read_note("Agent sessions", &failed.join("; ")));
         }
         return Ok(Vec::new());
     }
-    if let Some(s) = &mut sessions {
+    let mut s = sessions.unwrap_or_default();
+    if read {
         run.readers += 1;
-        // A folder of sessions that leads into a folder macOS asks permission for is told as
-        // a session file that does.
-        s.guarded.extend(not_entered);
         // Where each file was read up to, in the run's transaction: committed with the facts
         // derived from it or not at all.
         agent_folders::keep(run.tx, &s.held)?;
     }
+    // What this version has no reader for: sessions of other agents, named only by the agent.
+    // A checkout is dropped only when it is gone from disk, so these alone leave what was
+    // found compared in full.
+    let unread = agent_folders::unread_here(&args.home, &homes);
+    if !unread.is_empty() {
+        let why = format!("sessions of {} are not read", covered::listed(&unread));
+        look.short(Cause::NoReader, why);
+    }
+    for agent in &unread {
+        look.lack(Lack::new(agent_folders::OTHER_AGENT, Some(agent)));
+    }
+    look.add(std::mem::take(&mut s.look));
+    // A folder of sessions that leads into a folder macOS asks permission for is told as a
+    // session file that does, last, so that what comes before it names no folder.
+    let not_entered: BTreeSet<PathBuf> = not_entered.into_iter().map(|(_, g)| g).collect();
+    for folder in not_entered {
+        let unit = Unit::whole(folder.display().to_string());
+        look.not_into_as(unit, folder, &args.home, look::Said::FilesInto);
+    }
     let mut found: BTreeMap<String, PathBuf> = BTreeMap::new();
-    let mut unknown = BTreeSet::new();
     // Folders macOS asks permission for are not looked into, as in the walk, whatever name
     // led to them: a working folder or a held checkout is made real without entering one.
-    let mut guarded: BTreeSet<PathBuf> = sessions
-        .iter()
-        .flat_map(|s| s.guarded.iter().cloned())
-        .collect();
-    for folder in sessions.iter().flat_map(|s| &s.folders) {
+    for folder in &s.folders {
         match agent_folders::checkout_of(folder, &home, &homes) {
             agent_folders::OnDisk::Checkout(path) => {
                 found.insert(checkouts::rel(&home, &path), path);
             }
             agent_folders::OnDisk::Nothing => {}
             agent_folders::OnDisk::Unknown => {
-                unknown.insert(folder.clone());
+                let why = "the disk could not say whether it is there".to_string();
+                look.unread_as(Unit::whole(folder), look::Said::WorkingFolder, why);
             }
-            agent_folders::OnDisk::Guarded(g) => {
-                guarded.insert(g);
-            }
+            agent_folders::OnDisk::Guarded(g) => look.met(g),
         }
     }
     let prefix = format!("checkout:{machine}/");
-    let mut kept = 0;
     // Held checkouts in a guarded folder: kept as they were, nothing inside them read.
     let mut carried = BTreeSet::new();
     for id in store::live_subjects(run.tx, agent_folders::READER)? {
@@ -3309,7 +3298,7 @@ fn read_agent_folders(
         };
         let there = match guarded::real(&path, &homes) {
             guarded::Real::Guarded(g) => {
-                guarded.insert(g);
+                look.met(g);
                 carried.insert(rel.to_string());
                 continue;
             }
@@ -3322,7 +3311,10 @@ fn read_agent_folders(
             }
             Some(false) => {}
             // Not known to be gone: the reading is partial, so it stays as it was.
-            None => kept += 1,
+            None => {
+                let why = "the disk could not say whether it is there".to_string();
+                look.unread_as(Unit::whole(rel), look::Said::Checkout, why);
+            }
         }
     }
 
@@ -3334,7 +3326,8 @@ fn read_agent_folders(
         raw.push_str(&format!("kept, not looked into\t{rel}\n"));
     }
     let raw_file = run.keep_raw(agent_folders::READER, "agent-folders.txt", raw.as_bytes())?;
-    let guarded: Vec<PathBuf> = guarded.into_iter().collect();
+    let mut guarded = look.guarded.clone();
+    guarded.sort();
     not_looked_into(run, agent_folders::READER, &guarded, &args.home)?;
     let statements: Vec<Statement> = found
         .keys()
@@ -3347,109 +3340,14 @@ fn read_agent_folders(
             source_ref: format!("{raw_file}:{}", i + 1),
         })
         .collect();
-    let mut reasons = failed;
-    let count = |n: usize, one: &str, many: &str| things(n as i64, one, many);
-    if let Some(s) = &sessions {
-        if s.unreadable > 0 {
-            reasons.push(format!(
-                "{} of {} could not be read",
-                s.unreadable,
-                count(s.files, "session file", "session files")
-            ));
-        }
-        if s.unlisted > 0 {
-            reasons.push(format!(
-                "{} could not be listed",
-                count(s.unlisted, "session folder", "session folders")
-            ));
-        }
-        if s.unparsed > 0 {
-            reasons.push(format!(
-                "{} with a working folder could not be parsed",
-                count(s.unparsed, "line", "lines")
-            ));
-        }
-    }
-    if !unknown.is_empty() {
-        reasons.push(format!(
-            "{} could not be looked at",
-            count(unknown.len(), "working folder", "working folders")
-        ));
-    }
-    if kept > 0 {
-        reasons.push(format!(
-            "{} could not be checked and {} kept",
-            count(kept, "checkout", "checkouts"),
-            if kept == 1 { "is" } else { "are" }
-        ));
-    }
-    // Every reason above is a session, a folder or a checkout that could not be read; a
-    // session file that leads into a folder macOS asks permission for was not given.
-    let mut causes = Vec::new();
-    if !reasons.is_empty() {
-        causes.push(Cause::Failed);
-    }
-    // What this version has no reader for: sessions of other agents, named only by the agent.
-    // A checkout is dropped only when it is gone from disk, so these alone leave what was
-    // found compared in full.
-    let unread = agent_folders::unread_here(&args.home, &homes);
-    let mut lacks: Vec<Lack> = unread
-        .iter()
-        .map(|agent| Lack::new(agent_folders::OTHER_AGENT, Some(agent)))
-        .collect();
-    let mut no_reader = Vec::new();
-    if !unread.is_empty() {
-        no_reader.push(format!(
-            "sessions of {} are not read",
-            covered::listed(&unread)
-        ));
-    }
-    // A walk below the level of the sessions that reached its budget, as the lockfile
-    // reader's does: what the folders past it hold is not known.
-    if sessions.as_ref().is_some_and(|s| s.stopped) {
-        lacks.push(Lack::new(agent_folders::NOT_LOOKED, None));
-        no_reader.push(format!(
-            "session folders past the first {look_limit} below a project's folder were not listed"
-        ));
-    }
-    if !lacks.is_empty() {
-        causes.push(Cause::NoReader);
-    }
-    // A session file that leads into a folder macOS asks permission for was not given. Its
-    // clause comes last, so that what comes before it has no folder in it.
-    if let Some(s) = sessions.as_ref().filter(|s| !s.guarded.is_empty()) {
-        causes.push(Cause::NotGiven);
-        let folders: Vec<String> = s
-            .guarded
-            .iter()
-            .map(|g| guarded::leads_into(g, &args.home))
-            .collect();
-        no_reader.push(format!(
-            "{}{}",
-            agent_folders::FILES_NOT_LOOKED_INTO,
-            folders.join("; ")
-        ));
-    }
-    let compared = match causes.iter().any(|c| *c != Cause::NoReader) {
-        true => "partial",
-        false => "full",
-    };
-    reasons.append(&mut no_reader);
-    let (completeness, reason, gap) = match (reasons.is_empty(), &sessions) {
-        (false, _) => (
-            "partial",
-            Some(reasons.join("; ")),
-            Gap {
-                cause: Cause::worst(causes),
-                lacks,
-            },
-        ),
-        (true, None) => (
-            "full",
-            Some(agent_folders::NOT_HERE.to_string()),
-            Gap::default(),
-        ),
-        (true, Some(_)) => ("full", None, Gap::default()),
+    let (completeness, reason) = look.completeness_here(agent_folders::NOT_HERE, None);
+    let gap = look.gap();
+    // A checkout is dropped only when it is gone from disk: what this version has no reader
+    // for hides none, so a reading short only of that compares what it found in full.
+    let compared = match completeness {
+        "none" => "none",
+        _ if look.short_of_other_than(Cause::NoReader) => "partial",
+        _ => "full",
     };
     let applied = Applied {
         completeness,
@@ -4708,15 +4606,15 @@ fn read_integrity(run: &mut Run, args: &Args) -> Result<Vec<findings::Observed>,
             &reading,
             integrity::BASIS,
             completeness,
-            Some(&reason),
+            reason.as_deref(),
             &gap,
             &statements,
         )?;
     }
-    if kinds.iter().any(|k| k.present > 0) {
+    if kinds.iter().any(|k| k.look.present > 0) {
         run.readers += 1;
     }
-    let mut guarded: Vec<PathBuf> = kinds.iter().flat_map(|k| k.guarded.clone()).collect();
+    let mut guarded: Vec<PathBuf> = kinds.iter().flat_map(|k| k.look.guarded.clone()).collect();
     guarded.extend(read_managers(run, args)?);
     guarded.sort();
     guarded.dedup();
@@ -5734,43 +5632,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_store_held_by_another_is_a_run_in_progress_by_sqlite_s_code_and_anything_else_unreadable()
-    {
-        let dir = crate::common::Scratch::new("held-store");
-        let path = dir.join("held.db");
-        let holder = rusqlite::Connection::open(&path).unwrap();
-        holder
-            .execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1); BEGIN EXCLUSIVE")
-            .unwrap();
-        let reader = rusqlite::Connection::open(&path).unwrap();
-        reader.busy_timeout(std::time::Duration::ZERO).unwrap();
-        let busy = || {
-            reader
-                .query_row("SELECT x FROM t", [], |_| Ok(()))
-                .unwrap_err()
-        };
-        // Locked: a connection drops a table one of its own statements is still reading.
-        let mem = rusqlite::Connection::open_in_memory().unwrap();
-        mem.execute_batch("CREATE TABLE t (x); INSERT INTO t VALUES (1)")
-            .unwrap();
-        let mut read = mem.prepare("SELECT x FROM t").unwrap();
-        let mut rows = read.query([]).unwrap();
-        rows.next().unwrap();
-        let locked = mem.execute_batch("DROP TABLE t").unwrap_err();
-        let missing = mem.execute_batch("SELECT * FROM nowhere").unwrap_err();
-        assert!(matches!(Stop::from(busy()), Stop::RunInProgress));
-        assert!(matches!(Stop::from(locked), Stop::RunInProgress));
-        let boxed: Box<dyn Error> = Box::new(busy());
-        assert!(matches!(Stop::from(boxed), Stop::RunInProgress));
-        assert!(matches!(Stop::from(missing), Stop::Store(_)));
-        // The words of a busy store, said by anything but SQLite, are a store that cannot be read.
-        let words: Box<dyn Error> = "database is locked".into();
-        assert!(matches!(Stop::from(words), Stop::Store(_)));
-        // A `Stop` already made passes as it is, its words without a second prefix.
-        let held: Box<dyn Error> = Box::new(Stop::RunInProgress);
-        assert!(matches!(Stop::from(held), Stop::RunInProgress));
-        let said: Box<dyn Error> = Box::new(Stop::Store("gone".into()));
-        assert!(matches!(Stop::from(said), Stop::Store(w) if w == "gone"));
+    fn a_check_committed_and_then_not_read_back_is_never_a_skip_or_a_failed_check() {
+        let (error, exit) = unread(&Outcome::new(Code::StoreBusy, "database is locked"));
+        assert_eq!(exit, 1);
+        assert_eq!(error.code, "answer_unreadable");
+        assert_eq!(error.outcome.as_deref(), Some("store_busy"));
+        assert!(
+            error.message.starts_with("the check finished"),
+            "{}",
+            error.message
+        );
     }
 
     #[test]
@@ -5790,7 +5661,7 @@ mod tests {
         let held = std::fs::File::open(&dir).unwrap();
         held.lock().unwrap();
         let failed = take_store(&dir, std::time::Duration::ZERO).unwrap_err();
-        assert!(failed.downcast_ref::<Stop>().is_none(), "{failed}");
+        assert!(failed.downcast_ref::<Outcome>().is_none(), "{failed}");
         std::thread::scope(|s| {
             s.spawn(|| {
                 std::thread::sleep(std::time::Duration::from_secs(3));
@@ -5871,7 +5742,8 @@ mod tests {
     }
 
     #[test]
-    fn a_walk_of_sessions_that_reached_its_budget_makes_the_reading_partial_with_the_count() {
+    fn a_walk_of_sessions_that_reached_its_budget_or_did_not_enter_a_folder_is_partial_and_lets_go_of_nothing()
+     {
         // Folders past the budget were not listed: what sessions they hold is not known, so
         // the reading never says every project an agent worked in was found.
         let dir = crate::common::Scratch::new("session-budget");
@@ -5932,6 +5804,72 @@ mod tests {
                 agent_folders::NOT_LOOKED,
             ]
         );
+
+        // A folder of sessions not entered, for macOS asks permission for it, may name what
+        // became of a checkout: one held stays held, gone from disk or not, and the reading
+        // says it was not given, not that it failed.
+        let home = dir.join("home");
+        std::fs::create_dir_all(home.join("Documents/kept/sessions")).unwrap();
+        std::os::unix::fs::symlink(home.join("Documents/kept"), home.join(".codex")).unwrap();
+        let held = "checkout:machine:mac/dev/gone";
+        store::put_entity(&tx, held).unwrap();
+        tx.execute(
+            "INSERT INTO assertion (layer, subject, predicate, object, reader, scope, kind,
+                                    source_ref, basis, observed_at, run_id)
+             VALUES ('live', ?1, 'located_on', 'machine:mac', ?2, 'machine:mac', ?3, 'x:1',
+                     'observed', 1, 'run-1')",
+            rusqlite::params![held, agent_folders::READER, agent_folders::KIND],
+        )
+        .unwrap();
+        let said = |tx: &rusqlite::Transaction| -> (String, String, i64) {
+            tx.query_row(
+                "SELECT completeness, cause, (SELECT COUNT(*) FROM assertion
+                                              WHERE layer = 'live' AND subject = ?2)
+                 FROM coverage WHERE reader = ?1 ORDER BY id DESC LIMIT 1",
+                [agent_folders::READER, held],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap()
+        };
+        run.run_id = "run-2";
+        read_agent_folders(&mut run, &args, agent_folders::LOOK_LIMIT).unwrap();
+        assert_eq!(said(&tx), ("partial".into(), "not_given".into(), 1));
+        // Beside another agent's sessions, which have no reader and are the worse cause, the
+        // folder not entered still keeps what it may name.
+        std::fs::create_dir_all(home.join(".gemini/tmp")).unwrap();
+        run.run_id = "run-2b";
+        read_agent_folders(&mut run, &args, agent_folders::LOOK_LIMIT).unwrap();
+        assert_eq!(said(&tx), ("partial".into(), "no_reader".into(), 1));
+
+        // With no folder of sessions entered, nothing was read: the folders alone are named, as
+        // the rows of folders macOS asks permission for name them.
+        let args = Args {
+            sessions_root: Some(home.join("Documents/kept/sessions")),
+            ..args
+        };
+        run.run_id = "run-3";
+        read_agent_folders(&mut run, &args, agent_folders::LOOK_LIMIT).unwrap();
+        let into = "it leads into ~/Documents, which macOS asks permission for";
+        let said: (String, String, String) = tx
+            .query_row(
+                "SELECT completeness, cause, reason FROM coverage
+                 WHERE reader = ?1 AND kind = ?2 ORDER BY id DESC LIMIT 1",
+                [agent_folders::READER, agent_folders::KIND],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        let reason = format!("not looked into: {into}, {into}, {into}");
+        assert_eq!(said, ("none".into(), "not_given".into(), reason));
+        let folders: String = tx
+            .query_row(
+                "SELECT reason FROM coverage WHERE reader = ?1 AND kind = ?2
+                 ORDER BY id DESC LIMIT 1",
+                [agent_folders::READER, guarded::KIND],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let docs = "~/Documents";
+        assert_eq!(folders, format!("not looked into: {docs}, {docs}, {docs}"));
     }
 
     #[test]

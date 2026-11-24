@@ -1,6 +1,7 @@
 //! The store: vocabulary, entities, the three assertion layers, coverage and the journal.
 //! The shape is described in docs/how-it-works.md.
 
+use crate::outcome::{Code, Outcome};
 use crate::resolver;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use std::collections::BTreeSet;
@@ -483,8 +484,8 @@ fn schema() -> String {
 /// Opens the store, making it first where no file is: what `immunity run`, `immunity sample` and
 /// the start of `immunity watch` do. Every other command, and a watcher already running, only
 /// opens (`open`).
-pub fn open_or_make(path: &Path) -> Res<Connection> {
-    make_if_absent(path)?;
+pub fn open_or_make(path: &Path) -> Result<Connection, Outcome> {
+    make_if_absent(path).map_err(Outcome::from)?;
     open(path)
 }
 
@@ -501,7 +502,9 @@ fn exists(path: &Path) -> Res<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(_) => Ok(true),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(e) => Err(format!("cannot look at {}: {e}", path.display()).into()),
+        Err(e) => {
+            Err(Outcome::new(Code::Io, format!("cannot look at {}: {e}", path.display())).into())
+        }
     }
 }
 
@@ -561,7 +564,11 @@ fn make(path: &Path) -> Res<()> {
 /// without creating files next to it. Waiting on a lock is rusqlite's busy timeout of five
 /// seconds on every connection: a reader waits out the commit, and the commit waits out a
 /// reader.
-pub fn open(path: &Path) -> Res<Connection> {
+pub fn open(path: &Path) -> Result<Connection, Outcome> {
+    opened(path).map_err(Outcome::from)
+}
+
+fn opened(path: &Path) -> Res<Connection> {
     if !exists(path)? {
         return Err(absent(path).into());
     }
@@ -624,11 +631,19 @@ fn give_id(conn: &Connection) -> Res<()> {
 /// and then fail to delete the journal, so nothing is tried; a store file that cannot be
 /// written is opened read-only by SQLite itself, which refuses the rollback the same way. In
 /// both the first refusal is returned as SQLite gave it.
-pub fn open_read_only(path: &Path) -> Res<Connection> {
-    match read_only(path) {
-        Err(e) if hot_journal(e.as_ref()) && roll_back(path) => read_only(path),
+pub fn open_read_only(path: &Path) -> Result<Connection, Outcome> {
+    let opened = match read_only(path) {
+        // Told by the one mapping, by SQLite's extended code (`outcome::of`).
+        Err(e) if crate::outcome::of(e.as_ref()).code == Code::HotJournal => {
+            match roll_back(path) {
+                Ok(true) => read_only(path),
+                // Nothing was tried, or the read that rolls back failed: the first refusal stands.
+                _ => Err(e),
+            }
+        }
         opened => opened,
-    }
+    };
+    opened.map_err(Outcome::from)
 }
 
 fn read_only(path: &Path) -> Res<Connection> {
@@ -637,29 +652,20 @@ fn read_only(path: &Path) -> Res<Connection> {
     Ok(conn)
 }
 
-/// Whether a read was refused because a journal left by a writer that is gone waits to be
-/// rolled back. Told by SQLite's extended code, never by its words.
-fn hot_journal(e: &(dyn std::error::Error + 'static)) -> bool {
-    e.downcast_ref::<rusqlite::Error>()
-        .and_then(rusqlite::Error::sqlite_error)
-        .is_some_and(|e| e.extended_code == rusqlite::ffi::SQLITE_READONLY_ROLLBACK)
-}
-
 /// Lets SQLite roll a hot journal back through a connection that may write, opened without
-/// `SQLITE_OPEN_CREATE` so that a store that is not there is not made. Whether the read went
-/// through, and with it the rollback.
-fn roll_back(path: &Path) -> bool {
+/// `SQLITE_OPEN_CREATE` so that a store that is not there is not made. `false` when the folder
+/// cannot be written, so nothing was tried; an error when the read that rolls back failed, as
+/// beside another connection rolling the same journal back.
+fn roll_back(path: &Path) -> rusqlite::Result<bool> {
     let folder = path.parent().filter(|p| !p.as_os_str().is_empty());
     if !writable(folder.unwrap_or(Path::new("."))) {
-        return false;
+        return Ok(false);
     }
-    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
-        .and_then(|c| {
-            c.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| {
-                r.get::<_, i64>(0)
-            })
-        })
-        .is_ok()
+    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| {
+        r.get::<_, i64>(0)
+    })?;
+    Ok(true)
 }
 
 /// Whether this process may write in the folder, by access(2), as SQLite will need to delete
@@ -673,14 +679,15 @@ fn writable(folder: &Path) -> bool {
     unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
 }
 
-/// What a failure says when there is no store at the path, as every command of the contract
-/// gives it in `detail_text`: the same words wherever it is found that there is none.
-pub fn absent(path: &Path) -> String {
-    format!("{ABSENT_BEFORE}{}{ABSENT_AFTER}", path.display())
+/// The refusal of a path that holds no store, as every command gives it: the same words wherever
+/// it is found that there is none.
+pub fn absent(path: &Path) -> Outcome {
+    let said = format!(
+        "there is no store at {}; `immunity run` makes it",
+        path.display()
+    );
+    Outcome::new(Code::NoStore, said)
 }
-
-const ABSENT_BEFORE: &str = "there is no store at ";
-const ABSENT_AFTER: &str = "; `immunity run` makes it";
 
 /// Why a part of an answer was not computed when there is no store (`not_computed`), as every
 /// message of the contract gives it.
@@ -696,45 +703,6 @@ pub const NO_STORE_FIX: &str =
 pub const OTHER_FORMAT: &str = "this store was made by another build of Immunity Core";
 pub const OTHER_FORMAT_FIX: &str = "It was left unchanged. Move it aside or pass another --store; \
                                     the next check starts one from the beginning.";
-
-/// The two conditions of a store that every command words the same way for a person, told from
-/// the words this module wrote into a failure's detail, and the path the detail names.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Condition<'a> {
-    /// No store at the path.
-    Absent(&'a str),
-    /// A store of an older or a newer format than this build's.
-    OtherFormat(&'a str),
-    /// Anything else: the detail is shown as it is.
-    Other,
-}
-
-/// What a failure's detail says of the store, as `absent` and `check` worded it, behind the words
-/// a caller may have put before it (`Stop`'s "the store cannot be read: "). The path is the text
-/// between the fixed words, as the detail holds it.
-pub fn condition(detail: &str) -> Condition<'_> {
-    let detail = detail
-        .strip_prefix("the store cannot be read: ")
-        .unwrap_or(detail);
-    if let Some(path) = detail
-        .strip_prefix(ABSENT_BEFORE)
-        .and_then(|rest| rest.strip_suffix(ABSENT_AFTER))
-    {
-        return Condition::Absent(path);
-    }
-    if let Some(rest) = detail.strip_prefix(STORE_AT) {
-        for words in [OLDER, NEWER] {
-            if let Some(at) = rest.rfind(words) {
-                return Condition::OtherFormat(&rest[..at]);
-            }
-        }
-    }
-    Condition::Other
-}
-
-const STORE_AT: &str = "the store at ";
-const OLDER: &str = " is from an older format (";
-const NEWER: &str = " is from a newer format (";
 
 /// What every refusal of a store ends with: what was done to it and what to do.
 const START_OVER: &str = "Nothing was changed. Move the old store aside or pass another --store; \
@@ -755,24 +723,29 @@ const NOT_A_STORE: &str = "Nothing was changed. Move it aside or pass another --
 /// of the file would ever see.
 fn check(conn: &Connection, path: &Path) -> Res<()> {
     let at = path.display();
+    let refused =
+        |code, said: String| -> Box<dyn std::error::Error> { Outcome::new(code, said).into() };
     let objects: i64 = match conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get(0))
     {
         Err(e) if e.sqlite_error_code() == Some(rusqlite::ErrorCode::NotADatabase) => {
-            return Err(
-                format!("{at} is not a store: it is not an SQLite file. {NOT_A_STORE}").into(),
-            );
+            return Err(refused(
+                Code::NotAStore,
+                format!("{at} is not a store: it is not an SQLite file. {NOT_A_STORE}"),
+            ));
         }
         other => other?,
     };
     if objects == 0 {
         let empty = std::fs::metadata(path).is_ok_and(|m| m.len() == 0);
-        return Err(match empty {
-            true => format!("{at} is an empty file, not a store. {NOT_A_STORE}"),
-            false => {
-                format!("{at} is an SQLite file that holds no tables, not a store. {NOT_A_STORE}")
-            }
-        }
-        .into());
+        return Err(refused(
+            Code::NotAStore,
+            match empty {
+                true => format!("{at} is an empty file, not a store. {NOT_A_STORE}"),
+                false => format!(
+                    "{at} is an SQLite file that holds no tables, not a store. {NOT_A_STORE}"
+                ),
+            },
+        ));
     }
     let one = |key: &str| -> rusqlite::Result<Option<String>> {
         // A table `meta` without the columns `key` and `value` holds no value; any other
@@ -794,11 +767,13 @@ fn check(conn: &Connection, path: &Path) -> Res<()> {
         Ok(value.filter(|_| rows == 1))
     };
     let Some(version) = one("format_version")? else {
-        return Err(format!(
-            "{at} is not a store of this tool: it does not name exactly one format. \
+        return Err(refused(
+            Code::UnknownFormat,
+            format!(
+                "{at} is not a store of this tool: it does not name exactly one format. \
                  {START_OVER}"
-        )
-        .into());
+            ),
+        ));
     };
     let ours: u32 = FORMAT_VERSION.parse()?;
     // A format is a number written as `FORMAT_VERSION` is: digits, with no sign or leading zero.
@@ -808,34 +783,41 @@ fn check(conn: &Connection, path: &Path) -> Res<()> {
         .filter(|n| n.to_string() == version);
     match found {
         None => {
-            return Err(format!(
-                "the store at {at} names a format this version does not know ({version:?}). \
-                 {START_OVER}"
-            )
-            .into());
+            return Err(refused(
+                Code::UnknownFormat,
+                format!(
+                    "the store at {at} names a format this version does not know ({version:?}). \
+                     {START_OVER}"
+                ),
+            ));
         }
         Some(found) if found < ours => {
-            return Err(format!(
-                "{STORE_AT}{at}{OLDER}{found}); this version uses format \
-                 {ours} and does not convert old stores. {START_OVER}"
-            )
-            .into());
+            return Err(refused(
+                Code::OlderFormat,
+                format!(
+                    "the store at {at} is from an older format ({found}); this version uses \
+                     format {ours} and does not convert old stores. {START_OVER}"
+                ),
+            ));
         }
         Some(found) if found > ours => {
-            return Err(format!(
-                "{STORE_AT}{at}{NEWER}{found}) than this version knows \
-                 ({ours}). Nothing was changed. Use the version of Immunity Core that made it, or pass \
-                 another --store."
-            )
-            .into());
+            return Err(refused(
+                Code::NewerFormat,
+                format!(
+                    "the store at {at} is from a newer format ({found}) than this version knows \
+                     ({ours}). Nothing was changed. Use the version of Immunity Core that made it, \
+                     or pass another --store."
+                ),
+            ));
         }
         Some(_) => {}
     }
     if let Some(why) = differs(expected(), &shape(conn)?) {
-        return Err(damaged(path, &why).into());
+        return Err(refused(Code::Damaged, damaged(path, &why)));
     }
     if !one("store_id")?.is_some_and(|id| is_id(&id)) {
-        return Err(damaged(path, "it has no id of the form Immunity Core gives one").into());
+        let why = "it has no id of the form Immunity Core gives one";
+        return Err(refused(Code::Damaged, damaged(path, why)));
     }
     Ok(())
 }
@@ -1866,10 +1848,10 @@ mod tests {
 
     /// Every way a command opens a store, to write, to read and to make one where no file is,
     /// refuses the file at `path` in the same words, saying each of `said`, and leaves it byte for
-    /// byte as it was with nothing beside it. The words.
-    fn refused(path: &Path, said: &[&str]) -> String {
+    /// byte as it was with nothing beside it, under the outcome `code`. The words.
+    fn refused(path: &Path, code: Code, said: &[&str]) -> String {
         let before = std::fs::read(path).ok();
-        type Opens = fn(&Path) -> Res<Connection>;
+        type Opens = fn(&Path) -> Result<Connection, Outcome>;
         let ways: [(&str, Opens); 3] = [
             ("open", open),
             ("open_read_only", open_read_only),
@@ -1878,10 +1860,9 @@ mod tests {
         let words: Vec<String> = ways
             .iter()
             .map(|(way, opened)| {
-                let words = opened(path)
-                    .err()
-                    .unwrap_or_else(|| panic!("{way}"))
-                    .to_string();
+                let refusal = opened(path).err().unwrap_or_else(|| panic!("{way}"));
+                assert_eq!(refusal.code, code, "{way}: {refusal}");
+                let words = refusal.to_string();
                 for s in said {
                     assert!(words.contains(s), "{way}: {words}");
                 }
@@ -1922,7 +1903,7 @@ mod tests {
             "DELETE FROM meta WHERE key = 'store_id'",
         ] {
             let (_dir, path) = changed(damage);
-            refused(&path, &["is damaged", START_OVER]);
+            refused(&path, Code::Damaged, &["is damaged", START_OVER]);
         }
     }
 
@@ -1938,11 +1919,11 @@ mod tests {
         assert!(tables.len() > 40, "{tables:?}");
         for table in tables {
             let (_dir, path) = changed(&format!("DROP TABLE {table}"));
-            let said = match table {
-                "meta" => "does not name exactly one format",
-                _ => "is damaged",
+            let (code, said) = match table {
+                "meta" => (Code::UnknownFormat, "does not name exactly one format"),
+                _ => (Code::Damaged, "is damaged"),
             };
-            refused(&path, &[said, START_OVER]);
+            refused(&path, code, &[said, START_OVER]);
         }
     }
 
@@ -1990,28 +1971,27 @@ mod tests {
                  INSERT INTO {table} SELECT * FROM old_{table};
                  DROP TABLE old_{table};"
             ));
-            refused(&path, &["is damaged", START_OVER]);
+            refused(&path, Code::Damaged, &["is damaged", START_OVER]);
         }
     }
 
     #[test]
     fn a_store_whose_id_or_format_has_another_form_fails_the_check() {
-        for (damage, said) in [
-            (
-                "UPDATE meta SET value = ' ' WHERE key = 'store_id'",
-                "it has no id of the form",
-            ),
-            (
-                "UPDATE meta SET value = 'x' WHERE key = 'store_id'",
-                "it has no id of the form",
-            ),
+        let no_id = (Code::Damaged, "it has no id of the form");
+        let unknown = (
+            Code::UnknownFormat,
+            "names a format this version does not know",
+        );
+        for (damage, (code, said)) in [
+            ("UPDATE meta SET value = ' ' WHERE key = 'store_id'", no_id),
+            ("UPDATE meta SET value = 'x' WHERE key = 'store_id'", no_id),
             (
                 "UPDATE meta SET value = upper(value) || '' WHERE key = 'store_id'",
-                "it has no id of the form",
+                no_id,
             ),
             (
                 "UPDATE meta SET value = substr(value, 2) WHERE key = 'store_id'",
-                "it has no id of the form",
+                no_id,
             ),
             // Two rows of the format, in a `meta` made again without its key: the one that names
             // a newer format is not taken for the store's.
@@ -2021,53 +2001,57 @@ mod tests {
                  INSERT INTO meta SELECT * FROM old_meta;
                  DROP TABLE old_meta;
                  INSERT INTO meta VALUES ('format_version', '10');",
-                "does not name exactly one format",
+                (Code::UnknownFormat, "does not name exactly one format"),
             ),
             (
                 "UPDATE meta SET value = '07' WHERE key = 'format_version'",
-                "names a format this version does not know",
+                unknown,
             ),
             (
                 "UPDATE meta SET value = ' 7' WHERE key = 'format_version'",
-                "names a format this version does not know",
+                unknown,
             ),
         ] {
             let (_dir, path) = changed(damage);
-            refused(&path, &[said, START_OVER]);
+            refused(&path, code, &[said, START_OVER]);
         }
     }
 
     #[test]
     fn a_store_of_another_format_fails_the_check_and_an_older_or_a_newer_one_is_told_as_another_build_s()
      {
-        // An older or a newer format is the condition every command words once for a person
-        // (`condition`); a format that is no number is shown as the check words it.
-        for (version, said, what_to_do, other_build) in [
-            ("8", "is from an older format (8)", START_OVER, true),
-            ("5", "is from an older format (5)", START_OVER, true),
+        // An older or a newer format is the outcome every command words once for a person
+        // (`text::error`); a format that is no number is shown as the check words it.
+        for (version, code, said, what_to_do) in [
+            (
+                "8",
+                Code::OlderFormat,
+                "is from an older format (8)",
+                START_OVER,
+            ),
+            (
+                "5",
+                Code::OlderFormat,
+                "is from an older format (5)",
+                START_OVER,
+            ),
             (
                 "10",
+                Code::NewerFormat,
                 "is from a newer format (10)",
                 "Use the version of Immunity Core that made it",
-                true,
             ),
             (
                 "six",
+                Code::UnknownFormat,
                 "names a format this version does not know",
                 START_OVER,
-                false,
             ),
         ] {
             let (_dir, path) = changed(&format!(
                 "UPDATE meta SET value = '{version}' WHERE key = 'format_version'"
             ));
-            let words = refused(&path, &[said, what_to_do]);
-            let at = path.to_str().unwrap();
-            let told = match other_build {
-                true => Condition::OtherFormat(at),
-                false => Condition::Other,
-            };
-            assert_eq!(condition(&words), told, "{version}");
+            refused(&path, code, &[said, what_to_do]);
         }
     }
 
@@ -2079,16 +2063,22 @@ mod tests {
         let (_dir, path) = changed("PRAGMA writable_schema = ON; DELETE FROM sqlite_master;");
         refused(
             &path,
+            Code::NotAStore,
             &[
                 "is an SQLite file that holds no tables, not a store",
                 NOT_A_STORE,
             ],
         );
         std::fs::write(&path, b"").unwrap();
-        refused(&path, &["is an empty file, not a store", NOT_A_STORE]);
+        refused(
+            &path,
+            Code::NotAStore,
+            &["is an empty file, not a store", NOT_A_STORE],
+        );
         std::fs::write(&path, b"invented notes, not a database\n").unwrap();
         refused(
             &path,
+            Code::NotAStore,
             &["is not a store: it is not an SQLite file", NOT_A_STORE],
         );
     }
@@ -2833,28 +2823,21 @@ mod tests {
     }
 
     #[test]
-    fn a_rollback_makes_no_store_where_there_is_none() {
-        let dir = crate::common::Scratch::new("hot-none");
-        let missing = dir.join("store.db");
-        assert!(!roll_back(&missing));
-        assert!(!missing.exists());
+    fn a_hot_journal_in_a_folder_that_cannot_be_written_is_its_own_outcome_and_is_left_as_it_is() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::common::Scratch::new("hot-shut");
+        let (path, _) = hot(&dir);
+        std::fs::set_permissions(&*dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let refused = open_read_only(&path).unwrap_err();
+        assert_eq!(refused.code, Code::HotJournal, "{refused}");
+        assert!(dir.join("store.db-journal").exists());
     }
 
     #[test]
-    fn only_the_refusal_of_a_hot_journal_opens_the_store_to_write() {
-        // Beside a writer that is alive SQLite answers busy, and a store of another format is
-        // refused by Immunity Core: neither is a journal to roll back.
-        let refused = |code| -> Box<dyn std::error::Error> {
-            rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None).into()
-        };
-        assert!(hot_journal(
-            refused(rusqlite::ffi::SQLITE_READONLY_ROLLBACK).as_ref()
-        ));
-        assert!(!hot_journal(
-            refused(rusqlite::ffi::SQLITE_READONLY).as_ref()
-        ));
-        assert!(!hot_journal(refused(rusqlite::ffi::SQLITE_BUSY).as_ref()));
-        let other: Box<dyn std::error::Error> = "not a store of this tool".into();
-        assert!(!hot_journal(other.as_ref()));
+    fn a_rollback_makes_no_store_where_there_is_none() {
+        let dir = crate::common::Scratch::new("hot-none");
+        let missing = dir.join("store.db");
+        assert!(roll_back(&missing).is_err());
+        assert!(!missing.exists());
     }
 }

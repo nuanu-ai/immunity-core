@@ -86,7 +86,6 @@ fi
 # listed; the list only shrinks, and a file on it is split when it is next reworked.
 ceiling=2000
 longer_today='
-src/agent_folders.rs
 src/answers_text.rs
 src/autorun.rs
 src/events.rs
