@@ -63,6 +63,7 @@
   "use strict";
   var EVERY = 10000; // milliseconds between loads
   var STALE = 60; // seconds without a new file before the page says it is not updating
+  var AHEAD = 300; // seconds a time may be ahead of the clock and still be now (store::age)
   var H = 32; // the height of the bars, as the page drew them
   var sec = document.getElementById("as-it-happens");
   if (!sec) return;
@@ -89,6 +90,7 @@
   // What the header says: how fresh the numbers are, or that nothing updates them.
   function said(live, now) {
     var age = live ? now - live.written_at_seconds : NaN;
+    if (age < -AHEAD) return "updated at a time ahead of this Mac's clock";
     if (!(age <= STALE)) return "not updating: no watcher is running";
     var s = Math.max(0, Math.round(age));
     return "updated " + s + (s === 1 ? " second ago" : " seconds ago");

@@ -258,17 +258,16 @@ pub fn fetch(curl: &Path, etag: Option<&str>) -> Fetched {
         Ok(child) => child,
         Err(e) => return Fetched::Failed(format!("cannot run {}: {e}", curl.display())),
     };
+    let said = crate::osv::stderr_of(&mut child);
     let body = capped(child.stdout.take().expect("stdout is piped"));
-    let mut said = Vec::new();
-    let _ = child
-        .stderr
-        .take()
-        .expect("stderr is piped")
-        .read_to_end(&mut said);
+    if body.is_err() {
+        let _ = child.kill();
+    }
     let status = match child.wait() {
         Ok(status) => status,
         Err(e) => return Fetched::Failed(format!("curl did not finish: {e}")),
     };
+    let said = said.join().unwrap_or_default();
     let bytes = match body {
         Ok(bytes) => bytes,
         Err(reason) => return Fetched::Failed(reason),
@@ -485,6 +484,34 @@ pub fn record(tx: &Transaction, run_id: &str, at: i64, entries: &[Entry]) -> rus
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A curl that says more than a pipe holds on stderr before any output, then writes past
+    /// the cap and stays, ends the download at once with the cap as its reason.
+    #[test]
+    fn a_curl_that_fills_its_error_stream_or_passes_the_cap_does_not_hold_the_download() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::common::Scratch::new("threats-fetch-stand-in");
+        let curl = dir.join("curl");
+        let script = format!(
+            "#!/bin/sh\n/usr/bin/head -c 262144 /dev/zero >&2\n\
+             /usr/bin/head -c {} /dev/zero\nexec /bin/sleep 60\n",
+            MAX_BYTES + 1
+        );
+        std::fs::write(&curl, script).unwrap();
+        std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let reason = match fetch(&curl, None) {
+                Fetched::Failed(reason) => reason,
+                _ => "not a failure".to_string(),
+            };
+            let _ = tx.send(reason);
+        });
+        let reason = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the download was held");
+        assert!(reason.contains("larger than the cap"), "{reason}");
+    }
 
     #[test]
     fn a_failed_download_is_told_by_what_curl_says_and_who_acts_only_when_that_is_certain() {
