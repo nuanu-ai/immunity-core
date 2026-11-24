@@ -39,9 +39,11 @@ pub const RAW_SOME: &str = "watched-places-touched.txt";
 pub const CAP: u64 = 8 * 1024 * 1024;
 /// The note of a full reading of a checkout's hooks when it has none.
 pub const NO_HOOKS: &str = "the checkout has no hooks";
-/// Journal note for a scoped removal while another checkout still uses the same hook.
+/// Journal note for a removal from one scope while a reading of its kind in another, as another
+/// checkout's reading of the same hook, still places it.
 pub const HOOK_STILL_ACTIVE: &str = "this hook is still watched in another checkout";
-/// Journal note for a hook a checkout's reading places that another checkout's already did.
+/// Journal note for a thing a reading places that a reading of its kind in another scope, as
+/// another checkout's reading of the same hook, placed when the run began.
 pub const HOOK_ALREADY_WATCHED: &str = "this hook is already watched in another checkout";
 /// Why the hooks of a checkout whose `.git` is a file were not read.
 pub const GIT_FILE: &str = ".git is a file, as in a worktree or a submodule: the hooks are kept elsewhere and were not read";
@@ -73,10 +75,6 @@ pub const SSH_FILES: Kind = (SSH, SSH_KIND);
 pub const AUTHS: Kind = (AUTH, AUTH_KIND);
 pub const HOOKS: Kind = (HOOK, HOOK_KIND);
 
-pub fn hook_departure(kind: &str, event: &crate::store::Event) -> bool {
-    kind == HOOK_KIND && event.kind == "removed" && event.predicate == "watched_as"
-}
-
 /// Journals the digest a file that is gone had as the removal of its content, so that the
 /// finding that it is gone rests on it (`findings::raise`). The file took its content reading
 /// with it and journaled nothing (`lifecycle::retract_inside`). An entry watched only for
@@ -102,12 +100,6 @@ pub fn content_gone(
         rusqlite::params![r.at, r.run_id, READER, id, CONTENT],
     )?;
     Ok(())
-}
-
-/// A hook added to a checkout's reading: journaled once it is known whether another
-/// checkout's reading already placed it.
-pub fn hook_arrival(kind: &str, event: &crate::store::Event) -> bool {
-    kind == HOOK_KIND && event.kind == "added" && event.predicate == "watched_as"
 }
 
 /// The unit a reading of a checkout's hooks reads when it tells the folder Git runs hooks
@@ -383,7 +375,7 @@ pub fn look_machine(roots: &Roots, kind: &str) -> Look {
 /// How the hooks of one checkout could be looked at.
 pub enum Hooks {
     /// What was read, short of the folder Git's configuration names when it could not be told.
-    Looked(Look),
+    Looked(Box<Look>),
     /// `.git` is a file: the hooks are elsewhere.
     GitFile,
 }
@@ -427,18 +419,28 @@ pub fn look_checkout(
         look_place(&mut look, p, k, path, &checkout.path, &shown, &at);
     }
     let mut told = untold.is_none();
+    let before = look.not_read().count();
     for (path, names) in folder.configured() {
         let unit = Unit::whole(crate::checkouts::rel(at.homes[0], path));
         configured_hooks(&mut look, path, unit.clone(), names, &at);
         // A folder that could not be looked at is not told yet.
         told &= !look.not_read().any(|u| u.unit == unit);
     }
+    // A hook read outside `.git/hooks` may be in any folder the configuration names: while
+    // that folder cannot be told, or anything there could not be read, only what was read
+    // itself is covered.
+    if look.not_read().count() > before {
+        look.unplaced();
+    }
     match untold {
-        Some((cause, why)) => look.short(cause, why),
+        Some((cause, why)) => {
+            look.short(cause, why);
+            look.unplaced();
+        }
         None if told => look.read(hooks_told(&checkout.rel)),
         None => {}
     }
-    Hooks::Looked(look)
+    Hooks::Looked(Box::new(look))
 }
 
 /// Reads the hooks Git runs by `names` from a configured folder, `path` as written and
@@ -542,7 +544,7 @@ fn look_place(
         }
     };
     look.present += 1;
-    look.read(Unit::whole(shown));
+    look.listed(Unit::whole(shown));
     for name in names {
         let text = name.to_string_lossy();
         if p.scope == Scope::Checkout && text.ends_with(SAMPLE) {

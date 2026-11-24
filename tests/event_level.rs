@@ -1325,6 +1325,33 @@ fn the_file_being_written_is_never_deleted_by_age_after_a_mac_slept_for_more_tha
 }
 
 #[test]
+fn a_file_deleted_by_age_is_not_counted_against_the_cap_and_never_noted_twice() {
+    // The sizes of all the files are read once, before any is deleted. A file deleted by age is
+    // no longer part of the log: counted, its bytes would push a file out early by the cap.
+    let dir = Dir::new("age-then-cap");
+    let log = dir.0.join("log");
+    std::fs::create_dir_all(&log).unwrap();
+    let from = now_secs();
+    aged(&log, "exec-20261006T01.jsonl", GIB, 30);
+    aged(&log, "exec-20261006T02.jsonl", GIB, 2);
+    aged(&log, "exec-20261006T03.jsonl", 10, 1);
+    let out = tidy(&log, &(GIB + 10).to_string());
+    assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
+    assert_eq!(notes(&log, from), ["exec-20261006T01.jsonl 1073741824 age"]);
+    // Over the cap, a file deleted by age first in the order is passed over, not noted again.
+    aged(&log, "exec-20261006T00.jsonl", 10, 30);
+    assert!(tidy(&log, &GIB.to_string()).status.success());
+    assert_eq!(
+        notes(&log, from),
+        [
+            "exec-20261006T01.jsonl 1073741824 age",
+            "exec-20261006T00.jsonl 10 age",
+            "exec-20261006T02.jsonl 1073741824 cap"
+        ]
+    );
+}
+
+#[test]
 fn a_log_file_whose_name_holds_a_space_is_deleted_by_age_without_a_word_in_the_error_file() {
     // What tidy.sh prints goes to scripts.err, which Immunity Core reads as the scripts failing.
     let dir = Dir::new("spaced");
@@ -1333,9 +1360,23 @@ fn a_log_file_whose_name_holds_a_space_is_deleted_by_age_without_a_word_in_the_e
     let from = now_secs();
     aged(&log, "exec-20261003T01 a.jsonl", 10, 30);
     aged(&log, "exec-20261003T02.jsonl", 20, 1);
+    // Only files are deleted: a folder of such a name stays, however old, and no word is said.
+    std::fs::create_dir(log.join("exec-20261003T00.jsonl")).unwrap();
+    let old = SystemTime::now() - Duration::from_secs(30 * 3600);
+    std::fs::File::open(log.join("exec-20261003T00.jsonl"))
+        .unwrap()
+        .set_modified(old)
+        .unwrap();
     let out = tidy(&log, CAP);
     assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
-    assert_eq!(files(&log), ["exec-20261003T02.jsonl", "removed"]);
+    assert_eq!(
+        files(&log),
+        [
+            "exec-20261003T00.jsonl",
+            "exec-20261003T02.jsonl",
+            "removed"
+        ]
+    );
     assert_eq!(notes(&log, from), ["exec-20261003T01 a.jsonl 10 age"]);
 }
 
@@ -1453,6 +1494,83 @@ fn two_tidy_runs_at_once_never_both_delete_and_a_lock_a_killed_run_left_is_taken
         files(&log),
         ["exec-20261004T060000-20261004T060000.jsonl", "removed"]
     );
+}
+
+#[test]
+fn no_program_the_periodic_scripts_start_is_matched_by_a_shipped_rule() {
+    // The tidy job runs every ten minutes and at each new log file, and what its scripts start
+    // is in the log like any other start: a rule that matched one would raise matches from the
+    // core's own work, thousands a day. Every program the periodic scripts name by absolute
+    // path, started with the arguments they give it as fixed text, matches no shipped rule.
+    let dir = Dir::new("own-starts");
+    dir.install();
+    let (mut lines, mut seq) = (String::new(), 0);
+    for script in ["tidy.sh", "rotated.sh", "collect.sh"] {
+        let text = std::fs::read_to_string(Path::new(SCRIPTS).join(script)).unwrap();
+        for line in text.lines().filter(|l| !l.trim_start().starts_with('#')) {
+            let words: Vec<&str> = line.split_whitespace().collect();
+            for (i, word) in words.iter().enumerate() {
+                // As in `size=$(/usr/bin/stat`, `'/bin/rmdir` and `/bin/date)`.
+                let image = word.rsplit(['(', '\'', '"', '=']).next().unwrap();
+                let image = image.trim_end_matches([')', '\'']);
+                if !["/bin/", "/sbin/", "/usr/bin/", "/usr/sbin/"]
+                    .iter()
+                    .any(|p| image.starts_with(p))
+                {
+                    continue;
+                }
+                let fixed = words[i + 1..].iter().copied().take_while(|w| {
+                    !w.contains(['$', '"', '\'', '<', '>', '|', '&', ';', '(', ')', '\\'])
+                });
+                let args: Vec<&str> = std::iter::once(image).chain(fixed).collect();
+                seq += 1;
+                lines += &started(seq, "/bin/sh", image, &args);
+            }
+        }
+    }
+    assert!(lines.contains(r#""/usr/bin/stat","-f""#), "{lines}");
+    dir.append("exec-20261004T00.jsonl", &lines);
+    let (ok, out) = dir.replay(&["--json"]);
+    assert!(ok, "{out}");
+    let v: Value = serde_json::from_str(&out).unwrap();
+    assert_eq!(v["program_starts"], json!(seq));
+    assert_eq!(v["matched"], json!([]), "{lines}{v:#}");
+}
+
+/// How many programs one pass of tidy.sh as installed starts over `log`, told by the shell's
+/// own trace: each command it runs by an absolute path is a program it starts.
+fn tidy_starts(log: &Path) -> usize {
+    let out = Command::new("/bin/sh")
+        .env_clear()
+        .env("PATH", "/nonexistent")
+        .arg("-x")
+        .arg(Path::new(SCRIPTS).join("tidy.sh"))
+        .arg(log)
+        .arg(CAP)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let trace = String::from_utf8_lossy(&out.stderr);
+    let started = |l: &&str| l.trim_start_matches('+').starts_with(" /");
+    trace.lines().filter(started).count()
+}
+
+#[test]
+fn a_tidy_pass_starts_as_many_programs_over_many_log_files_as_over_few() {
+    // Each start is a line in the log. A pass asks about all the log files at once, so a log of
+    // many files does not make the core's own work a larger share of what is recorded.
+    let dir = Dir::new("starts");
+    let log = dir.0.join("log");
+    std::fs::create_dir_all(&log).unwrap();
+    let mut counts = Vec::new();
+    for n in [2, 30] {
+        for i in 0..n {
+            aged(&log, &format!("exec-20261005T000000-{i:06}.jsonl"), 10, 1);
+        }
+        counts.push(tidy_starts(&log));
+    }
+    assert_eq!(counts[0], counts[1]);
+    assert!(log.read_dir().unwrap().count() == 30 && counts[0] > 0);
 }
 
 /// A property list as JSON, through Apple's plutil.

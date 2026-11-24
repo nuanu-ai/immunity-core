@@ -97,6 +97,16 @@ pub fn remember_units(
     Ok(())
 }
 
+/// The unit of each thing a reading recorded, by subject (`remember_units`).
+pub fn units_of(tx: &Transaction, r: &store::Reading) -> rusqlite::Result<HashMap<String, Unit>> {
+    tx.prepare("SELECT subject, path, part FROM watched_unit WHERE kind = ?1 AND scope = ?2")?
+        .query_map(params![r.kind, r.scope], |row| {
+            let (path, part) = (row.get(1)?, row.get(2)?);
+            Ok((row.get(0)?, Unit { path, part }))
+        })?
+        .collect()
+}
+
 /// Every checkout a walk or an agent's sessions ever found, as `<machine>/<path>`.
 pub fn past_checkouts(conn: &Connection) -> rusqlite::Result<BTreeSet<String>> {
     conn.prepare(

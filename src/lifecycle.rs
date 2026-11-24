@@ -1,5 +1,6 @@
 //! Draft becomes live at the end of a run, for one reading, by its coverage.
-//! Full: new assertions become live and those no longer made are retracted.
+//! Full: new assertions become live and those no longer made are retracted, unless the reading
+//! does not cover where they were (`may_go`): those are held back as they were.
 //! Partial: new assertions become live and nothing is retracted.
 //! None: nothing changes. A missing reading is not evidence of absence.
 //!
@@ -7,7 +8,8 @@
 //! when its last `located_on` is retracted, every live assertion of a reading scoped to it
 //! is retracted in the same run, whatever that reading's completeness was, and with it what
 //! was read inside anything located there. The entity's removal is the one event; what was
-//! inside it adds none.
+//! inside it adds none. This is decided once, after the run's last reader (`Run::settle` in
+//! `main.rs`), so that no order of readers decides what goes.
 //!
 //! A kind an earlier version read and this one does not is retired, which is neither a full
 //! reading nor a removal: nothing was looked at, so nothing is known to be gone. Its facts are
@@ -16,6 +18,7 @@
 
 use crate::store::{Cause, Event, Gap, Reading};
 use rusqlite::{Transaction, params};
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Objects per (subject, predicate), each with the id of one row that holds it.
@@ -48,14 +51,24 @@ fn joined(objects: &BTreeMap<String, i64>) -> Option<String> {
     Some(objects.keys().cloned().collect::<Vec<_>>().join(", "))
 }
 
-/// Compares this run's draft with live and returns the differences as events.
+/// What a reading held back as it was, not having read it now: subject, predicate and object.
+pub type Held = (String, String, String);
+
+/// Compares this run's draft with live and returns the differences as events, and what was
+/// held back: all a partial reading did not see, and what `may_go` says a full one does not
+/// cover.
 /// A different set of objects for the same subject and predicate is one
 /// `changed` event, so a new version of a component is not a remove plus an add.
 /// Under partial coverage only growth is seen: `added` and `changed`, never `removed`.
-pub fn promote(tx: &Transaction, r: &Reading, completeness: &str) -> rusqlite::Result<Vec<Event>> {
-    let mut events = Vec::new();
+pub fn promote(
+    tx: &Transaction,
+    r: &Reading,
+    completeness: &str,
+    may_go: &dyn Fn(&str) -> bool,
+) -> rusqlite::Result<(Vec<Event>, Vec<Held>)> {
+    let mut events = (Vec::new(), Vec::new());
     if completeness != "none" {
-        events = compare(tx, r, completeness == "full")?;
+        events = compare(tx, r, completeness == "full", may_go)?;
     }
     // What is still draft was already live, repeated within the run, or not read.
     tx.execute(
@@ -66,20 +79,28 @@ pub fn promote(tx: &Transaction, r: &Reading, completeness: &str) -> rusqlite::R
     Ok(events)
 }
 
-fn compare(tx: &Transaction, r: &Reading, full: bool) -> rusqlite::Result<Vec<Event>> {
+fn compare(
+    tx: &Transaction,
+    r: &Reading,
+    full: bool,
+    may_go: &dyn Fn(&str) -> bool,
+) -> rusqlite::Result<(Vec<Event>, Vec<Held>)> {
     let draft = load(tx, r, "draft")?;
     let live = load(tx, r, "live")?;
     let empty = BTreeMap::new();
     let keys: BTreeSet<_> = draft.keys().chain(live.keys()).cloned().collect();
-    let mut events = Vec::new();
+    let (mut events, mut held) = (Vec::new(), Vec::new());
 
     for key in keys {
         let old = live.get(&key).unwrap_or(&empty);
         let mut new = draft.get(&key).unwrap_or(&empty).clone();
-        if !full {
-            // What partial reading did not see stays as it was.
+        if !(full && may_go(&key.0)) {
+            // What a partial reading did not see, or a full one does not cover, stays as it was.
             for (object, id) in old {
-                new.entry(object.clone()).or_insert(*id);
+                if let Entry::Vacant(v) = new.entry(object.clone()) {
+                    v.insert(*id);
+                    held.push((key.0.clone(), key.1.clone(), object.clone()));
+                }
             }
         }
         let new = &new;
@@ -105,11 +126,6 @@ fn compare(tx: &Transaction, r: &Reading, full: bool) -> rusqlite::Result<Vec<Ev
             (_, true) => "removed",
             _ => "changed",
         };
-        // A hook may gain another checkout in the same reading. The hook reader
-        // checks its final locations before retracting the content.
-        if kind == "removed" && key.1 == "located_on" && r.kind != crate::watched::HOOK_KIND {
-            retract_inside(tx, r, &key.0)?;
-        }
         events.push(Event {
             kind,
             subject: key.0,
@@ -118,7 +134,7 @@ fn compare(tx: &Transaction, r: &Reading, full: bool) -> rusqlite::Result<Vec<Ev
             new: joined(new),
         });
     }
-    Ok(events)
+    Ok((events, held))
 }
 
 /// How the reason of the reading of a retired kind begins; why follows.
@@ -234,19 +250,27 @@ pub(crate) fn retract_inside(
     Ok(true)
 }
 
-/// Whether something live says where `entity` is. With `before`, only a reading of its kind
-/// that placed it before its run counts: another scope's, as what this reading adds is new
-/// to its own.
-pub(crate) fn placed(
-    tx: &Transaction,
-    entity: &str,
-    before: Option<&Reading>,
-) -> rusqlite::Result<bool> {
+/// Whether something live says where `entity` is. With `kind`, only a reading of that kind
+/// counts: one of another scope, since the reading that no longer places it retracted its own.
+pub(crate) fn placed(tx: &Transaction, entity: &str, kind: Option<&str>) -> rusqlite::Result<bool> {
     tx.query_row(
         "SELECT EXISTS (SELECT 1 FROM assertion
                         WHERE layer = 'live' AND predicate = 'located_on' AND subject = ?1
-                          AND (?2 IS NULL OR (kind = ?2 AND run_id != ?3)))",
-        params![entity, before.map(|r| r.kind), before.map(|r| r.run_id)],
+                          AND (?2 IS NULL OR kind = ?2))",
+        params![entity, kind],
         |row| row.get(0),
     )
+}
+
+/// Every live placement of `reader`'s readings, as subject and kind: what a run starts from.
+pub(crate) fn placements(
+    tx: &Transaction,
+    reader: &str,
+) -> rusqlite::Result<BTreeSet<[String; 2]>> {
+    tx.prepare(
+        "SELECT DISTINCT subject, kind FROM assertion
+         WHERE layer = 'live' AND predicate = 'located_on' AND reader = ?1",
+    )?
+    .query_map([reader], |row| Ok([row.get(0)?, row.get(1)?]))?
+    .collect()
 }
