@@ -72,7 +72,7 @@ The catalogue's raw copy is kept and copied only when it changed. OSV's archives
 | `advisory_affects` | one package a record affects in its feed's ecosystem: the name as given and as compared, ranges and versions as given |
 | `vulnerability_answer` | one answer per record, checkout and package, with its reason, what it rests on and since when it holds |
 | `vulnerability_answer_past` | an answer that changed or went, with when it stopped holding |
-| `vulnerability_place` | per checkout and ecosystem: whether its lockfiles were read in full in the latest check, and whether the data is current |
+| `vulnerability_place` | per checkout and matched ecosystem: whether its lockfiles were read in full in the latest check, and whether the data is current. A checkout has a place of an ecosystem only when the reading of lockfiles found a lockfile of it there (`has_lockfile`), read or not, or did not read everything in a way that may hide one, such as a folder that could not be listed or a reading not of the latest check. A project with only a `package-lock.json` has no crates.io place, so no crates.io record is answered for it and it is never counted as compared through crates.io's data |
 | `vulnerability_linked` | a record linked to a catalogue CVE through its aliases, or through the aliases of a record it names |
 
 ## Matching

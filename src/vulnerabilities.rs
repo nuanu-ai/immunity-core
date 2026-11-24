@@ -505,9 +505,17 @@ fn freshness_of(
     Ok(out)
 }
 
-/// A checkout's lockfiles reading: its scope, completeness, reason, run, and the names of what
-/// it says it did not read (`coverage_lack`), `None` for one without a name.
-type LockfileReading = (String, String, Option<String>, String, Vec<Option<String>>);
+/// A checkout's lockfiles reading: its scope, completeness, reason, run, the names of what it
+/// says it did not read (`coverage_lack`), `None` for one without a name, and the ecosystems of
+/// the lockfiles found in it, read or not (`lockfiles::HAS_LOCKFILE`).
+type LockfileReading = (
+    String,
+    String,
+    Option<String>,
+    String,
+    Vec<Option<String>>,
+    HashSet<&'static str>,
+);
 
 /// The lockfiles reader's latest reading of each checkout that is still there.
 fn lockfile_readings(conn: &Connection) -> rusqlite::Result<Vec<LockfileReading>> {
@@ -524,13 +532,30 @@ fn lockfile_readings(conn: &Connection) -> rusqlite::Result<Vec<LockfileReading>
         })?
         .collect::<rusqlite::Result<_>>()?;
     let mut lacks = conn.prepare("SELECT name FROM coverage_lack WHERE coverage = ?1")?;
+    let mut found = conn.prepare(
+        "SELECT object FROM assertion
+         WHERE layer = 'live' AND reader = ?1 AND scope = ?2 AND subject = ?2 AND predicate = ?3",
+    )?;
     readings
         .into_iter()
         .map(|(id, scope, completeness, reason, run)| {
             let names = lacks
                 .query_map([id], |r| r.get(0))?
                 .collect::<rusqlite::Result<_>>()?;
-            Ok((scope, completeness, reason, run, names))
+            let paths: Vec<String> = found
+                .query_map(
+                    params![
+                        crate::lockfiles::READER,
+                        scope,
+                        crate::lockfiles::HAS_LOCKFILE
+                    ],
+                    |r| r.get(0),
+                )?
+                .collect::<rusqlite::Result<_>>()?;
+            let of = (paths.iter())
+                .filter_map(|p| crate::lockfiles::ecosystem_of_file(p))
+                .collect();
+            Ok((scope, completeness, reason, run, names, of))
         })
         .collect()
 }
@@ -709,7 +734,7 @@ pub fn match_all(tx: &Transaction, run_id: &str, at: i64) -> rusqlite::Result<Ma
     let mut places: HashMap<(String, &'static str), (&'static str, Option<String>)> =
         HashMap::new();
     let mut read = HashSet::new();
-    for (scope, completeness, reason, reading_run, lacks) in &readings {
+    for (scope, completeness, reason, reading_run, lacks, found) in &readings {
         for f in &fresh {
             let eco = f.feed.ecosystem;
             let (lockfiles, why) = lockfiles_for(
@@ -720,12 +745,18 @@ pub fn match_all(tx: &Transaction, run_id: &str, at: i64) -> rusqlite::Result<Ma
                 run_id,
                 eco,
             );
+            // Read in full with no lockfile of the ecosystem left, the checkout holds none of its
+            // packages for certain, so a finding about one it held is over (`Matched::known`).
             if lockfiles == "full" {
                 read.insert((scope.clone(), eco));
             }
-            // A checkout with no lockfile has no place: it is one counted item
-            // (`unread_places`), never a place of every ecosystem that would read as compared.
-            if reason.as_deref() == Some(crate::lockfiles::NONE_FOUND_NOTE) {
+            // A place only where there is something to say of the ecosystem: a lockfile of it
+            // was found, read or not, or the reading may hide one, as folders not looked through
+            // or a reading not of the latest check (`lockfiles_for`). A checkout with no lockfile
+            // of it is never a place that would read as compared; one in which the reading found
+            // no lockfile at all is one counted item (`unread_places`).
+            let none = reason.as_deref() == Some(crate::lockfiles::NONE_FOUND_NOTE);
+            if !found.contains(eco) && (lockfiles == "full" || none) {
                 continue;
             }
             tx.execute(

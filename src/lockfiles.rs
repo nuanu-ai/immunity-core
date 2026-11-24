@@ -234,6 +234,16 @@ pub fn ecosystem_of(kind: &str) -> Option<&'static str> {
         .and_then(|(_, ecosystem)| ecosystem)
 }
 
+/// The predicate of a lockfile found in a checkout: the checkout `has_lockfile` the file at
+/// this path relative to it.
+pub const HAS_LOCKFILE: &str = "has_lockfile";
+
+/// The ecosystem whose dependencies the lockfile at a path declares, by its file name as
+/// `lockfile_kind` tells it; `None` for a kind of no ecosystem a record can be about.
+pub fn ecosystem_of_file(path: &str) -> Option<&'static str> {
+    lockfile_kind(path.rsplit('/').next()?).and_then(ecosystem_of)
+}
+
 /// Whether a partial reading leaves the dependencies of one ecosystem in part unknown. What the
 /// reading names it did not read, `lacks` by their names (a kind with no reader, a lockfile not
 /// opened, a kind with entries not told), leaves the ecosystem of each name unknown and no
@@ -549,7 +559,16 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize) -> Option<Outcome> {
         }
     }
 
-    let mut statements = Vec::new();
+    // Every lockfile found, of any kind, read or not: the ecosystems matching has something to
+    // say of in this checkout (`vulnerabilities::match_all`).
+    let mut statements: Vec<Statement> = (walked.lockfiles.iter())
+        .map(|(rel, ..)| Statement {
+            subject: id.to_string(),
+            predicate: HAS_LOCKFILE,
+            object: rel.clone(),
+            source_ref: rel.clone(),
+        })
+        .collect();
     for ((ecosystem, name), (first, versions)) in deps {
         let component = format!("component:{id}/{ecosystem}/{name}");
         statements.push(Statement {
@@ -745,9 +764,9 @@ fn version_shape(v: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CACHE_SIGNATURE, Checkout, DEEPER, FORMATS, LINKED, LOCKFILE_KIND, NOT_LOOKED, NOT_TOLD,
-        SET_ASIDE, ecosystem_of, has_reader, lockfile_kind, partial_for, read, read_as_text,
-        read_within,
+        CACHE_SIGNATURE, Checkout, DEEPER, FORMATS, HAS_LOCKFILE, LINKED, LOCKFILE_KIND,
+        NOT_LOOKED, NOT_TOLD, SET_ASIDE, ecosystem_of, has_reader, lockfile_kind, partial_for,
+        read, read_as_text, read_within,
     };
 
     fn file_name(path: &str) -> &str {
@@ -1070,8 +1089,9 @@ snapshots:
             Dir(dir)
         }
 
-        /// What the reader says of it: each statement as `subject|predicate|object|where`,
-        /// with the checkout's id left out.
+        /// What the reader says of its dependencies: each statement as
+        /// `subject|predicate|object|where`, with the checkout's id left out. The lockfiles
+        /// found (`HAS_LOCKFILE`) are left to `found`.
         pub(super) fn read(&self) -> (super::Outcome, Vec<String>) {
             let checkout = Checkout {
                 rel: "dev/shop".to_string(),
@@ -1081,6 +1101,7 @@ snapshots:
             let said = o
                 .statements
                 .iter()
+                .filter(|s| s.predicate != HAS_LOCKFILE)
                 .map(|s| {
                     let subject = s
                         .subject
