@@ -145,8 +145,9 @@ pub fn refs(items: &[Item]) -> BTreeMap<String, v1::FindingRef> {
         .collect()
 }
 
-/// The package each finding about a package is about, by that entity's id: its name and the
-/// releases a record affects, as `package` gives them for one finding, each release once.
+/// The package each finding about a package is about, by the id of the package under its plain
+/// name: its name and the releases a record affects, as `package` gives them for one finding,
+/// each release once.
 pub struct Packages(BTreeMap<String, (String, BTreeSet<String>)>);
 
 /// Every package a record affects, read once for a whole list.
@@ -164,6 +165,14 @@ pub fn packages(conn: &Connection) -> rusqlite::Result<Packages> {
     Ok(Packages(out))
 }
 
+impl Packages {
+    /// The package a finding about the component `about` is about, whatever source its id
+    /// carries.
+    pub fn of(&self, about: &str) -> Option<&(String, BTreeSet<String>)> {
+        self.0.get(crate::lockfiles::split_name(about).0)
+    }
+}
+
 /// A published rule's own title, whole, for a finding of one; `None` for any other.
 pub fn rule_title(rule: &str) -> Option<String> {
     findings::published(rule)
@@ -177,7 +186,7 @@ pub fn listed(
     refs: &BTreeMap<String, v1::FindingRef>,
     packages: &Packages,
 ) -> v1::ListedFinding {
-    let package = packages.0.get(&i.about);
+    let package = packages.of(&i.about);
     v1::ListedFinding {
         short_title: i.words.short.to_string(),
         rule_title_text: rule_title(&i.rule),
@@ -403,7 +412,7 @@ fn detached(conn: &Connection, finding: &str) -> rusqlite::Result<v1::DetachedPr
 fn package(conn: &Connection, about: &str) -> rusqlite::Result<v1::VulnerablePackage> {
     let mine: Vec<vulnerabilities::Affecting> = vulnerabilities::affecting(conn)?
         .into_iter()
-        .filter(|a| format!("component:{}/{}/{}", a.checkout, a.ecosystem, a.package) == about)
+        .filter(|a| a.is_about(about))
         .collect();
     let mut out = v1::VulnerablePackage::default();
     let Some(first) = mine.first() else {
