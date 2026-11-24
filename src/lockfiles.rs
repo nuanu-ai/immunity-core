@@ -291,11 +291,11 @@ struct Walk {
 }
 
 /// How a walk says what it did not read, in the words of the reading it is for: a folder it
-/// could not list, a lockfile of a kind it looks for that is not a regular file (`None`, a kind
-/// it does not, which is aside), and what lies past its limit.
+/// could not list, a lockfile of a kind with a reader that is not a regular file, and what lies
+/// past its limit.
 struct Say {
     folder: Said,
-    file: fn(&'static str) -> Option<Said>,
+    file: fn(&'static str) -> Said,
     stopped: String,
 }
 
@@ -367,23 +367,27 @@ fn walk(checkout: &Path, prefix: &str, limit: usize, say: Say) -> Walk {
                 folders.push((name, entry.path()));
                 continue;
             }
-            // A file is known by its name: nothing lies under it.
-            if file_type.is_file() {
-                files.extend(lockfile_kind(&name).map(|kind| (name, kind, at)));
+            // A file is known by its name: nothing lies under it. A kind with no reader is never
+            // opened, so it is that kind whatever the entry is.
+            let (kind, link) = (lockfile_kind(&name), file_type.is_symlink());
+            let no_reader = kind.is_some_and(|kind| reader_of(kind).is_none());
+            if file_type.is_file() || no_reader {
+                files.extend(kind.map(|kind| (name, kind, at)));
                 continue;
             }
-            // A lockfile that is neither a regular file nor a link, such as a named pipe, is
-            // met and cannot be read: it is never opened, and said with what it is.
-            let kind = lockfile_kind(&name);
-            if let (false, Some(said)) = (file_type.is_symlink(), kind.and_then(say.file)) {
-                special.push((name, said, crate::watched::kind_of(file_type)));
+            // A lockfile of a kind with a reader that is neither a regular file nor a link, such
+            // as a named pipe, is met and cannot be read: it is never opened, and said with what
+            // it is.
+            if let (false, Some(kind)) = (link, kind) {
+                let what = crate::watched::kind_of(file_type);
+                special.push((name, (say.file)(kind), what));
                 continue;
             }
             // Neither gone into nor opened, whatever the reason: a folder never entered, a link
             // of any kind, which is not followed, or an entry of another kind. What was known
             // under it is kept; a lockfile that is a link is also said.
             out.look.aside(unit(&format!("{rel}{name}")));
-            if file_type.is_symlink() {
+            if link {
                 files.extend(kind.map(|kind| (name, kind, Where::Linked)));
             }
         }
@@ -444,7 +448,7 @@ pub fn looked_for_as_text(rel: &str) -> bool {
 pub fn read_as_text(checkout: &Checkout) -> Texts {
     let say = Say {
         folder: Said::Failed,
-        file: |kind| reader_of(kind).map(|_| Said::Failed),
+        file: |_| Said::Failed,
         stopped: format!(
             "lockfiles were not looked for past the walk's limit in {}",
             checkout.rel
@@ -479,7 +483,7 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize, cap: u64) -> Option<
     };
     let say = Say {
         folder: Said::Unlisted,
-        file: |kind| Some(Said::Lockfile(kind)),
+        file: Said::Lockfile,
         stopped: format!(
             "{NOT_OPENED_SAID}what lies past the first {limit} folders looked through \
              for lockfiles below {MAX_DEPTH} folders or in vendor and hidden folders"

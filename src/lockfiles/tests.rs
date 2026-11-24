@@ -1245,16 +1245,7 @@ fn a_lockfile_that_is_not_a_regular_file_is_never_opened_and_never_leaves_its_ec
             ("tools/x", ""),
         ],
     );
-    let pipe = std::ffi::CString::new(dir.0.join("tools/Cargo.lock").to_str().unwrap()).unwrap();
-    // SAFETY: `pipe` is a valid NUL-terminated path.
-    assert_eq!(unsafe { libc::mkfifo(pipe.as_ptr(), 0o600) }, 0);
-    let (checkout, (tx, rx)) = (dir.checkout(), std::sync::mpsc::channel());
-    std::thread::spawn(move || {
-        let o = read(&checkout, "checkout:machine:mac/dev/shop").unwrap();
-        tx.send((o, read_as_text(&checkout))).unwrap();
-    });
-    let wait = std::time::Duration::from_secs(10);
-    let (o, texts) = rx.recv_timeout(wait).expect("the reading waited on a pipe");
+    let (o, texts) = read_with_pipe(&dir, "tools/Cargo.lock");
     assert_eq!(o.completeness, "partial");
     assert_eq!(o.gap.cause, Some(Cause::Failed));
     assert_eq!(o.reason.as_deref(), Some("could not be read: Cargo.lock"));
@@ -1265,4 +1256,37 @@ fn a_lockfile_that_is_not_a_regular_file_is_never_opened_and_never_leaves_its_ec
         texts.look.completeness_noted(None).1.as_deref(),
         Some("could not be read: dev/shop/tools/Cargo.lock (not a regular file: fifo)")
     );
+}
+
+/// Both readings of `dir` with a named pipe made at `rel`, or a failed test when either has
+/// not returned in ten seconds: a reading that waits on the pipe never holds the suite.
+fn read_with_pipe(dir: &Dir, rel: &str) -> (super::Outcome, super::Texts) {
+    let pipe = std::ffi::CString::new(dir.0.join(rel).to_str().unwrap()).unwrap();
+    // SAFETY: `pipe` is a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(pipe.as_ptr(), 0o600) }, 0);
+    let (checkout, (tx, rx)) = (dir.checkout(), std::sync::mpsc::channel());
+    std::thread::spawn(move || {
+        let o = read(&checkout, "checkout:machine:mac/dev/shop").unwrap();
+        tx.send((o, read_as_text(&checkout))).unwrap();
+    });
+    let wait = std::time::Duration::from_secs(10);
+    rx.recv_timeout(wait).expect("the reading waited on a pipe")
+}
+
+#[test]
+fn a_special_file_named_like_a_lockfile_no_reader_exists_for_is_said_as_that_kind_with_no_reader_as_a_regular_one_is()
+ {
+    // A kind with no reader is never opened, so what the file is does not matter: a named pipe
+    // `Gemfile.lock` beside a valid `Cargo.lock` gives the lack a regular one gives, and the
+    // place of RubyGems is named as having no reader.
+    let regular = Dir::new(
+        "no-reader-file",
+        &[("Cargo.lock", CARGO), ("Gemfile.lock", "")],
+    );
+    let (o, _) = regular.read();
+    let dir = Dir::new("no-reader-pipe", &[("Cargo.lock", CARGO)]);
+    let (piped, _) = read_with_pipe(&dir, "Gemfile.lock");
+    assert_eq!(lacks(&piped), [format!("{LOCKFILE_KIND} Gemfile.lock")]);
+    assert_eq!(lacks(&piped), lacks(&o));
+    assert_eq!((piped.reason, piped.gap.cause), (o.reason, o.gap.cause));
 }
