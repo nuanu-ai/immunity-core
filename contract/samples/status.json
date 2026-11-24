@@ -1053,7 +1053,7 @@
         "value_text": "[file:hashes.'SHA-256' = '128344f1f3352b53701662b12b748ff9df8ea044a2acf076d438e8f5a0a75911']"
       },
       {
-        "advice": "Look at the program, its arguments and what started it, shown here. If you or a tool you use ran it, mark it expected; if nobody knows it, ask your agent to look into it.",
+        "advice": "Look at the program, its arguments and what started it, shown here. The finding keeps a few starts, and immunity matches --json gives every match the log still holds, each with its start. If you or a tool you use ran it, mark it expected; if nobody knows it, ask your agent to look into it.",
         "change": "new",
         "evidence": {
           "published_rule_matched": {
@@ -1214,7 +1214,7 @@
         "value_text": "Binary Padding - MacOS, by Igor Fits, Mikhail Larin, oscd.community"
       },
       {
-        "advice": "If you did not, open the file and look at its last lines.",
+        "advice": "If you did not, read the whole file and compare it with what you expect it to hold, since a line can be added anywhere. A tool's installer adding a line is the usual cause.",
         "change": "changed",
         "evidence": {
           "place_changed": {

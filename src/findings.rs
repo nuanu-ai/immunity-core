@@ -158,7 +158,7 @@ fn shell_profile() -> Rule {
             title: "A file your terminal runs every time it starts was added, changed or removed.",
             short: "File your terminal runs at start changed",
             meaning: "This is normal when you or an installer just edited it; many tools add a line there.",
-            advice: "If you did not, open the file and look at its last lines.",
+            advice: "If you did not, read the whole file and compare it with what you expect it to hold, since a line can be added anywhere. A tool's installer adding a line is the usual cause.",
         },
         fires: |o| changed_in(o, watched::PROFILE),
     }
@@ -372,7 +372,7 @@ fn app_seal() -> Rule {
             title: "An app's files were changed after its developer signed it, while its version stayed the same.",
             short: "App files changed after signing",
             meaning: "This happens when something writes code into an app so that it runs whenever you open the app; some apps that update themselves in place cause it too.",
-            advice: "If the app did not just update itself, do not open it; reinstall it from its developer and look for what else changed.",
+            advice: "An app that updates itself in place is the usual cause. To see which files no longer verify, run codesign --verify --deep --strict --verbose=2 <the app>. If the app did not just update itself, do not open it, and reinstall it from its developer.",
         },
         fires: |o| o.place == integrity::SEAL_BROKEN,
     }
@@ -427,7 +427,7 @@ fn app_code_outside() -> Rule {
             title: "Code an app keeps in your Library folder, outside the app itself, changed while the app's version stayed the same.",
             short: "App code in your Library folder changed",
             meaning: "Many apps download parts of themselves there and update them on their own, so this is often normal; it is also where code can be added so that it runs inside the app.",
-            advice: "If this happens again without an update, reinstall the app and remove its folder named here.",
+            advice: "Apps update the code in this folder by themselves without changing their version, and the folder also holds the app's settings and data. Check, or ask your agent to check, whether the app changed the code named here itself: through its own updater, or signed by its developer where it is signed. If nobody can tell, reinstall the app and remove the code that changed, never the whole folder.",
         },
         fires: |o| o.place == integrity::CODE_OUTSIDE_CHANGED,
     }
@@ -1947,10 +1947,10 @@ fn kinds() -> Vec<&'static str> {
 const START_TITLE: &str =
     "A program started on this Mac in a way that a published detection rule marks as high risk.";
 const START_ORDINARY: &str = "Coding agents, build tools and people run the same commands for ordinary work, so a match is often harmless.";
-const START_ADVICE: &str = "Look at the program, its arguments and what started it, shown here. If you or a tool you use ran it, mark it expected; if nobody knows it, ask your agent to look into it.";
+const START_ADVICE: &str = "Look at the program, its arguments and what started it, shown here. The finding keeps a few starts, and immunity matches --json gives every match the log still holds, each with its start. If you or a tool you use ran it, mark it expected; if nobody knows it, ask your agent to look into it.";
 const FILE_TITLE: &str = "A file was created or renamed on this Mac where a published detection rule marks it as high risk.";
 const FILE_ORDINARY: &str = "Installers, updaters and people put files in the same places for ordinary work, so a match is often harmless.";
-const FILE_ADVICE: &str = "Look at the file and the program that wrote it, shown here. If you or a tool you use put it there, mark it expected; if nobody knows it, ask your agent to look into it.";
+const FILE_ADVICE: &str = "Look at the file and the program that wrote it, shown here. The finding keeps a few file events, and immunity matches --json gives every match the log still holds, each with its event. If you or a tool you use put it there, mark it expected; if nobody knows it, ask your agent to look into it.";
 
 /// The words for a finding of a rule of this set: for a rule about program starts, then for
 /// one about file events. They differ between sets only in the set's name, `Source::set`, which

@@ -388,15 +388,16 @@ fn events_lines(s: &Screen, events: &[v1::Event], now: i64) -> Vec<String> {
     let mut out = Vec::new();
     for group in grouped(events) {
         out.push(String::new());
-        out.extend(event_lines(s, &group, now));
+        out.extend(event_lines(s, &group, now, ""));
     }
     out
 }
 
 /// A group of events equal but for their times and process ids, as one block: what they are and
 /// when, with how many times and the first and the last when there are more than one, then the
-/// fields of the first, one a line, and the process ids of all of them in one line.
-fn event_lines(s: &Screen, group: &[&v1::Event], now: i64) -> Vec<String> {
+/// fields of the first, one a line, and the process ids of all of them in one line. `mark` follows
+/// what they are, in the same style.
+fn event_lines(s: &Screen, group: &[&v1::Event], now: i64, mark: &str) -> Vec<String> {
     use v1::event::Body;
     let when = |at: Option<i64>| at.map_or("time not known".to_string(), |at| s.time(at, now));
     let times: Vec<i64> = group
@@ -416,7 +417,10 @@ fn event_lines(s: &Screen, group: &[&v1::Event], now: i64) -> Vec<String> {
         ),
         (n, _, _) => format!("{n} times, time not known"),
     };
-    let headed = |what: &str| parts_line(s, 4, &[(what, BOLD), (" · ", PLAIN), (&said_when, DIM)]);
+    let headed = |what: &str| {
+        let what = format!("{what}{mark}");
+        parts_line(s, 4, &[(&what, BOLD), (" · ", PLAIN), (&said_when, DIM)])
+    };
     let f = |label: &str, value: &str| field(s, 6, EVENT_LABEL, label, &[(value, PLAIN)]);
     let mut out = Vec::new();
     let Some(e) = group.first() else {
@@ -643,8 +647,9 @@ fn package_lines(s: &Screen, f: &v1::Finding, p: &v1::VulnerablePackage) -> Vec<
 }
 
 /// The evidence of a published rule's finding: the rule by its own title with its name dim, its
-/// author, its set and its file in the set, how many events it matched, and the events kept,
-/// newest first, with how many more there are.
+/// author, its set and its file in the set, how many events it matched, and the events kept:
+/// the one that raised it on its own and marked, when the message holds it beside the latest,
+/// then the latest, newest first, with how many more there are.
 fn published_lines(s: &Screen, f: &v1::Finding, p: &v1::PublishedRuleMatched) -> Vec<String> {
     let e = |label: &str, parts: &[(&str, Style)]| field(s, 4, EVIDENCE_LABEL, label, parts);
     let rule = p.rule.clone().unwrap_or_default();
@@ -674,7 +679,16 @@ fn published_lines(s: &Screen, f: &v1::Finding, p: &v1::PublishedRuleMatched) ->
         None => "the store keeps no count of its matches".to_string(),
     };
     out.extend(e("Matched", &[(&matched, PLAIN)]));
-    out.extend(events_lines(s, &p.events, f.answered_at));
+    let latest = match p.events.split_first() {
+        Some((first, latest)) if p.events.len() > crate::events::EVIDENCE => {
+            out.push(String::new());
+            let mark = ", the one that raised the finding";
+            out.extend(event_lines(s, &[first], f.answered_at, mark));
+            latest
+        }
+        _ => &p.events[..],
+    };
+    out.extend(events_lines(s, latest, f.answered_at));
     let kept = p.events.len() as u64;
     if let Some(more) = p.matches.filter(|n| *n > kept).map(|n| n - kept) {
         out.push(String::new());
@@ -2344,11 +2358,23 @@ mod tests {
         if let Some(Body::PublishedRuleMatched(p)) =
             f.evidence.as_mut().and_then(|e| e.body.as_mut())
         {
-            p.events = events.clone();
-            p.matches = Some(10);
+            // Before the latest, the start that raised the finding, told alone and as such
+            // however like the others it is.
+            p.events = [events[0].clone()]
+                .into_iter()
+                .chain(events.clone())
+                .collect();
+            p.matches = Some(11);
         }
         let text = finding(&f, &Screen::pipe());
         assert_eq!(text.matches("    Program start · ").count(), 2, "{text}");
+        assert!(
+            text.contains(&format!(
+                "    Program start, the one that raised the finding · {}\n",
+                view::utc(NOW - 600)
+            )),
+            "{text}"
+        );
         // An event alone keeps its own time.
         assert!(
             text.contains(&format!("    Program start · {}\n", view::utc(NOW - 601))),
@@ -2400,7 +2426,7 @@ mod tests {
             f.happened_at = None;
         }
         let both = [timeless.clone(), timeless];
-        let lines = event_lines(&Screen::pipe(), &grouped(&both)[0], NOW);
+        let lines = event_lines(&Screen::pipe(), &grouped(&both)[0], NOW, "");
         assert_eq!(lines[0], "    File event · 2 times, time not known");
     }
 

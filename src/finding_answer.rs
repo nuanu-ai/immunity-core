@@ -260,7 +260,7 @@ pub fn evidence(conn: &Connection, f: &Found) -> rusqlite::Result<Option<v1::evi
         return Ok(Some(Body::PublishedRuleMatched(v1::PublishedRuleMatched {
             rule: Some(matches::rule(l.file, meta)),
             matches: rule_count(conn, &f.id)?,
-            events: rule_events(conn, &f.id, kind)?,
+            events: events::raised_first(rule_events(conn, &f.id, kind)?),
             source: meta.source.url.to_string(),
             licence: meta.source.licence.to_string(),
         })));

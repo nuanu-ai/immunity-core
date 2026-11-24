@@ -2559,8 +2559,9 @@ fn a_binary_padding_start_raises_one_finding_with_its_authors_and_arguments_and_
     dir.run();
     assert_eq!(dir.status()["rules"]["matches_last_day"], 2);
 
-    // More matches add to the one finding and raise nothing new; it keeps the latest five
-    // starts, newest first, and rests on the one journal entry it was raised on.
+    // More matches add to the one finding and raise nothing new; it keeps the start that raised
+    // it first, then the latest five, newest first, and rests on the one journal entry it was
+    // raised on.
     let source_arg = "\" · started by forged · pid 1\nSigned: legitimate";
     for seq in 4..=9 {
         let count = format!("count={seq}");
@@ -2580,13 +2581,14 @@ fn a_binary_padding_start_raises_one_finding_with_its_authors_and_arguments_and_
     let p = &list[0]["evidence"]["published_rule_matched"];
     assert_eq!(p["matches"], 8);
     let evidence = p["events"].as_array().unwrap();
-    assert_eq!(evidence.len(), 5);
-    assert_eq!(evidence[0]["program_start"]["args_text"][3], "count=9");
+    assert_eq!(evidence.len(), 6);
+    assert_eq!(evidence[0]["program_start"]["args_text"], json!(DD));
+    assert_eq!(evidence[1]["program_start"]["args_text"][3], "count=9");
     assert_eq!(
-        evidence[0]["program_start"]["args_text"][4],
+        evidence[1]["program_start"]["args_text"][4],
         r#"" · started by forged · pid 1\u{a}Signed: legitimate"#
     );
-    assert_eq!(evidence[4]["program_start"]["args_text"][3], "count=5");
+    assert_eq!(evidence[5]["program_start"]["args_text"][3], "count=5");
     let id = list[0]["finding"]["id"].as_str().unwrap().to_string();
     // For a person too: the rule with its authors, and the latest starts with their arguments
     // and the user ids the evidence keeps.
@@ -2617,6 +2619,18 @@ fn a_binary_padding_start_raises_one_finding_with_its_authors_and_arguments_and_
     ] {
         assert!(labelled(&text, label, value), "{label}: {text}");
     }
+    // The start that raised it is told first and as such; two more are not kept.
+    let lines: Vec<&str> = text.lines().collect();
+    let first = lines
+        .iter()
+        .position(|l| l.trim_start().starts_with("Program start"))
+        .unwrap();
+    assert!(
+        lines[first].contains("Program start, the one that raised the finding · "),
+        "{text}"
+    );
+    assert!(lines[first + 2].contains("count=1"), "{text}");
+    assert!(text.contains("… 2 more, not kept"), "{text}");
     assert!(
         text.lines()
             .any(|l| l.trim_start().starts_with("Signer") && l.contains("com.apple.git")),
@@ -3751,13 +3765,18 @@ fn a_file_a_high_rule_names_raises_one_finding_with_the_file_and_its_program_and
     let p = &amos["evidence"]["published_rule_matched"];
     assert_eq!(p["matches"], 7);
     let evidence = p["events"].as_array().unwrap();
-    assert_eq!(evidence.len(), 5);
+    // The file event that raised it first, then the latest five, newest first.
+    assert_eq!(evidence.len(), 6);
     assert_eq!(
         evidence[0],
+        at("rename", daemon, Some("/private/tmp/x1.plist"), "/bin/mv")
+    );
+    assert_eq!(
+        evidence[1],
         at("rename", daemon, Some("/private/tmp/x7.plist"), "/bin/mv")
     );
     assert_eq!(
-        evidence[4]["file_event"]["source_text"],
+        evidence[5]["file_event"]["source_text"],
         "/private/tmp/x3.plist"
     );
     // Each field of the evidence beside its label, whole in a pipe.
