@@ -1398,6 +1398,11 @@ fn counted(screen: &Screen, s: &v1::Status, f: &v1::FinishedCheck) -> Vec<(&'sta
                     }
                 }
             })
+            .zip(&d.feeds)
+            .map(|(said, f)| match v1::FeedOutcome::try_from(f.outcome) {
+                Ok(v1::FeedOutcome::NeverRead) => said,
+                _ => said + &crate::osv::not_compared(&f.ecosystem, f.matched),
+            })
             .collect();
         let mut matched = String::new();
         if let Some(v) = &s.vulnerabilities {
@@ -2221,6 +2226,7 @@ mod tests {
                     records: Some(1_234_567),
                     malicious_records: Some(4),
                     read_at: Some(CHECKED),
+                    matched: true,
                     ..Default::default()
                 }],
             }),

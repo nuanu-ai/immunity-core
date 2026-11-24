@@ -1006,7 +1006,8 @@ pub fn vulnerabilities(m: &v1::Vulnerabilities, screen: &Screen) -> String {
     if let Some(line) = &scope {
         out.extend(sentence(screen, 2, line, PLAIN));
     }
-    for f in &t.feeds {
+    // Only data an answer rests on: no answer rests on a feed whose ecosystem is not matched.
+    for f in t.feeds.iter().filter(|f| f.matched) {
         if let Some(why) = &f.not_current_why {
             out.extend(sentence(
                 screen,

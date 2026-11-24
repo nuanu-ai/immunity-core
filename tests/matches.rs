@@ -178,6 +178,8 @@ impl Dir {
                     "absent",
                     "--osv-npm-input",
                     "absent",
+                    "--osv-pypi-input",
+                    "absent",
                 ],
                 &[
                     "--brew-input".as_ref(),
