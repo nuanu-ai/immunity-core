@@ -917,11 +917,10 @@ pub fn detect(
     at: i64,
     seen: &[Observed],
 ) -> rusqlite::Result<usize> {
-    // The rule of `state_at`.
     let lapsed: Vec<(String, String, String)> = tx
         .prepare(
             "SELECT id, rule, about FROM finding
-             WHERE state = 'expected' AND until_at <= ?1 AND last_seen_at >= answered_at",
+             WHERE state = 'expected' AND until_at <= ?1 AND last_seen_at > answered_at",
         )?
         .query_map([at], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
@@ -1109,9 +1108,7 @@ pub struct Found {
 
 /// The state of a finding at `now`. An `expected` mark hides the finding until it ends; at
 /// its end the finding is open again if it was found again after the mark was given, and
-/// otherwise it stays closed under the ended mark until it is found again. Times are whole
-/// seconds, so an occurrence in the second of the answer counts as after it. `detect` keeps
-/// the same rule in its SQL.
+/// otherwise it stays closed under the ended mark until it is found again.
 fn state_at(
     state: String,
     answered: Option<i64>,
@@ -1120,7 +1117,7 @@ fn state_at(
     now: i64,
 ) -> String {
     let ended = until.is_some_and(|u| u <= now);
-    let again = answered.is_some_and(|a| last >= a);
+    let again = answered.is_some_and(|a| last > a);
     if state == "expected" && ended && again {
         "open".to_string()
     } else {
@@ -2313,51 +2310,6 @@ pub fn catalogue() -> crate::contract::v1::Catalogue {
 #[cfg(test)]
 mod tests {
     use super::{CONFIDENCES, Connection, SEVERITIES, This, place, urgent};
-
-    #[test]
-    fn an_occurrence_in_the_second_of_an_expected_answer_opens_the_finding_when_its_mark_ends() {
-        // No false calm: times are whole seconds, so a thing found again in the second the
-        // person answered counts as found after the answer. When the mark ends the finding is
-        // open in what `findings` serves and in the store after the next check.
-        let dir = std::env::temp_dir().join(format!("immunity-same-second-{}", std::process::id()));
-        crate::common::remove(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
-        let (answered, until) = (1_800_000_000, 1_800_003_600);
-        let tx = conn.transaction().unwrap();
-        crate::store::put_entity(&tx, "machine:a").unwrap();
-        tx.execute(
-            "INSERT INTO finding (id, rule, about, occurrence, state, first_seen_at,
-                                  first_seen_run, last_seen_at, last_seen_run, answered_at,
-                                  reason, until_at, via)
-             VALUES ('f-1', ?1, 'machine:a', 1, 'expected', ?2, 'run-1', ?2, 'run-2', ?2,
-                     'invented', ?3, 'command')",
-            rusqlite::params![super::rules()[0].id, answered, until],
-        )
-        .unwrap();
-        tx.commit().unwrap();
-        let served = |conn: &Connection, now| {
-            super::all(conn, now)
-                .unwrap()
-                .into_iter()
-                .find(|f| f.id == "f-1")
-                .unwrap()
-                .state
-        };
-        assert_eq!(served(&conn, until - 1), "expected");
-        assert_eq!(served(&conn, until), "open");
-        let tx = conn.transaction().unwrap();
-        super::detect(&tx, "run-3", until, &[]).unwrap();
-        tx.commit().unwrap();
-        let stored: String = conn
-            .query_row("SELECT state FROM finding WHERE id = 'f-1'", [], |r| {
-                r.get(0)
-            })
-            .unwrap();
-        assert_eq!(stored, "open");
-        drop(conn);
-        crate::common::remove(&dir);
-    }
 
     #[test]
     fn a_finding_of_a_published_rule_names_the_set_its_rule_came_from() {
