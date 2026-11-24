@@ -2,6 +2,7 @@
 // No reader calls these yet: the change that adds the first Python reader removes this line.
 #![allow(dead_code)]
 
+use super::{At, Dep, Parsed, Source};
 use std::sync::OnceLock;
 
 /// The addresses of PyPI's simple index.
@@ -325,5 +326,127 @@ mod tests {
             PYPI_INDEX,
             ["https://pypi.org/simple", "https://pypi.org/simple/"]
         );
+    }
+}
+
+/// What `poetry.lock` and `pdm.lock` share: TOML, their format's version as the string
+/// `metadata.<version_key>`, and the array of tables `package`, each with a string `name`. A
+/// version `known` refuses is named as the kind `<kind> version <n>` with no reader. `entry` tells
+/// from a table and its name, normalised (`None` for a name `pypi_name` refuses), where it comes
+/// from and its version: `Err` fails the reading, and `Ok(None)` leaves the entry not told, as
+/// does a name refused. An entry not told is keyed `L<line of its name>`. A file that is not TOML,
+/// a version missing or not a string, and a `package` that is not an array of tables fail too.
+pub(super) fn toml_lock(
+    text: &str,
+    kind: &str,
+    version_key: &str,
+    known: fn(&str) -> bool,
+    entry: impl Fn(&toml::de::DeTable, Option<&str>) -> Result<Option<(Source, Option<String>)>, ()>,
+) -> Parsed {
+    use toml::de::{DeTable, DeValue};
+    let Ok(lock) = DeTable::parse(text) else {
+        return Parsed::Failed;
+    };
+    let lock = lock.get_ref();
+    let metadata = lock.get("metadata").map(|m| m.get_ref());
+    match metadata
+        .and_then(|m| m.get(version_key))
+        .map(|v| v.get_ref().as_str())
+    {
+        Some(Some(v)) if known(v) => {}
+        Some(Some(v)) if super::version_shape(v) => {
+            return Parsed::NoReader(format!("{kind} version {v}"));
+        }
+        _ => return Parsed::Failed,
+    }
+    let packages = match lock.get("package").map(|p| p.get_ref()) {
+        None => &[][..],
+        Some(DeValue::Array(packages)) => &packages[..],
+        Some(_) => return Parsed::Failed,
+    };
+    // Where each line break is, to tell the line of a name from its offset.
+    let breaks: Vec<usize> = text.match_indices('\n').map(|(i, _)| i).collect();
+    let (mut out, mut unknown) = (Vec::new(), Vec::new());
+    for package in packages {
+        let Some(package) = package.get_ref().as_table() else {
+            return Parsed::Failed;
+        };
+        let Some((key, Some(name))) =
+            (package.get_key_value("name")).map(|(k, v)| (k.span().start, v.get_ref().as_str()))
+        else {
+            return Parsed::Failed;
+        };
+        let line = breaks.partition_point(|&b| b < key) + 1;
+        let name = pypi_name(name);
+        match (entry(package, name.as_deref()), name) {
+            (Err(()), _) => return Parsed::Failed,
+            (Ok(Some((source, version))), Some(name)) => out.push(Dep {
+                at: At::Line(line),
+                name,
+                version,
+                source,
+            }),
+            (Ok(_), _) => unknown.push(format!("L{line}")),
+        }
+    }
+    Parsed::Deps("PyPI", out, unknown)
+}
+
+/// Whether the array `files` of a `poetry.lock` or `pdm.lock` entry lists only PyPI's files of
+/// the project `name`, normalised, at `version`: at least one, each a table with a string `file`
+/// that `pypi_file_name` takes or, as PDM writes with static URLs, a string `url` that
+/// `pypi_file` takes, never both. Anything else is not known to be PyPI's.
+pub(super) fn pypi_files(files: Option<&toml::de::DeValue>, name: &str, version: &str) -> bool {
+    let Some(files) = files.and_then(|f| f.as_array()) else {
+        return false;
+    };
+    !files.is_empty()
+        && files.iter().all(|row| {
+            let text = |key: &str| row.get_ref().get(key).map(|v| v.get_ref().as_str());
+            match (text("file"), text("url")) {
+                (Some(Some(file)), None) => pypi_file_name(file, name, version),
+                (None, Some(Some(url))) => pypi_file(url, name, version),
+                _ => false,
+            }
+        })
+}
+
+#[cfg(test)]
+mod toml_lock_tests {
+    use super::pypi_files;
+
+    #[test]
+    fn an_entry_s_files_are_pypi_s_only_when_each_row_names_one_of_its_files_in_one_way() {
+        let at = "https://files.pythonhosted.org/packages/3a/1b/0123456789abcdef0123456789abcdef0123456789abcdef0123456789ab";
+        let rows = |rows: &str| {
+            let text = format!("files = [{rows}]");
+            let table = toml::de::DeTable::parse(&text).unwrap().into_inner();
+            pypi_files(table.get("files").map(|f| f.get_ref()), "widget", "1.2.0")
+        };
+        let wheel = "file = \"widget-1.2.0-py3-none-any.whl\"";
+        let sdist = format!("url = \"{at}/widget-1.2.0.tar.gz\"");
+        assert!(rows(&format!("{{{wheel}}}, {{{sdist}}}")));
+        for (case, text) in [
+            ("no row", String::new()),
+            (
+                "a row of another version",
+                "{file = \"widget-1.2.1.tar.gz\"}".to_string(),
+            ),
+            (
+                "one row of two",
+                format!("{{{wheel}}}, {{file = \"gadget-1.2.0.tar.gz\"}}"),
+            ),
+            (
+                "an address elsewhere",
+                "{url = \"https://example.invalid/widget-1.2.0.tar.gz\"}".to_string(),
+            ),
+            ("both keys", format!("{{{wheel}, {sdist}}}")),
+            ("neither key", "{hash = \"sha256:00\"}".to_string()),
+            ("a file not a string", "{file = 1}".to_string()),
+            ("a row not a table", "\"widget-1.2.0.tar.gz\"".to_string()),
+        ] {
+            assert!(!rows(&text), "{case}");
+        }
+        assert!(!pypi_files(None, "widget", "1.2.0"));
     }
 }
