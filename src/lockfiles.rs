@@ -101,7 +101,8 @@ const CACHE_SIGNATURE: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55";
 const CHECKOUT_MARK: &str = ".git";
 
 /// `npm-shrinkwrap.json` is in the format of `package-lock.json`, as npm documents it.
-/// `yarn.lock` is read in the formats of Yarn 1 and of Yarn 2 and later.
+/// `yarn.lock` is read in the formats of Yarn 1 and of Yarn 2 and later. A kind comes here
+/// only with a feed for its ecosystem in `osv::FEEDS` (a test in `vulnerabilities` holds it).
 pub(crate) const SUPPORTED: [&str; 6] = [
     "package-lock.json",
     "npm-shrinkwrap.json",
