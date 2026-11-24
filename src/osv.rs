@@ -929,7 +929,7 @@ fn bsdtar(args: &[&str], archive: &Path) -> Command {
 }
 
 /// Reads stderr of a child on a thread, so that a child that says much is never stuck.
-fn stderr_of(child: &mut Child) -> std::thread::JoinHandle<Vec<u8>> {
+pub fn stderr_of(child: &mut Child) -> std::thread::JoinHandle<Vec<u8>> {
     let stderr = child.stderr.take();
     std::thread::spawn(move || drain(stderr))
 }
