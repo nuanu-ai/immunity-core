@@ -14,6 +14,7 @@
 
 use crate::baseline::Unit;
 use crate::checkouts::Checkout;
+use crate::look::{Look, Said, Unread};
 use crate::store::Statement;
 use crate::store::{Cause, Gap, Lack};
 use std::collections::{BTreeMap, BTreeSet};
@@ -214,8 +215,9 @@ pub fn ecosystem_of_file(path: &str) -> Option<&'static str> {
 /// other: a name of no ecosystem a record can be about, such as `flake.lock`, leaves none. A
 /// lack with no name, folders not looked through, counts for every ecosystem. The reason's
 /// clauses for the lacks are only words for a person. The reason decides the rest: a lockfile
-/// of that ecosystem not parsed, a folder not listed. A clause this does not recognise counts for every ecosystem,
-/// so that nothing reads as fully known that is not.
+/// of that ecosystem that could not be read, by its kind, a folder not listed. A clause this
+/// does not recognise counts for every ecosystem, so that nothing reads as fully known that is
+/// not.
 pub fn partial_for(reason: &str, lacks: &[Option<String>], ecosystem: &str) -> bool {
     let of_it = |name: &str| ecosystem_of(name) == Some(ecosystem);
     lacks.iter().any(|name| name.as_deref().is_none_or(of_it))
@@ -277,16 +279,24 @@ enum Where {
 }
 
 /// What the walk of a checkout found: lockfiles relative to it, each with its kind and where,
-/// and the folders it did not look through, relative to it with `/` after each.
+/// and what it looked at (`Look`), each unit by its path as the reading names it. A folder
+/// listed is read; a folder that could not be listed in full and an entry named as a lockfile
+/// that is neither a regular file nor a link are units not read, with why; what it passes over
+/// by design, every entry of a folder listed that it neither goes into nor opens and a folder
+/// a mark sets aside, is aside; and folders the look limit kept it from looking through are
+/// said together, with a lack of no name.
 struct Walk {
     lockfiles: Vec<(String, &'static str, Where)>,
-    /// Folders that could not be listed in full, each with the system's error.
-    unlisted: Vec<(String, String)>,
-    /// What the walk passes over by design: every entry of a folder it listed that it neither
-    /// goes into nor opens, and a folder a mark sets aside.
-    aside: Vec<String>,
-    /// Whether folders were left that the look limit kept it from looking through.
-    stopped: bool,
+    look: Look,
+}
+
+/// How a walk says what it did not read, in the words of the reading it is for: a folder it
+/// could not list, a lockfile of a kind with a reader that is not a regular file, and what lies
+/// past its limit.
+struct Say {
+    folder: Said,
+    file: fn(&'static str) -> Said,
+    stopped: String,
 }
 
 /// Whether a file is a cache's tag: `CACHE_MARK` beginning with its signature.
@@ -303,15 +313,15 @@ fn cache_tag(name: &str, path: &Path) -> bool {
 /// Walks a checkout for lockfiles: opened down to `MAX_DEPTH`, as they always were, and below
 /// it and in folders set aside looked for by name only, at most `limit` folders. Links are not
 /// followed. A folder a mark says is not the project's is not looked at by that look; where
-/// lockfiles are opened, marks change nothing.
-fn walk(checkout: &Path, limit: usize) -> Walk {
+/// lockfiles are opened, marks change nothing. Units are named `prefix` and the path relative
+/// to the checkout.
+fn walk(checkout: &Path, prefix: &str, limit: usize, say: Say) -> Walk {
     let mut out = Walk {
         lockfiles: Vec::new(),
-        unlisted: Vec::new(),
-        aside: Vec::new(),
-        stopped: false,
+        look: Look::default(),
     };
-    let mut looked = 0;
+    let unit = |rel: &str| Unit::whole(format!("{prefix}{rel}"));
+    let (mut looked, mut stopped) = (0, false);
     // Each folder with where it is and whether a mark above it says it is not the project's.
     let mut stack = vec![(
         String::new(),
@@ -323,7 +333,7 @@ fn walk(checkout: &Path, limit: usize) -> Walk {
     while let Some((rel, dir, depth, at, not_own)) = stack.pop() {
         if at != Where::Opened {
             if looked == limit {
-                out.stopped = true;
+                stopped = true;
                 continue;
             }
             looked += 1;
@@ -331,11 +341,13 @@ fn walk(checkout: &Path, limit: usize) -> Walk {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) => {
-                out.unlisted.push((rel, e.to_string()));
+                out.look.unread_as(unit(&rel), say.folder, e.to_string());
                 continue;
             }
         };
-        let (mut files, mut folders, mut missed) = (Vec::new(), Vec::new(), None);
+        out.look.present += 1;
+        let (mut files, mut special, mut folders, mut missed) =
+            (Vec::new(), Vec::new(), Vec::new(), None);
         let (mut environment, mut whole) = (false, not_own);
         for entry in entries {
             let (entry, file_type) = match entry.and_then(|e| e.file_type().map(|t| (e, t))) {
@@ -355,24 +367,42 @@ fn walk(checkout: &Path, limit: usize) -> Walk {
                 folders.push((name, entry.path()));
                 continue;
             }
-            // A file is known by its name: nothing lies under it.
-            if file_type.is_file() {
-                files.extend(lockfile_kind(&name).map(|kind| (name, kind, at)));
+            // A file is known by its name: nothing lies under it. A kind with no reader is never
+            // opened, so it is that kind whatever the entry is.
+            let (kind, link) = (lockfile_kind(&name), file_type.is_symlink());
+            let no_reader = kind.is_some_and(|kind| reader_of(kind).is_none());
+            if file_type.is_file() || no_reader {
+                files.extend(kind.map(|kind| (name, kind, at)));
+                continue;
+            }
+            // A lockfile of a kind with a reader that is neither a regular file nor a link, such
+            // as a named pipe, is met and cannot be read: it is never opened, and said with what
+            // it is.
+            if let (false, Some(kind)) = (link, kind) {
+                let what = crate::watched::kind_of(file_type);
+                special.push((name, (say.file)(kind), what));
                 continue;
             }
             // Neither gone into nor opened, whatever the reason: a folder never entered, a link
             // of any kind, which is not followed, or an entry of another kind. What was known
-            // under it is kept (`Walk::aside`); a lockfile that is a link is also said.
-            out.aside.push(format!("{rel}{name}"));
-            if file_type.is_symlink() {
-                files.extend(lockfile_kind(&name).map(|kind| (name, kind, Where::Linked)));
+            // under it is kept; a lockfile that is a link is also said.
+            out.look.aside(unit(&format!("{rel}{name}")));
+            if link {
+                files.extend(kind.map(|kind| (name, kind, Where::Linked)));
             }
         }
-        out.unlisted.extend(missed.map(|e| (rel.clone(), e)));
+        match missed {
+            Some(why) => out.look.unread_as(unit(&rel), say.folder, why),
+            None => out.look.listed(unit(&rel)),
+        }
         // The look for names does not look at what a mark says is not the project's.
         if at != Where::Opened && whole {
-            out.aside.push(rel);
+            out.look.aside(unit(&rel));
             continue;
+        }
+        for (name, said, what) in special {
+            let why = format!("{}{what}", crate::watched::NOT_A_FILE);
+            out.look.unread_as(unit(&format!("{rel}{name}")), said, why);
         }
         out.lockfiles.extend(
             files
@@ -391,19 +421,22 @@ fn walk(checkout: &Path, limit: usize) -> Walk {
             stack.push((format!("{rel}{name}/"), path, depth + 1, next, not_own));
         }
     }
+    if stopped {
+        out.look.short_of([unit("")], Cause::NoReader, say.stopped);
+        out.look.lack(Lack::new(NOT_LOOKED, None));
+    }
     out.lockfiles.sort();
     out
 }
 
-/// What one walk of a checkout gives the indicators reader to look for strings in, relative
-/// to the checkout: the lockfiles of the kinds read here that are opened as text, those found
-/// and not opened, the folders it did not look through (`Walk`), and whether it went to its end.
+/// What one walk of a checkout gives the indicators reader to look for strings in: the
+/// lockfiles of the kinds read here that are opened as text and those found and not opened,
+/// relative to the checkout, and what the walk did not read (`Walk`) in the words of that
+/// reader, each unit by its path relative to the home folder.
 pub struct Texts {
     pub opened: Vec<String>,
     pub not_opened: Vec<String>,
-    pub unlisted: Vec<(String, String)>,
-    pub aside: Vec<String>,
-    pub stopped: bool,
+    pub look: Look,
 }
 
 /// Whether the file at `rel` in a checkout is one the walk of `read_as_text` looks for: a
@@ -412,8 +445,17 @@ pub fn looked_for_as_text(rel: &str) -> bool {
     lockfile_kind(rel.rsplit('/').next().unwrap_or(rel)).is_some()
 }
 
-pub fn read_as_text(checkout: &Path) -> Texts {
-    let walked = walk(checkout, LOOK_LIMIT);
+pub fn read_as_text(checkout: &Checkout) -> Texts {
+    let say = Say {
+        folder: Said::Failed,
+        file: |_| Said::Failed,
+        stopped: format!(
+            "lockfiles were not looked for past the walk's limit in {}",
+            checkout.rel
+        ),
+    };
+    let prefix = format!("{}/", checkout.rel);
+    let walked = walk(&checkout.path, &prefix, LOOK_LIMIT, say);
     let (opened, not_opened) = (walked.lockfiles.into_iter())
         .filter(|(_, kind, _)| reader_of(kind).is_some())
         .partition::<Vec<_>, _>(|(_, _, at)| *at == Where::Opened);
@@ -421,9 +463,7 @@ pub fn read_as_text(checkout: &Path) -> Texts {
     Texts {
         opened: paths(opened),
         not_opened: paths(not_opened),
-        unlisted: walked.unlisted,
-        aside: walked.aside,
-        stopped: walked.stopped,
+        look: walked.look,
     }
 }
 
@@ -436,19 +476,26 @@ pub fn read(checkout: &Checkout, id: &str) -> Option<Outcome> {
 /// `read`, with the look for names below the folders opened stopping after `limit` folders,
 /// and lockfiles read up to `cap`.
 fn read_within(checkout: &Checkout, id: &str, limit: usize, cap: u64) -> Option<Outcome> {
-    let walked = walk(&checkout.path, limit);
-    if walked.lockfiles.is_empty() && walked.unlisted.is_empty() && !walked.stopped {
-        return None;
-    }
     let prefix = if checkout.rel == "." {
         String::new()
     } else {
         format!("{}/", checkout.rel)
     };
-    let mut not_supported: BTreeSet<String> = BTreeSet::new();
-    let mut not_parsed: BTreeSet<&str> = BTreeSet::new();
-    // Entries whose package cannot be told, as `<lockfile>#<key>`, and the kinds they are of.
-    let mut not_told: Vec<String> = Vec::new();
+    let say = Say {
+        folder: Said::Unlisted,
+        file: Said::Lockfile,
+        stopped: format!(
+            "{NOT_OPENED_SAID}what lies past the first {limit} folders looked through \
+             for lockfiles below {MAX_DEPTH} folders or in vendor and hidden folders"
+        ),
+    };
+    let walked = walk(&checkout.path, &prefix, limit, say);
+    if walked.lockfiles.is_empty() && walked.look.cause().is_none() {
+        return None;
+    }
+    let mut look = Look::default();
+    // Kinds and versions with no reader, with the lockfiles of each.
+    let mut not_supported: BTreeMap<String, Vec<Unit>> = BTreeMap::new();
     let mut not_told_kinds: BTreeSet<&str> = BTreeSet::new();
     // Lockfiles of a kind read here that were not opened, by where, and their kinds.
     let mut not_opened: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
@@ -457,10 +504,11 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize, cap: u64) -> Option<
     // (ecosystem, name with its source) -> where it was first read, and version -> where
     // that version was first read.
     let mut deps: BTreeMap<(&str, String), Found> = BTreeMap::new();
+    let mut no_reader = |kind: String, unit| not_supported.entry(kind).or_default().push(unit);
 
     for (rel, kind, at) in &walked.lockfiles {
         let source = format!("{prefix}{rel}");
-        let name: &str = kind;
+        let (name, unit): (&str, _) = (kind, Unit::whole(&source));
         // A kind with no reader is that wherever it is; one read here is not opened where the
         // walk does not open lockfiles, or when it is a link, and is named as such.
         let unopened = match at {
@@ -474,7 +522,7 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize, cap: u64) -> Option<
                 not_opened.entry(what).or_default().push(source);
                 lacks.insert((what, name));
             } else {
-                not_supported.insert(name.to_string());
+                no_reader(name.to_string(), unit);
             }
             continue;
         }
@@ -484,30 +532,41 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize, cap: u64) -> Option<
         let size = std::fs::symlink_metadata(&path).map_or(0, |m| m.len());
         lockfiles.push((source.clone(), size));
         let Some(reader) = reader_of(name) else {
-            not_supported.insert(name.to_string());
+            no_reader(name.to_string(), unit);
             continue;
         };
         // Opened as the walk found it: a regular file, a link in its place not followed,
         // without waiting, up to the cap. One refused could not be read.
-        let text = crate::autorun::read_capped_resolved(&path, cap).ok();
-        let parsed = match text.and_then(|t| String::from_utf8(t).ok()) {
-            None => Parsed::Failed,
-            Some(t) => reader(&t, name),
+        let text = crate::autorun::read_capped_resolved(&path, cap)
+            .and_then(|t| String::from_utf8(t).map_err(|_| "not UTF-8 text".to_string()));
+        let parsed = match text {
+            Err(why) => {
+                look.unread_as(unit, Said::Lockfile(name), why);
+                continue;
+            }
+            Ok(t) => reader(&t, name),
         };
         let (ecosystem, found) = match parsed {
             Parsed::Deps(ecosystem, found, unknown) => {
                 if !unknown.is_empty() {
                     not_told_kinds.insert(name);
                 }
-                not_told.extend(unknown.iter().map(|key| format!("{source}#{key}")));
+                // Never a guess: an entry that is not known to be the package it names is
+                // left out, and the reading is partial, so it never says that a package is
+                // not there.
+                for key in &unknown {
+                    look.unread_as(Unit::part(&source, key), Said::Untold, String::new());
+                }
+                look.read(unit);
                 (ecosystem, found)
             }
             Parsed::NoReader(kind) => {
-                not_supported.insert(kind);
+                no_reader(kind, unit);
                 continue;
             }
             Parsed::Failed => {
-                not_parsed.insert(name);
+                let why = "it could not be parsed".to_string();
+                look.unread_as(unit, Said::Lockfile(name), why);
                 continue;
             }
         };
@@ -553,10 +612,14 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize, cap: u64) -> Option<
         }
     }
 
-    let mut reasons = Vec::new();
+    // Kinds with no reader and lockfiles not opened where they are are said together, each with
+    // its lack by name, so that what it leaves unknown is decided from the lacks and never from
+    // the reason's words (`partial_for`).
     if !not_supported.is_empty() {
-        let names: Vec<&str> = not_supported.iter().map(String::as_str).collect();
-        reasons.push(format!("{NOT_SUPPORTED_SAID}{}", names.join(", ")));
+        let names: Vec<&str> = not_supported.keys().map(String::as_str).collect();
+        let why = format!("{NOT_SUPPORTED_SAID}{}", names.join(", "));
+        let units = not_supported.values().flatten().cloned();
+        look.short_of(units, Cause::NoReader, why);
     }
     for (what, paths) in &not_opened {
         let place = match *what {
@@ -566,74 +629,60 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize, cap: u64) -> Option<
             _ => "in vendor or hidden folders".to_string(),
         };
         let n = counted(paths.len(), "lockfile", "lockfiles");
-        reasons.push(format!("{NOT_OPENED_SAID}{n} {place}: {}", some_of(paths)));
+        let why = format!("{NOT_OPENED_SAID}{n} {place}: {}", some_of(paths));
+        look.short_of(paths.iter().map(Unit::whole), Cause::NoReader, why);
     }
-    if walked.stopped {
-        reasons.push(format!(
-            "{NOT_OPENED_SAID}what lies past the first {limit} folders looked through \
-             for lockfiles below {MAX_DEPTH} folders or in vendor and hidden folders"
-        ));
+    for name in not_supported.keys() {
+        look.lack(Lack::new(LOCKFILE_KIND, Some(name)));
     }
-    if !not_parsed.is_empty() {
-        let names: Vec<&str> = not_parsed.iter().copied().collect();
-        reasons.push(format!("could not be read: {}", names.join(", ")));
+    for (what, name) in lacks {
+        look.lack(Lack::new(what, Some(name)));
     }
-    if !not_told.is_empty() {
-        // Never a guess: an entry that is not known to be the package it names is left out,
-        // and the reading is partial, so it never says that a package is not there.
-        let n = counted(not_told.len(), "entry", "entries");
-        reasons.push(format!(
-            "the package of {n} cannot be told: {}",
-            some_of(&not_told)
-        ));
+    for name in not_told_kinds {
+        look.lack(Lack::new(NOT_TOLD, Some(name)));
     }
-    if !walked.unlisted.is_empty() {
-        // Each folder with what the system said, so that a permission is told from another
-        // failure. `partial_for` takes this clause for every ecosystem.
-        let named: Vec<String> = (walked.unlisted.iter())
-            .map(|(rel, why)| format!("{} ({why})", Unit::whole(format!("{prefix}{rel}"))))
-            .collect();
-        let n = counted(named.len(), "folder", "folders");
-        reasons.push(format!("{n} could not be listed: {}", some_of(&named)));
-    }
-    // A lockfile that could not be read or a folder that could not be listed failed; a kind
-    // of lockfile without a reader, a lockfile not opened where it is and folders not looked
-    // through are no reader; an entry the lockfile does not say enough about is not given.
-    // The reading takes the worst. Folders not looked through by design (`Walk::aside`) are
-    // limits of the reader, said in docs/reference.md.
-    let mut causes = Vec::new();
-    if !not_parsed.is_empty() || !walked.unlisted.is_empty() {
-        causes.push(Cause::Failed);
-    }
-    if !not_supported.is_empty() || !lacks.is_empty() || walked.stopped {
-        causes.push(Cause::NoReader);
-    }
-    if !not_told.is_empty() {
-        causes.push(Cause::NotGiven);
-    }
-    // What was not read, each by name where it has one, so that what it leaves unknown is
-    // decided from these and never from the reason's words (`partial_for`).
-    let gap = Gap {
-        cause: Cause::worst(causes),
-        lacks: not_supported
-            .iter()
-            .map(|name| Lack::new(LOCKFILE_KIND, Some(name)))
-            .chain(lacks.iter().map(|(what, name)| Lack::new(what, Some(name))))
-            .chain((not_told_kinds.iter()).map(|name| Lack::new(NOT_TOLD, Some(name))))
-            .chain(walked.stopped.then(|| Lack::new(NOT_LOOKED, None)))
-            .collect(),
-    };
+    look.add(walked.look);
+    let (completeness, reason) = look.completeness_noted(None);
     Some(Outcome {
-        gap,
-        completeness: if reasons.is_empty() {
-            "full"
-        } else {
-            "partial"
-        },
-        reason: (!reasons.is_empty()).then(|| reasons.join("; ")),
+        completeness,
+        reason,
+        gap: look.gap(),
         statements,
         lockfiles,
     })
+}
+
+/// The clause of the units of one kind a reading of lockfiles did not read (`look::Said`):
+/// lockfiles that could not be read, by their kinds; entries whose package cannot be told; and
+/// folders that could not be listed in full, each with what the system said, so that a
+/// permission is told from another failure. `partial_for` takes the last for every ecosystem.
+pub fn said(units: &[&Unread]) -> String {
+    let n = units.len();
+    let some = |each: fn(&Unread) -> String| {
+        let named: Vec<String> = units.iter().map(|u| each(u)).collect();
+        some_of(&named)
+    };
+    match units[0].said {
+        Said::Lockfile(_) => {
+            let kinds: BTreeSet<&str> = (units.iter())
+                .filter_map(|u| match u.said {
+                    Said::Lockfile(kind) => Some(kind),
+                    _ => None,
+                })
+                .collect();
+            format!("could not be read: {}", Vec::from_iter(kinds).join(", "))
+        }
+        Said::Untold => format!(
+            "the package of {} cannot be told: {}",
+            counted(n, "entry", "entries"),
+            some(|u| format!("{}#{}", u.unit.path, u.unit.part))
+        ),
+        _ => format!(
+            "{} could not be listed: {}",
+            counted(n, "folder", "folders"),
+            some(|u| format!("{} ({})", u.unit, u.why))
+        ),
+    }
 }
 
 /// `n` things, as a reason counts them.

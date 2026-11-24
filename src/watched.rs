@@ -796,7 +796,7 @@ pub fn open_regular(path: &Path) -> std::io::Result<Result<(File, Metadata), &'s
 
 /// What a thing that is not a regular file is, after links are followed: then nothing else
 /// is left once the first four are ruled out.
-fn kind_of(t: FileType) -> &'static str {
+pub fn kind_of(t: FileType) -> &'static str {
     if t.is_dir() {
         "folder"
     } else if t.is_fifo() {
