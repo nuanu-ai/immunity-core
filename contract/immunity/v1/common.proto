@@ -150,6 +150,15 @@ message Error {
   // When a question fits more than one thing, every id it fits, whole, so each can be asked
   // again.
   repeated string ids_text = 5;
+  // How the access to the store ended, when the failure is one: a word of a closed list, decided
+  // by SQLite's result codes, the store's own refusal and the locks, never by the words of a
+  // message. A skip, asked again: `store_busy`, `run_lock_held`, `check_running`,
+  // `watch_running`. A refusal of the store: `no_store`, `not_a_store`, `older_format`,
+  // `newer_format`, `unknown_format`, `damaged`. A failure of the store: `hot_journal`,
+  // `not_writable`, `moved`, `disk_full`, `io`, `cannot_open`, `folder`. A failure of the work:
+  // `failed`. Absent for a failure that is no access to the store, such as `usage`. A word this
+  // reader does not know is read as a failure of the store. Since 1.27.0.
+  optional string outcome = 6;
 }
 
 // A count under a name, where a set of counts is keyed by the core's words: a label, a reason, a

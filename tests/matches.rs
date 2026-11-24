@@ -1739,6 +1739,7 @@ fn without_a_store_the_answer_is_a_failure_that_never_parses_as_a_calm_message()
         ),
         (&json!(false), &json!("store_unreadable"), None)
     );
+    assert_eq!(failure["errors"][0]["outcome"], "no_store");
     let said = failure["errors"][0]["detail_text"].as_str().unwrap();
     assert!(said.ends_with("`immunity run` makes it"), "{said}");
     let parsed: v1::Matches = serde_json::from_slice(&out.stdout).unwrap();

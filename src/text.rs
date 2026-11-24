@@ -267,9 +267,10 @@ pub fn refusal(f: &v1::Failure, next: &crate::usage::Pasted, screen: &Screen) ->
 
 /// One error of a failure in the one form of an error (`Screen::error`), rendered from the
 /// error alone: its cause in Immunity Core's words, what to do, and what it quotes under a label. The
-/// two conditions of a store that every command meets, none at the path and one of another
+/// two refusals of a store that every command meets, none at the path and one of another
 /// format, are worded once (`store::NO_STORE`, `store::OTHER_FORMAT`), whichever command met
-/// them; their exit codes and the message itself are as each command gives them.
+/// them, told by the error's `outcome`; their exit codes and the message itself are as each
+/// command gives them.
 pub fn error(e: &v1::Error, screen: &Screen) -> String {
     told(e, None, screen)
 }
@@ -277,44 +278,26 @@ pub fn error(e: &v1::Error, screen: &Screen) -> String {
 /// One error, with the command to run next when the caller made one from what was typed.
 fn told(e: &v1::Error, next: Option<&crate::usage::Pasted>, screen: &Screen) -> String {
     let detail = e.detail_text.as_deref().unwrap_or_default();
-    let condition = match e.code.as_str() {
-        // `immunity owner` names the path alone, under a code of its own.
-        "no_store" => store::Condition::Absent(detail),
-        "store_unreadable" | "command_failed" => store::condition(detail),
-        _ => store::Condition::Other,
+    // Under its label, what the store's refusal said of it, or for `immunity owner` its path.
+    let refusal = match e.outcome.as_deref() {
+        Some("no_store") => Some((store::NO_STORE, store::NO_STORE_FIX)),
+        Some("older_format" | "newer_format") => {
+            Some((store::OTHER_FORMAT, store::OTHER_FORMAT_FIX))
+        }
+        _ => None,
     };
-    match condition {
-        store::Condition::Absent(path) => {
-            return screen.error(
-                store::NO_STORE,
-                &[Step::Words(store::NO_STORE_FIX.to_string())],
-                &[("Store", path)],
-            );
-        }
-        store::Condition::OtherFormat(path) => {
-            return screen.error(
-                store::OTHER_FORMAT,
-                &[Step::Words(store::OTHER_FORMAT_FIX.to_string())],
-                &[("Store", path)],
-            );
-        }
-        store::Condition::Other => {}
-    }
-    if e.code == "run_in_progress" {
-        return screen.error(
-            "another check is running on this store",
-            &[Step::Words(
-                "Nothing was done. Try again when it ends, or see it with: `immunity status`"
-                    .to_string(),
-            )],
-            &[],
-        );
+    if let Some((cause, fix)) = refusal {
+        return screen.error(cause, &[Step::Words(fix.to_string())], &[("Store", detail)]);
     }
     // The message is the cause, and what was done about it, after "; nothing was", a step.
     let (cause, done) = match e.message.split_once("; nothing was ") {
         Some((cause, done)) => (cause, Some(format!("Nothing was {done}."))),
         None => (e.message.as_str(), None),
     };
+    if e.code == "run_in_progress" {
+        let step = "Nothing was done. Try again when it ends, or see it with: `immunity status`";
+        return screen.error(cause, &[Step::Words(step.to_string())], &[]);
+    }
     let mut steps: Vec<Step> = done.into_iter().map(Step::Words).collect();
     let label = match e.code.as_str() {
         "changed_since_read" => "Finding",
@@ -389,6 +372,7 @@ mod tests {
     const CODES: &[&str] = &[
         "another_job",
         "another_store",
+        "answer_unreadable",
         "busy",
         "case_too_long",
         "changed_since_read",
@@ -529,60 +513,37 @@ mod tests {
 
     #[test]
     fn no_store_and_another_format_are_worded_once_whatever_command_met_them() {
-        let none = crate::store::absent(std::path::Path::new("/x/store.db"));
-        let older = "the store at /x/store.db is from an older format (5); this version uses \
-                     format 6 and does not convert old stores. Nothing was changed.";
-        let cases = [
-            (
-                "store_unreadable",
-                "the store cannot be read; nothing was changed",
-                none.clone(),
-            ),
-            (
-                "store_unreadable",
-                "the store cannot be read, so what became of a match cannot be told; nothing was evaluated",
-                none.clone(),
-            ),
-            (
-                "no_store",
-                "there is no store at the path given; `immunity run` makes it",
-                "/x/store.db".to_string(),
-            ),
-            (
-                "command_failed",
-                "immunity view could not finish",
-                format!("the store cannot be read: {none}"),
-            ),
-        ];
-        for (code, message, detail) in &cases {
+        use crate::outcome::{Code, Outcome};
+        let path = std::path::Path::new("/x/store.db");
+        let format = |code| Outcome::new(code, "the store at /x/store.db is from …");
+        for op in ["findings", "matches", "finding", "view"] {
             let said = error(
-                &crate::answer::error(code, message, "", detail),
+                &crate::store::absent(path).error(op, "immunity status --json"),
                 &Screen::pipe(),
             );
             assert_eq!(
                 said,
                 "error: there is no store here yet\n  immunity run makes one, or immunity on, \
-                 which also keeps it checked.\n  Store   /x/store.db\n",
-                "{code}"
+                 which also keeps it checked.\n  Store   there is no store at /x/store.db; \
+                 `immunity run` makes it\n",
+                "{op}"
             );
+            for code in [Code::OlderFormat, Code::NewerFormat] {
+                let said = error(&format(code).error(op, ""), &Screen::pipe());
+                assert_eq!(
+                    said,
+                    "error: this store was made by another build of Immunity Core\n  It was left \
+                     unchanged. Move it aside or pass another --store; the next check starts one \
+                     from the beginning.\n  Store   the store at /x/store.db is from …\n",
+                    "{op}"
+                );
+            }
         }
-        let newer = "the store at /x/store.db is from a newer format (7) than this version \
-                     knows (6). Nothing was changed.";
-        for (code, detail) in [
-            ("store_unreadable", older),
-            ("command_failed", older),
-            ("store_unreadable", newer),
-        ] {
-            let said = error(
-                &crate::answer::error(code, "m", "", detail),
-                &Screen::pipe(),
-            );
-            assert!(
-                said.starts_with("error: this store was made by another build of Immunity Core\n  It was left unchanged."),
-                "{said}"
-            );
-            assert!(said.ends_with("  Store   /x/store.db\n"), "{said}");
-        }
+        // A format that is no number, and the same words without the outcome, are shown as said.
+        let unknown = format(Code::UnknownFormat).error("status", "");
+        assert!(error(&unknown, &Screen::pipe()).contains("Reason   the store at"));
+        let unmarked = crate::answer::error("store_unreadable", "m", "", "the store at /x is from");
+        assert!(!error(&unmarked, &Screen::pipe()).contains("another build"));
     }
 
     #[test]

@@ -107,6 +107,7 @@ use serde_json::{Value, json};
 
 use crate::fsevents::{self, Where};
 use crate::look::Absent;
+use crate::outcome::{Code, Outcome};
 use crate::secrets::Text;
 use crate::{autorun, checkouts, status, store, watched};
 
@@ -300,37 +301,39 @@ pub fn watch(args: &WatchArgs) -> ExitCode {
         return failed(&format!("the signal handlers could not be set: {e}"));
     }
     let folder = crate::home(&args.store);
-    let unreadable = |e: &dyn std::fmt::Display| {
+    // Why it does not start, as the one mapping of outcomes words it and with its exit code.
+    let stopped = |o: Outcome, example: &str| {
+        let e = o.error("watch", example);
+        let detail = e.detail_text.as_deref().map(crate::contract::unescape);
         crate::print_json(&status::failure(
             Some("watch"),
-            "store_unreadable",
-            "the store cannot be read; nothing was changed",
-            "immunity status --json --store <file>",
-            &e.to_string(),
+            &e.code,
+            &e.message,
+            example,
+            detail.as_deref().unwrap_or_default(),
         ));
-        ExitCode::from(crate::EXIT_STORE)
+        ExitCode::from(o.exit())
     };
+    let unreadable = |o: Outcome| stopped(o, "immunity status --json --store <file>");
     // A store it cannot read is refused before anything is made beside it.
-    if let Err(e) = readable(&args.store) {
-        return unreadable(&e);
+    if args.store.exists()
+        && let Err(o) = store::open_read_only(&args.store)
+    {
+        return unreadable(o);
     }
     if let Err(e) = std::fs::create_dir_all(&folder) {
-        return unreadable(&e);
+        return unreadable(Outcome::new(Code::Folder, e.to_string()));
     }
     let started = crate::now_secs();
     let watch_lock = match store::lock_watch(&folder) {
         Ok(Some(lock)) => lock,
         Ok(None) => {
-            crate::print_json(&status::failure(
-                Some("watch"),
-                "watch_in_progress",
-                "another watcher is running on this store; nothing was done",
+            return stopped(
+                Outcome::new(Code::WatchRunning, ""),
                 "immunity status --json",
-                "",
-            ));
-            return ExitCode::from(EXIT_WATCHING);
+            );
         }
-        Err(e) => return unreadable(&e),
+        Err(e) => return unreadable(crate::outcome::of(&e)),
     };
     // Every watcher, however started, says in its lock file since when it holds it and that it
     // is alive, and stops when it stalls; status reads the file.
@@ -339,12 +342,12 @@ pub fn watch(args: &WatchArgs) -> ExitCode {
         Err(e) => return failed(&format!("the watcher could not be supervised: {e}")),
     };
     if let Err(e) = heartbeat.write() {
-        return unreadable(&e);
+        return unreadable(crate::outcome::of(&e));
     }
     // The watcher makes the store where there is none, at its start only: a store that goes or
     // is emptied while it runs is a problem it reports, never one it makes again.
     if let Err(e) = store::make_if_absent(&args.store) {
-        return unreadable(&e);
+        return unreadable(crate::outcome::of(&*e));
     }
     let checks = if args.background {
         let binary = match std::env::current_exe() {
@@ -462,15 +465,6 @@ fn problem_of(code: &str, detail: Text) -> Value {
             "detail_text": detail.said_within(status::TEXT_CAP),
         }),
     )
-}
-
-/// Whether the store, where there is one, is one this build can read, read without writing.
-/// A store it cannot read stops the watcher here, before it watches anything.
-fn readable(path: &Path) -> Result<(), Box<dyn Error>> {
-    if path.exists() {
-        store::open_read_only(path)?;
-    }
-    Ok(())
 }
 
 struct Watcher<'a> {
