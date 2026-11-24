@@ -21,10 +21,12 @@
 //! and leaves the finding as it is. What a kind is not matched against is named in a reading
 //! of its own, with no reader for it.
 
-use std::collections::BTreeSet;
-use std::net::Ipv4Addr;
+use std::collections::{BTreeSet, HashSet};
+use std::net::{IpAddr, Ipv4Addr};
+use std::os::unix::fs::MetadataExt;
+use std::path::Path;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, Transaction};
 use serde_json::Value;
 
 use crate::store::Lack;
@@ -76,6 +78,62 @@ pub struct List {
     pub matched: BTreeSet<Indicator>,
     pub unmatched: BTreeSet<String>,
     pub entries: usize,
+}
+
+type IpStatKey = (String, u64, u64, u64, i64, i64, i64, i64);
+
+/// Stat-keyed cache of canonical IPv4 indicator addresses read from the saved copy of the last
+/// run's indicator list, reused across process samples so the watcher does not re-read and
+/// re-parse `indicators.json` every thirty seconds.
+#[derive(Default)]
+pub struct IpCache {
+    cached: Option<(IpStatKey, HashSet<IpAddr>)>,
+}
+
+impl IpCache {
+    pub fn ipv4_set(
+        &mut self,
+        tx: &Transaction,
+        folder: &Path,
+    ) -> rusqlite::Result<Option<&HashSet<IpAddr>>> {
+        let Some(raw) = crate::store::last_raw(tx, READER, LIST)? else {
+            self.cached = None;
+            return Ok(None);
+        };
+        let path = folder.join(&raw);
+        let Ok(m) = std::fs::metadata(&path) else {
+            self.cached = None;
+            return Ok(None);
+        };
+        let key: IpStatKey = (
+            raw,
+            m.dev(),
+            m.ino(),
+            m.size(),
+            m.mtime(),
+            m.mtime_nsec(),
+            m.ctime(),
+            m.ctime_nsec(),
+        );
+        if self.cached.as_ref().is_none_or(|(k, _)| *k != key) {
+            let Ok(bytes) = std::fs::read(&path) else {
+                self.cached = None;
+                return Ok(None);
+            };
+            let Ok(list) = parse(&bytes) else {
+                self.cached = None;
+                return Ok(None);
+            };
+            let ips: HashSet<IpAddr> = list
+                .matched
+                .iter()
+                .filter(|i| i.kind == IPV4)
+                .filter_map(|i| i.value.parse::<IpAddr>().ok().map(|ip| ip.to_canonical()))
+                .collect();
+            self.cached = Some((key, ips));
+        }
+        Ok(self.cached.as_ref().map(|(_, ips)| ips))
+    }
 }
 
 /// Reads a list; an error says which entry is out of shape and how, in the program's words.

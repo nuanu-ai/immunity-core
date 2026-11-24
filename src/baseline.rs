@@ -112,14 +112,14 @@ pub fn past_checkouts(conn: &Connection) -> rusqlite::Result<BTreeSet<String>> {
     conn.prepare(
         "SELECT DISTINCT substr(subject, 10) FROM assertion
          WHERE predicate = 'located_on' AND layer != 'draft'
-           AND reader IN (?1, ?2) AND subject LIKE 'checkout:%'",
+           AND reader IN (?1, ?2) AND subject >= 'checkout:' AND subject < 'checkout;'",
     )?
     .query_map([checkouts::READER, agent_folders::READER], |r| r.get(0))?
     .collect()
 }
 
 /// A physical path, or one selected part of it. Only the public name combines the two.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Unit {
     pub path: String,
     pub part: String,
@@ -246,32 +246,66 @@ pub fn record(
     read: &[Unit],
     seen: &[Unit],
 ) -> rusqlite::Result<()> {
-    let mut stmt = tx.prepare(
-        "INSERT OR IGNORE INTO unit_read (reader, kind, unit, how, run_id, at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-    )?;
-    for (how, units) in [("read", read), ("seen", seen)] {
-        for unit in units.iter().filter(|u| u.part.is_empty()) {
-            stmt.execute(params![reader, kind, unit.path, how, run_id, at])?;
+    if !read.is_empty() || !seen.is_empty() {
+        let mut stmt = tx.prepare(
+            "INSERT OR IGNORE INTO unit_read (reader, kind, unit, how, run_id, at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )?;
+        for (how, units) in [("read", read), ("seen", seen)] {
+            for unit in units.iter().filter(|u| u.part.is_empty()) {
+                stmt.execute(params![reader, kind, unit.path, how, run_id, at])?;
+            }
         }
     }
-    let mut again =
-        tx.prepare("DELETE FROM unit_unread WHERE reader = ?1 AND kind = ?2 AND unit = ?3")?;
-    let mut part_again = tx.prepare(
-        "DELETE FROM part_unread WHERE reader = ?1 AND kind = ?2 AND unit = ?3
-           AND (?4 = '' OR part = ?4)",
+    if read.is_empty() {
+        return Ok(());
+    }
+    let has_unread: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM unit_unread WHERE reader = ?1 AND kind = ?2)",
+        params![reader, kind],
+        |r| r.get(0),
     )?;
-    for unit in read {
-        // A readable part ends the whole-file failure without establishing full coverage.
-        again.execute(params![reader, kind, unit.path])?;
-        if !unit.part.is_empty() {
-            tx.execute(
+    let has_part_unread: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM part_unread WHERE reader = ?1 AND kind = ?2)",
+        params![reader, kind],
+        |r| r.get(0),
+    )?;
+    let mut again = has_unread
+        .then(|| {
+            tx.prepare("DELETE FROM unit_unread WHERE reader = ?1 AND kind = ?2 AND unit = ?3")
+        })
+        .transpose()?;
+    let mut part_again = has_part_unread
+        .then(|| {
+            tx.prepare(
+                "DELETE FROM part_unread WHERE reader = ?1 AND kind = ?2 AND unit = ?3
+                   AND (?4 = '' OR part = ?4)",
+            )
+        })
+        .transpose()?;
+    let mut part_stmt = read
+        .iter()
+        .any(|u| !u.part.is_empty())
+        .then(|| {
+            tx.prepare(
                 "INSERT OR IGNORE INTO part_read (reader, kind, unit, part, run_id)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![reader, kind, unit.path, unit.part, run_id],
-            )?;
+            )
+        })
+        .transpose()?;
+    for unit in read {
+        // A readable part ends the whole-file failure without establishing full coverage.
+        if let Some(again) = again.as_mut() {
+            again.execute(params![reader, kind, unit.path])?;
         }
-        part_again.execute(params![reader, kind, unit.path, unit.part])?;
+        if !unit.part.is_empty()
+            && let Some(part_stmt) = part_stmt.as_mut()
+        {
+            part_stmt.execute(params![reader, kind, unit.path, unit.part, run_id])?;
+        }
+        if let Some(part_again) = part_again.as_mut() {
+            part_again.execute(params![reader, kind, unit.path, unit.part])?;
+        }
     }
     Ok(())
 }

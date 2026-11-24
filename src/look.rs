@@ -34,7 +34,7 @@ use crate::baseline::{self, Unit};
 use crate::store::{Cause, Gap, Lack, Reading};
 use crate::watched::{self, Entry};
 use rusqlite::{Transaction, params};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 use std::io::{Error, ErrorKind};
 use std::path::{Path, PathBuf};
 
@@ -234,12 +234,16 @@ pub struct Look {
     /// The units read in full, by their paths as ids name them: a file looked at, found or
     /// absent, and a folder listed or found absent (`baseline.rs`).
     read: Vec<Unit>,
+    /// O(1) lookup index mirroring `read`.
+    read_set: HashSet<Unit>,
     /// The units found present and not read in full. One read in full is known to be there by
     /// its reading, which is all the store asks of it (`baseline::Judge::facts`).
     seen: Vec<Unit>,
     /// The units of `read` whose listing was read or that were found absent: what is in them
     /// is known. A folder met and not listed is no proof of what is inside it.
     listed: Vec<Unit>,
+    /// O(1) lookup index mirroring `listed`.
+    listed_set: HashSet<Unit>,
     /// Whether the reading could not tell every place its units may be (`unplaced`).
     unplaced: bool,
     /// What this build has no reader for in what the reading met (`lack`).
@@ -254,18 +258,23 @@ impl Look {
 
     /// A folder there whose listing was read in full.
     pub fn listed(&mut self, unit: Unit) {
+        self.listed_set.insert(unit.clone());
         self.listed.push(unit.clone());
+        self.read_set.insert(unit.clone());
         self.read.push(unit);
     }
 
     /// A unit there and read in full: a file read, a folder listed.
     pub fn read(&mut self, unit: Unit) {
+        self.read_set.insert(unit.clone());
         self.read.push(unit);
     }
 
     /// A part of a file that was parsed whole, there or known absent from it: read in full.
     pub fn read_part(&mut self, file: &Unit, pointer: impl Into<String>) {
-        self.read.push(Unit::part(&file.path, pointer));
+        let part = Unit::part(&file.path, pointer);
+        self.read_set.insert(part.clone());
+        self.read.push(part);
     }
 
     /// A unit there whose parts are judged one by one, one of them not read: seen and not read
@@ -329,8 +338,10 @@ impl Look {
             self.short(cause, why);
         }
         self.hidden.extend(other.hidden);
+        self.read_set.extend(other.read_set);
         self.read.extend(other.read);
         self.seen.extend(other.seen);
+        self.listed_set.extend(other.listed_set);
         self.listed.extend(other.listed);
         self.unplaced |= other.unplaced;
         for lack in other.lacks {
@@ -347,7 +358,7 @@ impl Look {
     /// Something the reading did not read that is no unit of it, with its cause and why, said
     /// once however often it was met.
     pub fn short(&mut self, cause: Cause, why: String) {
-        if !self.short.contains(&(cause, why.clone())) {
+        if !self.short.iter().any(|(c, w)| *c == cause && w == &why) {
             self.short.push((cause, why));
         }
     }
@@ -404,17 +415,31 @@ impl Look {
     /// One that merely contains a unit read inside it that `proves` `unit` does not: the
     /// deepest unit that holds a path decides.
     pub fn hides(&self, unit: &Unit) -> bool {
+        if self.unread.is_empty() && self.hidden.is_empty() {
+            return false;
+        }
+        let whole = (!unit.part.is_empty()).then(|| Unit::whole(&unit.path));
+        let folder = Unit::whole(baseline::parent(&unit.path));
+        let has_unit = self.read_set.contains(unit);
+        let has_whole = whole.as_ref().is_some_and(|w| self.read_set.contains(w));
+        let has_folder = self.listed_set.contains(&folder);
         // Strictly inside: a unit both read and not read is not read, in whatever order.
-        let within =
-            |h: &Unit| (self.read.iter()).any(|r| r != h && h.hides(r) && self.proves(r, unit));
+        let within = |h: &Unit| {
+            (has_unit && unit != h && h.hides(unit))
+                || (has_whole && whole.as_ref().is_some_and(|w| w != h && h.hides(w)))
+                || (has_folder && &folder != h && h.hides(&folder))
+        };
         self.hiding().any(|h| h.hides(unit) && !within(h))
     }
 
-    /// Whether `r`, read in full, tells what became of `unit`: it is that unit, its file, or
+    /// Whether any unit read in full proves what became of `unit`: the unit itself, its file, or
     /// the folder that holds it, listed.
-    fn proves(&self, r: &Unit, unit: &Unit) -> bool {
-        let folder = || *r == Unit::whole(baseline::parent(&unit.path)) && self.listed.contains(r);
-        r == unit || *r == Unit::whole(&unit.path) || folder()
+    fn is_proven(&self, unit: &Unit) -> bool {
+        self.read_set.contains(unit)
+            || (!unit.part.is_empty() && self.read_set.contains(&Unit::whole(&unit.path)))
+            || self
+                .listed_set
+                .contains(&Unit::whole(baseline::parent(&unit.path)))
     }
 
     /// `hides`, for the unit at `path`, with paths compared as a Mac's volumes compare names
@@ -440,8 +465,7 @@ impl Look {
         let Some(unit) = unit else {
             return self.cause().is_none();
         };
-        let proven = || (self.read.iter()).any(|r| self.proves(r, unit));
-        !self.hides(unit) && (!self.unplaced || proven())
+        !self.hides(unit) && (!self.unplaced || self.is_proven(unit))
     }
 
     /// The completeness of the reading of which entries are there, and its reason or note. A

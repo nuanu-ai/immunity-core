@@ -452,26 +452,47 @@ extern "C" fn callback(
                 &*(info as *const Sink),
             )
         };
+        // Short-circuit before copying any C strings when paths are absent or any flag already
+        // forces `Where::Anywhere`.
+        if paths.is_null() || flags.iter().any(|&f| f & EVERYWHERE != 0) {
+            (sink.deliver)(Batch {
+                events: count,
+                at: Where::Anywhere,
+            });
+            return;
+        }
         // Without `UseCFTypes` the paths are "a raw C array of raw C strings", one per event,
-        // freed by FSEvents after the callback returns (`FSEvents.h:674-677`): each is copied
-        // out here. A missing one names no path.
-        let named: Vec<Option<std::path::PathBuf>> = if paths.is_null() {
-            vec![None; count]
-        } else {
-            // SAFETY: `count` pointers, valid for this call, as above.
-            let each = unsafe { std::slice::from_raw_parts(paths as *const *const c_char, count) };
-            each.iter()
-                .map(|&p| {
-                    // SAFETY: a non-null pointer FSEvents gives is a NUL-terminated string
-                    // valid for this call.
-                    (!p.is_null()).then(|| {
-                        let bytes = unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes();
-                        std::path::PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
-                    })
-                })
-                .collect()
-        };
-        (sink.deliver)(summarise(flags, &named));
+        // freed by FSEvents after the callback returns (`FSEvents.h:674-677`): copy unique paths
+        // directly into one set and stop as soon as any is null or the set exceeds `MOST_PATHS`.
+        // SAFETY: `count` pointers, valid for this call, as above.
+        let each = unsafe { std::slice::from_raw_parts(paths as *const *const c_char, count) };
+        let mut set = std::collections::BTreeSet::new();
+        for &p in each {
+            if p.is_null() {
+                (sink.deliver)(Batch {
+                    events: count,
+                    at: Where::Anywhere,
+                });
+                return;
+            }
+            // SAFETY: a non-null pointer FSEvents gives is a NUL-terminated string valid for this call.
+            let bytes = unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes();
+            let path = Path::new(std::ffi::OsStr::from_bytes(bytes));
+            if !set.contains(path) {
+                if set.len() >= MOST_PATHS {
+                    (sink.deliver)(Batch {
+                        events: count,
+                        at: Where::Anywhere,
+                    });
+                    return;
+                }
+                set.insert(path.to_path_buf());
+            }
+        }
+        (sink.deliver)(Batch {
+            events: count,
+            at: Where::Paths(set),
+        });
     }));
     if run.is_err() {
         std::process::abort();
@@ -480,17 +501,31 @@ extern "C" fn callback(
 
 /// One batch from the flags and paths of one callback. An event whose flags say the path does
 /// not place the change (`EVERYWHERE`), or that names no path, makes the batch say anywhere.
+#[cfg(test)]
 fn summarise(flags: &[Flags], paths: &[Option<std::path::PathBuf>]) -> Batch {
-    let mut b = Batch::default();
+    let events = flags.len().min(paths.len());
+    let mut set = std::collections::BTreeSet::new();
     for (&f, path) in flags.iter().zip(paths) {
-        b.events += 1;
-        let here = match path {
-            Some(path) if f & EVERYWHERE == 0 => Where::Paths([path.clone()].into()),
-            _ => Where::Anywhere,
+        let Some(path) = path.as_ref().filter(|_| f & EVERYWHERE == 0) else {
+            return Batch {
+                events,
+                at: Where::Anywhere,
+            };
         };
-        b.at = std::mem::take(&mut b.at).and(here);
+        if !set.contains(path) {
+            if set.len() >= MOST_PATHS {
+                return Batch {
+                    events,
+                    at: Where::Anywhere,
+                };
+            }
+            set.insert(path.clone());
+        }
     }
-    b
+    Batch {
+        events,
+        at: Where::Paths(set),
+    }
 }
 
 #[cfg(test)]

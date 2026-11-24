@@ -208,9 +208,10 @@ pub const INTERPRETERS: [Interpreter; 7] = [
 
 /// The interpreter a file name names, if any.
 pub fn interpreter(file_name: &str) -> Option<&'static Interpreter> {
-    let lower = file_name.to_ascii_lowercase();
-    let name = lower.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
-    INTERPRETERS.iter().find(|i| i.names.contains(&name))
+    let name = file_name.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    INTERPRETERS
+        .iter()
+        .find(|i| i.names.iter().any(|n| n.eq_ignore_ascii_case(name)))
 }
 
 /// Whether these arguments, the first one being the program's own name, give the interpreter
@@ -218,31 +219,36 @@ pub fn interpreter(file_name: &str) -> Option<&'static Interpreter> {
 /// option: what follows a script's path belongs to the script. An option with a value that
 /// the table does not list ends the reading early, so code after it is not seen.
 pub fn inline_code(i: &Interpreter, args: &[String]) -> bool {
+    let has_short = |list: &[&str], c: char| {
+        let mut buf = [b'-', 0, 0, 0, 0];
+        let n = 1 + c.encode_utf8(&mut buf[1..]).len();
+        list.iter().any(|&s| s.as_bytes() == &buf[..n])
+    };
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         if a == "--" || a == "-" || !a.starts_with('-') {
             return i.subcommand == Some(a.as_str());
         }
-        if let Some(long) = a.strip_prefix("--") {
-            let name = format!("--{}", long.split('=').next().unwrap_or_default());
-            if i.inline.contains(&name.as_str()) {
+        if a.starts_with("--") {
+            let eq = a.find('=');
+            let name = &a[..eq.unwrap_or(a.len())];
+            if i.inline.contains(&name) {
                 return true;
             }
-            if i.with_value.contains(&name.as_str()) && !long.contains('=') {
+            if i.with_value.contains(&name) && eq.is_none() {
                 it.next();
             }
             continue;
         }
         // A cluster of short options: each letter is one, until one that takes a value,
         // which takes the rest of the cluster or else the next argument.
-        let letters: Vec<char> = a.chars().skip(1).collect();
-        for (n, c) in letters.iter().enumerate() {
-            let flag = format!("-{c}");
-            if i.inline.contains(&flag.as_str()) {
+        let mut chars = a[1..].chars().peekable();
+        while let Some(c) = chars.next() {
+            if has_short(i.inline, c) {
                 return true;
             }
-            if i.with_value.contains(&flag.as_str()) {
-                if n + 1 == letters.len() {
+            if has_short(i.with_value, c) {
+                if chars.peek().is_none() {
                     it.next();
                 }
                 break;
@@ -411,6 +417,7 @@ pub fn derive(r: Reading) -> Sample {
 
 /// The connections to any of these addresses, compared in canonical form. The port is not
 /// compared: an indicator names an address.
+#[cfg(test)]
 pub fn connections_to<'a>(all: &'a [Connection], addresses: &[IpAddr]) -> Vec<&'a Connection> {
     let wanted: HashSet<IpAddr> = addresses.iter().map(IpAddr::to_canonical).collect();
     all.iter().filter(|c| wanted.contains(&c.address)).collect()
@@ -420,11 +427,12 @@ pub fn connections_to<'a>(all: &'a [Connection], addresses: &[IpAddr]) -> Vec<&'
 type FileKey = (String, u64, u64, u64, i64, i64, i64, i64);
 
 /// Who signed an executable, looked up once per file: the key is the path with the file's
-/// device, inode, size and times, so a file replaced in place is looked up again. A lookup
-/// costs about one to two milliseconds; only tracked processes are looked up.
+/// device, inode, size and times, so a file replaced in place is looked up again. Also holds
+/// the stat-keyed cache of indicator IP addresses across samples.
 #[derive(Default)]
 pub struct Signers {
     known: HashMap<FileKey, Option<String>>,
+    indicators: crate::indicators::IpCache,
     pub looked_up: usize,
 }
 
@@ -441,15 +449,18 @@ impl Signers {
             m.ctime(),
             m.ctime_nsec(),
         );
-        self.known
-            .entry(key)
-            .or_insert_with(|| {
-                self.looked_up += 1;
-                codesign::Code::at(Path::new(path))
-                    .ok()
-                    .and_then(|c| c.signer())
-            })
-            .clone()
+        if let Some(cached) = self.known.get(&key) {
+            return cached.clone();
+        }
+        if self.known.len() >= 4096 {
+            self.known.clear();
+        }
+        self.looked_up += 1;
+        let signer = codesign::Code::at(Path::new(path))
+            .ok()
+            .and_then(|c| c.signer());
+        self.known.insert(key, signer.clone());
+        signer
     }
 }
 
@@ -588,7 +599,7 @@ pub fn take(
             seen.push(observed(DETACHED_INLINE, file));
         }
     }
-    let matched = match_connections(tx, w, &sample, &mut seen)?;
+    let matched = match_connections(tx, w, &sample, signers, &mut seen)?;
     // What has been gone for a day is no longer kept.
     tx.execute(
         "DELETE FROM tracked_process WHERE last_seen_at < ?1",
@@ -688,19 +699,6 @@ fn basis(
     Ok(())
 }
 
-/// The indicator list the last run read, from its saved copy; `None` when there is none or it
-/// cannot be read now.
-fn indicator_list(
-    tx: &Transaction,
-    folder: &Path,
-) -> rusqlite::Result<Option<crate::indicators::List>> {
-    use crate::indicators;
-    let raw = crate::store::last_raw(tx, indicators::READER, indicators::LIST)?;
-    Ok(raw
-        .and_then(|raw| std::fs::read(folder.join(raw)).ok())
-        .and_then(|bytes| indicators::parse(&bytes).ok()))
-}
-
 /// Connections to an address of an `ipv4-addr:value` indicator, each raised once per process
 /// and indicator. A `domain-name:value` indicator is not matched: a sample has addresses, not
 /// names, and names are not resolved. Returns how many connections matched.
@@ -708,20 +706,25 @@ fn match_connections(
     tx: &Transaction,
     w: &At,
     sample: &Sample,
+    signers: &mut Signers,
     seen: &mut Vec<Observed>,
 ) -> rusqlite::Result<usize> {
     use crate::indicators::{self, IPV4, Indicator};
-    let Some(list) = indicator_list(tx, w.folder)? else {
+    if sample.connections.is_empty() {
+        return Ok(0);
+    }
+    let Some(wanted) = signers.indicators.ipv4_set(tx, w.folder)? else {
         return Ok(0);
     };
-    let addresses: Vec<IpAddr> = list
-        .matched
-        .iter()
-        .filter(|i| i.kind == IPV4)
-        .filter_map(|i| i.value.parse().ok())
-        .collect();
+    if wanted.is_empty() {
+        return Ok(0);
+    }
     // Indicators: the list's addresses are matched against the sample's connections here.
-    let found = connections_to(&sample.connections, &addresses);
+    let found: Vec<&Connection> = sample
+        .connections
+        .iter()
+        .filter(|c| wanted.contains(&c.address))
+        .collect();
     for c in &found {
         let Some(p) = sample
             .processes
@@ -1146,7 +1149,7 @@ fn pids(kind: u32, arg: u32) -> Vec<i32> {
 
 /// The executable's path, as the kernel gives it.
 fn path(pid: i32) -> Option<String> {
-    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let mut buf = [0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
     // SAFETY: the buffer is valid for its length.
     let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
     (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
@@ -1188,25 +1191,27 @@ fn leader(pid: i32, id: i32) -> Option<Leader> {
 
 /// `kern.argmax`: the largest argument area, the buffer `KERN_PROCARGS2` needs.
 fn argmax() -> usize {
-    let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
-    let mut value: c_int = 0;
-    let mut size = size_of::<c_int>();
-    // SAFETY: `value` is valid for `size` bytes.
-    let r = unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            2,
-            (&mut value as *mut c_int).cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if r == 0 && value > 0 {
-        value as usize
-    } else {
-        1 << 20
-    }
+    static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MAX.get_or_init(|| {
+        let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+        let (mut value, mut size): (c_int, usize) = (0, size_of::<c_int>());
+        // SAFETY: `value` is valid for `size` bytes.
+        let r = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                (&mut value as *mut c_int).cast(),
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if r == 0 && value > 0 {
+            value as usize
+        } else {
+            1 << 20
+        }
+    })
 }
 
 /// The area `KERN_PROCARGS2` gives: the argument count as an `int`, the path the program was
@@ -1290,9 +1295,8 @@ fn c_name(raw: &[libc::c_char]) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// The internet sockets of a process that have a remote end. Returns them and how many sockets
-/// could not be read.
-fn sockets(pid: i32, start: i64) -> (Vec<Connection>, usize) {
+/// Returns them and how many sockets could not be read.
+fn sockets(pid: i32, start: i64, fds: &mut Vec<libc::proc_fdinfo>) -> (Vec<Connection>, usize) {
     let fd_size = size_of::<libc::proc_fdinfo>();
     // SAFETY: with no buffer the call returns the size it needs.
     let need =
@@ -1300,7 +1304,8 @@ fn sockets(pid: i32, start: i64) -> (Vec<Connection>, usize) {
     if need <= 0 {
         return (Vec::new(), 0);
     }
-    let mut fds: Vec<libc::proc_fdinfo> = Vec::with_capacity(need as usize / fd_size + 32);
+    fds.clear();
+    fds.reserve((need as usize / fd_size + 32).saturating_sub(fds.capacity()));
     let size = (fds.capacity() * fd_size) as c_int;
     // SAFETY: the buffer is valid for `size` bytes, and the call says how many it wrote.
     let got =
@@ -1397,75 +1402,85 @@ pub fn read_system(at: i64) -> Reading {
         sockets_unreadable: 0,
         arguments_layout_unknown: false,
     };
-    let mut buf = vec![0u8; argmax()];
-    let own = arguments(std::process::id() as i32, &mut buf);
-    r.arguments_layout_unknown = !layout_known(own, std::env::args_os());
-    for pid in mine {
-        // SAFETY: all-zero is a valid `proc_bsdinfo`.
-        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-        let want = size_of::<libc::proc_bsdinfo>() as c_int;
-        // SAFETY: `info` is valid for `want` bytes.
-        let n = unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDTBSDINFO,
-                0,
-                (&mut info as *mut libc::proc_bsdinfo).cast(),
-                want,
-            )
-        };
-        if n != want {
-            if errno() == libc::ESRCH {
-                r.ended += 1;
-            } else {
-                r.unreadable += 1;
-            }
-            continue;
-        }
-        let start = info.pbi_start_tvsec as i64 * 1_000_000 + info.pbi_start_tvusec as i64;
-        let name = c_name(&info.pbi_comm);
-        let mut executable = path(pid);
-        let file_name = executable
-            .as_deref()
-            .and_then(|e| e.rsplit('/').next())
-            .unwrap_or(&name);
-        let kind = interpreter(file_name);
-        let args = if kind.is_some() {
-            arguments(pid, &mut buf).map(|(exec, args)| {
-                executable = where_from(executable.take(), exec);
-                args
-            })
-        } else {
-            None
-        };
-        let given_code = kind
-            .zip(args.as_deref())
-            .is_some_and(|(i, a)| inline_code(i, a));
-        let around = if given_code {
-            // SAFETY: a plain call; it fails with -1 for a process that has ended.
-            let sid = unsafe { libc::getsid(pid) };
-            Around {
-                working_directory: working_directory(pid),
-                session: leader(pid, sid),
-                group: leader(pid, info.pbi_pgid as i32),
-            }
-        } else {
-            Around::default()
-        };
-        let (connections, failed) = sockets(pid, start);
-        r.connections.extend(connections);
-        r.sockets_unreadable += failed;
-        r.processes.push(Seen {
-            pid,
-            start,
-            parent: info.pbi_ppid as i32,
-            executable,
-            name,
-            terminal: info.pbi_flags & PROC_FLAG_CONTROLT != 0,
-            args,
-            around,
-        });
+    thread_local! {
+        static PROCARGS_BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
+    let mut fds: Vec<libc::proc_fdinfo> = Vec::new();
+    PROCARGS_BUF.with(|cell| {
+        let mut buf = cell.borrow_mut();
+        let cap = argmax();
+        if buf.len() < cap {
+            buf.resize(cap, 0);
+        }
+        let own = arguments(std::process::id() as i32, &mut buf);
+        r.arguments_layout_unknown = !layout_known(own, std::env::args_os());
+        for pid in mine {
+            // SAFETY: all-zero is a valid `proc_bsdinfo`.
+            let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+            let want = size_of::<libc::proc_bsdinfo>() as c_int;
+            // SAFETY: `info` is valid for `want` bytes.
+            let n = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDTBSDINFO,
+                    0,
+                    (&mut info as *mut libc::proc_bsdinfo).cast(),
+                    want,
+                )
+            };
+            if n != want {
+                if errno() == libc::ESRCH {
+                    r.ended += 1;
+                } else {
+                    r.unreadable += 1;
+                }
+                continue;
+            }
+            let start = info.pbi_start_tvsec as i64 * 1_000_000 + info.pbi_start_tvusec as i64;
+            let name = c_name(&info.pbi_comm);
+            let mut executable = path(pid);
+            let file_name = executable
+                .as_deref()
+                .and_then(|e| e.rsplit('/').next())
+                .unwrap_or(&name);
+            let kind = interpreter(file_name);
+            let args = if kind.is_some() {
+                arguments(pid, &mut buf).map(|(exec, args)| {
+                    executable = where_from(executable.take(), exec);
+                    args
+                })
+            } else {
+                None
+            };
+            let given_code = kind
+                .zip(args.as_deref())
+                .is_some_and(|(i, a)| inline_code(i, a));
+            let around = if given_code {
+                // SAFETY: a plain call; it fails with -1 for a process that has ended.
+                let sid = unsafe { libc::getsid(pid) };
+                Around {
+                    working_directory: working_directory(pid),
+                    session: leader(pid, sid),
+                    group: leader(pid, info.pbi_pgid as i32),
+                }
+            } else {
+                Around::default()
+            };
+            let (connections, failed) = sockets(pid, start, &mut fds);
+            r.connections.extend(connections);
+            r.sockets_unreadable += failed;
+            r.processes.push(Seen {
+                pid,
+                start,
+                parent: info.pbi_ppid as i32,
+                executable,
+                name,
+                terminal: info.pbi_flags & PROC_FLAG_CONTROLT != 0,
+                args,
+                around,
+            });
+        }
+    });
     r
 }
 

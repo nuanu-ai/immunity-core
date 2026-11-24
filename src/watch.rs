@@ -91,7 +91,7 @@
 //! watcher running: nothing could start again. A watcher started without `--background` is left
 //! running on the file it opened.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::error::Error;
 use std::io::{Read, Write};
 use std::os::fd::FromRawFd;
@@ -376,6 +376,9 @@ pub fn watch(args: &WatchArgs) -> ExitCode {
         paths: Vec::new(),
         parent,
         signers: crate::processes::Signers::default(),
+        git_cache: crate::git_hooks::Cache::default(),
+        retired_unread: false,
+        again_at: None,
         standing: BTreeSet::new(),
         checks,
         check_result: None,
@@ -489,13 +492,21 @@ struct Watcher<'a> {
     parent: libc::pid_t,
     /// Who signed what the samples track, kept across samples.
     signers: crate::processes::Signers,
+    /// Stat-keyed cache of Git configuration parses and `xcode-select`, kept across ticks.
+    git_cache: crate::git_hooks::Cache,
+    /// Whether `look::retire_unread` has already run in this watcher process.
+    retired_unread: bool,
+    /// When `alive` last refreshed subscriptions with no events since, to skip a duplicate
+    /// `again()` inside the immediately following `read()`.
+    again_at: Option<Instant>,
     /// The kinds whose latest attempt failed, or whose failure may still stand in the store
     /// because clearing it failed: `READ`, `SAMPLED`, `RESUBSCRIBE`, `PLACES`, `EVENTS`,
     /// `FULL_CHECK`.
     standing: BTreeSet<&'static str>,
     checks: Option<crate::background::Checks>,
-    /// Applied under the next run lock, so a failed full check is visible in status too.
-    check_result: Option<Result<(), String>>,
+    /// Applied under the next run lock, so a failed full check is visible in status too, carrying
+    /// the UTC timestamp when the check finished.
+    check_result: Option<(i64, Result<(), String>)>,
     /// The places the latest look left unwatched, each with why.
     left_out: BTreeMap<PathBuf, String>,
     /// What the latest look left unwatched, as the detail of `PLACES`, or `None` inside when it
@@ -812,35 +823,46 @@ impl Watcher<'_> {
     /// The paths to watch now, from the table of places and the checkouts the store holds,
     /// each path with the reading its place belongs to, and each place that cannot be watched,
     /// or path FSEvents does not take, with why.
-    fn derive(&self) -> Result<Derived, Box<dyn Error>> {
-        let (machine, found) = holds(self.args)?;
+    fn derive(&mut self) -> Result<Derived, Box<dyn Error>> {
         let homes = watched::homes(&self.args.home);
         let homes = [homes[0].as_path(), homes[1].as_path()];
+        let ids = crate::guarded::Identities::of(&homes);
+        let (machine, found) = holds(self.args, &homes, &ids)?;
         let mut wanted = BTreeSet::new();
         let mut targets = Vec::new();
         let mut left = BTreeMap::new();
+        let mut resolved: HashMap<(PathBuf, bool), Result<Vec<PathBuf>, String>> = HashMap::new();
         for p in places(
             &self.args.home,
             &self.args.system_root,
             &machine,
             &found,
             &homes,
+            &ids,
+            &mut self.git_cache,
         ) {
-            match subscribed(&p.path, p.folder, &homes) {
+            let sub = resolved
+                .entry((p.path.clone(), p.folder))
+                .or_insert_with(|| subscribed_with(&p.path, p.folder, &homes, &ids));
+            match sub {
                 Ok(paths) => {
-                    for path in &paths {
+                    for path in paths.iter() {
                         if let Some(why) = fsevents::refuses(path) {
                             left.insert(path.clone(), why.to_string());
                         }
                     }
                     targets.extend(paths.iter().map(|path| (path.clone(), p.reading.clone())));
-                    wanted.extend(paths);
+                    wanted.extend(paths.iter().cloned());
                 }
                 Err(why) => {
-                    left.insert(p.path, why);
+                    left.insert(p.path, why.clone());
                 }
             }
         }
+        // Keep `targets` independent of `read_dir` entry order so unchanged symlinked folders do
+        // not falsely mark a full reading owed.
+        targets.sort();
+        targets.dedup();
         Ok((wanted.into_iter().collect(), targets, left))
     }
 
@@ -863,6 +885,7 @@ impl Watcher<'_> {
             match rx.recv_timeout(next.saturating_duration_since(Instant::now())) {
                 Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => return,
                 Ok(Msg::Events(b)) if b.events > 0 => {
+                    self.again_at = None;
                     let now = Instant::now();
                     due = Some(match due {
                         None => Due {
@@ -913,7 +936,7 @@ impl Watcher<'_> {
             if sample <= Instant::now() {
                 sample = Instant::now() + self.args.sample_every;
                 let recovered = self.standing.contains(SAMPLED);
-                match self.sample() {
+                match self.sample(recovered) {
                     // A sample that opened a finding, or the first to succeed after one that
                     // failed, which the app takes as the end of that failure.
                     Ok(Some((opened, needs))) if opened > 0 || recovered => {
@@ -980,6 +1003,7 @@ impl Watcher<'_> {
                 }
                 match again {
                     Ok((moved, problems)) => {
+                        self.again_at = Some(Instant::now());
                         if problems.iter().any(|p| !emit(p)) {
                             return;
                         }
@@ -1046,9 +1070,15 @@ impl Watcher<'_> {
         };
         // A config change can activate a new folder. Start watching it before the read
         // so a write between re-reading the config and hashing the hooks is seen too.
-        // The startup read uses the subscriptions just opened by `subscribe`. Checkouts
-        // a concurrent full run discovers are then picked up by the next scheduled look.
+        // The startup read uses the subscriptions just opened by `subscribe`, and a reading
+        // triggered immediately by `alive`'s `again()` without intervening events or lock wait
+        // reuses those subscriptions too.
+        let fresh_again = self
+            .again_at
+            .take()
+            .is_some_and(|t| t.elapsed() < Duration::from_millis(250));
         if self.read_everything
+            && !fresh_again
             && only
                 .as_ref()
                 .is_none_or(|readings| readings.iter().any(|(_, kind)| kind == watched::HOOK_KIND))
@@ -1064,12 +1094,22 @@ impl Watcher<'_> {
             }
             self.mark_pending();
         }
-        let read = read_held(self.args, &self.folder, only.as_ref());
+        let retire = only.is_none() && !self.retired_unread;
+        let read = read_held(
+            self.args,
+            &self.folder,
+            only.as_ref(),
+            &mut self.git_cache,
+            retire,
+        );
         self.mark_held(READ, read.as_ref().err().map(|e| e.to_string()));
         // The first reading is of every place (`to_read`), and one that failed is tried again as
         // one of every place (`run`): after any reading, every place was read or is read next,
         // and after one of some places, every place is owed.
         self.read_everything = true;
+        if only.is_none() && read.is_ok() {
+            self.retired_unread = true;
+        }
         self.owed = only.is_some();
         read.map(Some)
     }
@@ -1127,7 +1167,7 @@ impl Watcher<'_> {
             {
                 return false;
             }
-            self.check_result = Some(result);
+            self.check_result = Some((crate::now_secs(), result));
         }
         true
     }
@@ -1160,17 +1200,24 @@ impl Watcher<'_> {
         true
     }
 
-    /// One sample under the run lock: how many findings it opened and how many things need a
-    /// look after it. `None` when the watcher was stopped while it waited for the lock.
-    fn sample(&mut self) -> Result<Option<(usize, usize)>, Box<dyn Error>> {
+    /// One sample: reads the system outside the run lock, then commits under it. Returns how
+    /// many findings it opened and how many things need a look after it. `None` when the watcher
+    /// was stopped while it waited for the lock.
+    fn sample(&mut self, compute_needs: bool) -> Result<Option<(usize, usize)>, Box<dyn Error>> {
+        let prepared = crate::sample_read(self.args.sample_input.as_deref());
         let Some(_lock) = self.lock_for(SAMPLED)? else {
             return Ok(None);
         };
-        let sampled = crate::sample_held(
-            &self.args.store,
-            self.args.sample_input.as_deref(),
-            &mut self.signers,
-        );
+        let sampled = prepared.and_then(|(run_id, reading, took)| {
+            crate::sample_commit(
+                &self.args.store,
+                &run_id,
+                reading,
+                took,
+                &mut self.signers,
+                compute_needs,
+            )
+        });
         self.mark_held(SAMPLED, sampled.as_ref().err().map(|e| e.to_string()));
         let (report, needs) = sampled?;
         Ok(Some((report.findings_opened, needs)))
@@ -1201,10 +1248,20 @@ impl Watcher<'_> {
     /// does not take is said in the lock file until the kind succeeds or its failure is
     /// recorded.
     fn mark_held(&mut self, what: &'static str, failed: Option<String>) {
+        self.mark_held_at(what, failed, crate::now_secs());
+    }
+
+    fn mark_held_at(&mut self, what: &'static str, failed: Option<String>, at: i64) {
         match failed {
             Some(detail) => {
                 self.standing.insert(what);
-                match mark(&self.args.store, what, Some(&detail), self.heartbeat.since) {
+                match mark_at(
+                    &self.args.store,
+                    what,
+                    Some(&detail),
+                    self.heartbeat.since,
+                    at,
+                ) {
                     Ok(()) => self.heartbeat.recorded(what),
                     Err(e) => self.heartbeat.unrecorded(what, &e.to_string()),
                 }
@@ -1212,7 +1269,7 @@ impl Watcher<'_> {
             None => {
                 self.heartbeat.recorded(what);
                 if self.standing.contains(what)
-                    && mark(&self.args.store, what, None, self.heartbeat.since).is_ok()
+                    && mark_at(&self.args.store, what, None, self.heartbeat.since, at).is_ok()
                 {
                     self.standing.remove(what);
                 }
@@ -1223,8 +1280,8 @@ impl Watcher<'_> {
     /// Under the run lock the caller holds: records what was learned outside it, the result of
     /// a full check and what the latest look left unwatched.
     fn mark_pending(&mut self) {
-        if let Some(result) = self.check_result.take() {
-            self.mark_held(FULL_CHECK, result.err());
+        if let Some((at, result)) = self.check_result.take() {
+            self.mark_held_at(FULL_CHECK, result.err(), at);
         }
         if let Some(left) = self.unwatched.take() {
             self.mark_held(PLACES, left);
@@ -1247,15 +1304,26 @@ impl Watcher<'_> {
 }
 
 /// Records a failure of `what` with what it said, or with `None` clears it. The caller holds
-/// the run lock. It is recorded now, and never before `since`, when the watcher started: the
+/// the run lock. It is recorded at `at`, and never before `since`, when the watcher started: the
 /// status reads no failure older than that, and a clock set back must not hide one.
+#[cfg(test)]
 fn mark(store: &Path, what: &str, failed: Option<&str>, since: i64) -> Result<(), Box<dyn Error>> {
+    mark_at(store, what, failed, since, crate::now_secs())
+}
+
+fn mark_at(
+    store: &Path,
+    what: &str,
+    failed: Option<&str>,
+    since: i64,
+    at: i64,
+) -> Result<(), Box<dyn Error>> {
     let conn = store::open(store)?;
     match failed {
         Some(detail) => conn.execute(
             "INSERT INTO watcher_failed (what, at, detail) VALUES (?1, ?2, ?3)
              ON CONFLICT (what) DO UPDATE SET at = excluded.at, detail = excluded.detail",
-            params![what, crate::now_secs().max(since), detail],
+            params![what, at.max(since), detail],
         )?,
         None => conn.execute("DELETE FROM watcher_failed WHERE what = ?1", [what])?,
     };
@@ -1269,8 +1337,13 @@ fn read_held(
     args: &WatchArgs,
     folder: &Path,
     only: Option<&BTreeSet<Reading>>,
+    git_cache: &mut crate::git_hooks::Cache,
+    retire: bool,
 ) -> Result<Value, Box<dyn Error>> {
-    let (machine, found) = holds(args)?;
+    let homes = watched::homes(&args.home);
+    let homes = [homes[0].as_path(), homes[1].as_path()];
+    let ids = crate::guarded::Identities::of(&homes);
+    let (machine, found) = holds(args, &homes, &ids)?;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
     let at = now.as_secs() as i64;
     let run_id = format!("{RUN_PREFIX}{}-{:09}", now.as_secs(), now.subsec_nanos());
@@ -1289,8 +1362,15 @@ fn read_held(
     };
     // The reading and the rules of `immunity run`: a change seen here is a finding at once. It
     // settles what it read alone.
-    let (mut rows, mut opened) =
-        crate::watch_places(&mut run, &reader_args(args), &found, only, None)?;
+    let (mut rows, mut opened) = crate::watch_places(
+        &mut run,
+        &reader_args(args),
+        &found,
+        only,
+        None,
+        git_cache,
+        retire,
+    )?;
     opened += crate::settled(&mut run, &mut rows)?;
     // What needs a look after it, counted by the code `immunity status --json` counts it with.
     let needs = status::needs(&tx, at)?.items.len();
@@ -1319,13 +1399,17 @@ fn read_held(
 }
 
 /// This machine's id and the checkouts the store holds on it.
-fn holds(args: &WatchArgs) -> Result<(String, Vec<checkouts::Checkout>), Box<dyn Error>> {
+fn holds(
+    args: &WatchArgs,
+    homes: &[&Path],
+    ids: &crate::guarded::Identities,
+) -> Result<(String, Vec<checkouts::Checkout>), Box<dyn Error>> {
     if !args.store.exists() {
         return Ok((this_machine(None)?, Vec::new()));
     }
     let conn = store::open_read_only(&args.store)?;
     let machine = this_machine(Some(&conn))?;
-    let found = held_checkouts(&conn, &machine, &args.home)?;
+    let found = held_checkouts(&conn, &machine, &args.home, homes, ids)?;
     Ok((machine, found))
 }
 
@@ -1375,20 +1459,23 @@ fn held_checkouts(
     conn: &Connection,
     machine: &str,
     home: &Path,
+    homes: &[&Path],
+    ids: &crate::guarded::Identities,
 ) -> rusqlite::Result<Vec<checkouts::Checkout>> {
     let prefix = format!("checkout:{machine}/");
+    // `'/'` is 0x2F and `'0'` is 0x30, so `[prefix, end)` matches the exact prefix via the
+    // `assertion_subject` index range scan without a full table scan.
+    let end = format!("checkout:{machine}0");
     let mut stmt = conn.prepare(
         "SELECT DISTINCT subject FROM assertion
          WHERE layer = 'live' AND predicate = 'located_on'
-           AND substr(subject, 1, length(?1)) = ?1
+           AND subject >= ?1 AND subject < ?2
          ORDER BY subject",
     )?;
-    let ids: Vec<String> = stmt
-        .query_map([&prefix], |r| r.get(0))?
+    let subjects: Vec<String> = stmt
+        .query_map(params![&prefix, &end], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-    let homes = watched::homes(home);
-    let homes = [homes[0].as_path(), homes[1].as_path()];
-    Ok(ids
+    Ok(subjects
         .into_iter()
         .map(|id| {
             let rel = id[prefix.len()..].to_string();
@@ -1404,7 +1491,7 @@ fn held_checkouts(
         // since the run that found it. What is held about it is kept as it was.
         .filter(|c| {
             !matches!(
-                crate::guarded::real(&c.path, &homes),
+                crate::guarded::real_with(&c.path, homes, ids),
                 crate::guarded::Real::Guarded(_)
             )
         })
@@ -1440,6 +1527,8 @@ fn places(
     machine: &str,
     found: &[checkouts::Checkout],
     homes: &[&Path],
+    ids: &crate::guarded::Identities,
+    git_cache: &mut crate::git_hooks::Cache,
 ) -> Vec<Place> {
     let mut out = Vec::new();
     let mut add = |path: PathBuf, folder: bool, scope: &str, kind: &str| {
@@ -1464,7 +1553,8 @@ fn places(
             }
         }
     }
-    let git = (!found.is_empty()).then(|| crate::git_hooks::Config::new(home, system, homes));
+    let git = (!found.is_empty())
+        .then(|| crate::git_hooks::Config::new(home, system, homes, ids, git_cache));
     for c in found {
         use crate::git_hooks::{Folder, Unread};
         let git = git.as_ref().unwrap();
@@ -1477,7 +1567,7 @@ fn places(
         for path in [".git/config", ".git/config.worktree", ".git/commondir"] {
             add(c.path.join(path), false, &scope, kind);
         }
-        let folder = git.folder(&c.path, home, homes, &[]);
+        let folder = git.folder(&c.path, home, homes, &[], ids, git_cache);
         for (path, names) in folder.configured() {
             for name in names {
                 add(path.join(name), false, &scope, kind);
@@ -1546,15 +1636,26 @@ fn touched(targets: &[(PathBuf, Reading)], paths: &BTreeSet<PathBuf>) -> Option<
 /// watched folder; a change at a target is reported under the target. Nothing that leads
 /// into a folder macOS asks permission for: FSEvents resolves the paths it is given, and the
 /// reading of the place says it was not looked into. Made real without entering one.
+#[cfg(test)]
 fn subscribed(place: &Path, folder: bool, homes: &[&Path]) -> Result<Vec<PathBuf>, String> {
-    let Some(at) = real(place, homes)? else {
+    let ids = crate::guarded::Identities::of(homes);
+    subscribed_with(place, folder, homes, &ids)
+}
+
+fn subscribed_with(
+    place: &Path,
+    folder: bool,
+    homes: &[&Path],
+    ids: &crate::guarded::Identities,
+) -> Result<Vec<PathBuf>, String> {
+    let Some(at) = real_with(place, homes, ids)? else {
         return Ok(Vec::new());
     };
     let target = |link: &Path| -> Result<Option<PathBuf>, ()> {
         if !std::fs::symlink_metadata(link).is_ok_and(|m| m.file_type().is_symlink()) {
             return Ok(None);
         }
-        match crate::guarded::real(link, homes) {
+        match crate::guarded::real_with(link, homes, ids) {
             crate::guarded::Real::At(t) => Ok(Some(t)),
             crate::guarded::Real::Guarded(_) => Err(()),
             crate::guarded::Real::Failed(_) => Ok(None),
@@ -1573,11 +1674,17 @@ fn subscribed(place: &Path, folder: bool, homes: &[&Path]) -> Result<Vec<PathBuf
     Ok(out)
 }
 
-/// The path as FSEvents names it: the real path of its folder, which need not exist yet, and
-/// its own name. FSEvents reports real paths, and `/etc` is a link to `/private/etc`. `None`
-/// when its folder leads into a folder macOS asks permission for, which is not entered, or
-/// cannot be there now. `Err` only when it could not be looked at.
+#[cfg(test)]
 fn real(path: &Path, homes: &[&Path]) -> Result<Option<PathBuf>, String> {
+    let ids = crate::guarded::Identities::of(homes);
+    real_with(path, homes, &ids)
+}
+
+fn real_with(
+    path: &Path,
+    homes: &[&Path],
+    ids: &crate::guarded::Identities,
+) -> Result<Option<PathBuf>, String> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Ok(Some(path.to_path_buf()));
     };
@@ -1589,7 +1696,7 @@ fn real(path: &Path, homes: &[&Path]) -> Result<Option<PathBuf>, String> {
     let mut missing = Vec::new();
     let mut existing = parent.to_path_buf();
     let mut out = loop {
-        match crate::guarded::real(&existing, homes) {
+        match crate::guarded::real_with(&existing, homes, ids) {
             crate::guarded::Real::At(real) => break real,
             crate::guarded::Real::Guarded(_) => return Ok(None),
             // Could not look, such as a folder that cannot be searched, a link in a loop, a path
@@ -1961,6 +2068,20 @@ pub fn failures(conn: &Connection, folder: &Path) -> rusqlite::Result<Vec<Failur
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    // A full check that finished at or after a recorded `full_check` failure supersedes it,
+    // whether the check was started by the watcher or directly via `immunity run`.
+    if failed.iter().any(|f| f.what == FULL_CHECK) {
+        let finished: Option<i64> = conn
+            .query_row(
+                "SELECT at FROM journal WHERE entry = 'run_finished' ORDER BY seq DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(finished) = finished {
+            failed.retain(|f| f.what != FULL_CHECK || finished < f.at);
+        }
+    }
     let said = match state {
         LockState::Unrecorded { at, said } => Some((STORE, at, said)),
         // Places left unwatched are the lock file's word, whatever the store holds; its row,
@@ -2360,7 +2481,14 @@ mod tests {
             background: false,
         };
         let folder = crate::home(&store);
-        read_held(&w, &folder, None).unwrap();
+        read_held(
+            &w,
+            &folder,
+            None,
+            &mut crate::git_hooks::Cache::default(),
+            true,
+        )
+        .unwrap();
         (w, folder)
     }
 
@@ -2437,13 +2565,14 @@ mod tests {
             reading("machine:mac", watched::AUTOSTART_KIND),
             reading("checkout:machine:mac/dev/api", watched::HOOK_KIND),
         );
+        let mut cache = crate::git_hooks::Cache::default();
         // The agent goes with its content; the hook, whose reading this was not, stays whole.
-        let read = read_held(&w, &folder, Some(&[agents].into())).unwrap();
+        let read = read_held(&w, &folder, Some(&[agents].into()), &mut cache, false).unwrap();
         assert_eq!(
             (read["gone"].as_u64(), live(agent), live(hook)),
             (Some(1), 0, 3)
         );
-        let read = read_held(&w, &folder, Some(&[hooks].into())).unwrap();
+        let read = read_held(&w, &folder, Some(&[hooks].into()), &mut cache, false).unwrap();
         assert_eq!((read["gone"].as_u64(), live(hook)), (Some(1), 0));
     }
 
@@ -2460,10 +2589,11 @@ mod tests {
                 .iter()
                 .for_each(|c| std::fs::write(c, text).unwrap())
         };
+        let mut cache = crate::git_hooks::Cache::default();
         set(&format!("[core]\n hooksPath = {}\n", shared.display()));
-        read_held(&w, &folder, None).unwrap();
+        read_held(&w, &folder, None, &mut cache, true).unwrap();
         set("[core]\n hooksPath = /dev/null\n");
-        let read = read_held(&w, &folder, None).unwrap();
+        let read = read_held(&w, &folder, None, &mut cache, true).unwrap();
         assert_eq!(read["gone"].as_u64(), Some(1));
     }
 
@@ -2472,7 +2602,14 @@ mod tests {
         // A reading that grew with the history would after months take longer than the quiet
         // second it waits, and hold the store from a full run and from the status as long.
         let (first, later) = first_day_and_later("watch-flat", |w, folder| {
-            read_held(w, folder, None).unwrap()
+            read_held(
+                w,
+                folder,
+                None,
+                &mut crate::git_hooks::Cache::default(),
+                true,
+            )
+            .unwrap()
         });
         assert!(
             later < first + READINGS,
@@ -2866,5 +3003,26 @@ mod tests {
         let shown = watcher(&store_path).unwrap().failed[0].detail_text.clone();
         assert_eq!(shown, crate::secrets::said(&odd));
         assert!(!shown.contains(&token));
+    }
+
+    #[test]
+    fn a_full_check_failure_is_superseded_by_a_later_finished_run() {
+        let (dir, lock) = held("full-check-cleared");
+        let store_path = dir.join("store.db");
+        let conn = store::open_or_make(&store_path).unwrap();
+        let since = crate::now_secs() - 100;
+        put_lock(&lock, &lock_text(since, &LockState::Ready));
+        let failed_at = since + 20;
+        mark_at(
+            &store_path,
+            FULL_CHECK,
+            Some("check failed earlier"),
+            since,
+            failed_at,
+        )
+        .unwrap();
+        assert_eq!(failures(&conn, &dir).unwrap().len(), 1);
+        store::journal_note(&conn, failed_at + 10, "run-2", "run_finished", "").unwrap();
+        assert!(failures(&conn, &dir).unwrap().is_empty());
     }
 }

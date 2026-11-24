@@ -931,23 +931,24 @@ fn sample(args: &SampleArgs) -> Result<processes::Report, Box<dyn Error>> {
     store_folder(&home)?;
     let _lock = store::lock_run(&home)?.ok_or(Outcome::new(Code::RunLockHeld, ""))?;
     // `immunity sample` makes the store where there is none; a watcher's sample only opens it.
-    drop(store::open_or_make(&args.store)?);
-    let (report, _) = sample_held(
+    let mut conn = store::open_or_make(&args.store)?;
+    let (run_id, reading, took) = sample_read(args.input.as_deref())?;
+    let (report, _) = sample_commit_conn(
+        &mut conn,
         &args.store,
-        args.input.as_deref(),
+        &run_id,
+        reading,
+        took,
         &mut processes::Signers::default(),
+        false,
     )?;
     Ok(report)
 }
 
-/// One sample, with the run lock held by the caller: of the system, or of the reading in
-/// `input`. Returns its report and how many things need a look after it. `immunity sample` and
-/// the watcher both take their samples here.
-pub fn sample_held(
-    path: &Path,
+/// Reads the system's processes and connections (or `input`) without holding the run lock.
+pub fn sample_read(
     input: Option<&Path>,
-    signers: &mut processes::Signers,
-) -> Result<(processes::Report, usize), Box<dyn Error>> {
+) -> Result<(String, processes::Reading, std::time::Instant), Box<dyn Error>> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
     let run_id = format!(
         "{}{}-{:09}",
@@ -955,24 +956,62 @@ pub fn sample_held(
         now.as_secs(),
         now.subsec_nanos()
     );
-    let mut conn = store::open(path)?;
     let took = std::time::Instant::now();
     let reading = match input {
         Some(file) => processes::Reading::from_json(&std::fs::read_to_string(file)?)?,
         None => processes::read_system(now.as_secs() as i64),
     };
+    Ok((run_id, reading, took))
+}
+
+/// Commits one already-read sample under the run lock held by the caller. Computes
+/// `needs_a_look_total` only when a finding was opened or `compute_needs` is true (e.g. a
+/// watcher recovering from a prior sample failure).
+pub fn sample_commit(
+    path: &Path,
+    run_id: &str,
+    reading: processes::Reading,
+    took: std::time::Instant,
+    signers: &mut processes::Signers,
+    compute_needs: bool,
+) -> Result<(processes::Report, usize), Box<dyn Error>> {
+    let mut conn = store::open(path)?;
+    sample_commit_conn(
+        &mut conn,
+        path,
+        run_id,
+        reading,
+        took,
+        signers,
+        compute_needs,
+    )
+}
+
+fn sample_commit_conn(
+    conn: &mut rusqlite::Connection,
+    path: &Path,
+    run_id: &str,
+    reading: processes::Reading,
+    took: std::time::Instant,
+    signers: &mut processes::Signers,
+    compute_needs: bool,
+) -> Result<(processes::Report, usize), Box<dyn Error>> {
     let tx = conn.transaction()?;
     // The machine the readings of this Mac are scoped to, so the sample is of the same one.
     let machine = this_machine_or_named(&tx)?;
     store::put_entity(&tx, &machine)?;
     let at = processes::At {
-        run_id: &run_id,
+        run_id,
         machine: &machine,
         home: &user_home()?,
         folder: &home(path),
     };
     let report = processes::take(&tx, &at, reading, took, signers)?;
-    let needs = status::needs(&tx, report.sample.at)?.items.len();
+    let needs = if report.findings_opened > 0 || compute_needs {
+        status::needs(&tx, report.sample.at)?.items.len()
+    } else {
+        0
+    };
     tx.commit()?;
     Ok((report, needs))
 }
@@ -2468,7 +2507,16 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
         read_lockfiles(&mut run, args, &found)?;
     }
     stage(CheckStage::Places);
-    let (mut watched, mut opened) = watch_places(&mut run, args, &found, None, walk_failure)?;
+    let mut git_cache = git_hooks::Cache::default();
+    let (mut watched, mut opened) = watch_places(
+        &mut run,
+        args,
+        &found,
+        None,
+        walk_failure,
+        &mut git_cache,
+        true,
+    )?;
     // What was set aside as no longer read, by this run or by a watcher since the last run's
     // line, is said once, here: a watcher's own line is not where a person is told.
     let set_aside = lifecycle::set_aside(run.tx, run.run_id, Some(watched::READER))?;
@@ -2531,6 +2579,11 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     store::journal_note(&tx, at, &run_id, "report", &line)?;
     // The time the run finished, so that its start and its end are both in the journal.
     store::journal_note(&tx, now_secs(), &run_id, "run_finished", "")?;
+    // A completed full check clears any standing background full-check failure.
+    tx.execute(
+        "DELETE FROM watcher_failed WHERE what = ?1",
+        [watch::FULL_CHECK],
+    )?;
     tx.commit()?;
     // The readings no page or answer asks for one by one any more are folded, under the run
     // lock still held; what the run did is committed, whatever comes of that.
@@ -3810,8 +3863,10 @@ fn watch_places(
     checkouts: &[checkouts::Checkout],
     only: Option<&BTreeSet<watch::Reading>>,
     walk_failure: Option<&str>,
+    git_cache: &mut git_hooks::Cache,
+    retire: bool,
 ) -> Result<(Rows, usize), Box<dyn Error>> {
-    let (rows, seen) = read_watched(run, args, checkouts, only, walk_failure)?;
+    let (rows, seen) = read_watched(run, args, checkouts, only, walk_failure, git_cache, retire)?;
     let mut opened = findings::detect(run.tx, run.run_id, run.at, &seen)?;
     targets::evidence(run.tx, run.run_id)?;
     opened += usize::from(findings::first_read(
@@ -3847,6 +3902,8 @@ fn read_watched(
     checkouts: &[checkouts::Checkout],
     only: Option<&BTreeSet<watch::Reading>>,
     walk_failure: Option<&str>,
+    git_cache: &mut git_hooks::Cache,
+    retire: bool,
 ) -> Result<(Rows, Vec<findings::Observed>), Box<dyn Error>> {
     let (run_id, machine) = (run.run_id.to_string(), run.machine.to_string());
     let wanted = |scope: &str, kind: &str| {
@@ -3868,10 +3925,9 @@ fn read_watched(
     let rels: Vec<String> = checkouts.iter().map(|c| c.rel.clone()).collect();
     // What an earlier run read and this build has no row for is closed as retired before any
     // reading compares with it: not shown as watched, never told as removed, and said once in
-    // the run's line (`run`), the watcher's included. Only a reading of every place does it: a
-    // build's rows change between runs, never between two looks of a watcher, which would pay
-    // for it at every change.
-    if only.is_none() {
+    // the run's line (`run`), the watcher's included. Only a reading of every place does it, and
+    // a watcher only once per process: a build's rows never change while one binary runs.
+    if only.is_none() && retire {
         look::retire_unread(
             run.tx,
             &Reading {
@@ -3930,6 +3986,7 @@ fn read_watched(
     };
     let homes = watched::homes(&args.home);
     let homes = [homes[0].as_path(), homes[1].as_path()];
+    let ids = guarded::Identities::of(&homes);
     let given_root = args.checkouts_root.as_ref().and_then(|root| {
         if homes
             .iter()
@@ -3946,8 +4003,9 @@ fn read_watched(
         if !wanted(&scope, watched::HOOK_KIND) {
             continue;
         }
-        let git = git
-            .get_or_insert_with(|| git_hooks::Config::new(&args.home, &args.system_root, &homes));
+        let git = git.get_or_insert_with(|| {
+            git_hooks::Config::new(&args.home, &args.system_root, &homes, &ids, git_cache)
+        });
         // A walk pointed into a guarded folder may read its checkout. The paths in
         // Git config do not extend that permission to another guarded location.
         // The walk names a checkout under the root as given or made real: both names are allowed.
@@ -3959,7 +4017,7 @@ fn read_watched(
         });
         let names = names.as_ref().map(|[a, b]| [a.as_path(), b.as_path()]);
         let given = names.as_ref().map_or(&[][..], |names| names.as_slice());
-        let folder = git.folder(&c.path, &args.home, &homes, given);
+        let folder = git.folder(&c.path, &args.home, &homes, given, &ids, git_cache);
         let (look, elsewhere) = match watched::look_checkout(c, &args.home, homes, folder, given) {
             watched::Hooks::GitFile => elsewhere(Cause::NoReader, watched::GIT_FILE.to_string()),
             watched::Hooks::Looked(look) => (*look, None),

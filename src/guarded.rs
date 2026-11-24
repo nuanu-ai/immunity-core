@@ -138,9 +138,39 @@ fn identities(homes: &[&Path]) -> (Option<Id>, Vec<(Id, PathBuf, PathBuf)>) {
     (meta(Path::new(VOLUMES)).map(|m| id(&m)), in_home)
 }
 
+/// Precomputed guarded-folder identities for a pass over paths under `homes`, avoiding repeated
+/// `lstat` calls on `/Volumes` and each guarded folder in `homes`.
+#[derive(Clone)]
+pub struct Identities {
+    volumes: Option<Id>,
+    in_home: Vec<(Id, PathBuf, PathBuf)>,
+}
+
+impl Identities {
+    pub fn of(homes: &[&Path]) -> Identities {
+        let (volumes, in_home) = identities(homes);
+        Identities { volumes, in_home }
+    }
+}
+
+/// Like `real`, reusing precomputed `Identities`.
+pub fn real_with(path: &Path, homes: &[&Path], ids: &Identities) -> Real {
+    real_in_with(path, homes, &[], Some(ids))
+}
+
 /// Like `real`, with the given checkout allowed under both its supplied and resolved names.
 /// Its guarded ancestors may be traversed to reach it.
 pub fn real_in(path: &Path, homes: &[&Path], given: &[&Path]) -> Real {
+    real_in_with(path, homes, given, None)
+}
+
+/// Like `real_in`, reusing precomputed `Identities` when provided.
+pub fn real_in_with(
+    path: &Path,
+    homes: &[&Path],
+    given: &[&Path],
+    pre: Option<&Identities>,
+) -> Real {
     let exempt = |p: &Path, on_the_way: bool| {
         given
             .iter()
@@ -173,7 +203,7 @@ pub fn real_in(path: &Path, homes: &[&Path], given: &[&Path]) -> Real {
     let mut done = PathBuf::from("/");
     // The identity of `done`, while it is known; and the guarded folders', asked once.
     let mut done_id: Option<Id> = None;
-    let mut ids = None;
+    let mut owned_ids: Option<Identities> = None;
     let mut links = 0;
     while let Some(part) = todo.pop_front() {
         if part == "." {
@@ -191,10 +221,13 @@ pub fn real_in(path: &Path, homes: &[&Path], given: &[&Path]) -> Real {
         }
         // A folder directly under /Volumes is told by its parent before it is looked at:
         // looking at a mount point can wait on a server.
-        let (volumes, in_home) = ids.get_or_insert_with(|| identities(homes));
+        let ids = match pre {
+            Some(ids) => ids,
+            None => owned_ids.get_or_insert_with(|| Identities::of(homes)),
+        };
         let parent = done_id.or_else(|| std::fs::symlink_metadata(&done).ok().map(|m| id(&m)));
         let volume =
-            (parent.is_some() && parent == *volumes).then(|| Path::new(VOLUMES).join(&part));
+            (parent.is_some() && parent == ids.volumes).then(|| Path::new(VOLUMES).join(&part));
         if let Some(name) = &volume
             && !exempt(name, more)
             && !exempt(&next, more)
@@ -226,7 +259,7 @@ pub fn real_in(path: &Path, homes: &[&Path], given: &[&Path]) -> Real {
                 return Real::Failed(std::io::Error::from_raw_os_error(libc::ENOTDIR));
             }
             Ok(m) if m.is_dir() => {
-                done = match in_home.iter().find(|(i, ..)| *i == id(&m)) {
+                done = match ids.in_home.iter().find(|(i, ..)| *i == id(&m)) {
                     Some((_, name, at)) if !exempt(name, more) && !exempt(at, more) => {
                         return Real::Guarded(name.clone());
                     }
