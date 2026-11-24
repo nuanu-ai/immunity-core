@@ -3896,7 +3896,7 @@ fn read_watched(
             .filter(|p| targets::runs_of(p.watched_as).is_some())
             .map(|p| &p.look)
             .collect();
-        let (look, read) = targets::read(run.tx, &machine, &roots, &items, &all)?;
+        let (look, read) = targets::read(run.tx, &run_id, &machine, &roots, &items, &all)?;
         let (completeness, reason, gap) = read.coverage(&look);
         for (item, why) in &read.rows {
             rows.push(not_read_row(targets::TARGET, item, "", why));
@@ -4342,28 +4342,15 @@ fn read_watched(
                     source_ref,
                 });
             }
-            let (completeness, reason, gap) = match &e.content {
-                // A link into a folder macOS asks permission for: where it points is read,
-                // what it leads to is not, and what was known of that stays.
-                watched::Content::Unread(Cause::NotGiven, why) if e.link.is_some() => {
-                    ("partial", Some(why.as_str()), Gap::of(Cause::NotGiven))
-                }
-                watched::Content::Unread(cause, why) => {
-                    let mut gap = Gap::of(*cause);
-                    if *cause == Cause::NoReader {
-                        gap.lacks.push(Lack::new(watched::OVER_CAP, None));
-                    }
-                    ("none", Some(why.as_str()), gap)
-                }
-                _ => ("full", None, Gap::default()),
-            };
+            let read_before =
+                store::read_before(tx, watched::READER, &id, watched::CONTENT, &run_id)?;
+            let (completeness, reason, gap) =
+                watched::content_coverage(&e.content, e.link.is_some(), read_before);
             let reading = Reading {
                 scope: &id,
                 kind: watched::CONTENT,
                 ..reading
             };
-            let read_before =
-                store::read_before(tx, watched::READER, &id, watched::CONTENT, &run_id)?;
             let lost = completeness != "full"
                 && store::read_full_before(tx, watched::READER, &id, watched::CONTENT, &run_id)?;
             // The content of a file judged in this reading is judged with it; content read for
