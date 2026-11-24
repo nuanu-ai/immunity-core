@@ -1,6 +1,4 @@
 //! What ties an entry of a Python lockfile to PyPI's own package of a name and a version.
-// No reader calls these yet: the change that adds the first Python reader removes this line.
-#![allow(dead_code)]
 
 use std::sync::OnceLock;
 

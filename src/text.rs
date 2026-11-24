@@ -215,8 +215,12 @@ impl Matched {
             return said;
         }
         let all = self.all_compared();
+        let matched: Vec<&str> = crate::vulnerabilities::matched_feeds()
+            .map(|f| f.ecosystem)
+            .collect();
         let mut said = format!(
-            "matched against the package-lock.json, npm-shrinkwrap.json, pnpm-lock.yaml, yarn.lock, bun.lock and Cargo.lock of {}, {} compared in full: {known} in {}",
+            "matched against the {} lockfiles of {}, {} compared in full: {known} in {}",
+            crate::covered::listed(&matched),
             found.projects(),
             grouped(self.compared),
             if all {

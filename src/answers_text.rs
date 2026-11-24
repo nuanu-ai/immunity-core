@@ -824,6 +824,9 @@ fn reason_said(reason: &str) -> String {
             "it does not come from the registry".to_string()
         }
         crate::vulnerabilities::NOT_COVERED => "the data does not cover this version".to_string(),
+        crate::vulnerabilities::INDEX_NOT_RECORDED => {
+            "its lockfile does not record which index it comes from".to_string()
+        }
         crate::vulnerabilities::NO_MATCHER => {
             "no vulnerability data is read for its ecosystem".to_string()
         }
@@ -2517,6 +2520,10 @@ mod tests {
             (
                 crate::vulnerabilities::NOT_COVERED,
                 "the data does not cover this version",
+            ),
+            (
+                crate::vulnerabilities::INDEX_NOT_RECORDED,
+                "its lockfile does not record which index it comes from",
             ),
             (
                 crate::vulnerabilities::NO_MATCHER,

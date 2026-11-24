@@ -30,6 +30,7 @@ mod poetry;
 mod pylock;
 mod pypi;
 mod requirements;
+mod source;
 mod uv;
 mod yarn;
 
@@ -39,6 +40,7 @@ pub use commit::commit;
 use npm::npm;
 use pnpm::pnpm;
 pub use pypi::pypi_normalized;
+pub use source::{Source, component_name, split_name};
 use yarn::yarn;
 
 pub const READER: &str = "lockfiles";
@@ -182,47 +184,6 @@ const NOT_SUPPORTED: [(&str, Option<&str>); 17] = [
     ("flake.lock", None),
 ];
 
-/// Where a lockfile entry comes from. A closed set: only `Registry`, the ecosystem's public
-/// registry, is what the ecosystem's open vulnerability data speaks of.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Source {
-    /// npm's public registry; for Cargo, crates.io.
-    Registry,
-    Git,
-    /// A file, a link or a folder on disk: npm's `file:` and linked entries, Cargo's path and
-    /// workspace crates.
-    Path,
-    /// Any other registry, or an address that is not the public registry's.
-    OtherRegistry,
-}
-
-/// The name part of a component's id: the real name, and for any source but the public registry
-/// the source in brackets.
-fn component_name(name: &str, source: Source) -> String {
-    let source = match source {
-        Source::Registry => return name.to_string(),
-        Source::Git => "git",
-        Source::Path => "path",
-        Source::OtherRegistry => "other registry",
-    };
-    format!("{name} ({source})")
-}
-
-/// The name part of a component's id told apart: the package's name, and where it comes from
-/// when that is not the public registry. The inverse of `component_name`.
-pub fn split_name(name: &str) -> (&str, Option<&'static str>) {
-    for (suffix, from) in [
-        (" (git)", "git"),
-        (" (path)", "a path"),
-        (" (other registry)", "another registry"),
-    ] {
-        if let Some(package) = name.strip_suffix(suffix) {
-            return (package, Some(from));
-        }
-    }
-    (name, None)
-}
-
 /// The ecosystem whose dependencies a kind of lockfile declares, by its name as `read` names
 /// it, a version of its format with no reader as `<kind> version <n>`; `None` for one not known
 /// here.
@@ -232,6 +193,16 @@ pub fn ecosystem_of(kind: &str) -> Option<&'static str> {
         .chain(NOT_SUPPORTED)
         .find(|(name, _)| *name == kind)
         .and_then(|(_, ecosystem)| ecosystem)
+}
+
+/// The predicate of a lockfile found in a checkout: the checkout `has_lockfile` the file at
+/// this path relative to it.
+pub const HAS_LOCKFILE: &str = "has_lockfile";
+
+/// The ecosystem whose dependencies the lockfile at a path declares, by its file name as
+/// `lockfile_kind` tells it; `None` for a kind of no ecosystem a record can be about.
+pub fn ecosystem_of_file(path: &str) -> Option<&'static str> {
+    lockfile_kind(path.rsplit('/').next()?).and_then(ecosystem_of)
 }
 
 /// Whether a partial reading leaves the dependencies of one ecosystem in part unknown. What the
@@ -549,7 +520,16 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize) -> Option<Outcome> {
         }
     }
 
-    let mut statements = Vec::new();
+    // Every lockfile found, of any kind, read or not: the ecosystems matching has something to
+    // say of in this checkout (`vulnerabilities::match_all`).
+    let mut statements: Vec<Statement> = (walked.lockfiles.iter())
+        .map(|(rel, ..)| Statement {
+            subject: id.to_string(),
+            predicate: HAS_LOCKFILE,
+            object: rel.clone(),
+            source_ref: rel.clone(),
+        })
+        .collect();
     for ((ecosystem, name), (first, versions)) in deps {
         let component = format!("component:{id}/{ecosystem}/{name}");
         statements.push(Statement {
@@ -745,9 +725,9 @@ fn version_shape(v: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        CACHE_SIGNATURE, Checkout, DEEPER, FORMATS, LINKED, LOCKFILE_KIND, NOT_LOOKED, NOT_TOLD,
-        SET_ASIDE, ecosystem_of, has_reader, lockfile_kind, partial_for, read, read_as_text,
-        read_within,
+        CACHE_SIGNATURE, Checkout, DEEPER, FORMATS, HAS_LOCKFILE, LINKED, LOCKFILE_KIND,
+        NOT_LOOKED, NOT_TOLD, SET_ASIDE, ecosystem_of, has_reader, lockfile_kind, partial_for,
+        read, read_as_text, read_within,
     };
 
     fn file_name(path: &str) -> &str {
@@ -1070,8 +1050,9 @@ snapshots:
             Dir(dir)
         }
 
-        /// What the reader says of it: each statement as `subject|predicate|object|where`,
-        /// with the checkout's id left out.
+        /// What the reader says of its dependencies: each statement as
+        /// `subject|predicate|object|where`, with the checkout's id left out. The lockfiles
+        /// found (`HAS_LOCKFILE`) are left to `found`.
         pub(super) fn read(&self) -> (super::Outcome, Vec<String>) {
             let checkout = Checkout {
                 rel: "dev/shop".to_string(),
@@ -1081,6 +1062,7 @@ snapshots:
             let said = o
                 .statements
                 .iter()
+                .filter(|s| s.predicate != HAS_LOCKFILE)
                 .map(|s| {
                     let subject = s
                         .subject
@@ -1155,18 +1137,15 @@ snapshots:
     #[test]
     fn a_lockfile_of_a_kind_with_no_reader_is_never_opened_and_is_listed_with_its_size() {
         // Its size comes from the folder, so one this user may not open is still named as a
-        // kind with no reader, never as a failed reading, and listed with its size. The six
-        // Python kinds have a row with no reader yet, and a named `pylock.<name>.toml` is a
-        // `pylock.toml`: each leaves PyPI unknown, and npm and crates.io as they were.
+        // kind with no reader, never as a failed reading, and listed with its size. Python
+        // kinds with a row and no reader yet leave PyPI unknown, and npm and crates.io as they
+        // were.
         use std::os::unix::fs::PermissionsExt;
         let text = "bun-lockfile-format-v0\n";
         for (file, kind) in [
             ("bun.lockb", "bun.lockb"),
-            ("uv.lock", "uv.lock"),
             ("poetry.lock", "poetry.lock"),
             ("pdm.lock", "pdm.lock"),
-            ("pylock.toml", "pylock.toml"),
-            ("pylock.dev.toml", "pylock.toml"),
             ("requirements.txt", "requirements.txt"),
         ] {
             let dir = Dir::new("kind-closed", &[("Cargo.lock", CARGO), (file, text)]);
@@ -1232,6 +1211,8 @@ snapshots:
             ("yarn.lock", YARN, "npm"),
             ("bun.lock", BUN, "npm"),
             ("Cargo.lock", CARGO, "crates.io"),
+            ("uv.lock", &super::uv::tests::sample(), "PyPI"),
+            ("pylock.toml", &super::pylock::tests::sample(), "PyPI"),
             ("Pipfile.lock", super::pipfile::tests::PIPFILE, "PyPI"),
         ] {
             let (said, reason) = read_one("own-reader", kind, sample);
@@ -1641,11 +1622,10 @@ __metadata:
     fn a_lockfile_of_an_ecosystem_with_no_reader_is_named_as_a_kind_wherever_it_is() {
         // `go.sum`, `Gemfile.lock` and the rest of the published list are lockfiles: one
         // beside a `Cargo.lock` is a kind with no reader, by name, whether at the root, deep or
-        // set aside. It leaves its own ecosystem unknown and no other: a deep `uv.lock` makes
-        // PyPI partial and not npm, and a name of no ecosystem a record can be about leaves none.
+        // set aside. It leaves its own ecosystem unknown and no other: a deep `go.sum` makes
+        // Go partial and not npm, and a name of no ecosystem a record can be about leaves none.
         for (tag, path, eco) in [
-            ("uv-deep", "a/b/c/d/e/uv.lock", Some("PyPI")),
-            ("go-sum", "go.sum", Some("Go")),
+            ("go-deep", "a/b/c/d/e/go.sum", Some("Go")),
             ("gemfile", "api/Gemfile.lock", Some("RubyGems")),
             (
                 "composer-deep",
