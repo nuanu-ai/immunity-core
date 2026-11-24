@@ -848,8 +848,9 @@ pub fn match_all(tx: &Transaction, run_id: &str, at: i64) -> rusqlite::Result<Ma
         .collect();
 
     // What the findings rest on: each component with an affected entry, by record kind. A
-    // component follows its own entries, whatever the package's answer: with none affected and
-    // one that cannot be told, it is untold.
+    // component follows its own entries, whatever the package's answer: with one that cannot be
+    // told it is untold, even when another is affected, so a finding of another rule about it
+    // stands.
     let mut affected: BTreeMap<String, Vec<(String, String, Vec<String>)>> = BTreeMap::new();
     for c in &computed {
         let entries = &packages[&(c.checkout.clone(), c.ecosystem, c.package.clone())];
@@ -870,7 +871,8 @@ pub fn match_all(tx: &Transaction, run_id: &str, at: i64) -> rusqlite::Result<Ma
                     c.kind.clone(),
                     versions,
                 ));
-            } else if unknown {
+            }
+            if unknown {
                 untold.insert(component.to_string());
             }
         }
@@ -2844,7 +2846,13 @@ mod tests {
         );
         let untold = component("blog", Source::UnrecordedIndex);
         assert!(!matched.known(&tx, &untold).unwrap());
-        assert!(matched.known(&tx, &about).unwrap());
+        // `site`'s 1.3.0 cannot be told beside its affected 1.2.0; `shop`'s answer is certain.
+        assert!(!matched.known(&tx, &about).unwrap());
+        assert!(
+            matched
+                .known(&tx, &component("shop", Source::Registry))
+                .unwrap()
+        );
 
         // Only the project whose answers are all certain, and the one affected, are compared in
         // full; the package that cannot be told is counted under the new reason.
@@ -2967,6 +2975,46 @@ mod tests {
                 (vec![(release, at.as_str())], records.to_vec())
             );
         }
+    }
+
+    #[test]
+    fn a_standing_finding_about_a_component_is_held_while_a_release_of_it_cannot_be_told_though_another_is_affected()
+     {
+        let dir = crate::common::Scratch::new("component-one-untold");
+        let mut conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
+        let tx = conn.transaction().unwrap();
+        // A record that ends at npm's placeholder with no fix: the placeholder is affected, and
+        // 1.0.0 above it is not covered by the data.
+        let at = "package-lock.json#node_modules/quill";
+        by_hand(
+            &tx,
+            "quill",
+            &[("shop", Source::Registry, &["0.0.1-security", "1.0.0"], at)],
+            &[(
+                LEFT_PAD,
+                r#"[{"type": "SEMVER", "events": [{"introduced": "0"}, {"last_affected": "0.0.1-security"}]}]"#,
+            )],
+        );
+        // A finding of another rule about it, from an earlier check.
+        let rule = crate::findings::MALICIOUS_PACKAGE;
+        let about = component("shop", "quill", Source::Registry);
+        let never = |_: &str| Ok(false);
+        crate::findings::hold(&tx, rule, &[(about.clone(), vec![])], &never, "r0", NOW).unwrap();
+
+        let matched = match_all(&tx, "r1", NOW).unwrap();
+        assert!(matched.affected.contains_key(&about));
+        // This check holds it under another rule, so this one is cleared only if it is known.
+        let known = |about: &str| matched.known(&tx, about);
+        crate::findings::hold(&tx, rule, &[], &known, "r1", NOW).unwrap();
+
+        let state: String = tx
+            .query_row(
+                "SELECT state FROM finding WHERE about = ?1",
+                [&about],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "open");
     }
 
     fn v(s: &str) -> semver::Version {
