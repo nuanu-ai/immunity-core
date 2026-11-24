@@ -141,21 +141,48 @@ struct Held {
     findings: BTreeMap<String, v1::FindingRef>,
     /// What arrives, as the latest reading stored it: not yet known before any.
     arrivals: Arrivals,
-    /// What the time the Mac was awake is counted from.
-    awake: events::Awake,
 }
 
 fn read(args: &MatchesArgs, now: i64) -> Result<v1::Matches, Failure> {
     read_with(Rules::shipped(), args, now)
 }
 
+fn unreadable(e: &(dyn std::error::Error + 'static)) -> Failure {
+    Failure::Store(crate::Stop::of(e))
+}
+
 /// `read`, naming in `unevaluated` these rules. Matching itself is the shipped rules'.
+///
+/// The event log is read with no lock on the store, so a check or a watcher can commit while it
+/// is read. Only what the time awake is counted from is read before the log; everything the
+/// answer says about the store comes from one transaction opened after it, at least as new as
+/// the hits. An older count of the time awake can only make the collector look silent sooner.
 fn read_with(rules: &Rules, args: &MatchesArgs, now: i64) -> Result<v1::Matches, Failure> {
-    if !args.store.is_file() {
-        let absent = crate::store::absent(&args.store);
+    let awake = before_log(&args.store)?;
+    let after_place = args.after.as_ref().map(|(_, p)| p);
+    let queue = events::queue(&args.system_root, after_place, args.limit, now, &awake);
+    after_log(rules, args, now, queue)
+}
+
+/// What the queue counts the time awake from, read in a transaction that is closed, with its
+/// connection, when this returns.
+fn before_log(store: &std::path::Path) -> Result<events::Awake, Failure> {
+    if !store.is_file() {
+        let absent = crate::store::absent(store);
         return Err(Failure::Store(crate::Stop::Store(absent)));
     }
-    let unreadable = |e: &(dyn std::error::Error + 'static)| Failure::Store(crate::Stop::of(e));
+    let conn = store::open_read_only(store).map_err(|e| unreadable(&*e))?;
+    let tx = conn.unchecked_transaction().map_err(|e| unreadable(&e))?;
+    events::Awake::read(&tx).map_err(|e| unreadable(&e))
+}
+
+/// The answer to the log's `queue`, with what the store says read in one transaction.
+fn after_log(
+    rules: &Rules,
+    args: &MatchesArgs,
+    now: i64,
+    queue: Queue,
+) -> Result<v1::Matches, Failure> {
     let conn = store::open_read_only(&args.store).map_err(|e| unreadable(&*e))?;
     let tx = conn.unchecked_transaction().map_err(|e| unreadable(&e))?;
     let held = Held {
@@ -163,11 +190,8 @@ fn read_with(rules: &Rules, args: &MatchesArgs, now: i64) -> Result<v1::Matches,
         state: events::state_read(&tx).map_err(|e| unreadable(&e))?,
         findings: finding_refs(&tx, now).map_err(|e| unreadable(&e))?,
         arrivals: events::arrivals(&tx).map_err(|e| unreadable(&e))?,
-        awake: events::Awake::read(&tx).map_err(|e| unreadable(&e))?,
     };
     let after = args.after.as_ref();
-    let after_place = after.map(|(_, p)| p);
-    let queue = events::queue(&args.system_root, after_place, args.limit, now, &held.awake);
     let mut answer = v1::Matches {
         format: FORMAT,
         answered_at: now,
@@ -1187,5 +1211,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(state, v1::CollectorState::Running as i32);
         assert_eq!(left, slept);
+    }
+
+    #[test]
+    fn matches_holds_no_lock_on_the_store_while_it_reads_the_log() {
+        let (dir, root) = installed_root("unlocked");
+        log_file(&root, "exec-20261004T00.jsonl", &dd(1, "kept"), 10);
+        let store = dir.join("store.db");
+        core_reads(&store, &root);
+        let awake = before_log(&store).ok().unwrap();
+        // Where the log is read, a writer that waits for nothing begins and commits.
+        let mut writer = rusqlite::Connection::open(&store).unwrap();
+        writer.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let tx = writer
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        tx.execute("INSERT INTO meta (key, value) VALUES ('example', 'x')", [])
+            .unwrap();
+        let committed = tx.commit();
+        let args = MatchesArgs {
+            store: store.clone(),
+            form: answer::Form::Json,
+            after: None,
+            limit: LIMIT,
+            single: false,
+            system_root: root.clone(),
+        };
+        let queue = events::queue(&root, None, LIMIT, 1_791_090_000, &awake);
+        let answered = after_log(Rules::shipped(), &args, 1_791_090_000, queue);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(committed.is_ok(), "{committed:?}");
+        assert!(answered.is_ok());
     }
 }
