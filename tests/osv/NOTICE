@@ -1,6 +1,8 @@
-Public advisory records, copied unchanged as test data on 11 November 2026 from OSV.dev's
-bucket, https://osv-vulnerabilities.storage.googleapis.com/<ecosystem>/<id>.json, where
-<ecosystem> is the folder each file is in. GHSA-j7hp-h8jx-5ppr is served the same in both.
+Public advisory records, copied unchanged as test data. Those in crates.io/ and npm/ were
+copied on 11 November 2026 from OSV.dev's bucket,
+https://osv-vulnerabilities.storage.googleapis.com/<ecosystem>/<id>.json, where <ecosystem>
+is the folder each file is in. GHSA-j7hp-h8jx-5ppr is served the same in both. Those in PyPI/
+were copied on 24 November 2026 from OSV.dev's API, https://api.osv.dev/v1/vulns/<id>.
 
 GHSA-*.json: from the GitHub Advisory Database, https://github.com/github/advisory-database,
 licensed under the Creative Commons Attribution 4.0 International licence (CC-BY-4.0),
@@ -15,3 +17,8 @@ LICENSE-APACHE-2.0. Copyright the OpenSSF Malicious Packages authors. Not modifi
 RUSTSEC-2016-0004.json: from the RustSec Advisory Database,
 https://github.com/rustsec/advisory-db, released into the public domain under CC0-1.0, as
 the record itself states.
+
+PYSEC-*.json: from the Python Packaging Advisory Database,
+https://github.com/pypa/advisory-database, licensed under the Creative Commons Attribution 4.0
+International licence (CC-BY-4.0), https://creativecommons.org/licenses/by/4.0/. Copyright
+the advisories' contributors. Not modified.

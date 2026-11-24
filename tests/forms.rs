@@ -108,6 +108,7 @@ impl Estate {
             .arg(self.0.join("brew.json"))
             .args(["--osv-crates-input", none.to_str().unwrap()])
             .args(["--osv-npm-input", none.to_str().unwrap()])
+            .args(["--osv-pypi-input", none.to_str().unwrap()])
             .args(["--tailscale", none.to_str().unwrap()])
             .args(["--threats-input", none.to_str().unwrap()])
             .arg("--checkouts-root")

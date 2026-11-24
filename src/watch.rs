@@ -1281,9 +1281,13 @@ fn read_held(
         machine: &machine,
         notes: Vec::new(),
         readers: 0,
+        settle: Default::default(),
     };
-    // The reading and the rules of `immunity run`: a change seen here is a finding at once.
-    let (rows, opened) = crate::watch_places(&mut run, &reader_args(args), &found, only, None)?;
+    // The reading and the rules of `immunity run`: a change seen here is a finding at once. It
+    // settles what it read alone.
+    let (mut rows, mut opened) =
+        crate::watch_places(&mut run, &reader_args(args), &found, only, None)?;
+    opened += crate::settled(&mut run, &mut rows)?;
     // What needs a look after it, counted by the code `immunity status --json` counts it with.
     let needs = status::needs(&tx, at)?.items.len();
     // The row says when every place was last read: only a reading of every place moves it.
@@ -1336,6 +1340,7 @@ fn reader_args(args: &WatchArgs) -> crate::Args {
         threats_input: None,
         osv_crates_input: None,
         osv_npm_input: None,
+        osv_pypi_input: None,
         curl: None,
         system_root: args.system_root.clone(),
         indicators: None,
@@ -2319,7 +2324,8 @@ mod tests {
             tailscale: Some(absent.clone()),
             threats_input: Some(absent.clone()),
             osv_crates_input: Some(absent.clone()),
-            osv_npm_input: Some(absent),
+            osv_npm_input: Some(absent.clone()),
+            osv_pypi_input: Some(absent),
             curl: None,
             system_root: sys.clone(),
             indicators: None,
@@ -2390,6 +2396,59 @@ mod tests {
         let (_, later) = store::steps::counted(|| work(&w, &folder));
         assert!(first > 0, "nothing was counted");
         (first, later)
+    }
+
+    #[test]
+    fn a_watchers_reading_settles_its_own_removals_and_never_those_of_places_it_did_not_read() {
+        let dir = crate::common::Scratch::new("watch-settles");
+        let (w, folder) = watched_for_a_while(&dir);
+        std::fs::remove_file(w.home.join("Library/LaunchAgents/org.example.sync.plist")).unwrap();
+        std::fs::remove_file(w.home.join("dev/api/.git/hooks/pre-commit")).unwrap();
+        let live = |subject: &str| -> i64 {
+            let conn = Connection::open(&w.store).unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM assertion WHERE layer = 'live' AND subject = ?1",
+                [subject],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let (agent, hook) = (
+            "file:machine:mac/Library/LaunchAgents/org.example.sync.plist",
+            "file:machine:mac/dev/api/.git/hooks/pre-commit",
+        );
+        let (agents, hooks) = (
+            reading("machine:mac", watched::AUTOSTART_KIND),
+            reading("checkout:machine:mac/dev/api", watched::HOOK_KIND),
+        );
+        // The agent goes with its content; the hook, whose reading this was not, stays whole.
+        let read = read_held(&w, &folder, Some(&[agents].into())).unwrap();
+        assert_eq!(
+            (read["gone"].as_u64(), live(agent), live(hook)),
+            (Some(1), 0, 3)
+        );
+        let read = read_held(&w, &folder, Some(&[hooks].into())).unwrap();
+        assert_eq!((read["gone"].as_u64(), live(hook)), (Some(1), 0));
+    }
+
+    #[test]
+    fn a_hook_every_checkout_stops_using_in_one_reading_is_counted_gone_once() {
+        let dir = crate::common::Scratch::new("watch-gone-once");
+        let (w, folder) = watched_for_a_while(&dir);
+        let shared = w.home.join(".shared-hooks");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(shared.join("pre-push"), "#!/bin/sh\n").unwrap();
+        let configs = ["api", "site"].map(|c| w.home.join(format!("dev/{c}/.git/config")));
+        let set = |text: &str| {
+            configs
+                .iter()
+                .for_each(|c| std::fs::write(c, text).unwrap())
+        };
+        set(&format!("[core]\n hooksPath = {}\n", shared.display()));
+        read_held(&w, &folder, None).unwrap();
+        set("[core]\n hooksPath = /dev/null\n");
+        let read = read_held(&w, &folder, None).unwrap();
+        assert_eq!(read["gone"].as_u64(), Some(1));
     }
 
     #[test]
