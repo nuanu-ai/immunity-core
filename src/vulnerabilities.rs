@@ -2418,12 +2418,17 @@ pub fn one(conn: Option<&Connection>, id: &str, now: i64) -> rusqlite::Result<v1
 /// once with its reasons, so that the sentence is never calmer than any answer under it; with no
 /// answer at all, nothing was compared, and that cannot be told either.
 fn no_record_said(answers: &[v1::PlaceAnswer], found: crate::covered::Found) -> String {
-    const HELD: &str = "The catalogue of exploited vulnerabilities holds this id, and no record of the npm or crates.io data names it";
+    // A record of any feed downloaded may name the id, matched or not.
+    let feeds: Vec<&str> = FEEDS.iter().map(|f| f.ecosystem).collect();
+    let held = format!(
+        "The catalogue of exploited vulnerabilities holds this id, and no record of the {} data names it",
+        crate::covered::listed(&feeds)
+    );
     const NOT_EVERY: &str =
         "The data does not claim to name every vulnerability a package may hold.";
     if answers.is_empty() {
         return format!(
-            "{HELD}. The store knows no project whose lockfiles it compared, so whether it affects one cannot be told. {NOT_EVERY}"
+            "{held}. The store knows no project whose lockfiles it compared, so whether it affects one cannot be told. {NOT_EVERY}"
         );
     }
     let not_affected = crate::contract::value_of::<v1::PackageAnswer>("not_affected");
@@ -2441,7 +2446,7 @@ fn no_record_said(answers: &[v1::PlaceAnswer], found: crate::covered::Found) -> 
             crate::covered::Found::All => "any project's lockfiles".to_string(),
             f => format!("the lockfiles of any of {}", f.projects()),
         };
-        return format!("{HELD}: it does not affect {of}, with no signs. {NOT_EVERY}");
+        return format!("{held}: it does not affect {of}, with no signs. {NOT_EVERY}");
     }
     let projects_said = |n: usize| crate::things(n as i64, "project", "projects");
     // A place's answer is derived from its lockfiles and its data: these are its only reasons.
@@ -2465,7 +2470,7 @@ fn no_record_said(answers: &[v1::PlaceAnswer], found: crate::covered::Found) -> 
     }
     let rest = projects.len() - unknown.len();
     let mut said = format!(
-        "{HELD}. For {} of {} it cannot be told whether it affects their lockfiles: {}.",
+        "{held}. For {} of {} it cannot be told whether it affects their lockfiles: {}.",
         unknown.len(),
         projects_said(projects.len()),
         why.join(", ")
