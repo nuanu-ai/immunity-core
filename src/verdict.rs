@@ -34,9 +34,10 @@ use crate::contract::{v1, value_of};
 use crate::events::{self, AtLine, LineAt};
 use crate::findings::{self, CONFIDENCES, Found, SEVERITIES, Words};
 use crate::known::{self, whole};
+use crate::outcome::{self, Code, Outcome};
 use crate::secrets::{Kept, Text, holds};
 use crate::sigma::Rules;
-use crate::{Stop, answer, store};
+use crate::{answer, store};
 use prost::Message;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde_json::{Value, json};
@@ -419,22 +420,24 @@ pub fn parse(
     })
 }
 
-/// Why nothing was recorded: a stable code, the core's words, what was found, and the exit code.
+/// Why nothing was recorded, as the failure says it, and the exit code.
 pub struct Refusal {
-    pub code: &'static str,
-    pub message: &'static str,
-    /// Raw detail. The failure message escapes it when it is built.
-    pub detail: String,
-    pub exit: u8,
+    error: Box<v1::Error>,
+    exit: u8,
+}
+
+impl Refusal {
+    /// A refusal with a stable code, the core's words, what was found, and the exit code.
+    fn of(code: &str, message: &str, detail: impl Into<String>, exit: u8) -> Refusal {
+        Refusal {
+            error: Box::new(answer::error(code, message, EXAMPLE, &detail.into())),
+            exit,
+        }
+    }
 }
 
 fn refused(code: &'static str, message: &'static str, detail: impl Into<String>) -> Refusal {
-    Refusal {
-        code,
-        message,
-        detail: detail.into(),
-        exit: crate::EXIT_USAGE,
-    }
+    Refusal::of(code, message, detail, crate::EXIT_USAGE)
 }
 
 fn not_a_verdict(detail: impl Into<String>) -> Refusal {
@@ -445,38 +448,19 @@ fn not_a_verdict(detail: impl Into<String>) -> Refusal {
     )
 }
 
-fn store_unreadable(detail: impl Into<String>) -> Refusal {
-    Refusal {
-        code: "store_unreadable",
-        message: "the store cannot be read or written; nothing was recorded",
-        detail: Stop::Store(detail.into()).to_string(),
-        exit: crate::EXIT_STORE,
-    }
-}
-
-/// Another writer holds the store: the code and exit the other writing commands give, which a
-/// caller asks again on.
-pub fn busy() -> Refusal {
-    Refusal {
-        code: "run_in_progress",
-        message: "another run or answer is writing to this store; nothing was recorded, ask again",
-        detail: String::new(),
-        exit: crate::EXIT_RUN_IN_PROGRESS,
-    }
-}
-
-/// A failure met on the store, by the rule every command tells it by (`Stop::of`): busy with
-/// another writer, which is asked again, or unreadable.
-fn failed(e: &(dyn std::error::Error + 'static)) -> Refusal {
-    match Stop::of(e) {
-        Stop::RunInProgress => busy(),
-        Stop::Store(detail) => store_unreadable(detail),
+/// A failure met on the store, by the one mapping every command tells it by (`outcome::of`).
+impl From<Outcome> for Refusal {
+    fn from(o: Outcome) -> Refusal {
+        Refusal {
+            error: Box::new(o.error("verdict", EXAMPLE)),
+            exit: o.exit(),
+        }
     }
 }
 
 impl From<rusqlite::Error> for Refusal {
     fn from(e: rusqlite::Error) -> Refusal {
-        failed(&e)
+        outcome::of(&e).into()
     }
 }
 
@@ -670,11 +654,13 @@ fn holds_secret(field: &str) -> Refusal {
 }
 
 fn unchecked(holds: Result<bool, &'static str>) -> Result<bool, Refusal> {
-    holds.map_err(|_| Refusal {
-        code: "secrets_unchecked",
-        message: "the patterns Immunity Core recognises secrets by did not load, so the verdict cannot be checked; nothing was recorded",
-        detail: String::new(),
-        exit: 1,
+    holds.map_err(|_| {
+        Refusal::of(
+            "secrets_unchecked",
+            "the patterns Immunity Core recognises secrets by did not load, so the verdict cannot be checked; nothing was recorded",
+            "",
+            1,
+        )
     })
 }
 
@@ -739,21 +725,18 @@ pub fn verdict_cmd(args: &VerdictArgs) -> ExitCode {
     match take(args) {
         // The form is binary or JSON (`parse`), so there is no text to give.
         Ok(m) => answer::print("verdict", args.form, &m, |_| String::new()),
-        Err(r) => {
-            let error = answer::error(r.code, r.message, EXAMPLE, &r.detail);
-            answer::fail("verdict", args.form, error, r.exit)
-        }
+        Err(r) => answer::fail("verdict", args.form, *r.error, r.exit),
     }
 }
 
 /// Opens the store to write as every writing command does: under the run lock, waited for as
 /// they wait, with the write lock taken at the start of the transaction. A store another writer
-/// holds is `run_in_progress`, never a broken store.
-pub fn writing(store: &std::path::Path) -> Result<(std::fs::File, Connection), Refusal> {
+/// holds is a skip, asked again, never a broken store.
+pub fn writing(store: &std::path::Path) -> Result<(std::fs::File, Connection), Outcome> {
     let lock = store::lock_run(&crate::home(store))
-        .map_err(|e| store_unreadable(e.to_string()))?
-        .ok_or_else(busy)?;
-    Ok((lock, store::open(store).map_err(|e| failed(&*e))?))
+        .map_err(|e| outcome::of(&e))?
+        .ok_or_else(|| Outcome::new(Code::RunLockHeld, ""))?;
+    Ok((lock, store::open(store)?))
 }
 
 /// Reads the verdict, records it in one transaction, and gives what was recorded.
@@ -772,14 +755,14 @@ fn take(args: &VerdictArgs) -> Result<v1::VerdictRecorded, Refusal> {
         .map_err(|e| not_a_verdict(format!("standard input could not be read: {e}")))?;
     let sent = read(&bytes, args.form == answer::Form::Json)?;
     if !args.store.is_file() {
-        return Err(store_unreadable(crate::store::absent(&args.store)));
+        return Err(store::absent(&args.store).into());
     }
     let now = crate::now_secs();
     // Everything that can refuse is checked first against the store opened for reading only, so
     // a refused verdict writes nothing: it makes no store of a file, migrates none and gives none
     // an id.
     let line = {
-        let read = store::open_read_only(&args.store).map_err(|e| failed(&*e))?;
+        let read = store::open_read_only(&args.store)?;
         this_store(&read, &sent)?;
         // A verdict sent again under its id gets its first answer before anything else can
         // refuse it: its line may have left the log since, or its finding been answered. Nothing
@@ -1002,12 +985,12 @@ fn checked_match(
             };
         }
         Err(why) => {
-            return Err(Refusal {
-                code: "log_unreadable",
-                message: "the event log could not be read, so the match cannot be read again; nothing was recorded",
-                detail: why,
-                exit: 1,
-            });
+            return Err(Refusal::of(
+                "log_unreadable",
+                "the event log could not be read, so the match cannot be read again; nothing was recorded",
+                why,
+                1,
+            ));
         }
     };
     if !hit.matched.iter().any(|(_, m)| m.name == rule) {
@@ -1166,12 +1149,7 @@ mod tests {
             let failure = v1::Failure {
                 operation: "verdict".to_string(),
                 ok: false,
-                errors: vec![answer::error(
-                    refusal.code,
-                    refusal.message,
-                    EXAMPLE,
-                    &refusal.detail,
-                )],
+                errors: vec![*refusal.error],
             };
             let detail = format!(
                 "/{escaped} is not a field of the message, or names a second thing it is about"

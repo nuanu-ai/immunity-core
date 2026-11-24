@@ -222,11 +222,25 @@ A command that only reads the store opens it read-only and creates nothing next 
 | Exit | Means |
 |---|---|
 | 0 | answered |
-| 1 | the event log cannot be read: `immunity matches`, `immunity rules --over-log` and `immunity verdict`; `immunity on` or `immunity off` refused or did not finish, and the failure's `code` says which |
+| 1 | the event log cannot be read: `immunity matches`, `immunity rules --over-log` and `immunity verdict`; `immunity on` or `immunity off` refused or did not finish; the work on the store failed (`command_failed`); `immunity run` committed its check and could not read its answer back (`answer_unreadable`). The failure's `code` says which |
 | 2 | a misuse or an unknown id |
-| 3 | an unreadable store |
-| 4 | a check or another writer holds the store; ask again |
+| 3 | an unreadable store: none, not this build's, or one the system failed to read or write |
+| 4 | a check or another writer holds the store, or another check runs; ask again |
 | 5 | another watcher has the store: `immunity watch` |
+
+Every failure met on the store carries `outcome`, one word of a closed list, decided by SQLite's result codes, the store's own refusal and the locks, never by the words of a message. It says why more exactly than the code, which stays as each command gave it:
+
+| Outcome | Code | Exit | When |
+|---|---|---|---|
+| `store_busy` | `run_in_progress` | 4 | another process held the store past the five seconds, SQLite's `BUSY` |
+| `run_lock_held` | `run_in_progress` | 4 | another command held the run lock past its wait |
+| `check_running` | `run_in_progress` | 4 | `immunity run`: another check holds the downloads |
+| `watch_running` | `watch_in_progress` | 5 | `immunity watch`: another watcher has the store |
+| `no_store`, `not_a_store`, `older_format`, `newer_format`, `unknown_format`, `damaged` | `store_unreadable` | 3 | the store was refused and left as it is: none at the path, a file that is not a store, a store of another format or of none this build knows, or one whose schema or id is not its format's |
+| `hot_journal`, `not_writable`, `moved`, `disk_full`, `io`, `cannot_open`, `folder` | `store_unreadable` | 3 | the system failed the store: a write left unfinished in a folder this process cannot write, a store or folder that cannot be written, a store moved or replaced while it was read, a full disk, a failed read or write, a file that cannot be opened, a folder that cannot be made |
+| `failed` | `command_failed` | 1 | anything else, SQLite's `LOCKED` included |
+
+`immunity owner` without a store keeps its code `no_store`, and `immunity sample` and `immunity run` keep `sample_failed` and `run_failed` for a failure of their work. `immunity run` takes the run lock for its check for up to 60 seconds and, when it cannot, fails with `run_failed`.
 
 | Command | Does |
 |---|---|
@@ -348,7 +362,7 @@ The crate's version follows the contract. Its major version is the `format` the 
 
 A command of the contract answers with one message, in one of three forms: binary protobuf with `--proto`, the same message as one line of JSON with `--json`, and with neither, text for a person rendered from that message alone, so a person, an agent and a program are given the same thing. Text from a source is set in quotes or a column of its own, escaped as in the message. A program names its form on every call. Naming both flags is a misuse and returns a JSON failure. `immunity verdict` reads a message, which is not typed as text, so without a form it is refused. The binary form is standard protobuf, and a program in another language reads that. The JSON is Immunity Core's own and is not protobuf's JSON mapping. The generated types print it. Field names are the schema's, an enum is the name of its value without the enum's prefix and in lower case (`CAUSE_NOT_GIVEN` prints as `not_given`, the store's own word), a 64-bit number is a JSON number, and an absent optional field is null. Times are seconds since the epoch, UTC, in fields ending in `_at`.
 
-A failure to answer is the message `Failure` in `common.proto`, and a reader checks the exit code, the ones above, before it parses. With `--proto` the binary `Failure` is on stdout, with `--json` the same as JSON, and for a person it is on stderr with nothing on stdout. It has `operation`, `ok` (always false) and `errors`, each with a stable `code`, the core's `message`, an `example` of a right call where there is one, `detail_text`, what the failure quotes (null when nothing), and `ids_text`, the ids a question fits when it fits several. `Failure` has no `format`, and its fields are numbered from 1000, which every answer reserves, so one read as any answer, in binary or JSON, reads format 0 and the reader stops.
+A failure to answer is the message `Failure` in `common.proto`, and a reader checks the exit code, the ones above, before it parses. With `--proto` the binary `Failure` is on stdout, with `--json` the same as JSON, and for a person it is on stderr with nothing on stdout. It has `operation`, `ok` (always false) and `errors`, each with a stable `code`, the core's `message`, an `example` of a right call where there is one, `detail_text`, what the failure quotes (null when nothing), `ids_text`, the ids a question fits when it fits several, and `outcome`, how an access to the store ended (null for a failure that is no access to the store; since 1.27.0). `Failure` has no `format`, and its fields are numbered from 1000, which every answer reserves, so one read as any answer, in binary or JSON, reads format 0 and the reader stops.
 
 An enum value a reader does not know, and the value `unspecified`, are read as the unsafe case, which the schema names for each enum: for `Presence` not known, for `Completeness` not full, for `Cause` failed, for `FindingState` open, for a severity and for a rule's level the highest level and for a confidence the lowest (a finding's `severity` is absent when the core cannot say, and a reader built before it could be absent reads it as `unspecified`), for `AnswerKind` no answer, for `Via` not known who gave it, for `Change` changed, and for `VerdictKind` no verdict. The generated types read a word they do not know as `unspecified`, so a value added within version 1 does not break an older reader.
 

@@ -193,6 +193,7 @@ fn a_failure_read_as_any_answer_reads_format_zero() {
             example: Some("immunity project <id> --json".to_string()),
             detail_text: Some("invented detail".to_string()),
             ids_text: vec!["checkout:machine:mac/dev/Shop".to_string()],
+            outcome: Some("store_busy".to_string()),
         }],
     };
     let binary = failure.encode_to_vec();
