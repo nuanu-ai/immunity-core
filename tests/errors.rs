@@ -105,7 +105,7 @@ fn a_refusal_for_a_person_is_one_error_on_stderr_and_never_the_usage() {
         (vec!["finding", "f0123456789", "seen"], &none, 3),
         (vec!["owner"], &none, 3),
         (vec!["status"], &older, 3),
-        (vec!["view", "--no-open"], &older, 1),
+        (vec!["view", "--no-open"], &older, 3),
     ];
     for (args, store, exit) in cases {
         let out = e.on(store, &args);
@@ -190,42 +190,42 @@ fn a_failure_has_the_documented_json_and_protobuf_fields() {
         (
             &["findings"],
             &none,
-            r#"{"operation":"findings","ok":false,"errors":[{"code":"store_unreadable","message":"the store cannot be read; nothing was changed","example":"immunity status --json --store <file>","detail_text":"there is no store at <dir>/none.db; `immunity run` makes it","ids_text":[]}]}"#,
+            r#"{"operation":"findings","ok":false,"errors":[{"code":"store_unreadable","message":"the store cannot be read; nothing was changed","example":"immunity status --json --store <file>","detail_text":"there is no store at <dir>/none.db; `immunity run` makes it","ids_text":[],"outcome":"no_store"}]}"#,
         ),
         (
             &["status"],
             &older,
-            r#"{"operation":"status","ok":false,"errors":[{"code":"store_unreadable","message":"the store cannot be read; nothing was changed","example":"immunity status --json --store <file>","detail_text":"the store at <dir>/older.db is from an older format (5); this version uses format 9 and does not convert old stores. Nothing was changed. Move the old store aside or pass another --store; the next run starts a store from the beginning.","ids_text":[]}]}"#,
+            r#"{"operation":"status","ok":false,"errors":[{"code":"store_unreadable","message":"the store cannot be read; nothing was changed","example":"immunity status --json --store <file>","detail_text":"the store at <dir>/older.db is from an older format (5); this version uses format 9 and does not convert old stores. Nothing was changed. Move the old store aside or pass another --store; the next run starts a store from the beginning.","ids_text":[],"outcome":"older_format"}]}"#,
         ),
         (
             &["findings", "--frob"],
             &none,
-            r#"{"operation":"findings","ok":false,"errors":[{"code":"usage","message":"the command line is not one Immunity Core understands; the usage is on stderr","example":"immunity findings --json","detail_text":"unexpected argument: --frob","ids_text":[]}]}"#,
+            r#"{"operation":"findings","ok":false,"errors":[{"code":"usage","message":"the command line is not one Immunity Core understands; the usage is on stderr","example":"immunity findings --json","detail_text":"unexpected argument: --frob","ids_text":[],"outcome":null}]}"#,
         ),
         (
             &["project", "dev/shop", "dev/cli"],
             &none,
-            r#"{"operation":"project","ok":false,"errors":[{"code":"usage","message":"the command line is not one Immunity Core understands; the usage is on stderr","example":"immunity project ~/<folder> --json","detail_text":"immunity project takes a path on this Mac, absolute, beginning with ~/ or relative to the folder it is started in, or an id as the store names it: a project's, beginning with checkout:, or a file's, beginning with file:. A word is an id when what comes before its first colon is a type of id the store knows; anything else is a path","ids_text":[]}]}"#,
+            r#"{"operation":"project","ok":false,"errors":[{"code":"usage","message":"the command line is not one Immunity Core understands; the usage is on stderr","example":"immunity project ~/<folder> --json","detail_text":"immunity project takes a path on this Mac, absolute, beginning with ~/ or relative to the folder it is started in, or an id as the store names it: a project's, beginning with checkout:, or a file's, beginning with file:. A word is an id when what comes before its first colon is a type of id the store knows; anything else is a path","ids_text":[],"outcome":null}]}"#,
         ),
         (
             &["vulnerability"],
             &none,
-            r#"{"operation":"vulnerability","ok":false,"errors":[{"code":"usage","message":"the command line is not one Immunity Core understands; the usage is on stderr","example":"immunity vulnerability CVE-2023-4863 --json","detail_text":"immunity vulnerability takes one record id or CVE id, as in: immunity vulnerability CVE-2023-4863","ids_text":[]}]}"#,
+            r#"{"operation":"vulnerability","ok":false,"errors":[{"code":"usage","message":"the command line is not one Immunity Core understands; the usage is on stderr","example":"immunity vulnerability CVE-2023-4863 --json","detail_text":"immunity vulnerability takes one record id or CVE id, as in: immunity vulnerability CVE-2023-4863","ids_text":[],"outcome":null}]}"#,
         ),
         (
             &["owner"],
             &none,
-            r#"{"operation":"owner","ok":false,"errors":[{"code":"no_store","message":"there is no store at the path given; `immunity run` makes it","example":"immunity run --json","detail_text":"<dir>/none.db","ids_text":[]}]}"#,
+            r#"{"operation":"owner","ok":false,"errors":[{"code":"no_store","message":"there is no store at the path given; `immunity run` makes it","example":"immunity run --json","detail_text":"<dir>/none.db","ids_text":[],"outcome":"no_store"}]}"#,
         ),
         (
             &["matches", "--limit", "0"],
             &none,
-            r#"{"operation":"matches","ok":false,"errors":[{"code":"usage","message":"the command line is not one Immunity Core understands; the usage is on stderr","example":"immunity matches --json","detail_text":"--limit takes a whole number of at least 1","ids_text":[]}]}"#,
+            r#"{"operation":"matches","ok":false,"errors":[{"code":"usage","message":"the command line is not one Immunity Core understands; the usage is on stderr","example":"immunity matches --json","detail_text":"--limit takes a whole number of at least 1","ids_text":[],"outcome":null}]}"#,
         ),
         (
             &["finding", "f0123456789", "expected"],
             &none,
-            r#"{"operation":"finding","ok":false,"errors":[{"code":"usage","message":"the command line is not one Immunity Core understands; the usage is on stderr","example":"immunity finding f0123456789 seen --json","detail_text":"expected needs a reason: --reason <text>","ids_text":[]}]}"#,
+            r#"{"operation":"finding","ok":false,"errors":[{"code":"usage","message":"the command line is not one Immunity Core understands; the usage is on stderr","example":"immunity finding f0123456789 seen --json","detail_text":"expected needs a reason: --reason <text>","ids_text":[],"outcome":null}]}"#,
         ),
     ];
     for (args, store, line) in pinned {
@@ -286,21 +286,30 @@ fn a_store_another_process_holds_is_one_to_ask_again_in_every_form_and_never_unr
     db.execute_batch("ROLLBACK").unwrap();
     for (args, out) in asked.iter().zip(&outs) {
         assert_eq!(out.status.code(), Some(4), "{args:?}: {}", stderr(out));
-        let code = match args.get(1) {
-            Some(&"--proto") => v1::Failure::decode(&out.stdout[..]).unwrap().errors[0]
-                .code
-                .clone(),
+        let (code, outcome) = match args.get(1) {
+            Some(&"--proto") => {
+                let e = v1::Failure::decode(&out.stdout[..]).unwrap().errors[0].clone();
+                (e.code, e.outcome.unwrap_or_default())
+            }
             Some(_) => {
                 let said: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-                said["errors"][0]["code"].as_str().unwrap().to_string()
+                let e = &said["errors"][0];
+                (
+                    e["code"].as_str().unwrap().to_string(),
+                    e["outcome"].as_str().unwrap().to_string(),
+                )
             }
             None => {
                 let said = one_error(out, &format!("{args:?}"));
-                assert!(said.contains("another check is running"), "{said}");
-                "run_in_progress".to_string()
+                assert!(said.contains("another process held the store"), "{said}");
+                ("run_in_progress".to_string(), "store_busy".to_string())
             }
         };
-        assert_eq!(code, "run_in_progress", "{args:?}");
+        assert_eq!(
+            (&*code, &*outcome),
+            ("run_in_progress", "store_busy"),
+            "{args:?}"
+        );
     }
 }
 
@@ -314,8 +323,8 @@ const OTHER_FORMAT_FIX: &str = "  It was left unchanged. Move it aside or pass a
 #[test]
 fn no_store_and_a_store_of_another_format_are_worded_once_across_every_command() {
     let e = Estate::new("wording");
-    // What answers without a store says so, exit 0; what needs one fails, exit 3, and `view`,
-    // which is no command of the contract, exit 1.
+    // What answers without a store says so, exit 0; what needs one fails, exit 3, `view` among
+    // them, which is no command of the contract.
     let no_store: [(&[&str], i32); 12] = [
         (&["status"], 0),
         (&["vulnerabilities"], 0),
@@ -328,7 +337,7 @@ fn no_store_and_a_store_of_another_format_are_worded_once_across_every_command()
         (&["program", "jq"], 3),
         (&["machine"], 3),
         (&["owner"], 3),
-        (&["view", "--no-open"], 1),
+        (&["view", "--no-open"], 3),
     ];
     for (args, exit) in no_store {
         let out = e.on(&e.none(), args);
@@ -351,8 +360,8 @@ fn no_store_and_a_store_of_another_format_are_worded_once_across_every_command()
         (&["vulnerabilities"], 3),
         (&["rules"], 3),
         (&["sample", "--sample-input", "/nonexistent/sample.json"], 3),
-        (&["servers"], 1),
-        (&["view", "--no-open"], 1),
+        (&["servers"], 3),
+        (&["view", "--no-open"], 3),
     ];
     for (args, exit) in older {
         let out = e.on(&e.older(), args);

@@ -25,6 +25,7 @@ use crate::contract::{v1, value_of};
 use crate::events::{
     self, Arrival, Arrivals, Evidence, Hit, Lacked, LineAt, Place, Queue, Stretch,
 };
+use crate::outcome::{self, Code, Outcome};
 use crate::secrets::Args;
 use crate::sigma::{Kind, Meta, Placement, Reason, Rules};
 use crate::{answer, findings, known, store, verdict};
@@ -97,37 +98,30 @@ pub fn parse(
 
 /// Why an answer could not be given.
 enum Failure {
-    Store(crate::Stop),
+    Store(Outcome),
     Log(String),
 }
 
 /// Answers `immunity matches` in the form asked, or fails as every command of the contract does,
 /// with the exit codes the report commands use.
 pub fn matches_cmd(args: &MatchesArgs) -> ExitCode {
-    let (code, message, why, exit) = match read(args, crate::now_secs()) {
+    let (error, exit) = match read(args, crate::now_secs()) {
         Ok(m) => {
             return answer::print("matches", args.form, &m, |m| {
                 crate::lists::matches(m, args.single, &crate::screen::Screen::of_stdout())
             });
         }
-        Err(Failure::Store(crate::Stop::Store(why))) => (
-            "store_unreadable",
-            "the store cannot be read, so what became of a match cannot be told; nothing was evaluated",
-            why,
-            crate::EXIT_STORE,
-        ),
-        Err(Failure::Store(stop)) => {
-            let (error, exit) = answer::stopped(&stop, "immunity matches --json");
-            return answer::fail("matches", args.form, error, exit);
-        }
+        Err(Failure::Store(o)) => (o.error("matches", "immunity matches --json"), o.exit()),
         Err(Failure::Log(why)) => (
-            "log_unreadable",
-            "the event log could not be read, so nothing was evaluated",
-            why,
+            answer::error(
+                "log_unreadable",
+                "the event log could not be read, so nothing was evaluated",
+                "immunity matches --json",
+                &why,
+            ),
             1,
         ),
     };
-    let error = answer::error(code, message, "immunity matches --json", &why);
     answer::fail("matches", args.form, error, exit)
 }
 
@@ -148,7 +142,7 @@ fn read(args: &MatchesArgs, now: i64) -> Result<v1::Matches, Failure> {
 }
 
 fn unreadable(e: &(dyn std::error::Error + 'static)) -> Failure {
-    Failure::Store(crate::Stop::of(e))
+    Failure::Store(outcome::of(e))
 }
 
 /// `read`, naming in `unevaluated` these rules. Matching itself is the shipped rules'.
@@ -173,21 +167,20 @@ fn read_through(
     log: impl FnOnce(&events::Awake) -> Queue,
 ) -> Result<v1::Matches, Failure> {
     if !args.store.is_file() {
-        let absent = crate::store::absent(&args.store);
-        return Err(Failure::Store(crate::Stop::Store(absent)));
+        return Err(Failure::Store(crate::store::absent(&args.store)));
     }
     let (awake, id) = {
-        let conn = store::open_read_only(&args.store).map_err(|e| unreadable(&*e))?;
+        let conn = store::open_read_only(&args.store).map_err(Failure::Store)?;
         let tx = conn.unchecked_transaction().map_err(|e| unreadable(&e))?;
         let awake = events::Awake::read(&tx).map_err(|e| unreadable(&e))?;
         (awake, store::id(&tx).map_err(|e| unreadable(&e))?)
     };
     let queue = log(&awake);
-    let conn = store::open_read_only(&args.store).map_err(|e| unreadable(&*e))?;
+    let conn = store::open_read_only(&args.store).map_err(Failure::Store)?;
     let tx = conn.unchecked_transaction().map_err(|e| unreadable(&e))?;
     if store::id(&tx).map_err(|e| unreadable(&e))? != id {
         let why = "the store was replaced while the event log was read; ask again";
-        return Err(Failure::Store(crate::Stop::Store(why.to_string())));
+        return Err(Failure::Store(Outcome::new(Code::Moved, why)));
     }
     let held = Held {
         read_to: events::read_up_to(&tx).map_err(|e| unreadable(&e))?,
@@ -1266,12 +1259,13 @@ mod tests {
         });
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&other);
-        let Err(Failure::Store(crate::Stop::Store(why))) = answered else {
+        let Err(Failure::Store(o)) = answered else {
             panic!("a replaced store was answered from");
         };
+        assert_eq!(o.code, Code::Moved, "{o}");
         assert!(
-            why.contains("replaced while the event log was read"),
-            "{why}"
+            o.detail.contains("replaced while the event log was read"),
+            "{o}"
         );
     }
 }

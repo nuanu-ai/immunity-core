@@ -702,27 +702,25 @@ pub fn note_on(tx: &rusqlite::Transaction, at: i64) -> rusqlite::Result<usize> {
 /// Writes `turned_off` with the time alone into the job's store, under the run lock as every
 /// writer beside the watcher takes it. A store that is not there, or is not one of this build's
 /// format, is left as it is (`store::open` makes nothing and refuses before it writes). Why it was
-/// not written, or `None` when it was.
+/// not written, by the one mapping of outcomes (`outcome::of`): a skip is `busy`, and any other
+/// failure `store_refused`; `None` when it was written.
 fn record_off(places: &Places) -> Option<v1::NotRecorded> {
-    use v1::NotRecorded::*;
+    use crate::outcome::{Code, Kind, Outcome};
     if !places.store.exists() {
-        return Some(NoStore);
+        return Some(v1::NotRecorded::NoStore);
     }
-    let _lock = match crate::store::lock_run(&crate::home(&places.store)) {
-        Ok(Some(lock)) => lock,
-        Ok(None) => return Some(Busy),
-        Err(_) => return Some(StoreRefused),
-    };
-    let written = crate::store::open(&places.store).and_then(|conn| {
-        Ok(crate::store::journal_note(
-            &conn,
-            answered_at(),
-            JOURNAL_RUN,
-            "turned_off",
-            "",
-        )?)
-    });
-    written.err().map(|_| StoreRefused)
+    let written = (|| -> Result<(), Outcome> {
+        let _lock = crate::store::lock_run(&crate::home(&places.store))
+            .map_err(|e| crate::outcome::of(&e))?
+            .ok_or(Outcome::new(Code::RunLockHeld, ""))?;
+        let conn = crate::store::open(&places.store)?;
+        crate::store::journal_note(&conn, answered_at(), JOURNAL_RUN, "turned_off", "")?;
+        Ok(())
+    })();
+    written.err().map(|o| match o.kind {
+        Kind::Skip => v1::NotRecorded::Busy,
+        _ => v1::NotRecorded::StoreRefused,
+    })
 }
 
 /// What the command left, for the answer.

@@ -11,7 +11,7 @@
 
 use crate::contract::v1;
 use crate::screen::Screen;
-use crate::{EXIT_RUN_IN_PROGRESS, EXIT_STORE, Stop, known, text};
+use crate::{EXIT_STORE, known, text};
 use prost::Message;
 use std::io::Write;
 use std::process::ExitCode;
@@ -93,30 +93,7 @@ pub fn error(code: &str, message: &str, example: &str, detail: &str) -> v1::Erro
         example: (!example.is_empty()).then(|| example.to_string()),
         detail_text: (!detail.is_empty()).then(|| known::whole(detail)),
         ids_text: Vec::new(),
-    }
-}
-
-/// A store that cannot be read, or that another run holds, with its exit code.
-pub fn stopped(e: &Stop, example: &str) -> (v1::Error, u8) {
-    match e {
-        Stop::Store(detail) => (
-            error(
-                "store_unreadable",
-                "the store cannot be read; nothing was changed",
-                example,
-                detail,
-            ),
-            EXIT_STORE,
-        ),
-        Stop::RunInProgress => (
-            error(
-                "run_in_progress",
-                "another run is in progress on this store; nothing was done",
-                example,
-                "",
-            ),
-            EXIT_RUN_IN_PROGRESS,
-        ),
+        outcome: None,
     }
 }
 
