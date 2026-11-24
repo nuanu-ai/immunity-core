@@ -833,7 +833,9 @@ pub(crate) fn answer(
     let m = s.this_mac.as_ref();
     let fresh = m.is_some_and(|m| m.fresh);
     let finished = m.and_then(|m| m.checked_at).is_some();
-    let findings = headline == Ok(H::NeedsALook) || look.is_some_and(|n| n.total > 0);
+    // A finding is a finding however the message counts it.
+    let findings = headline == Ok(H::NeedsALook)
+        || look.is_some_and(|n| n.total > 0 || !n.items.is_empty() || !n.by_rule.is_empty());
     // Off is the headline only when it hides neither a finding nor a check that runs; otherwise
     // its own fault line says it.
     let off = off_by_command(s).filter(|_| !findings && !s.running);
@@ -870,10 +872,15 @@ pub(crate) fn answer(
             u => format!(" · {} urgent", grouped(u)),
         };
         let style = if n.urgent_total > 0 { RED } else { YELLOW };
+        // Never fewer than the message lists, by item or by rule.
+        let total = n
+            .total
+            .max(n.items.len() as u64)
+            .max(n.by_rule.iter().map(|g| g.count).sum());
         (
             format!(
                 "● {}{urgent}",
-                count(n.total, "thing needs a look", "things need a look")
+                count(total, "thing needs a look", "things need a look")
             ),
             style.bold(),
             checking(checked(screen, s)),
@@ -983,21 +990,25 @@ pub(crate) fn answer(
     out
 }
 
-/// That the message shows an answer held in part only by one of the two limits the design
-/// accepts, decided from its fields: machines beyond this Mac not reached and no reading failed,
-/// the reason `coverage` alone; or log files of the event level the size cap deleted since the
-/// check, none of them unread, the reason `this_mac` alone. Any other reason, or one this build
-/// does not know, is not explained by them.
+/// That the message shows an answer held in part only by the limits the design accepts, decided
+/// over every reason it gives: there is one, no reading failed, and each is explained by its own
+/// limit. `coverage` by machines beyond this Mac not reached; `this_mac` by log files of the
+/// event level the size cap deleted since the check, the cap itself read. A reason of any other
+/// kind, or one this build does not know, is never explained by a limit. A file deleted unread
+/// is a fault line of its own, so it never reaches here.
 fn accepted_limit(s: &v1::Status) -> bool {
     use v1::HeadlineBecause as B;
-    let only = |b: B| s.headline_because == [b as i32];
-    let c = s.coverage.clone().unwrap_or_default();
-    // A file deleted unread since the check is a fault line of its own, so it never reaches here.
-    let capped = s
-        .event_level
-        .as_ref()
-        .is_some_and(|l| l.files_removed_by_cap.is_some_and(|c| c.since_check > 0));
-    (only(B::Coverage) && c.unreached_total > 0 && c.failed == 0) || (only(B::ThisMac) && capped)
+    let failed = s.coverage.as_ref().map_or(0, |c| c.failed);
+    let unreached = s.coverage.as_ref().is_some_and(|c| c.unreached_total > 0);
+    let capped = s.event_level.as_ref().is_some_and(|l| {
+        l.files_removed_by_cap.is_some_and(|c| c.since_check > 0) && l.log_cap_reason_text.is_none()
+    });
+    let explained = |b: &i32| match B::try_from(*b) {
+        Ok(B::Coverage) => unreached,
+        Ok(B::ThisMac) => capped,
+        _ => false,
+    };
+    !s.headline_because.is_empty() && failed == 0 && s.headline_because.iter().all(explained)
 }
 
 /// What needs a look, by rule as the message orders them, each on two lines: its level and what
@@ -3717,20 +3728,12 @@ mod tests {
         s.headline_because = vec![v1::HeadlineBecause::ThisMac as i32];
         s.this_mac.as_mut().unwrap().state = 99;
         assert_eq!(fault_lines_of(&pipe(&s)), line);
-        // Machines beyond this Mac not reached, nothing failed: the reason alone, no line.
+        // Machines beyond this Mac not reached, as the core heads it: no line.
         let mut s = calm_status();
         s.coverage.as_mut().unwrap().unreached_total = 2;
         let s = crate::headline::headed(s);
         assert_eq!(s.headline, v1::Headline::InPart as i32);
         assert!(fault_lines_of(&pipe(&s)).is_empty(), "{}", pipe(&s));
-        // With a reading failed as well, or a reason this build does not know beside it, the
-        // line again.
-        let mut unknown = s.clone();
-        unknown.headline_because.push(99);
-        assert_eq!(fault_lines_of(&pipe(&unknown)), line);
-        let mut s = s;
-        s.coverage.as_mut().unwrap().failed = 1;
-        assert_eq!(fault_lines_of(&pipe(&s)), line);
         // Deleted unread as well as by the cap: said as its own fault, not as unexplained.
         let mut s = calm_status();
         s.headline = v1::Headline::InPart as i32;
@@ -3751,23 +3754,137 @@ mod tests {
                 "! 1 file of the event log was deleted before it was read since the latest check   immunity run"
             ]
         );
-        // Log files the cap deleted since the check, none unread, this Mac the reason alone.
-        let mut s = calm_status();
-        s.headline = v1::Headline::InPart as i32;
-        s.headline_because = vec![v1::HeadlineBecause::ThisMac as i32];
-        s.event_level = Some(v1::EventLevel {
-            state: v1::CollectorState::Running as i32,
-            files_removed_by_cap: Some(v1::Span {
-                since_check: 3,
+    }
+
+    #[test]
+    fn an_answer_held_in_part_only_by_the_limits_the_design_accepts_prints_no_line_and_a_gap_beside_them_prints_it()
+     {
+        use v1::HeadlineBecause as B;
+        let line =
+            vec!["! Something was not read in full   immunity status --coverage".to_string()];
+        // In part, with machines not reached, log files the cap deleted, the cap's own reading
+        // failed, readings failed, and the reasons the message gives.
+        let status =
+            |unreached: bool, cap: bool, cap_failed: bool, failed: u64, because: &[i32]| {
+                let mut s = calm_status();
+                s.headline = v1::Headline::InPart as i32;
+                s.headline_because = because.to_vec();
+                let c = s.coverage.as_mut().unwrap();
+                c.unreached_total = u64::from(unreached);
+                c.failed = failed;
+                s.event_level = Some(v1::EventLevel {
+                    state: v1::CollectorState::Running as i32,
+                    files_removed_by_cap: cap.then_some(v1::Span {
+                        since_check: 3,
+                        last_day: 3,
+                    }),
+                    log_cap_reason_text: cap_failed.then(|| "Permission denied".to_string()),
+                    ..Default::default()
+                });
+                s
+            };
+        let (c, m, w) = (B::Coverage as i32, B::ThisMac as i32, B::Watcher as i32);
+        let none: Vec<String> = Vec::new();
+        for (case, s, expected) in [
+            (
+                "both limits, both reasons",
+                status(true, true, false, 0, &[c, m]),
+                &none,
+            ),
+            (
+                "both, a reason repeated",
+                status(true, true, false, 0, &[m, c, m]),
+                &none,
+            ),
+            (
+                "not reached alone",
+                status(true, false, false, 0, &[c]),
+                &none,
+            ),
+            ("the cap alone", status(false, true, false, 0, &[m]), &none),
+            (
+                "not reached, a reading failed",
+                status(true, false, false, 1, &[c]),
+                &line,
+            ),
+            (
+                "the cap, a reading failed",
+                status(false, true, false, 1, &[m]),
+                &line,
+            ),
+            (
+                "the cap not read",
+                status(false, true, true, 0, &[m]),
+                &line,
+            ),
+            (
+                "a limit, an unknown reason",
+                status(true, false, false, 0, &[c, 99]),
+                &line,
+            ),
+            (
+                "a limit, another reason",
+                status(true, false, false, 0, &[c, w]),
+                &line,
+            ),
+            (
+                "a reason no limit explains",
+                status(false, true, false, 0, &[c, m]),
+                &line,
+            ),
+            ("no reason", status(true, true, false, 0, &[]), &line),
+        ] {
+            let text = super::status(&s, &Screen::pipe(), false);
+            assert!(text.starts_with("✓ Nothing needs a look"), "{case}\n{text}");
+            assert_eq!(&fault_lines_of(&text), expected, "{case}\n{text}");
+        }
+        // Files the cap deleted in the last day but none since the check explain nothing now.
+        let mut s = status(false, true, false, 0, &[m]);
+        if let Some(l) = s.event_level.as_mut() {
+            l.files_removed_by_cap = Some(v1::Span {
+                since_check: 0,
                 last_day: 3,
-            }),
+            });
+        }
+        assert_eq!(
+            &fault_lines_of(&super::status(&s, &Screen::pipe(), false)),
+            &line
+        );
+        // No coverage in the message counts as no reading failed.
+        let mut s = status(false, true, false, 0, &[m]);
+        s.coverage = None;
+        assert!(fault_lines_of(&super::status(&s, &Screen::pipe(), false)).is_empty());
+    }
+
+    #[test]
+    fn a_finding_is_a_finding_however_the_message_counts_it() {
+        let mut one = listed(3, v1::Level::Medium, false, "~/dev/site".to_string());
+        if let Some(r) = one.finding.as_mut() {
+            r.rule = Some("watched.git-hook".to_string());
+        }
+        let items = v1::NeedsALook {
+            items: vec![v1::LookFinding {
+                finding: Some(one),
+                ..Default::default()
+            }],
             ..Default::default()
-        });
-        assert!(fault_lines_of(&pipe(&s)).is_empty(), "{}", pipe(&s));
-        // Another reason beside it: the line.
-        s.headline_because
-            .push(v1::HeadlineBecause::Coverage as i32);
-        assert_eq!(fault_lines_of(&pipe(&s)), line);
+        };
+        let rules = v1::NeedsALook {
+            by_rule: vec![group("watched.git-hook", v1::Level::Medium, 1, 0)],
+            ..Default::default()
+        };
+        // Counted as none, but listed by item or by rule, in a message that says calm.
+        for (case, n) in [("an item", items), ("a rule", rules)] {
+            let mut s = calm_status();
+            s.headline = v1::Headline::Calm as i32;
+            s.needs_a_look = Some(n);
+            let text = super::status(&s, &Screen::pipe(), false);
+            assert!(text.starts_with("● 1 thing needs a look"), "{case}\n{text}");
+            assert!(!text.contains('✓'), "{case}\n{text}");
+            // The run says the same, so what it first saw never follows a ✓.
+            let ran = crate::after_run::run(&s, &Screen::pipe());
+            assert!(ran.starts_with("● 1 thing needs a look"), "{case}\n{ran}");
+        }
     }
 
     #[test]
