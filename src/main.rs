@@ -4960,27 +4960,15 @@ fn read_indicators(
     let homes = watched::homes(&args.home);
     let homes = [homes[0].as_path(), homes[1].as_path()];
     for c in found {
-        let texts = lockfiles::read_as_text(&c.path);
+        let texts = lockfiles::read_as_text(c);
         let in_project = |rel: &str| format!("{}/{rel}", c.rel);
-        for (folder, why) in texts.unlisted {
-            look.not_looked_at(Unit::whole(in_project(&folder)), why);
-        }
-        for folder in &texts.aside {
-            look.aside(Unit::whole(in_project(folder)));
-        }
         if !texts.not_opened.is_empty() {
             let n = things(texts.not_opened.len() as i64, "lockfile", "lockfiles");
             let units = texts.not_opened.iter().map(|f| Unit::whole(in_project(f)));
             let why = format!("{n} found and not opened in {}", c.rel);
             look.short_of(units, Cause::NoReader, why);
         }
-        if texts.stopped {
-            let why = format!(
-                "lockfiles were not looked for past the walk's limit in {}",
-                c.rel
-            );
-            look.short_of([Unit::whole(&c.rel)], Cause::NoReader, why);
-        }
+        look.add(texts.look);
         let mut opened: Vec<(String, PathBuf)> = (texts.opened.into_iter())
             .map(|rel| (rel.clone(), c.path.join(rel)))
             .collect();

@@ -3,9 +3,9 @@
 //! places reader (`watched.rs`) and the reader of parts (`autorun.rs`), record what they found
 //! through `Look`, and the store compares and retracts through it (`read_watched` in
 //! `main.rs`). The search for projects (`read_checkouts`), the reading of agent sessions
-//! (`agent_folders.rs`), the reading of software changed in place (`integrity.rs`) and the
-//! matching of indicators against the texts of projects (`read_indicators`) say what they did
-//! not read through it too:
+//! (`agent_folders.rs`), the reading of software changed in place (`integrity.rs`), the
+//! reading of lockfiles (`lockfiles.rs`) and the matching of indicators against the texts of
+//! projects (`read_indicators`) say what they did not read through it too:
 //!
 //! - Not read is not absent. A unit is read in full only by `absent`, which takes proof that
 //!   its path is not there, or by `read`, `read_part`; a unit that could not be read is
@@ -72,7 +72,7 @@ pub struct Unread {
 
 /// How a reading's reason says the units of one kind it did not read, and so their cause. Each
 /// kind is one clause, and the clauses come in the order of this list, with the reader's note
-/// and what is no unit of the reading (`Look::short`) between `SourceInto` and `FilesInto`. The
+/// and what is no unit of the reading (`Look::short`) between `SourceInto` and `Lockfile`. The
 /// words are those the store holds, and some are parsed back (`covered.rs`, `known.rs`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Said {
@@ -98,8 +98,15 @@ pub enum Said {
     Into,
     /// The same, said of a source whose reading read nothing at all: the folders alone.
     SourceInto,
-    /// The same, said of session files after everything else, so that what comes before names
-    /// no folder (`covered::projects_found`).
+    /// A lockfile of this kind that could not be read, said by its kind alone, which is what
+    /// `lockfiles::partial_for` parses back.
+    Lockfile(&'static str),
+    /// An entry of a lockfile whose package cannot be told, counted.
+    Untold,
+    /// A folder the walk for lockfiles could not list in full, counted, with why.
+    Unlisted,
+    /// The same as `Into`, said of session files after everything else, so that what comes
+    /// before names no folder (`covered::projects_found`).
     FilesInto,
 }
 
@@ -117,7 +124,12 @@ impl Said {
         Said::Into,
         Said::SourceInto,
     ];
-    const AFTER: [Said; 1] = [Said::FilesInto];
+    const AFTER: [Said; 4] = [
+        Said::Lockfile(""),
+        Said::Untold,
+        Said::Unlisted,
+        Said::FilesInto,
+    ];
 
     /// Why a unit said so was not read: it failed, or it was not given.
     pub fn cause(self) -> Cause {
@@ -127,10 +139,15 @@ impl Said {
             | Said::SessionFolder
             | Said::Lines(_)
             | Said::WorkingFolder
-            | Said::Checkout => Cause::Failed,
-            Said::SameName | Said::OverCap | Said::Into | Said::SourceInto | Said::FilesInto => {
-                Cause::NotGiven
-            }
+            | Said::Checkout
+            | Said::Lockfile(_)
+            | Said::Unlisted => Cause::Failed,
+            Said::SameName
+            | Said::OverCap
+            | Said::Into
+            | Said::SourceInto
+            | Said::Untold
+            | Said::FilesInto => Cause::NotGiven,
         }
     }
 
@@ -187,6 +204,7 @@ impl Said {
                 format!("{}: {}", u.unit, u.why)
             }),
             Said::SourceInto => named(crate::guarded::NOT_LOOKED_INTO, ", ", |u| u.why.clone()),
+            Said::Lockfile(_) | Said::Untold | Said::Unlisted => crate::lockfiles::said(units),
             Said::FilesInto => named(crate::agent_folders::FILES_NOT_LOOKED_INTO, "; ", |u| {
                 u.why.clone()
             }),

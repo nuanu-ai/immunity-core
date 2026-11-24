@@ -7,6 +7,7 @@ use super::{
 fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
+use crate::baseline::Unit;
 use crate::store::Cause;
 use std::path::PathBuf;
 
@@ -326,12 +327,15 @@ impl Dir {
     /// What the reader says of its dependencies: each statement as
     /// `subject|predicate|object|where`, with the checkout's id left out. The lockfiles
     /// found (`HAS_LOCKFILE`) are left to `found`.
-    pub(super) fn read(&self) -> (super::Outcome, Vec<String>) {
-        let checkout = Checkout {
+    pub(super) fn checkout(&self) -> Checkout {
+        Checkout {
             rel: "dev/shop".to_string(),
             path: self.0.clone(),
-        };
-        let o = read(&checkout, "checkout:machine:mac/dev/shop").unwrap();
+        }
+    }
+
+    pub(super) fn read(&self) -> (super::Outcome, Vec<String>) {
+        let o = read(&self.checkout(), "checkout:machine:mac/dev/shop").unwrap();
         let said = o
             .statements
             .iter()
@@ -388,7 +392,7 @@ fn an_npm_shrinkwrap_is_read_under_its_own_name_and_beside_a_package_lock_neithe
     }
     assert_eq!((o.completeness, o.reason), ("full", None));
     assert_eq!(
-        read_as_text(&dir.0).opened,
+        read_as_text(&dir.checkout()).opened,
         ["npm-shrinkwrap.json", "package-lock.json"]
     );
 }
@@ -403,7 +407,7 @@ fn a_project_with_only_bun_s_binary_lockfile_is_never_one_with_no_lockfile() {
     assert_eq!(o.completeness, "partial");
     assert_eq!(lacks(&o), [format!("{LOCKFILE_KIND} bun.lockb")]);
     assert_eq!(unknown_for(&o), [true, false]);
-    let texts = read_as_text(&dir.0);
+    let texts = read_as_text(&dir.checkout());
     assert!(texts.opened.is_empty() && texts.not_opened.is_empty());
 }
 
@@ -418,7 +422,7 @@ fn a_lockfile_of_a_kind_with_no_reader_is_never_opened_and_is_listed_with_its_si
     let path = dir.0.join(file);
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
     let (o, _) = dir.read();
-    let texts = read_as_text(&dir.0);
+    let texts = read_as_text(&dir.checkout());
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert_eq!(lacks(&o), [format!("{LOCKFILE_KIND} {file}")]);
     assert_eq!(o.gap.cause, Some(Cause::NoReader));
@@ -781,7 +785,7 @@ fn yarn_and_bun_lockfiles_beside_a_package_lock_are_each_read_and_none_hides_ano
     }
     assert_eq!((o.completeness, o.reason), ("full", None));
     assert_eq!(
-        read_as_text(&dir.0).opened,
+        read_as_text(&dir.checkout()).opened,
         ["bun.lock", "package-lock.json", "yarn.lock"]
     );
 }
@@ -881,7 +885,11 @@ fn a_lockfile_the_walk_does_not_open_makes_the_reading_partial_for_its_ecosystem
         assert_eq!(unknown_for(&o), eco, "{tag}");
         // Not opened, so neither in the copy of what was read nor read as text.
         assert_eq!(o.lockfiles.len(), 1, "{tag}");
-        assert_eq!(read_as_text(&dir.0).opened, ["Cargo.lock"], "{tag}");
+        assert_eq!(
+            read_as_text(&dir.checkout()).opened,
+            ["Cargo.lock"],
+            "{tag}"
+        );
     }
 }
 
@@ -959,12 +967,13 @@ fn a_folder_of_installed_copies_build_output_an_environment_or_a_cache_holds_no_
     let read: Vec<&str> = o.lockfiles.iter().map(|(p, _)| p.as_str()).collect();
     assert_eq!(read, ["dev/shop/Cargo.lock"]);
     // Each is told to the indicators reader as a folder left aside, so that what was known
-    // in it is kept.
-    let aside = read_as_text(&dir.0).aside;
+    // in it is kept, and the reading stays full.
+    let texts = read_as_text(&dir.checkout());
     for folder in ["node_modules", "target", ".git", ".cache", ".conda"] {
-        let at = |a: &String| a.trim_end_matches('/') == folder;
-        assert!(aside.iter().any(at), "{folder} {aside:?}");
+        let inside = Unit::whole(format!("dev/shop/{folder}/x/package-lock.json"));
+        assert!(texts.look.hides(&inside), "{folder}");
     }
+    assert_eq!(texts.look.cause(), None);
     let dir = Dir::new(
         "unsigned-tag",
         &[
@@ -1020,7 +1029,7 @@ fn a_mark_never_changes_which_lockfiles_are_opened() {
             "{mark}"
         );
         assert_eq!(
-            read_as_text(&dir.0).opened,
+            read_as_text(&dir.checkout()).opened,
             ["web/a/b/package-lock.json", "web/package-lock.json"],
             "{mark}"
         );
@@ -1167,7 +1176,7 @@ fn a_folder_that_could_not_be_listed_is_named_with_what_the_system_said_and_leav
     let web = dir.0.join("web");
     std::fs::set_permissions(&web, std::fs::Permissions::from_mode(0o000)).unwrap();
     let (o, _) = dir.read();
-    let texts = read_as_text(&dir.0);
+    let texts = read_as_text(&dir.checkout());
     std::fs::set_permissions(&web, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(
         o.reason.as_deref(),
@@ -1176,11 +1185,8 @@ fn a_folder_that_could_not_be_listed_is_named_with_what_the_system_said_and_leav
     assert_eq!(o.gap.cause, Some(Cause::Failed));
     assert_eq!(unknown_for(&o), [true, true]);
     assert_eq!(
-        texts.unlisted,
-        [(
-            "web/".to_string(),
-            "Permission denied (os error 13)".to_string()
-        )]
+        texts.look.completeness_noted(None).1.as_deref(),
+        Some("could not be read: dev/shop/web (Permission denied (os error 13))")
     );
 }
 
@@ -1222,4 +1228,41 @@ fn a_lockfile_over_the_cap_is_not_read_and_leaves_the_reading_partial_with_its_o
     assert_eq!(o.gap.cause, Some(Cause::Failed));
     assert_eq!(unknown_for(&o), [false, true]);
     assert_eq!(o.lockfiles, [("dev/shop/Cargo.lock".to_string(), size)]);
+}
+
+#[test]
+fn a_lockfile_that_is_not_a_regular_file_is_never_opened_and_never_leaves_its_ecosystem_read_in_full()
+ {
+    // No false calm. A named pipe named as a lockfile, beside a valid lockfile of the same
+    // ecosystem, was met and could not be read: crates.io is left in part unknown and npm is
+    // not, and the pipe is named with what it is. Nothing opens it, so the reading returns
+    // with no writer at the other end; a reading that waits fails the test.
+    let dir = Dir::new(
+        "special",
+        &[
+            ("Cargo.lock", CARGO),
+            ("package-lock.json", NPM),
+            ("tools/x", ""),
+        ],
+    );
+    let pipe = std::ffi::CString::new(dir.0.join("tools/Cargo.lock").to_str().unwrap()).unwrap();
+    // SAFETY: `pipe` is a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(pipe.as_ptr(), 0o600) }, 0);
+    let (checkout, (tx, rx)) = (dir.checkout(), std::sync::mpsc::channel());
+    std::thread::spawn(move || {
+        let o = read(&checkout, "checkout:machine:mac/dev/shop").unwrap();
+        tx.send((o, read_as_text(&checkout))).unwrap();
+    });
+    let wait = std::time::Duration::from_secs(10);
+    let (o, texts) = rx.recv_timeout(wait).expect("the reading waited on a pipe");
+    assert_eq!(o.completeness, "partial");
+    assert_eq!(o.gap.cause, Some(Cause::Failed));
+    assert_eq!(o.reason.as_deref(), Some("could not be read: Cargo.lock"));
+    assert_eq!(unknown_for(&o), [false, true]);
+    // Not a lockfile found: which files the walk finds and names is as it was.
+    assert_eq!(o.lockfiles.len(), 2);
+    assert_eq!(
+        texts.look.completeness_noted(None).1.as_deref(),
+        Some("could not be read: dev/shop/tools/Cargo.lock (not a regular file: fifo)")
+    );
 }
