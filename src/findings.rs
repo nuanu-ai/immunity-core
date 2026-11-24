@@ -427,7 +427,7 @@ fn app_code_outside() -> Rule {
             title: "Code an app keeps in your Library folder, outside the app itself, changed while the app's version stayed the same.",
             short: "App code in your Library folder changed",
             meaning: "Many apps download parts of themselves there and update them on their own, so this is often normal; it is also where code can be added so that it runs inside the app.",
-            advice: "Apps update the code in this folder by themselves without changing their version, and the folder also holds the app's settings and data. Check, or ask your agent to check, whether the app wrote the changed files listed here itself: through its own updater, or signed by its developer where they are signed. If nobody can tell, remove those files and reinstall the app, and never remove the whole folder.",
+            advice: "Apps update the code in this folder by themselves without changing their version, and the folder also holds the app's settings and data. Check, or ask your agent to check, whether the app changed the code named here itself: through its own updater, or signed by its developer where it is signed. If nobody can tell, reinstall the app and remove the code that changed, never the whole folder.",
         },
         fires: |o| o.place == integrity::CODE_OUTSIDE_CHANGED,
     }
@@ -1911,10 +1911,10 @@ fn kinds() -> Vec<&'static str> {
 const START_TITLE: &str =
     "A program started on this Mac in a way that a published detection rule marks as high risk.";
 const START_ORDINARY: &str = "Coding agents, build tools and people run the same commands for ordinary work, so a match is often harmless.";
-const START_ADVICE: &str = "Look at the program, its arguments and what started it, shown here. The finding keeps a few starts, and immunity matches lists every match the log still holds with its start. If you or a tool you use ran it, mark it expected; if nobody knows it, ask your agent to look into it.";
+const START_ADVICE: &str = "Look at the program, its arguments and what started it, shown here. The finding keeps a few starts, and immunity matches --json gives every match the log still holds, each with its start. If you or a tool you use ran it, mark it expected; if nobody knows it, ask your agent to look into it.";
 const FILE_TITLE: &str = "A file was created or renamed on this Mac where a published detection rule marks it as high risk.";
 const FILE_ORDINARY: &str = "Installers, updaters and people put files in the same places for ordinary work, so a match is often harmless.";
-const FILE_ADVICE: &str = "Look at the file and the program that wrote it, shown here. The finding keeps a few file events, and immunity matches lists every match the log still holds with its event. If you or a tool you use put it there, mark it expected; if nobody knows it, ask your agent to look into it.";
+const FILE_ADVICE: &str = "Look at the file and the program that wrote it, shown here. The finding keeps a few file events, and immunity matches --json gives every match the log still holds, each with its event. If you or a tool you use put it there, mark it expected; if nobody knows it, ask your agent to look into it.";
 
 /// The words for a finding of a rule of this set: for a rule about program starts, then for
 /// one about file events. They differ between sets only in the set's name, `Source::set`, which

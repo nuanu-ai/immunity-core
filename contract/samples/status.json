@@ -1051,7 +1051,7 @@
         "value_text": "[file:hashes.'SHA-256' = '128344f1f3352b53701662b12b748ff9df8ea044a2acf076d438e8f5a0a75911']"
       },
       {
-        "advice": "Look at the program, its arguments and what started it, shown here. The finding keeps a few starts, and immunity matches lists every match the log still holds with its start. If you or a tool you use ran it, mark it expected; if nobody knows it, ask your agent to look into it.",
+        "advice": "Look at the program, its arguments and what started it, shown here. The finding keeps a few starts, and immunity matches --json gives every match the log still holds, each with its start. If you or a tool you use ran it, mark it expected; if nobody knows it, ask your agent to look into it.",
         "change": "new",
         "evidence": {
           "published_rule_matched": {
