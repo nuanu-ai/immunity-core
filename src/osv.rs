@@ -206,13 +206,16 @@ fn last_etag(conn: &Connection, source: &str) -> rusqlite::Result<Option<(String
     .optional()
 }
 
-/// When the feed was last read successfully: read whole, or found unchanged.
-pub fn last_good_at(conn: &Connection, source: &str) -> rusqlite::Result<Option<i64>> {
+/// The feed's latest successful reading, read whole or found unchanged: its id and time.
+/// Latest by the store's order: after a clock set back the largest time is not the latest.
+pub fn last_good_at(conn: &Connection, source: &str) -> rusqlite::Result<Option<(i64, i64)>> {
     conn.query_row(
-        "SELECT MAX(at) FROM feed_reading WHERE source = ?1 AND outcome != 'failed'",
+        "SELECT id, at FROM feed_reading WHERE source = ?1 AND outcome != 'failed'
+         ORDER BY id DESC LIMIT 1",
         [source],
-        |r| r.get(0),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )
+    .optional()
 }
 
 /// Why the feed's latest reading failed, when it did.
@@ -344,7 +347,7 @@ pub fn get(
     }
     if feed.every > 0
         && let Some(conn) = conn
-        && let Some(at) = last_good_at(conn, feed.source)?
+        && let Some((_, at)) = last_good_at(conn, feed.source)?
         && crate::store::age(at, now).is_some_and(|age| age <= feed.every)
     {
         return Ok(Got::NotDue);
@@ -1408,7 +1411,7 @@ pub fn states(conn: &Connection) -> rusqlite::Result<Vec<State>> {
         out.push(State {
             feed,
             latest,
-            good_at: last_good_at(conn, feed.source)?,
+            good_at: last_good_at(conn, feed.source)?.map(|(_, at)| at),
             changed_at: changed.map(|(at, _)| at),
             records,
             malicious,
@@ -1443,6 +1446,28 @@ mod tests {
         fn drop(&mut self) {
             crate::common::remove(&self.0);
         }
+    }
+
+    #[test]
+    fn a_feed_read_after_the_clock_was_set_back_is_not_fetched_again_before_its_interval() {
+        // The latest good reading is the one read last, by the store's order. A reading
+        // dated ahead from before the clock was set back is the largest time, and taking it
+        // would fetch the large archives at every check until the clock passed it.
+        let dir = Dir::new("set-back");
+        let mut conn = crate::store::open_or_make(&dir.0.join("store.db")).unwrap();
+        let feed = super::FEEDS.iter().find(|f| f.every > 0).unwrap();
+        let now = 1_800_000_000;
+        let tx = conn.transaction().unwrap();
+        let good = super::Reading {
+            outcome: "read",
+            ..Default::default()
+        };
+        super::put_reading(&tx, feed.source, "run-1", now + 86_400, &good).unwrap();
+        super::put_reading(&tx, feed.source, "run-2", now - 60, &good).unwrap();
+        tx.commit().unwrap();
+        let curl = dir.0.join("no-curl");
+        let got = super::get(Some(&conn), feed, None, &curl, &dir.0, now).unwrap();
+        assert!(matches!(got, super::Got::NotDue));
     }
 
     /// A public record from the test fixtures, as OSV serves it.
