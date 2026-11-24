@@ -610,6 +610,8 @@ struct Heartbeat<'a> {
     /// The kinds whose latest failure the store did not take, each with when and what the
     /// store's error said.
     unrecorded: BTreeMap<&'static str, (i64, String)>,
+    /// The kinds whose latest reading met a busy store.
+    skipped: BTreeSet<&'static str>,
     /// Since when the latest looks at what to watch have left places unwatched.
     unwatched: Option<i64>,
     /// Why a rewrite failed; the watcher stops at its next turn.
@@ -637,6 +639,7 @@ impl<'a> Heartbeat<'a> {
             touched: SystemTime::UNIX_EPOCH,
             read: false,
             unrecorded: BTreeMap::new(),
+            skipped: BTreeSet::new(),
             unwatched: None,
             broken: None,
         })
@@ -712,6 +715,20 @@ impl<'a> Heartbeat<'a> {
 
     /// The store did not take a failure of `what`; `why` is what its error said.
     fn unrecorded(&mut self, what: &'static str, why: &str) {
+        self.skipped.remove(what);
+        self.say(what, why);
+    }
+
+    /// A reading of `what` met a busy store and did nothing. One alone is silent; the second in
+    /// a row of the same kind is said as a failure the store did not take, with `why`, until a
+    /// reading of the kind does not skip: a store held for good is then not watched live.
+    fn skipped(&mut self, what: &'static str, why: &str) {
+        if !self.skipped.insert(what) {
+            self.say(what, why);
+        }
+    }
+
+    fn say(&mut self, what: &'static str, why: &str) {
         let said: String = why
             .chars()
             .map(|c| if matches!(c, '\n' | '\r') { ' ' } else { c })
@@ -723,6 +740,7 @@ impl<'a> Heartbeat<'a> {
 
     /// A failure of `what` is in the store, or `what` succeeded.
     fn recorded(&mut self, what: &'static str) {
+        self.skipped.remove(what);
         if self.unrecorded.remove(what).is_some() {
             let _ = self.write();
         }
@@ -899,7 +917,7 @@ impl Watcher<'_> {
                     // Tried again with every place: what the failed reading would have read is
                     // not all that may have changed since.
                     Err(e) => {
-                        if !emit(&problem("read_failed", &e.to_string())) {
+                        if !is_skip(&*e) && !emit(&problem("read_failed", &e.to_string())) {
                             return;
                         }
                         due = Some(Due {
@@ -925,7 +943,7 @@ impl Watcher<'_> {
                     // Quiet, or stopped while it waited: the loop ends at its next turn.
                     Ok(_) => {}
                     Err(e) => {
-                        if !emit(&problem("sample_failed", &e.to_string())) {
+                        if !is_skip(&*e) && !emit(&problem("sample_failed", &e.to_string())) {
                             return;
                         }
                     }
@@ -951,7 +969,7 @@ impl Watcher<'_> {
                     // Stopped while it waited: the loop ends at its next turn.
                     Ok(None) => {}
                     Err(e) => {
-                        if !emit(&problem("events_failed", &e.to_string())) {
+                        if !is_skip(&*e) && !emit(&problem("events_failed", &e.to_string())) {
                             return;
                         }
                     }
@@ -969,7 +987,10 @@ impl Watcher<'_> {
                 if again.is_err() || recovered {
                     match self.lock() {
                         Ok(Some(_lock)) => {
-                            self.mark_held(RESUBSCRIBE, again.as_ref().err().cloned());
+                            self.mark_held(
+                                RESUBSCRIBE,
+                                again.as_ref().err().map(|e| e.to_string()),
+                            );
                         }
                         Ok(None) => {}
                         // A failed look that cannot be recorded; a look that succeeded has
@@ -995,7 +1016,7 @@ impl Watcher<'_> {
                     }
                     Err(e) => {
                         self.standing.insert(RESUBSCRIBE);
-                        if !emit(&problem("resubscribe_failed", &e)) {
+                        if !emit(&problem("resubscribe_failed", &e.to_string())) {
                             return;
                         }
                     }
@@ -1021,8 +1042,8 @@ impl Watcher<'_> {
     /// unwatched changed, which this look tells whether or not the stream is started again. What
     /// a change in each path reads is taken anew every time, and when that changed, a reading of
     /// every place is owed (`owed`).
-    fn again(&mut self) -> Result<(bool, Vec<Value>), String> {
-        let (wanted, targets, left) = self.derive().map_err(|e| e.to_string())?;
+    fn again(&mut self) -> Result<(bool, Vec<Value>), Box<dyn Error>> {
+        let (wanted, targets, left) = self.derive()?;
         // Where a watched path now leads to the place of another reading, as when a link on
         // the way to it, outside every watched place, was turned, nothing watched need have
         // been written: every place is owed, and read at this look.
@@ -1040,10 +1061,21 @@ impl Watcher<'_> {
     /// was stopped, or orphaned, while it waited for the run lock. The counts are of this
     /// reading, the baseline counting as nothing new.
     fn read(&mut self, changed: &Where) -> Result<Option<Value>, Box<dyn Error>> {
-        let mut only = to_read(&self.targets, changed, self.read_everything);
+        let only = to_read(&self.targets, changed, self.read_everything);
         let Some(_lock) = self.lock_for(READ)? else {
             return Ok(None);
         };
+        let read = self.read_locked(only);
+        self.mark_reading(READ, to_mark(&read, |_| None));
+        read
+    }
+
+    /// The reading of `read` under its run lock, from the look at what to watch to the reading
+    /// itself. Whatever ends it is the reading's own end, marked once by `read`.
+    fn read_locked(
+        &mut self,
+        mut only: Option<BTreeSet<Reading>>,
+    ) -> Result<Option<Value>, Box<dyn Error>> {
         // A config change can activate a new folder. Start watching it before the read
         // so a write between re-reading the config and hashing the hooks is seen too.
         // The startup read uses the subscriptions just opened by `subscribe`. Checkouts
@@ -1065,7 +1097,6 @@ impl Watcher<'_> {
             self.mark_pending();
         }
         let read = read_held(self.args, &self.folder, only.as_ref());
-        self.mark_held(READ, read.as_ref().err().map(|e| e.to_string()));
         // The first reading is of every place (`to_read`), and one that failed is tried again as
         // one of every place (`run`): after any reading, every place was read or is read next,
         // and after one of some places, every place is owed.
@@ -1177,7 +1208,7 @@ impl Watcher<'_> {
             self.args.sample_input.as_deref(),
             &mut self.signers,
         );
-        self.mark_held(SAMPLED, sampled.as_ref().err().map(|e| e.to_string()));
+        self.mark_reading(SAMPLED, to_mark(&sampled, |_| None));
         let (report, needs) = sampled?;
         Ok(Some((report.findings_opened, needs)))
     }
@@ -1190,16 +1221,21 @@ impl Watcher<'_> {
             return Ok(None);
         };
         let read = crate::read_events_held(&self.args.store, &self.args.system_root);
-        let failed = match &read {
-            Ok(r) => r.failed.clone(),
-            Err(e) => Some(e.to_string()),
-        };
-        self.mark_held(EVENTS, failed);
+        self.mark_reading(EVENTS, to_mark(&read, |r| r.failed.clone()));
         let read = read?;
         // A page that is open shows these numbers; one that could not be written is a page
         // that says it is not updating, not a failed reading.
         let _ = crate::happens::write_live(&self.folder, read.level.as_ref(), read.at);
         Ok(Some(read))
+    }
+
+    /// Under the run lock the caller holds: records a reading of `what` (`to_mark`). A skip is
+    /// told only as the second in a row of its kind (`Heartbeat::skipped`).
+    fn mark_reading(&mut self, what: &'static str, marked: Result<Option<String>, Outcome>) {
+        match marked {
+            Ok(failed) => self.mark_held(what, failed),
+            Err(skip) => self.heartbeat.skipped(what, skip.code.words()),
+        }
     }
 
     /// Under the run lock the caller holds: records that `what` failed, with what the failure
@@ -1249,6 +1285,27 @@ impl Watcher<'_> {
             "watching",
             json!({ "places": self.paths.len(), "cannot_see": CANNOT_SEE }),
         )
+    }
+}
+
+/// Whether a reading under the run lock met only a store another process held
+/// (`outcome::Kind::Skip`). Nothing was done and nothing failed, so it is neither said nor
+/// recorded, no earlier failure is cleared, and the next reading reads on from where the last
+/// one that committed left off.
+fn is_skip(e: &(dyn Error + 'static)) -> bool {
+    crate::outcome::of(e).kind == crate::outcome::Kind::Skip
+}
+
+/// What a reading under the run lock leaves for `mark_held`: its error, or the failure `own`
+/// finds in what it read; or the skip (`is_skip`), which is no failure.
+fn to_mark<T>(
+    read: &Result<T, Box<dyn Error>>,
+    own: impl FnOnce(&T) -> Option<String>,
+) -> Result<Option<String>, Outcome> {
+    match read {
+        Ok(r) => Ok(own(r)),
+        Err(e) if is_skip(&**e) => Err(crate::outcome::of(&**e)),
+        Err(e) => Ok(Some(e.to_string())),
     }
 }
 
@@ -1953,13 +2010,19 @@ pub struct Failure {
 /// since. Empty while no watcher runs; a failure recorded before this one started is a past
 /// watcher's and is left out. A failure the store did not take, which the lock file says, is
 /// one of the kind `STORE`; places the lock file says are left unwatched are one of `PLACES`.
+/// A failed full check is over once any full check has finished after it, by hand or not.
 pub fn failures(conn: &Connection, folder: &Path) -> rusqlite::Result<Vec<Failure>> {
     let Some((since, state)) = responsive(folder) else {
         return Ok(Vec::new());
     };
     let mut failed = conn
-        .prepare("SELECT what, at, detail FROM watcher_failed WHERE at >= ?1 ORDER BY what")?
-        .query_map([since], |r| {
+        .prepare(
+            "SELECT what, at, detail FROM watcher_failed AS f WHERE at >= ?1
+             AND NOT (what = ?2 AND EXISTS (SELECT 1 FROM journal
+                 WHERE entry = 'run_finished' AND journal.at > f.at))
+             ORDER BY what",
+        )?
+        .query_map(params![since, FULL_CHECK], |r| {
             Ok(Failure {
                 what: r.get(0)?,
                 at: r.get(1)?,
@@ -2221,6 +2284,151 @@ mod tests {
         drop(heartbeat);
     }
 
+    /// A watcher with a store, past its first reading, and what the status reads of its failures.
+    fn watcher_of(tag: &str) -> (crate::common::Scratch, std::fs::File, Connection) {
+        let (dir, lock) = held(tag);
+        let conn = store::open_or_make(&dir.join("store.db")).unwrap();
+        (dir, lock, conn)
+    }
+
+    fn told(conn: &Connection, dir: &Path) -> Vec<(String, String)> {
+        let failed = failures(conn, dir).unwrap().into_iter();
+        failed.map(|f| (f.what, f.detail)).collect()
+    }
+
+    /// The arguments of a watcher of an empty Mac with a store in `dir`.
+    fn args_in(dir: &Path) -> WatchArgs {
+        let (home, sys) = (dir.join("home"), dir.join("sys"));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&sys).unwrap();
+        let store = dir.join("store.db");
+        drop(store::open_or_make(&store).unwrap());
+        WatchArgs {
+            store,
+            system_root: sys,
+            home,
+            sample_input: None,
+            sample_every: SAMPLE,
+            events_every: EVENTS_EVERY,
+            alive_every: ALIVE,
+            standalone: false,
+            background: false,
+        }
+    }
+
+    /// A watcher past its first reading, ready, watching what it would watch now, whose next
+    /// reading of watched places looks again at what to watch first.
+    fn ready<'a>(args: &'a WatchArgs, lock: &'a std::fs::File) -> Watcher<'a> {
+        let mut heartbeat = Heartbeat::start(lock, crate::now_secs(), STALLED).unwrap();
+        heartbeat.read().unwrap();
+        let mut w = Watcher {
+            args,
+            folder: crate::home(&args.store),
+            tx: mpsc::channel().0,
+            streams: Vec::new(),
+            wanted: Vec::new(),
+            targets: Vec::new(),
+            read_everything: true,
+            owed: false,
+            paths: Vec::new(),
+            // SAFETY: getppid(2) takes nothing and cannot fail.
+            parent: unsafe { libc::getppid() },
+            signers: crate::processes::Signers::default(),
+            standing: BTreeSet::new(),
+            checks: None,
+            check_result: None,
+            left_out: BTreeMap::new(),
+            unwatched: None,
+            heartbeat,
+            core: None,
+            left: false,
+        };
+        (w.wanted, w.targets, _) = w.derive().unwrap();
+        w
+    }
+
+    #[test]
+    fn two_readings_of_watched_places_in_a_row_whose_look_met_a_busy_store_say_it_was_busy_and_not_live()
+     {
+        let (dir, lock) = held("watch-look-busy");
+        let args = args_in(&dir);
+        let mut w = ready(&args, &lock);
+        let conn = Connection::open(&args.store).unwrap();
+        assert!(watching_live(&dir));
+        conn.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        // The look at what to watch reads the store: each waits out the five seconds.
+        for _ in 0..2 {
+            assert!(is_skip(&*w.read(&Where::Anywhere).unwrap_err()));
+        }
+        conn.execute_batch("ROLLBACK").unwrap();
+        assert!(!watching_live(&dir));
+        let busy = Code::StoreBusy.words().to_string();
+        assert_eq!(told(&conn, &dir), [(STORE.to_string(), busy)]);
+        drop(w);
+    }
+
+    #[test]
+    fn a_look_that_failed_otherwise_is_the_failure_of_the_reading_of_watched_places_until_one_reads()
+     {
+        let (dir, lock) = held("watch-look-failed");
+        let args = args_in(&dir);
+        let mut w = ready(&args, &lock);
+        // A file that is not a store in place of the store: the look refuses it, and the
+        // store cannot take the failure either, so the lock file says it.
+        let kept = dir.join("kept.db");
+        std::fs::rename(&args.store, &kept).unwrap();
+        std::fs::write(&args.store, "invented notes, not a store\n").unwrap();
+        assert!(!is_skip(&*w.read(&Where::Anywhere).unwrap_err()));
+        assert!(w.standing.contains(READ) && w.heartbeat.unrecorded.contains_key(READ));
+        assert!(!watching_live(&dir));
+        std::fs::rename(&kept, &args.store).unwrap();
+        assert!(w.read(&Where::Anywhere).unwrap().is_some());
+        assert!(!w.standing.contains(READ));
+        assert!(watching_live(&dir));
+        drop(w);
+    }
+
+    #[test]
+    fn a_second_skip_in_a_row_of_one_kind_says_the_store_was_busy_and_one_alone_or_of_another_kind_does_not()
+     {
+        let (dir, lock, conn) = watcher_of("watch-skips");
+        let mut heartbeat = Heartbeat::start(&lock, 17, Duration::from_secs(3600)).unwrap();
+        heartbeat.read().unwrap();
+        let busy = Code::StoreBusy.words();
+        for what in [EVENTS, SAMPLED, READ] {
+            heartbeat.skipped(what, busy);
+        }
+        assert!(watching_live(&dir));
+        assert_eq!(told(&conn, &dir), []);
+        heartbeat.skipped(EVENTS, busy);
+        assert!(!watching_live(&dir));
+        assert_eq!(told(&conn, &dir), [(STORE.to_string(), busy.to_string())]);
+        drop(heartbeat);
+    }
+
+    #[test]
+    fn a_reading_of_the_kind_that_does_not_skip_ends_what_its_skips_said_and_counts_again() {
+        let (dir, lock, conn) = watcher_of("watch-skips-end");
+        let mut heartbeat = Heartbeat::start(&lock, 17, Duration::from_secs(3600)).unwrap();
+        heartbeat.read().unwrap();
+        let busy = Code::StoreBusy.words();
+        heartbeat.skipped(EVENTS, busy);
+        heartbeat.skipped(EVENTS, busy);
+        heartbeat.recorded(EVENTS);
+        assert!(watching_live(&dir));
+        heartbeat.skipped(EVENTS, busy);
+        assert!(watching_live(&dir));
+        // A failure the store did not take is no skip either: it is said as it is, and the
+        // skip after it is a first one.
+        heartbeat.unrecorded(EVENTS, "refused");
+        heartbeat.skipped(EVENTS, busy);
+        assert_eq!(
+            told(&conn, &dir),
+            [(STORE.to_string(), "refused".to_string())]
+        );
+        drop(heartbeat);
+    }
+
     #[test]
     fn a_watcher_whose_lock_file_cannot_say_an_unrecorded_failure_stops() {
         // A file it cannot rewrite would go on saying `ready`: the watcher stops instead, and
@@ -2242,8 +2450,7 @@ mod tests {
     #[test]
     fn a_failure_the_lock_file_says_is_a_store_failure_of_the_watcher_and_not_live() {
         let (dir, lock) = held("watch-lock-store-failure");
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(SCHEMA).unwrap();
+        let conn = store::open_or_make(&dir.join("store.db")).unwrap();
         conn.execute(
             "INSERT INTO watcher_failed (what, at, detail) VALUES ('events', 18, 'refused')",
             [],
@@ -2727,6 +2934,74 @@ mod tests {
             failure["errors"][0]["detail_text"],
             format!("{} ?t=…", "y".repeat(240))
         );
+    }
+
+    #[test]
+    fn a_failed_full_check_is_no_longer_said_once_a_check_has_finished_after_it_and_is_while_none_has()
+     {
+        let (dir, lock) = held("watch-check-after");
+        let store_path = dir.join("store.db");
+        store::open_or_make(&store_path).unwrap();
+        let since = crate::now_secs() - 10;
+        put_lock(&lock, &format!("{since}\nheartbeat\nready"));
+        mark(&store_path, FULL_CHECK, Some("exit status: 1"), since).unwrap();
+        mark(&store_path, EVENTS, Some("invented"), since).unwrap();
+        let at: i64 = store::open_read_only(&store_path)
+            .unwrap()
+            .query_row(
+                "SELECT at FROM watcher_failed WHERE what = ?1",
+                [FULL_CHECK],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let standing = || -> Vec<String> {
+            let conn = store::open_read_only(&store_path).unwrap();
+            failures(&conn, &dir)
+                .unwrap()
+                .into_iter()
+                .map(|f| f.what)
+                .collect()
+        };
+        let finished = |t: i64, id: &str| {
+            let conn = store::open(&store_path).unwrap();
+            store::journal_note(&conn, t, id, "run_finished", "").unwrap();
+        };
+        // A check that finished before it, or in the same second, does not end it.
+        finished(at - 100, "before");
+        finished(at, "same-second");
+        assert_eq!(standing(), [EVENTS, FULL_CHECK]);
+        // A check by hand finished after it: the failure is over, and only that one.
+        finished(at + 1, "by-hand");
+        assert_eq!(standing(), [EVENTS]);
+    }
+
+    #[test]
+    fn only_a_busy_store_is_a_reading_skipped_and_every_other_error_is_recorded() {
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        let locked = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_LOCKED),
+            None,
+        );
+        let full = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_FULL),
+            None,
+        );
+        let io: Box<dyn Error> = std::io::Error::other("invented").into();
+        let words: Box<dyn Error> = "database is locked".into();
+        let skip = to_mark::<()>(&Err(busy.into()), |_| None).unwrap_err();
+        assert_eq!(skip.code, Code::StoreBusy);
+        for e in [locked.into(), full.into(), io, words] {
+            let said = e.to_string();
+            assert_eq!(to_mark::<()>(&Err(e), |_| None).unwrap(), Some(said));
+        }
+        // A reading that read records its own failure, or clears one.
+        let own = |failed: &Option<String>| failed.clone();
+        for failed in [None, Some("invented".to_string())] {
+            assert_eq!(to_mark(&Ok(failed.clone()), own).unwrap(), failed);
+        }
     }
 
     #[test]

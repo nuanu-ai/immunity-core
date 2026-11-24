@@ -970,10 +970,12 @@ pub fn watch_in_progress(folder: &Path) -> std::io::Result<bool> {
     held(&folder.join(WATCH_LOCK))
 }
 
-/// How long a full run goes on waiting for the run lock. Measured on a store of 30,000 things:
-/// a watcher's reading holds the lock 0.03 s when one of 40 watched files changed, 0.3 s when
-/// all 40 did, and about 1 s and 8 s with 1,000 watched files. It leaves at least a second
-/// between readings, so a run waiting gets the lock.
+/// How long a full run waits for whoever holds the store: for the run lock, and at its commit for
+/// the readings that hold the store to leave. Measured on a store of 30,000 things: a watcher's
+/// reading holds the lock 0.03 s when one of 40 watched files changed, 0.3 s when all 40 did,
+/// and about 1 s and 8 s with 1,000 watched files. It leaves at least a second between
+/// readings, so a run waiting gets the lock. A reading under a heavy load of the Mac has held
+/// the store for 12 s.
 pub const CHECK_WAIT: Duration = Duration::from_secs(60);
 
 /// The run lock for a full run, which holds the lock on the downloads (`osv::lock_fetch`), so
