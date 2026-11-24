@@ -923,7 +923,7 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
         Some(Body::VulnerablePackage(p)) => {
             if let Some(why) = p.no_longer_found {
                 let said = crate::finding_text::no_longer_found_said(why);
-                let as_then = crate::finding_text::AS_THEN;
+                let as_then = crate::finding_text::as_then(p);
                 facts.push(("No longer found", word(&format!("{said}{as_then}"))));
                 if let Some(at) = p.no_longer_found_at {
                     facts.push(("Since", view::when(at, now)));

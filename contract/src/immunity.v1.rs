@@ -2066,11 +2066,12 @@ pub struct VulnerablePackage {
     #[prost(message, repeated, tag = "5")]
     pub records: ::prost::alloc::vec::Vec<PackageRecord>,
     /// Why the finding no longer finds what it is about, for a finding the core cleared and for a
-    /// malicious package that left the project, whose finding stays open until the person answers
-    /// it. Absent while it is found: `releases` and `records` are then what the lockfiles and the
-    /// data hold now. When set, they are what the finding was about at `no_longer_found_at`, kept
-    /// then, and never what the lockfiles hold now. Absent too for a finding cleared by a core
-    /// before 1.31.0, which kept nothing. Since 1.31.0.
+    /// malicious package's finding, which the core never clears: it stays open until the person
+    /// answers it. It describes and decides nothing. Absent while it is found: `releases` and
+    /// `records` are then what the lockfiles and the data hold now. When set, they are what the
+    /// finding was about when it was last found, kept at `no_longer_found_at`, and never what the
+    /// lockfiles hold now; when nothing of that was kept, the fields above are absent. Absent too
+    /// for a finding cleared by a core before 1.31.0, which kept nothing. Since 1.31.0.
     #[prost(enumeration = "NoLongerFound", optional, tag = "6")]
     #[serde(
         serialize_with = "crate::optional_enum_name::<NoLongerFound, _>",
@@ -2329,14 +2330,14 @@ impl Change {
 pub enum NoLongerFound {
     #[serde(rename = "unspecified")]
     Unspecified = 0,
-    /// The project's lockfiles were read in full and no longer declare the release.
+    /// The project's lockfiles were read in full and no longer declare a release it was about.
     #[serde(rename = "not_declared")]
     NotDeclared = 1,
     /// The project is no longer on the Mac.
     #[serde(rename = "project_gone")]
     ProjectGone = 2,
-    /// The lockfiles still declare the release, or a record it rested on was withdrawn or left the
-    /// data: no record says now what the rule found. Only this clears a malicious package's finding.
+    /// The project's lockfiles still declare the package and its rule no longer finds it, as when a
+    /// record was withdrawn or no longer lists the release.
     #[serde(rename = "not_named")]
     NotNamed = 3,
 }

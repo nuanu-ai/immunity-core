@@ -576,13 +576,22 @@ pub fn no_longer_found_said(why: i32) -> &'static str {
     match v1::NoLongerFound::try_from(why) {
         Ok(v1::NoLongerFound::NotDeclared) => "the project's lockfiles no longer declare it",
         Ok(v1::NoLongerFound::ProjectGone) => "the project is no longer on this Mac",
-        Ok(v1::NoLongerFound::NotNamed) => "no record says this of it now",
+        Ok(v1::NoLongerFound::NotNamed) => {
+            "its project's lockfiles still declare it and this rule no longer finds it"
+        }
         _ => "no longer found, for a reason this version does not know",
     }
 }
 
-/// What the evidence of a package no longer found is.
-pub const AS_THEN: &str = "; what follows is what the finding was about then";
+/// What the evidence of a package no longer found is: what the finding was about then, or
+/// nothing when nothing of it was kept.
+pub fn as_then(p: &v1::VulnerablePackage) -> &'static str {
+    if p.package_text.is_some() {
+        "; what follows is what the finding was about then"
+    } else {
+        "; nothing of what it was about then was kept"
+    }
+}
 
 /// The evidence of a package a project depends on: the package and its releases, where they are
 /// declared when that is not the place the finding names, each record, and the release each is
@@ -600,7 +609,10 @@ fn package_lines(s: &Screen, f: &v1::Finding, p: &v1::VulnerablePackage) -> Vec<
             .map(|at| format!(", since {}", s.time(at, f.answered_at)))
             .unwrap_or_default();
         let said = no_longer_found_said(why);
-        out.extend(e(label, &[(said, PLAIN), (&since, PLAIN), (AS_THEN, DIM)]));
+        out.extend(e(
+            label,
+            &[(said, PLAIN), (&since, PLAIN), (as_then(p), DIM)],
+        ));
     }
     if let Some(name) = &p.package_text {
         let mut said = name.clone();
@@ -1891,7 +1903,7 @@ mod tests {
         assert!(!open.contains("what the finding was about then"), "{open}");
         for (text, label, said) in [
             (&gone, "Now", "the project's lockfiles no longer declare it"),
-            (&cleared, "Cleared", "no record says this of it now"),
+            (&cleared, "Cleared", "this rule no longer finds it"),
             (&unknown, "Now", "for a reason this version does not know"),
         ] {
             let line = text
