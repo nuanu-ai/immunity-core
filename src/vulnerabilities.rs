@@ -487,6 +487,9 @@ fn held_packages(conn: &Connection) -> rusqlite::Result<Packages> {
             let Some((eco, name)) = rest.split_once('/') else {
                 continue;
             };
+            // No component of an ecosystem with no feed exists: every ecosystem a lockfile is
+            // read for has one, which a test in `lockfiles` holds
+            // (`every_ecosystem_a_lockfile_is_read_for_has_a_feed`).
             let Some(eco) = FEEDS.iter().map(|f| f.ecosystem).find(|e| *e == eco) else {
                 continue;
             };
@@ -1525,7 +1528,7 @@ fn totals_of(conn: &Connection, now: i64, t: &Totals) -> rusqlite::Result<v1::Vu
             .map(|f| v1::FeedFreshness {
                 source: f.feed.source.to_string(),
                 ecosystem: f.feed.ecosystem.to_string(),
-                matched: true,
+                matched: crate::lockfiles::has_reader(f.feed.ecosystem),
                 read_at: f.reading.map(|r| r.1),
                 current: f.not_current.is_none(),
                 not_current_why: f.not_current.clone(),
@@ -1615,15 +1618,21 @@ pub const NOT_READ: &str = "not_read";
 /// last two stand for every ecosystem, `any`. What they declare is not known, so none is ever
 /// "not affected".
 pub fn unread_places(conn: &Connection) -> rusqlite::Result<Vec<UnreadPlace>> {
-    let mut out: Vec<UnreadPlace> = conn
+    let rows: Vec<UnreadPlace> = conn
         .prepare(
             "SELECT checkout, ecosystem, lockfiles, lockfiles_why FROM vulnerability_place
-             WHERE lockfiles != 'full' ORDER BY checkout, ecosystem",
+             ORDER BY checkout, ecosystem",
         )?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
         .collect::<rusqlite::Result<_>>()?;
+    // The places the latest matching judged. Any other place the latest reading of lockfiles
+    // found is not read, whatever feeds this build has: the store may have been written by a
+    // build with other feeds.
+    let rowed: HashSet<(String, String)> =
+        rows.iter().map(|p| (p.0.clone(), p.1.clone())).collect();
+    let mut out: Vec<UnreadPlace> = rows.into_iter().filter(|p| p.2 != "full").collect();
     out.extend(
-        no_reader_places(conn)?
+        no_reader_places(conn, &rowed)?
             .into_iter()
             .map(|(c, e, names)| (c, e, NO_READER.to_string(), Some(no_reader_said(&names)))),
     );
@@ -1721,14 +1730,18 @@ fn untold(places: &[UnreadPlace]) -> BTreeMap<String, String> {
 }
 
 /// The places whose lockfiles are of a kind this version has no reader for, in an ecosystem no
-/// data is matched for, as checkout, ecosystem and the kinds by name, from each checkout's
+/// data was matched for, as checkout, ecosystem and the kinds by name, from each checkout's
 /// latest reading of lockfiles. Such a project was compared with nothing there, though every
-/// lockfile it has of a matched ecosystem was read. A kind of a matched ecosystem, such as
-/// `bun.lockb`, is not here: its place is `partial` (`vulnerability_place`). Nor is a kind of no
-/// ecosystem a record can be about. The store keeps only the ecosystem of a record's own feed,
-/// so a place of any other OSV ecosystem stands, through `untold`, between the project and
-/// every record, which may name that ecosystem too.
-fn no_reader_places(conn: &Connection) -> rusqlite::Result<Vec<(String, String, String)>> {
+/// lockfile it has of a matched ecosystem was read. A kind whose place the latest matching
+/// judged (`rowed`), such as `bun.lockb` for npm, is not here: that place is `partial`
+/// (`vulnerability_place`). Nor is a kind of no ecosystem a record can be about. The store
+/// keeps only the ecosystem of a record's own feed, so a place of any other OSV ecosystem
+/// stands, through `untold`, between the project and every record, which may name that
+/// ecosystem too.
+fn no_reader_places(
+    conn: &Connection,
+    rowed: &HashSet<(String, String)>,
+) -> rusqlite::Result<Vec<(String, String, String)>> {
     let rows: Vec<(String, String)> = conn
         .prepare(
             "SELECT c.scope, l.name FROM coverage c JOIN coverage_lack l ON l.coverage = c.id
@@ -1750,13 +1763,10 @@ fn no_reader_places(conn: &Connection) -> rusqlite::Result<Vec<(String, String, 
         let Some(ecosystem) = crate::lockfiles::ecosystem_of(&name) else {
             continue;
         };
-        if FEEDS.iter().any(|f| f.ecosystem == ecosystem) {
-            continue;
+        let place = (checkout, ecosystem.to_string());
+        if !rowed.contains(&place) {
+            places.entry(place).or_default().push(name);
         }
-        places
-            .entry((checkout, ecosystem.to_string()))
-            .or_default()
-            .push(name);
     }
     Ok(places
         .into_iter()
