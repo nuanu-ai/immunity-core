@@ -636,8 +636,9 @@ fn detached_inline_code() -> Rule {
 
 // ---- Packages the projects depend on: what matching the lockfiles against the vulnerability
 // data found, see `vulnerabilities`. These rules find a state: a finding stays while the
-// dependency matches and is cleared when it goes. They are raised by `hold`, never by what a
-// run saw change, so `fires` is false for every observation. ----
+// dependency matches and is cleared when it goes, but for a malicious package, whose finding
+// the core never clears: only the person's answer ends it (`hold`). They are raised by `hold`,
+// never by what a run saw change, so `fires` is false for every observation. ----
 
 /// What these rules are about, as the item's `kind`.
 pub const DEPENDENCY: &str = "lockfile dependency";
@@ -705,10 +706,12 @@ fn exploited_vulnerability() -> Rule {
 
 /// Holds a rule that finds a state for what a run found now: each thing in `now` has a finding
 /// that stands, raised when none does, with the journal entries it rests on. A finding of the
-/// rule about a thing not in `now` is cleared only when the run knows the thing's state
-/// (`known`), so the state is over; one the run cannot tell about is left exactly as it was,
-/// with its answer and its occurrence. A finding the owner answered stays answered while the
-/// thing stays. Returns how many findings were opened.
+/// rule about a thing not in `now` ends only when the run knows the thing's state (`known`), so
+/// the state is over: it is cleared, or for a malicious package its change becomes `gone` once and
+/// it stays (`OPEN_WHEN_GONE`). One the run cannot tell about is left exactly as it was, with its
+/// answer and its occurrence. A finding the owner answered stays answered while the thing stays;
+/// one seen while it was gone is found again as a new occurrence when the thing is back. Returns
+/// how many findings were opened.
 pub fn hold(
     tx: &Transaction,
     rule: &str,
@@ -719,20 +722,26 @@ pub fn hold(
 ) -> rusqlite::Result<usize> {
     let mut opened = 0;
     for (about, basis) in now {
-        let latest: Option<(String, i64, String, Option<i64>)> = tx
+        let latest: Option<(String, i64, String, Option<i64>, bool)> = tx
             .query_row(
-                "SELECT id, occurrence, state, until_at FROM finding
+                "SELECT id, occurrence, state, until_at, change IS 'gone' FROM finding
                  WHERE rule = ?1 AND about = ?2 ORDER BY occurrence DESC LIMIT 1",
                 params![rule, about],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?;
         match latest {
-            Some((id, _, state, until)) if state != "cleared" => {
+            // A package back after it left is found again: one the person saw while it was gone
+            // is a new occurrence, as after a cleared one.
+            Some((id, _, state, until, gone))
+                if state != "cleared" && !(gone && state == "seen") =>
+            {
                 let ended = state == "expected" && until.is_some_and(|u| u <= at);
+                // A package that left and is back is found as it is now.
                 tx.execute(
                     "UPDATE finding SET last_seen_at = ?2, last_seen_run = ?3,
-                            state = CASE WHEN ?4 THEN 'open' ELSE state END
+                            state = CASE WHEN ?4 THEN 'open' ELSE state END,
+                            change = CASE change WHEN 'gone' THEN 'new' ELSE change END
                      WHERE id = ?1",
                     params![id, at, run_id, ended],
                 )?;
@@ -760,7 +769,7 @@ pub fn hold(
                 }
             }
             latest => {
-                let n = latest.map_or(1, |(_, n, _, _)| n + 1);
+                let n = latest.map_or(1, |(_, n, _, _, _)| n + 1);
                 let id = short_id('f', &[rule, about, &n.to_string()]);
                 tx.execute(
                     "INSERT INTO finding (id, rule, about, occurrence, state, change, first_seen_at,
@@ -788,28 +797,51 @@ pub fn hold(
             }
         }
     }
-    let standing: Vec<(String, String)> = tx
-        .prepare("SELECT id, about FROM finding WHERE rule = ?1 AND state != 'cleared'")?
-        .query_map([rule], |r| Ok((r.get(0)?, r.get(1)?)))?
+    type Standing = (String, String, String, Option<String>, String);
+    let standing: Vec<Standing> = tx
+        .prepare(
+            "SELECT id, about, state, change, last_seen_run FROM finding
+             WHERE rule = ?1 AND state != 'cleared'",
+        )?
+        .query_map([rule], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+        })?
         .collect::<rusqlite::Result<_>>()?;
-    for (id, about) in standing {
+    for (id, about, state, change, since) in standing {
         if now.iter().any(|(a, _)| *a == about) || !known(&about)? {
             continue;
         }
-        tx.execute("UPDATE finding SET state = 'cleared' WHERE id = ?1", [&id])?;
-        journal(
-            tx,
-            at,
-            run_id,
-            "finding_cleared",
-            &id,
-            rule,
-            &about,
-            json!({}),
+        // Why it ended and what it was about, kept in the entry that says so, which it then
+        // rests on. The code of a malicious package may have run when it was installed, which
+        // stays true whatever the lockfiles or the data say later: the core never clears that
+        // finding, and only the person's answer ends it. One the person saw is closed already.
+        let (why, was) = crate::vulnerabilities::ended(tx, rule, &about, &since)?;
+        let stays = OPEN_WHEN_GONE.contains(&rule) && state != "seen";
+        let (entry, text) = if stays {
+            if change.as_deref() == Some("gone") {
+                continue;
+            }
+            tx.execute("UPDATE finding SET change = 'gone' WHERE id = ?1", [&id])?;
+            (
+                "finding_raised",
+                json!({"change": "gone", "why": why, "was": was}),
+            )
+        } else {
+            tx.execute("UPDATE finding SET state = 'cleared' WHERE id = ?1", [&id])?;
+            ("finding_cleared", json!({"why": why, "was": was}))
+        };
+        journal(tx, at, run_id, entry, &id, rule, &about, text)?;
+        tx.execute(
+            "INSERT INTO finding_basis (finding, journal) VALUES (?1, ?2)",
+            params![id, tx.last_insert_rowid()],
         )?;
     }
     Ok(opened)
 }
+
+/// The rules whose finding the core never clears: it stays when its rule no longer finds what it
+/// is about, until the person answers it (`hold`).
+const OPEN_WHEN_GONE: [&str; 2] = [MALICIOUS_PACKAGE, MALICIOUS_NAME_REMOVED];
 
 // ---- End of packages the projects depend on. ----
 
@@ -918,10 +950,11 @@ pub fn detect(
     seen: &[Observed],
 ) -> rusqlite::Result<usize> {
     let lapsed: Vec<(String, String, String)> = tx
-        .prepare(
+        .prepare(&format!(
             "SELECT id, rule, about FROM finding
-             WHERE state = 'expected' AND until_at <= ?1 AND last_seen_at > answered_at",
-        )?
+             WHERE state = 'expected' AND until_at <= ?1 AND {}",
+            again()
+        ))?
         .query_map([at], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
         .collect::<rusqlite::Result<_>>()?;
     for (id, rule, about) in lapsed {
@@ -1106,18 +1139,21 @@ pub struct Found {
     pub unread_only: bool,
 }
 
+/// Whether a finding whose `expected` mark has ended is open again, over a row of `finding`: it
+/// was found again after the mark was given, or it is a malicious package that left, which no
+/// check finds again (`OPEN_WHEN_GONE`). Otherwise it stays closed under the ended mark until it
+/// is found again. `all` and `detect` both go by it.
+fn again() -> String {
+    format!(
+        "(last_seen_at > answered_at OR (change IS 'gone' AND rule IN ('{}')))",
+        OPEN_WHEN_GONE.join("', '")
+    )
+}
+
 /// The state of a finding at `now`. An `expected` mark hides the finding until it ends; at
-/// its end the finding is open again if it was found again after the mark was given, and
-/// otherwise it stays closed under the ended mark until it is found again.
-fn state_at(
-    state: String,
-    answered: Option<i64>,
-    until: Option<i64>,
-    last: i64,
-    now: i64,
-) -> String {
+/// its end the finding is open again when `again` holds.
+fn state_at(state: String, until: Option<i64>, again: bool, now: i64) -> String {
     let ended = until.is_some_and(|u| u <= now);
-    let again = answered.is_some_and(|a| last > a);
     if state == "expected" && ended && again {
         "open".to_string()
     } else {
@@ -1129,7 +1165,8 @@ fn state_at(
 pub fn all(conn: &Connection, now: i64) -> rusqlite::Result<Vec<Found>> {
     let this = This::of(conn, this_machine(conn)?)?;
     let mut affecting: Option<Vec<crate::vulnerabilities::Affecting>> = None;
-    conn.prepare(
+    let mut kept: Option<std::collections::BTreeMap<String, crate::vulnerabilities::Kept>> = None;
+    conn.prepare(&format!(
         "SELECT id, rule, about, state, change, first_seen_at, first_seen_run, last_seen_at,
                 last_seen_run, answered_at, reason, until_at,
                 (SELECT object FROM assertion a WHERE a.subject = f.about
@@ -1148,12 +1185,15 @@ pub fn all(conn: &Connection, now: i64) -> rusqlite::Result<Vec<Found>> {
                           AND g.occurrence > f.occurrence),
                 f.change = 'not read'
                   AND NOT EXISTS (SELECT 1 FROM finding_basis b JOIN journal j ON j.seq = b.journal
-                                  WHERE b.finding = f.id AND j.entry != 'not_read')
+                                  WHERE b.finding = f.id AND j.entry != 'not_read'),
+                {}
          FROM finding f ORDER BY last_seen_at DESC, id",
-    )?
+        again()
+    ))?
     .query_map([], |r| {
         let (state, answered_at, until, last): (String, Option<i64>, Option<i64>, i64) =
             (r.get(3)?, r.get(9)?, r.get(11)?, r.get(7)?);
+        let again = r.get::<_, Option<bool>>(17)?.unwrap_or(false);
         let about: String = r.get(2)?;
         // Where it is installed, as the reader wrote it: under the home folder when it does
         // not start at the root.
@@ -1167,7 +1207,7 @@ pub fn all(conn: &Connection, now: i64) -> rusqlite::Result<Vec<Found>> {
                 None => place(&about, this.as_ref()),
             },
             about,
-            state: state_at(state, answered_at, until, last, now),
+            state: state_at(state, until, again, now),
             change: r.get(4)?,
             first_seen: (r.get(5)?, r.get(6)?),
             last_seen: (last, r.get(8)?),
@@ -1197,12 +1237,19 @@ pub fn all(conn: &Connection, now: i64) -> rusqlite::Result<Vec<Found>> {
                 f.thing = Some(first_read_thing(&read));
             }
             // A finding about a dependency says where its lockfile lines are and what records
-            // it rests on, from the answers that stand now. They are read once for all such
-            // findings, not once for each.
+            // it rests on, from the answers that stand now, or from what it kept when it was
+            // cleared or its package left. They are read once for all such findings, not once
+            // for each.
             if f.rule.starts_with("lockfiles.") {
-                let list = affecting.get_or_insert_with(|| {
-                    crate::vulnerabilities::affecting(conn).unwrap_or_default()
+                let kept = kept.get_or_insert_with(|| {
+                    crate::vulnerabilities::kept(conn).unwrap_or_default()
                 });
+                let list = match kept.get(&f.id) {
+                    Some(k) => &k.was,
+                    None => affecting.get_or_insert_with(|| {
+                        crate::vulnerabilities::affecting(conn).unwrap_or_default()
+                    }),
+                };
                 if let Some((place, value)) = crate::vulnerabilities::finding_detail(list, &f.about)
                 {
                     f.place = place;

@@ -1769,7 +1769,8 @@ pub struct Finding {
     #[prost(message, optional, tag = "14")]
     pub evidence: ::core::option::Option<Evidence>,
     /// The journal entries it rests on, oldest first: what a reader saw that raised it, or that it
-    /// was found again. The journal only grows, so an entry is never changed after it is written.
+    /// was found again, and for a finding about a package the entry that cleared it or said its
+    /// package left. The journal only grows, so an entry is never changed after it is written.
     #[prost(message, repeated, tag = "15")]
     pub rests_on: ::prost::alloc::vec::Vec<JournalEntry>,
     /// As in `Findings`.
@@ -2064,6 +2065,22 @@ pub struct VulnerablePackage {
     /// The records that say so.
     #[prost(message, repeated, tag = "5")]
     pub records: ::prost::alloc::vec::Vec<PackageRecord>,
+    /// Why the finding no longer finds what it is about, for a finding the core cleared and for a
+    /// malicious package's finding, which the core never clears: it stays open until the person
+    /// answers it. It describes and decides nothing. Absent while it is found: `releases` and
+    /// `records` are then what the lockfiles and the data hold now. When set, they are what the
+    /// finding was about when it was last found, kept at `no_longer_found_at`, and never what the
+    /// lockfiles hold now; when nothing of that was kept, the fields above are absent. Absent too
+    /// for a finding cleared by a core before 1.31.0, which kept nothing. Since 1.31.0.
+    #[prost(enumeration = "NoLongerFound", optional, tag = "6")]
+    #[serde(
+        serialize_with = "crate::optional_enum_name::<NoLongerFound, _>",
+        deserialize_with = "crate::optional_enum_from_name::<NoLongerFound, _>"
+    )]
+    pub no_longer_found: ::core::option::Option<i32>,
+    /// When the core's check found that. Absent when `no_longer_found` is. Since 1.31.0.
+    #[prost(int64, optional, tag = "7")]
+    pub no_longer_found_at: ::core::option::Option<i64>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -2301,6 +2318,49 @@ impl Change {
             "CHANGE_GONE" => Some(Self::Gone),
             "CHANGE_FIRST_READ" => Some(Self::FirstRead),
             "CHANGE_NOT_READ" => Some(Self::NotRead),
+            _ => None,
+        }
+    }
+}
+/// Why a finding about a package no longer finds it. `UNSPECIFIED`, or a value the reader does not
+/// know, is read as not known why: the finding's `state` alone says whether it needs a look.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum NoLongerFound {
+    #[serde(rename = "unspecified")]
+    Unspecified = 0,
+    /// The project's lockfiles were read in full and no longer declare a release it was about.
+    #[serde(rename = "not_declared")]
+    NotDeclared = 1,
+    /// The project is no longer on the Mac.
+    #[serde(rename = "project_gone")]
+    ProjectGone = 2,
+    /// The project's lockfiles still declare the package and its rule no longer finds it, as when a
+    /// record was withdrawn or no longer lists the release.
+    #[serde(rename = "not_named")]
+    NotNamed = 3,
+}
+impl NoLongerFound {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "NO_LONGER_FOUND_UNSPECIFIED",
+            Self::NotDeclared => "NO_LONGER_FOUND_NOT_DECLARED",
+            Self::ProjectGone => "NO_LONGER_FOUND_PROJECT_GONE",
+            Self::NotNamed => "NO_LONGER_FOUND_NOT_NAMED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "NO_LONGER_FOUND_UNSPECIFIED" => Some(Self::Unspecified),
+            "NO_LONGER_FOUND_NOT_DECLARED" => Some(Self::NotDeclared),
+            "NO_LONGER_FOUND_PROJECT_GONE" => Some(Self::ProjectGone),
+            "NO_LONGER_FOUND_NOT_NAMED" => Some(Self::NotNamed),
             _ => None,
         }
     }
