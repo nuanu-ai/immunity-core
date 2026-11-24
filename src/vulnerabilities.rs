@@ -411,6 +411,8 @@ pub fn source_name(id: &str) -> &'static str {
         "RustSec"
     } else if id.starts_with("MAL-") {
         "OpenSSF malicious packages"
+    } else if id.starts_with("PYSEC-") {
+        "Python Packaging Advisory Database"
     } else {
         "OSV.dev"
     }
@@ -427,10 +429,34 @@ pub struct Fresh {
     pub not_current: Option<String>,
 }
 
-/// Each feed: whether it was read whole within its limit and its newest change is recent.
+/// The feeds whose ecosystem is matched: this build has a feed for it and reads some kind of
+/// lockfile of it (`lockfiles::has_reader`). Only these give a place, an answer, a count or a
+/// word that says packages were compared. Any other feed is downloaded, read, counted and shown
+/// as a feed, and nothing else.
+pub fn matched_feeds() -> impl Iterator<Item = &'static Feed> {
+    let feeds: &'static [Feed] = &FEEDS;
+    (feeds.iter()).filter(|f| crate::lockfiles::has_reader(f.ecosystem))
+}
+
+/// Each feed as a feed: whether it was read whole within its limit and its newest change is
+/// recent.
 pub fn freshness(conn: &Connection, now: i64) -> rusqlite::Result<Vec<Fresh>> {
+    let feeds: &'static [Feed] = &FEEDS;
+    freshness_of(conn, now, feeds.iter())
+}
+
+/// The same for each matched feed (`matched_feeds`): what answers rest on.
+pub fn matched_freshness(conn: &Connection, now: i64) -> rusqlite::Result<Vec<Fresh>> {
+    freshness_of(conn, now, matched_feeds())
+}
+
+fn freshness_of(
+    conn: &Connection,
+    now: i64,
+    feeds: impl Iterator<Item = &'static Feed>,
+) -> rusqlite::Result<Vec<Fresh>> {
     let mut out = Vec::new();
-    for feed in &FEEDS {
+    for feed in feeds {
         let reading: Option<(i64, i64)> = conn
             .query_row(
                 "SELECT id, at FROM feed_reading WHERE source = ?1 AND outcome != 'failed'
@@ -674,7 +700,8 @@ impl Matched {
 /// and the conditions of each place, and links records to the catalogue. Run in the run's
 /// transaction after the feeds are read.
 pub fn match_all(tx: &Transaction, run_id: &str, at: i64) -> rusqlite::Result<Matched> {
-    let fresh = freshness(tx, at)?;
+    // A place for each checkout and each matched ecosystem alone (`matched_feeds`).
+    let fresh = matched_freshness(tx, at)?;
     let fresh_of = |eco: &str| fresh.iter().find(|f| f.feed.ecosystem == eco);
     // The conditions of each place.
     let readings = lockfile_readings(tx)?;
@@ -1138,8 +1165,8 @@ impl Affecting {
 /// The ecosystems whose lockfile packages the latest check compared with current data, in
 /// the order of `FEEDS`. Through the records linked to it, this is all of the catalogue that
 /// is compared with the estate: an ecosystem counts only where some checkout's lockfiles were
-/// read in that check and its data was current then. Empty: the catalogue is compared with
-/// nothing.
+/// read in that check and its data was current then, so only a matched one (`matched_feeds`),
+/// the only kind with places. Empty: the catalogue is compared with nothing.
 pub fn catalogue_compared(conn: &Connection) -> rusqlite::Result<Vec<&'static str>> {
     let mut out = Vec::new();
     for feed in &FEEDS {
@@ -1548,9 +1575,10 @@ pub fn reason_said(code: &str, n: usize) -> String {
     }
 }
 
-/// The oldest time a feed that is not current was last read, and whether any is not current.
+/// The oldest time a matched feed that is not current was last read, and whether any is not
+/// current.
 pub fn stale(conn: &Connection, now: i64) -> rusqlite::Result<Option<Option<i64>>> {
-    let fresh = freshness(conn, now)?;
+    let fresh = matched_freshness(conn, now)?;
     let old: Vec<&Fresh> = fresh.iter().filter(|f| f.not_current.is_some()).collect();
     if old.is_empty() {
         return Ok(None);

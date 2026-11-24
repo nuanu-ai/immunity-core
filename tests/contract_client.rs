@@ -153,6 +153,7 @@ impl Mac {
             ("--brew-input", &brew),
             ("--osv-crates-input", &none),
             ("--osv-npm-input", &none),
+            ("--osv-pypi-input", &none),
             ("--tailscale", &none),
             ("--threats-input", &none),
             ("--checkouts-root", &home),

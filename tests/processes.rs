@@ -559,6 +559,7 @@ fn run(dir: &Dir) {
         .arg(dir.0.join("brew.json"))
         .args(["--tailscale", "absent", "--threats-input", "absent"])
         .args(["--osv-crates-input", "absent", "--osv-npm-input", "absent"])
+        .args(["--osv-pypi-input", "absent"])
         .arg("--system-root")
         .arg(&absent)
         .arg("--servers-input")

@@ -75,6 +75,7 @@ impl Login {
             "--threats-input",
             "--osv-crates-input",
             "--osv-npm-input",
+            "--osv-pypi-input",
         ] {
             run.arg(input).arg(&absent);
         }

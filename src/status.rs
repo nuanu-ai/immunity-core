@@ -1972,12 +1972,7 @@ mod tests {
 
     #[test]
     fn a_feed_is_said_matched_only_when_some_kind_of_lockfile_of_its_ecosystem_is_read() {
-        // No feed of this build lacks a reader, so one of an invented ecosystem stands for it.
-        static INVENTED: crate::osv::Feed = crate::osv::Feed {
-            source: "osv-invented",
-            ecosystem: "Invented",
-            ..crate::osv::FEEDS[0]
-        };
+        // PyPI's data is downloaded while no Python lockfile is read: it is not matched.
         let state = |feed| crate::osv::State {
             feed,
             latest: None,
@@ -1988,9 +1983,12 @@ mod tests {
             withdrawn: 0,
             counts: None,
         };
-        let matched: Vec<bool> = (crate::osv::FEEDS.iter().chain([&INVENTED]))
-            .map(|f| feed_message(&state(f), "r1").matched)
+        let matched: Vec<(&str, bool)> = (crate::osv::FEEDS.iter())
+            .map(|f| (f.ecosystem, feed_message(&state(f), "r1").matched))
             .collect();
-        assert_eq!(matched, [true, true, false]);
+        assert_eq!(
+            matched,
+            [("crates.io", true), ("npm", true), ("PyPI", false)]
+        );
     }
 }
