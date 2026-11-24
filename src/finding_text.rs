@@ -743,7 +743,27 @@ fn evidence_lines(s: &Screen, f: &v1::Finding) -> Vec<String> {
             if said.is_empty() {
                 said.push("not known".to_string());
             }
-            e("Process", &[(&said.join(", "), PLAIN)])
+            let mut out = e("Process", &[(&said.join(", "), PLAIN)]);
+            if !p.args_text.is_empty() {
+                out.extend(e("Command", &[(&command_line(&p.args_text), PLAIN)]));
+            }
+            if let Some(folder) = &p.working_directory_text {
+                out.extend(e("Folder", &[(folder, PLAIN)]));
+            }
+            for (label, l) in [
+                ("Session", &p.session_leader),
+                ("Group", &p.process_group_leader),
+            ] {
+                if let Some(l) = l {
+                    let signed = l
+                        .signed_by_text
+                        .as_ref()
+                        .map_or("signer not known".to_string(), |s| format!("signed by {s}"));
+                    let said = format!("led by pid {}, {}, {signed}", l.pid, l.executable_text);
+                    out.extend(e(label, &[(&said, PLAIN)]));
+                }
+            }
+            out
         }
         Body::VulnerablePackage(p) => package_lines(s, f, p),
         Body::PublishedRuleMatched(p) => published_lines(s, f, p),
@@ -1292,6 +1312,18 @@ mod tests {
                 Body::DetachedProcess(v1::DetachedProcess {
                     pid: Some(4242),
                     start_micros: Some((NOW - 7200) * 1_000_000),
+                    args_text: vec![
+                        "zsh".to_string(),
+                        "-c".to_string(),
+                        format!("tool --name={odd} --password {MARK}"),
+                    ],
+                    working_directory_text: Some(format!("/Users/example/{odd}")),
+                    process_group_leader: Some(v1::ProcessLeader {
+                        pid: 812,
+                        executable_text: format!("/Applications/{odd}.app/Contents/MacOS/Tool"),
+                        signed_by_text: Some(format!("developer id, team {odd}")),
+                    }),
+                    ..Default::default()
                 }),
             ),
             (
@@ -1646,7 +1678,7 @@ mod tests {
             ("place", &["Change", "Why", "Watched", "First read"]),
             ("changed in place", &["Became"]),
             ("indicator", &["Matched"]),
-            ("detached", &["Process"]),
+            ("detached", &["Process", "Command", "Folder", "Group"]),
             (
                 "package",
                 &[

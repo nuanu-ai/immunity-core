@@ -431,15 +431,7 @@ pub fn event_cut(e: &Evidence, args: &Args) -> v1::Event {
                 }),
                 parent_pid: s.parent_pid,
                 args_text: args.shown(whole),
-                cuts: args
-                    .cuts()
-                    .into_iter()
-                    .map(|c| v1::Cut {
-                        argument: c.argument as u32,
-                        kind: c.kind,
-                        length: c.length as u64,
-                    })
-                    .collect(),
+                cuts: cuts(args),
                 working_directory_text: s.working_directory.as_deref().map(whole),
                 parent: identity(&s.who.parent),
                 script_text: s.who.script.as_deref().map(whole),
@@ -462,6 +454,18 @@ pub fn event_cut(e: &Evidence, args: &Args) -> v1::Event {
             }),
         }),
     }
+}
+
+/// What was cut out of arguments, as the contract lists it beside them.
+pub fn cuts(args: &Args) -> Vec<v1::Cut> {
+    args.cuts()
+        .into_iter()
+        .map(|c| v1::Cut {
+            argument: c.argument as u32,
+            kind: c.kind,
+            length: c.length as u64,
+        })
+        .collect()
 }
 
 fn stretch(s: &Stretch) -> v1::Stretch {

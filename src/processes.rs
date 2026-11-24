@@ -13,8 +13,11 @@
 //! checked at build time against the SDK's `sizeof` and at each call against what the kernel
 //! says it wrote. No tool is run.
 //!
-//! A command line is read into memory only for a program the interpreter table names, only to
-//! decide one literal, and is dropped there. It is never stored, printed or returned.
+//! A command line is read into memory only for a program the interpreter table names, to decide
+//! one literal. It is kept only for a process the rule may fire on, an interpreter given code
+//! and detached, and only with its secrets cut as the arguments of a published rule's evidence
+//! are (`secrets::Args`). Every other command line is dropped there. The environment is never
+//! read.
 //!
 //! What is kept: a small table of the processes the rule is tracking and one of connections
 //! that matched an indicator, see `SCHEMA`, both trimmed of what has been gone for `KEEP`.
@@ -22,7 +25,9 @@
 //! and their lifecycle are for what the owner has. A process with a stable identity belongs in
 //! a table of events, which is not built; these tables are its first rough form, for two rules.
 //! A finding a sample raises rests on a journal entry `sampled`, one per raise, naming the
-//! program, the process's identity and what was derived; never its command line.
+//! program, the process's identity and what was derived, and for the rule over detached
+//! interpreters its command line cut, its folder and the leaders of its session and group
+//! (`sampled`), so the finding still says what ran once the process has ended.
 //! Each sample's coverage is one row per kind, replaced at every sample: a sample every
 //! thirty seconds would otherwise outgrow every other reading's history.
 
@@ -260,9 +265,27 @@ pub struct Seen {
     pub name: String,
     /// It has a controlling terminal.
     pub terminal: bool,
-    /// Its arguments, read only for an interpreter, and dropped once the shape is derived.
-    /// `None` for an interpreter whose arguments could not be read.
+    /// Its arguments, read only for an interpreter, and dropped once the shape is derived but
+    /// for a process the rule may fire on. `None` for an interpreter whose arguments could not
+    /// be read.
     pub args: Option<Vec<String>>,
+    /// Read only for an interpreter given code.
+    pub around: Around,
+}
+
+/// What a process ran in and belongs to, as the system still says once its parent is gone.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Around {
+    pub working_directory: Option<String>,
+    pub session: Option<Leader>,
+    pub group: Option<Leader>,
+}
+
+/// The leader of a process's session or group, when it is another process and still runs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Leader {
+    pub pid: i32,
+    pub executable: String,
 }
 
 /// One internet socket of a process, with a remote end.
@@ -296,7 +319,8 @@ pub struct Reading {
     pub arguments_layout_unknown: bool,
 }
 
-/// A process as the rule reads it: nothing from its command line but the derived literal.
+/// A process as the rule reads it: from its command line the derived literal, and for one the
+/// rule may fire on the command line cut.
 pub struct Process {
     pub pid: i32,
     pub start: i64,
@@ -308,6 +332,10 @@ pub struct Process {
     /// `Some(INLINE_CODE)` when its arguments gave it code, `None` when they did not;
     /// for an interpreter whose arguments could not be read, see `args_unreadable`.
     pub shape: Option<&'static str>,
+    /// Its arguments with their secrets cut, in the store's form, for a detached interpreter
+    /// given code only.
+    pub args: Option<Vec<String>>,
+    pub around: Around,
 }
 
 pub struct Sample {
@@ -322,7 +350,8 @@ pub struct Sample {
     pub arguments_layout_unknown: bool,
 }
 
-/// Derives what the rule reads from a reading, and drops every command line in it.
+/// Derives what the rule reads from a reading. Every command line in it is dropped but that of a
+/// detached interpreter given code, which is kept cut.
 pub fn derive(r: Reading) -> Sample {
     let alive: HashSet<i32> = r
         .processes
@@ -342,22 +371,28 @@ pub fn derive(r: Reading) -> Sample {
                 .unwrap_or(&p.name);
             let kind = interpreter(file_name);
             let args = p.args.filter(|_| !r.arguments_layout_unknown);
-            let shape = match (kind, args) {
-                (Some(i), Some(args)) => inline_code(i, &args).then_some(INLINE_CODE),
+            let shape = match (kind, &args) {
+                (Some(i), Some(args)) => inline_code(i, args).then_some(INLINE_CODE),
                 (Some(_), None) => {
                     args_unreadable += 1;
                     None
                 }
                 _ => None,
             };
+            let detached = p.parent == 1 || !alive.contains(&p.parent);
             Process {
                 pid: p.pid,
                 start: p.start,
                 executable: p.executable,
                 terminal: p.terminal,
-                detached: p.parent == 1 || !alive.contains(&p.parent),
+                detached,
                 interpreter: kind,
                 shape,
+                // Cut as a published rule's evidence is cut where it is kept (`events::keep`).
+                args: args
+                    .filter(|_| detached && shape.is_some())
+                    .map(|a| crate::secrets::Args::raw(&a).store()),
+                around: p.around,
             }
         })
         .collect();
@@ -475,10 +510,7 @@ pub fn take(
         else {
             continue;
         };
-        let inside = crate::guarded::folder_of(Path::new(path), w.home).or_else(|| {
-            crate::guarded::folder_of(Path::new(path), &real_home)
-                .map(|g| w.home.join(g.strip_prefix(&real_home).unwrap_or(&g)))
-        });
+        let inside = guarded_folder(path, w.home, &real_home);
         if let Some(g) = &inside {
             guarded.insert(g.clone());
         }
@@ -544,7 +576,15 @@ pub fn take(
         // Raised once per process: when it first meets the rule.
         if fires(&after) && !before.as_ref().is_some_and(fires) {
             let file = program(w, path);
-            basis(tx, w, at, DETACHED_INLINE, &file, None, shape, p)?;
+            // A leader's executable is looked at as the process's is.
+            let note = sampled(p, |exe| match guarded_folder(exe, w.home, &real_home) {
+                Some(g) => {
+                    guarded.insert(g);
+                    None
+                }
+                None => signers.of(exe),
+            });
+            basis(tx, w, at, DETACHED_INLINE, &file, None, shape, note)?;
             seen.push(observed(DETACHED_INLINE, file));
         }
     }
@@ -586,8 +626,37 @@ fn observed(kind: &str, file: String) -> Observed {
     }
 }
 
-/// The journal entry a raise rests on: the program, the process's identity and what was
-/// derived or matched.
+/// The folder macOS asks permission for that holds `path`, named under the home folder as HOME
+/// gives it: the kernel names an executable by its real path.
+fn guarded_folder(path: &str, home: &Path, real_home: &Path) -> Option<PathBuf> {
+    crate::guarded::folder_of(Path::new(path), home).or_else(|| {
+        crate::guarded::folder_of(Path::new(path), real_home)
+            .map(|g| home.join(g.strip_prefix(real_home).unwrap_or(&g)))
+    })
+}
+
+/// What the entry `sampled` of a detached interpreter holds: its identity, its command line as
+/// `derive` cut it, its folder, and the leaders of its session and group with who signed them.
+/// Nothing in it is bounded here: the arguments are bounded by the cut, which withholds whole a
+/// command line longer than `secrets::LINE_CAP`, and the paths by the buffers the kernel fills.
+fn sampled(p: &Process, mut signed: impl FnMut(&str) -> Option<String>) -> Value {
+    let mut leader = |l: &Option<Leader>| {
+        l.as_ref().map(|l| {
+            json!({ "pid": l.pid, "executable": l.executable, "signed_by": signed(&l.executable) })
+        })
+    };
+    json!({
+        "pid": p.pid,
+        "start": p.start,
+        "args": p.args,
+        "working_directory": p.around.working_directory,
+        "session_leader": leader(&p.around.session),
+        "process_group_leader": leader(&p.around.group),
+    })
+}
+
+/// The journal entry a raise rests on: the program, what was derived or matched, and in `text`
+/// what the raise keeps of the process, its identity at least.
 #[allow(clippy::too_many_arguments)]
 fn basis(
     tx: &Transaction,
@@ -597,7 +666,7 @@ fn basis(
     file: &str,
     predicate: Option<&str>,
     value: &str,
-    p: &Process,
+    text: Value,
 ) -> rusqlite::Result<()> {
     crate::store::put_entity(tx, file)?;
     tx.execute(
@@ -613,7 +682,7 @@ fn basis(
             file,
             predicate,
             value,
-            json!({ "pid": p.pid, "start": p.start }).to_string()
+            text.to_string()
         ],
     )?;
     Ok(())
@@ -686,7 +755,7 @@ fn match_connections(
                 &file,
                 Some("matches_indicator"),
                 &literal,
-                p,
+                json!({ "pid": p.pid, "start": p.start }),
             )?;
             seen.push(observed(indicators::MATCHED, file));
         } else {
@@ -850,6 +919,12 @@ impl Reading {
         let v: Value = serde_json::from_str(text).map_err(|e| e.to_string())?;
         let int = |v: &Value, k: &str| v[k].as_i64().ok_or(format!("{k} is not a number"));
         let count = |k: &str| v[k].as_u64().unwrap_or_default() as usize;
+        let leader = |l: &Value| {
+            Some(Leader {
+                pid: l["pid"].as_i64()? as i32,
+                executable: l["executable"].as_str()?.to_string(),
+            })
+        };
         let mut processes = Vec::new();
         for p in v["processes"].as_array().ok_or("no processes")? {
             processes.push(Seen {
@@ -864,6 +939,11 @@ impl Reading {
                         .map(|s| s.as_str().unwrap_or_default().to_string())
                         .collect()
                 }),
+                around: Around {
+                    working_directory: p["working_directory"].as_str().map(str::to_string),
+                    session: leader(&p["session_leader"]),
+                    group: leader(&p["group_leader"]),
+                },
             });
         }
         let mut connections = Vec::new();
@@ -1070,6 +1150,40 @@ fn path(pid: i32) -> Option<String> {
     // SAFETY: the buffer is valid for its length.
     let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
     (n > 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+}
+
+/// The folder a process runs in, `pvi_cdir` of `PROC_PIDVNODEPATHINFO`; `None` when it cannot be
+/// read or the kernel gives no path.
+fn working_directory(pid: i32) -> Option<String> {
+    // SAFETY: all-zero is a valid value of this plain C structure.
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let want = size_of::<libc::proc_vnodepathinfo>() as c_int;
+    // SAFETY: `info` is valid for `want` bytes.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            (&mut info as *mut libc::proc_vnodepathinfo).cast(),
+            want,
+        )
+    };
+    let path = c_name(info.pvi_cdir.vip_path.as_flattened());
+    (n == want && !path.is_empty()).then_some(path)
+}
+
+/// The leader of a process's session or group, by the id the kernel gives for it, when it is
+/// another process than launchd and still runs. The kernel gives no new process a pid that a
+/// session or a group still bears (`forkproc` in XNU's `kern_fork.c`), so a process with that
+/// pid is the leader.
+fn leader(pid: i32, id: i32) -> Option<Leader> {
+    if id <= 1 || id == pid {
+        return None;
+    }
+    path(id).map(|executable| Leader {
+        pid: id,
+        executable,
+    })
 }
 
 /// `kern.argmax`: the largest argument area, the buffer `KERN_PROCARGS2` needs.
@@ -1315,13 +1429,28 @@ pub fn read_system(at: i64) -> Reading {
             .as_deref()
             .and_then(|e| e.rsplit('/').next())
             .unwrap_or(&name);
-        let args = if interpreter(file_name).is_some() {
+        let kind = interpreter(file_name);
+        let args = if kind.is_some() {
             arguments(pid, &mut buf).map(|(exec, args)| {
                 executable = where_from(executable.take(), exec);
                 args
             })
         } else {
             None
+        };
+        let given_code = kind
+            .zip(args.as_deref())
+            .is_some_and(|(i, a)| inline_code(i, a));
+        let around = if given_code {
+            // SAFETY: a plain call; it fails with -1 for a process that has ended.
+            let sid = unsafe { libc::getsid(pid) };
+            Around {
+                working_directory: working_directory(pid),
+                session: leader(pid, sid),
+                group: leader(pid, info.pbi_pgid as i32),
+            }
+        } else {
+            Around::default()
         };
         let (connections, failed) = sockets(pid, start);
         r.connections.extend(connections);
@@ -1334,6 +1463,7 @@ pub fn read_system(at: i64) -> Reading {
             name,
             terminal: info.pbi_flags & PROC_FLAG_CONTROLT != 0,
             args,
+            around,
         });
     }
     r
@@ -1410,7 +1540,8 @@ mod tests {
     }
 
     #[test]
-    fn a_detached_process_is_one_whose_parent_is_launchd_or_gone_and_its_command_line_is_dropped() {
+    fn a_detached_process_is_one_whose_parent_is_launchd_or_gone_and_only_its_command_line_is_kept_cut()
+     {
         let seen = |pid, parent, args: &[&str]| Seen {
             pid,
             start: 1,
@@ -1419,6 +1550,7 @@ mod tests {
             name: String::new(),
             terminal: false,
             args: Some(strings(args)),
+            around: Around::default(),
         };
         let mut gone_file = seen(13, 1, &["node", "-e", "x"]);
         gone_file.executable = None;
@@ -1428,7 +1560,7 @@ mod tests {
         let s = derive(Reading {
             at: 0,
             processes: vec![
-                seen(10, 1, &["node", "-e", "x"]),
+                seen(10, 1, &["node", "-e", "x", "--password", "Fake-Pa55word"]),
                 seen(11, 10, &["sh", "-c", "x"]),
                 seen(12, 99, &["sh", "-c", "x"]),
                 gone_file,
@@ -1459,6 +1591,47 @@ mod tests {
             ]
         );
         assert_eq!(s.args_unreadable, 1);
+        // The rule decides from the shape alone; what is kept is the command line of each
+        // process it may fire on, cut, and no other.
+        let kept: Vec<_> = s
+            .processes
+            .iter()
+            .map(|p| (p.pid, p.args.clone()))
+            .collect();
+        let cut = crate::secrets::mark(crate::secrets::FLAG_VALUE, 13);
+        assert_eq!(
+            kept,
+            [
+                (10, Some(strings(&["node", "-e", "x", "--password", &cut]))),
+                (11, None),
+                (12, Some(strings(&["sh", "-c", "x"]))),
+                (13, Some(strings(&["node", "-e", "x"]))),
+                (14, None),
+                (15, None),
+            ]
+        );
+        // A command line longer than the cut reads is kept as marks alone, so what is kept is
+        // bounded by it.
+        let long = "x".repeat(crate::secrets::LINE_CAP);
+        let s = derive(Reading {
+            at: 0,
+            processes: vec![seen(10, 1, &["sh", "-c", &long])],
+            connections: Vec::new(),
+            other_users: vec![1],
+            unreadable: 0,
+            ended: 0,
+            sockets_unreadable: 0,
+            arguments_layout_unknown: false,
+        });
+        let too_long = |n| crate::secrets::mark(crate::secrets::TOO_LONG, n);
+        assert_eq!(
+            s.processes[0].args,
+            Some(vec![
+                too_long(2),
+                too_long(2),
+                too_long(crate::secrets::LINE_CAP)
+            ])
+        );
     }
 
     #[test]
@@ -1638,6 +1811,71 @@ mod tests {
         assert_eq!(left.shape, Some(INLINE_CODE));
         // `/bin/sh` is a stub that starts the shell it is set to be.
         assert_eq!(left.interpreter.map(|i| i.kind), Some("shell"));
+    }
+
+    /// A shell left behind by its parent still names the folder it runs in and the leader of its
+    /// process group, a shell this test starts as a group of its own that is still running. The
+    /// leader itself names no leader: it leads its own group.
+    #[test]
+    fn a_process_its_parent_left_names_its_folder_and_its_group_leader_while_that_one_runs() {
+        use std::io::BufRead;
+        use std::os::unix::process::CommandExt;
+        let dir = std::env::temp_dir().join(format!("immunity-around-{}", std::process::id()));
+        let _removed = crate::common::Scratch::at(dir.clone());
+        std::fs::create_dir_all(&dir).unwrap();
+        let left = "/bin/sh -c '/bin/sh -c \"sleep 30; :\" </dev/null >/dev/null 2>&1 & echo $!'";
+        let mut leader = Command::new("/bin/sh")
+            .args(["-c", &format!("{left}; sleep 30; :")])
+            .current_dir(&dir)
+            .process_group(0)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(leader.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let pid: i32 = line
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("{e}: {line:?}"));
+        let r = reading_where(
+            pid as u32,
+            &strings(&["/bin/sh", "-c", "sleep 30; :"]),
+            String::new,
+        );
+        // SAFETY: a plain signal to the shell this test started.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        leader.kill().unwrap();
+        leader.wait().unwrap();
+        let of = |pid: i32| r.processes.iter().find(|p| p.pid == pid).unwrap();
+        let around = &of(pid).around;
+        let real = std::fs::canonicalize(&dir).unwrap();
+        assert_eq!(around.working_directory.as_deref(), real.to_str());
+        let group = around.group.as_ref().unwrap();
+        assert_eq!(group.pid, leader.id() as i32);
+        assert!(group.executable.starts_with('/'), "{group:?}");
+        assert_eq!(of(group.pid).around.group, None);
+        assert_ne!(around.session.as_ref().map(|l| l.pid), Some(pid));
+    }
+
+    #[test]
+    fn a_leader_is_named_only_when_it_is_another_process_than_launchd_and_runs() {
+        let me = std::process::id() as i32;
+        assert_eq!(leader(me, me), None);
+        assert_eq!(leader(me, 1), None);
+        assert_eq!(leader(me, -1), None);
+        // A pid no process has: the kernel's pids stay below 100,000.
+        assert_eq!(leader(1, 999_999), None);
+        let exe = std::env::current_exe().unwrap();
+        assert_eq!(
+            leader(1, me),
+            Some(Leader {
+                pid: me,
+                executable: exe.to_str().unwrap().to_string()
+            })
+        );
     }
 
     /// A reading of the system in which the process `pid` has the arguments `args`, read again

@@ -376,8 +376,9 @@ fn rule_events(
         .collect())
 }
 
-/// The process the latest sample that raised or found again a finding saw, by its pid and
-/// start, as the journal entry `sampled` keeps them.
+/// The process the latest sample that raised or found again a finding saw, as the journal entry
+/// `sampled` keeps it: its pid and start, its command line, cut again as a published rule's
+/// evidence is (`rule_events`), its folder and its leaders.
 fn detached(conn: &Connection, finding: &str) -> rusqlite::Result<v1::DetachedProcess> {
     let note: Option<String> = conn
         .query_row(
@@ -391,9 +392,23 @@ fn detached(conn: &Connection, finding: &str) -> rusqlite::Result<v1::DetachedPr
     let note: serde_json::Value = note
         .and_then(|n| serde_json::from_str(&n).ok())
         .unwrap_or_default();
+    let args: Vec<String> = serde_json::from_value(note["args"].clone()).unwrap_or_default();
+    let args = Args::stored(&args);
+    let leader = |l: &serde_json::Value| {
+        Some(v1::ProcessLeader {
+            pid: l["pid"].as_i64()?,
+            executable_text: whole(l["executable"].as_str()?),
+            signed_by_text: l["signed_by"].as_str().map(whole),
+        })
+    };
     Ok(v1::DetachedProcess {
         pid: note["pid"].as_i64(),
         start_micros: note["start"].as_i64(),
+        args_text: args.shown(whole),
+        cuts: matches::cuts(&args),
+        working_directory_text: note["working_directory"].as_str().map(whole),
+        session_leader: leader(&note["session_leader"]),
+        process_group_leader: leader(&note["process_group_leader"]),
     })
 }
 
