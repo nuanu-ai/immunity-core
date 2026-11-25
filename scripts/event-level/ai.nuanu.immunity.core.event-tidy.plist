@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- The event level's retention: every ten minutes /bin/sh runs tidy.sh, which deletes log
+<!-- The event level's retention: every ten minutes immunity-log-cleanup, named so
+     that macOS lists the job by that name, runs tidy.sh with /bin/sh. tidy.sh deletes log
      files older than a day, then the oldest while the log is larger than its cap, and keeps
      what eslogger and the scripts print small. The cap is the last argument, in bytes: 2 GiB
      (2147483648) unless the installer was given another with --log-gib, or kept the one of a
@@ -13,7 +14,7 @@
 	<string>ai.nuanu.immunity.core.event-tidy</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/bin/sh</string>
+		<string>/Library/Application Support/ai.nuanu.immunity.core/event-level/immunity-log-cleanup</string>
 		<string>/Library/Application Support/ai.nuanu.immunity.core/event-level/tidy.sh</string>
 		<string>/Library/Application Support/ai.nuanu.immunity.core/event-level/log</string>
 		<string>2147483648</string>
