@@ -288,10 +288,19 @@ pub fn evidence(conn: &Connection, f: &Found) -> rusqlite::Result<Option<v1::evi
                 became_text: became(),
                 files: crate::integrity::files_changed(conn, &f.id)?,
             }),
-            Some("indicator") => Body::IndicatorMatched(v1::IndicatorMatched {
-                indicators_text: became(),
-            }),
-            Some("processes") => Body::DetachedProcess(detached(conn, &f.id)?),
+            Some("indicator") => {
+                let note = f.sampled.as_ref();
+                Body::IndicatorMatched(v1::IndicatorMatched {
+                    indicators_text: became(),
+                    process: note.map(process),
+                    port: note.and_then(|n| u32::try_from(n["port"].as_u64()?).ok()),
+                    // The core's own word, as `processes::sampled` wrote it.
+                    transport: note.and_then(|n| n["transport"].as_str().map(str::to_string)),
+                })
+            }
+            Some("processes") => Body::DetachedProcess(process(
+                f.sampled.as_ref().unwrap_or(&serde_json::Value::Null),
+            )),
             Some("lockfiles") => {
                 Body::VulnerablePackage(match vulnerabilities::kept(conn)?.remove(&f.id) {
                     // What it was about when it was cleared or its package left, and why.
@@ -409,24 +418,9 @@ fn rule_events(
 }
 
 /// The process the latest sample that raised or found again a finding saw, as the journal entry
-/// `sampled` keeps it: its pid and start, its command line, cut again as a published rule's
-/// evidence is (`rule_events`), its folder and its leaders.
-fn detached(conn: &Connection, finding: &str) -> rusqlite::Result<v1::DetachedProcess> {
-    let note: Option<String> = conn
-        .query_row(
-            "SELECT j.text FROM finding_basis b JOIN journal j ON j.seq = b.journal
-             WHERE b.finding = ?1 AND j.entry = 'sampled' AND j.kind = ?2
-             ORDER BY j.seq DESC LIMIT 1",
-            // Only the rule's own entry: a process of the same program that matched an
-            // indicator in the same sample has one too, linked by its subject.
-            rusqlite::params![finding, crate::processes::DETACHED_INLINE],
-            |r| r.get(0),
-        )
-        .optional()?
-        .flatten();
-    let note: serde_json::Value = note
-        .and_then(|n| serde_json::from_str(&n).ok())
-        .unwrap_or_default();
+/// `sampled` keeps it (`Found::sampled`): its pid and start, its command line, cut again as a
+/// published rule's evidence is (`rule_events`), its folder, its parent and its leaders.
+fn process(note: &serde_json::Value) -> v1::DetachedProcess {
     let args: Vec<String> = serde_json::from_value(note["args"].clone()).unwrap_or_default();
     let args = Args::stored(&args);
     let leader = |l: &serde_json::Value| {
@@ -436,7 +430,7 @@ fn detached(conn: &Connection, finding: &str) -> rusqlite::Result<v1::DetachedPr
             signed_by_text: l["signed_by"].as_str().map(whole),
         })
     };
-    Ok(v1::DetachedProcess {
+    v1::DetachedProcess {
         pid: note["pid"].as_i64(),
         start_micros: note["start"].as_i64(),
         args_text: args.shown(whole),
@@ -444,7 +438,8 @@ fn detached(conn: &Connection, finding: &str) -> rusqlite::Result<v1::DetachedPr
         working_directory_text: note["working_directory"].as_str().map(whole),
         session_leader: leader(&note["session_leader"]),
         process_group_leader: leader(&note["process_group_leader"]),
-    })
+        parent: leader(&note["parent"]),
+    }
 }
 
 /// A package a project depends on, from the answers that stand now, as the report reads them

@@ -458,7 +458,8 @@ fn software_changed_in_place_says_what_its_seal_became_and_what_it_was() {
 }
 
 #[test]
-fn an_indicator_match_names_the_indicators_it_matched_as_the_list_gives_them() {
+fn an_indicator_match_of_a_file_names_the_indicators_it_matched_and_no_process_and_keeps_its_advice()
+ {
     let e = Estate::new("indicator");
     let profile = e.home().join(".zshrc");
     e.put(&profile, "export PATH=/opt/x:$PATH\n");
@@ -496,6 +497,19 @@ fn an_indicator_match_names_the_indicators_it_matched_as_the_list_gives_them() {
             "    Matched      [file:hashes.'SHA-256' = '{hash}']\n"
         )),
         "{text}"
+    );
+    // A file is not a process: nothing of a connection is said, and the advice is the file's.
+    let matched = &whole["evidence"]["indicator_matched"];
+    for field in ["process", "port", "transport"] {
+        assert!(matched[field].is_null(), "{field}: {matched}");
+    }
+    assert!(
+        !text.contains("Connection") && !text.contains("Process"),
+        "{text}"
+    );
+    assert_eq!(
+        whole["advice"],
+        "Do not open or run what is named here; find out how it got there, and treat this Mac as affected until you know."
     );
 }
 
