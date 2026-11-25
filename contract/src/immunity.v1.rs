@@ -1988,16 +1988,31 @@ pub struct ChangedPath {
 /// A match of the indicator list.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct IndicatorMatched {
     /// The indicators matched, as STIX comparisons, as the list gives them, such as
     /// `\[ipv4-addr:value = '203.0.113.7'\]`. Absent when the journal entry that holds them is gone.
+    /// Of a file, the latest the file matched. Of a connection, the address `process` was sampled
+    /// for. A finding of one program that holds both gives both, the file's first, joined by
+    /// ` OR ` as a STIX pattern joins observations. Both since 1.32.0.
     #[prost(string, optional, tag = "1")]
     pub indicators_text: ::core::option::Option<::prost::alloc::string::String>,
+    /// For a connection to a listed address that a sample saw, the process that held it, as the
+    /// latest sample that raised the finding read it. Absent for a finding that holds only a match
+    /// of a file. A finding raised before 1.32.0 gives its pid and start alone. Since 1.32.0.
+    #[prost(message, optional, tag = "2")]
+    pub process: ::core::option::Option<DetachedProcess>,
+    /// The remote port of that connection, and its transport, `tcp` or `udp`: of a process's sockets
+    /// to the address, the lowest port, then tcp before udp. Absent when `process` is, when the
+    /// reading did not give them, and for a finding raised before 1.32.0. Since 1.32.0.
+    #[prost(uint32, optional, tag = "3")]
+    pub port: ::core::option::Option<u32>,
+    #[prost(string, optional, tag = "4")]
+    pub transport: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// A process a sample saw, as the latest entry `sampled` names it, read when the sample raised the
 /// finding, so it holds after the process has ended. Its program is the finding's `about_text`.
-/// Its environment is never kept.
+/// Its environment is never kept. It also gives the process of `IndicatorMatched`.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2011,24 +2026,32 @@ pub struct DetachedProcess {
     /// Its arguments, the first included, each in its own string and whole but for what `cuts`
     /// lists, as `ProgramStart.args_text` and `ProgramStart.cuts` give a program start's. Empty
     /// when the entry does not hold them, as one written before 1.29.0: the rule fires only on a
-    /// process whose arguments were read. Since 1.29.0.
+    /// process whose arguments were read. For a connection, empty too when the program is not an
+    /// interpreter, whose arguments a sample does not read, or they could not be read. Since 1.29.0.
     #[prost(string, repeated, tag = "3")]
     pub args_text: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     #[prost(message, repeated, tag = "4")]
     pub cuts: ::prost::alloc::vec::Vec<Cut>,
-    /// The folder it ran in, as the kernel gave it. Absent when it could not be read. Since 1.29.0.
+    /// The folder it ran in, as the kernel gave it. Absent when it could not be read, and for a
+    /// connection when the sample did not read it: it is read only for an interpreter given code.
+    /// Since 1.29.0.
     #[prost(string, optional, tag = "5")]
     pub working_directory_text: ::core::option::Option<::prost::alloc::string::String>,
     /// The leaders of its session and of its process group, what it belongs to once its parent is
-    /// gone. Each is absent when the leader is the process itself, launchd, or no longer running.
-    /// Since 1.29.0.
+    /// gone. Each is absent when the leader is the process itself, launchd, or no longer running,
+    /// and for a connection when the sample did not read it, as for the folder. Since 1.29.0.
     #[prost(message, optional, tag = "6")]
     pub session_leader: ::core::option::Option<ProcessLeader>,
     #[prost(message, optional, tag = "7")]
     pub process_group_leader: ::core::option::Option<ProcessLeader>,
+    /// Its parent, for a connection: another process of this user that was running in the same
+    /// sample. Absent when the parent had ended, is launchd or another user's, and always for the
+    /// detached rule, whose parent is gone by its definition. Since 1.32.0.
+    #[prost(message, optional, tag = "8")]
+    pub parent: ::core::option::Option<ProcessLeader>,
 }
-/// A process that leads the session or the process group of another, as a sample saw it. Since
-/// 1.29.0.
+/// A process tied to another, as a sample saw it: the leader of its session or its process group,
+/// or its parent. Since 1.29.0.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -3429,7 +3452,10 @@ pub struct EventLevel {
     pub unreadable_lines: ::core::option::Option<Span>,
     #[prost(message, optional, tag = "9")]
     pub other_messages: ::core::option::Option<Span>,
-    /// Log files deleted by the cap, and deleted before they were read.
+    /// Log files deleted by the cap, and deleted before they were read. A file the cap deleted
+    /// after it was read to its end is no loss: every program start in it was judged, and only
+    /// `immunity matches` and a verdict can no longer read it again. One it deleted before that is
+    /// counted in `files_removed_unread` too, and that is the loss.
     #[prost(message, optional, tag = "10")]
     pub files_removed_by_cap: ::core::option::Option<Span>,
     #[prost(message, optional, tag = "11")]
@@ -3628,7 +3654,7 @@ pub struct Uncovered {
     /// A fault: something the core has reason to expect to work on this Mac now and that does not,
     /// such as a file read here before that cannot be read now, or a download that failed. False for
     /// a limit, such as a file never read on this Mac. A cause is listed twice when it is both, each
-    /// item holding only its own things. Since 1.32.0.
+    /// item holding only its own things. Since 1.33.0.
     #[prost(bool, tag = "15")]
     pub fault: bool,
 }
@@ -4356,7 +4382,7 @@ pub enum HeadlineBecause {
     /// `this_mac.state` is `watched_in_part`.
     #[serde(rename = "this_mac")]
     ThisMac = 2,
-    /// Not given since 1.32.0: a reading that failed or a machine not reached is a fault only by the
+    /// Not given since 1.33.0: a reading that failed or a machine not reached is a fault only by the
     /// rule of `Uncovered.fault`, and is said by `not_covered`.
     #[serde(rename = "coverage")]
     Coverage = 3,
@@ -4586,9 +4612,11 @@ pub enum ThisMacState {
     /// failed that `not_covered` holds with `fault`, such as a file read here before; or the event
     /// level is installed and records no program start (refused, failing or silent); or it runs and
     /// lost part of what it was to record in a reading since the latest finished full check, or at
-    /// any time when none has finished; or it could not read some lines over the last day, a failed
-    /// reading. `not_covered`, or the counts `since_check` of `event_level`, say which. A reading
-    /// that failed and is a limit, such as of a file never read here, leaves it `watched`.
+    /// any time when none has finished: starts or file events missing from the numbering, a
+    /// restart, lines it could not read, a log file deleted before it was read. A log file the cap
+    /// deleted after it was read is no loss. `not_covered`, or the counts `since_check` of
+    /// `event_level`, say which. A reading that failed and is a limit, such as of a file never read
+    /// here, leaves it `watched`.
     #[serde(rename = "watched_in_part")]
     WatchedInPart = 3,
 }

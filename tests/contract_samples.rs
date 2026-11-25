@@ -183,7 +183,8 @@ fn padding_with_a_secret(seq: u64) -> String {
 }
 
 /// One reading of this user's processes at `at`: a detached `node` given code on its command
-/// line, its start in microseconds since the epoch as a real reading gives it.
+/// line, its start in microseconds since the epoch as a real reading gives it, and a `node` an
+/// application started connected to a listed address.
 fn processes(at: i64, start: i64) -> Value {
     json!({
         "at": at,
@@ -196,8 +197,12 @@ fn processes(at: i64, start: i64) -> Value {
              "working_directory": "/Users/example/dev/tool",
              "group_leader": {"pid": 500,
                               "executable": "/Applications/Tool.app/Contents/MacOS/Tool"}},
+            {"pid": 4300, "start": start, "parent": 500, "executable": "/opt/tools/bin/node",
+             "name": "node", "terminal": false, "args": ["node", "server.js"]},
         ],
-        "connections": [], "other_users": [], "unreadable": 0, "ended": 0,
+        "connections": [{"pid": 4300, "start": start, "transport": "tcp",
+                         "address": "203.0.113.7", "port": 443}],
+        "other_users": [], "unreadable": 0, "ended": 0,
         "sockets_unreadable": 0,
     })
 }
@@ -338,8 +343,9 @@ fn a_client_reads_real_answers_of_every_kind_of_evidence_with_values_of_real_siz
     let digest = digest.split(' ').next().unwrap();
     mac.put(
         "indicators.json",
-        &json!([{"kind": "file:hashes.'SHA-256'", "value": digest, "note_text": "invented"}])
-            .to_string(),
+        &json!([{"kind": "file:hashes.'SHA-256'", "value": digest, "note_text": "invented"},
+                {"kind": "ipv4-addr:value", "value": "203.0.113.7"}])
+        .to_string(),
     );
     mac.append("system/opt/homebrew/Cellar/tool/1.0/bin/tool", "steal\n");
     mac.append(&log, &padding_with_a_secret(2));
@@ -415,12 +421,13 @@ fn a_client_reads_real_answers_of_every_kind_of_evidence_with_values_of_real_siz
         .unwrap()
     {
         let one = mac.json(&["finding", f["finding"]["id"].as_str().unwrap()]);
-        // Of a kind, the first, or one that holds the events a rule matched over one that holds
-        // none.
+        // Of a kind, the first, or one that holds the events a rule matched, or the process of
+        // a connection, over one that holds none.
         let events = |v: &Value| {
             v["evidence"]["published_rule_matched"]["events"]
                 .as_array()
                 .is_some_and(|e| !e.is_empty())
+                || v["evidence"]["indicator_matched"]["process"].is_object()
         };
         let name = format!("finding-{}.json", kind(&one));
         if answers

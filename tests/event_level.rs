@@ -1871,8 +1871,8 @@ fn whole_lines_are_read_once_through_rotation_and_deletion_and_losses_are_counte
         [2, 2, 1],
         "{l:#}"
     );
-    // A line this reader could not read is its own failure.
-    assert!(coverage_of(&r).unwrap().starts_with("failed|"));
+    // The log was read: a line in it that is no message is not given, as a loss is.
+    assert!(coverage_of(&r).unwrap().starts_with("not_given|"));
     // One short state, then each caveat as a sentence of its own, in words a person knows
     // without knowing what eslogger is; a restart is a moment not seen, said once. These lines
     // are an earlier collector's, and that is said last.
@@ -1895,11 +1895,10 @@ fn whole_lines_are_read_once_through_rotation_and_deletion_and_losses_are_counte
 }
 
 #[test]
-fn hours_the_root_side_deleted_early_or_before_they_were_read_are_partial_coverage_once() {
-    // The log is the only place a day of program starts is kept. The size cap deleting an
-    // hour before its day was over, or any deletion of an hour this reader had not read to
-    // its end, leaves the day with a hole; the reader learns of it from the root side's notes,
-    // and counts each note once.
+fn hours_the_root_side_deleted_before_they_were_read_are_partial_coverage_once() {
+    // The log is the only place a day of program starts is kept. A deletion of an hour this
+    // reader had not read to its end, by the cap or by age, leaves the day with a hole; the
+    // reader learns of it from the root side's notes, and counts each note once.
     let dir = Dir::new("removed");
     dir.install();
     let (h0, h1, h2) = (
@@ -1942,7 +1941,7 @@ fn hours_the_root_side_deleted_early_or_before_they_were_read_are_partial_covera
     );
     assert_eq!(
         coverage_of(&r).unwrap(),
-        "not_given|over the last day, program starts missing from the numbering: 1; log files deleted to stay under the size cap before their day was over: 1; log files deleted before this reader read them to their end: 2"
+        "not_given|over the last day, program starts missing from the numbering: 1; log files deleted before this reader read them to their end: 2"
     );
     assert_eq!(
         dir.words(),
@@ -3126,7 +3125,7 @@ fn a_file_created_or_renamed_reaches_the_disk_as_its_paths_and_its_program_and_n
     );
     assert_eq!(
         files_coverage_of(&r).unwrap(),
-        "failed|over the last day, file events that could not be made out: 5"
+        "not_given|over the last day, file events that could not be made out: 5"
     );
     assert_eq!(coverage_of(&r), None);
 }
@@ -3566,7 +3565,7 @@ fn file_events_lost_or_unreadable_judge_files_in_part_and_leave_program_starts_w
     );
     assert_eq!(
         files_coverage_of(&r).unwrap(),
-        "failed|over the last day, file events missing from the numbering: 2; file events that could not be made out: 1"
+        "not_given|over the last day, file events missing from the numbering: 2; file events that could not be made out: 1"
     );
     assert_eq!(coverage_of(&r), None);
     let rules = &r["rules"];
@@ -4943,7 +4942,8 @@ fn a_collector_that_lost_part_of_what_it_was_to_record_leaves_this_mac_watched_i
             None,
             ("watched_in_part", "part"),
         ),
-        // A file of the log deleted by the cap, and one deleted before it was read.
+        // A file of the log the cap deleted before it was read, and one deleted by age before
+        // it was read.
         (
             "cap",
             exec(1) + &exec(2),
@@ -5006,17 +5006,134 @@ fn a_collector_that_lost_part_of_what_it_was_to_record_leaves_this_mac_watched_i
     dir.uninstall();
     dir.run_apart();
     assert_eq!(dir.status()["this_mac"]["state"], "watched");
-    // Lines it could not read are a failed reading: they hold this Mac in part for the day,
-    // through a later check, and the text says program starts are why.
+}
+
+/// The status after a full check read a file of the log to its end, the cap deleted that file
+/// with a note of its size `unread` bytes off what was read, and a later full check read the
+/// next.
+fn capped(tag: &str, unread: i64) -> Value {
+    let dir = Dir::new(tag);
+    dir.install();
+    let (h0, h1) = ("exec-20261004T00.jsonl", "exec-20261004T01.jsonl");
+    dir.append(h0, &(exec(1) + &exec(2)));
+    dir.run();
+    let read = std::fs::metadata(dir.log().join(h0)).unwrap().len() as i64;
+    std::fs::remove_file(dir.log().join(h0)).unwrap();
+    let note = format!("{} {h0} {} cap\n", now_secs() + 1, read + unread);
+    std::fs::write(dir.log().join("removed"), note).unwrap();
+    dir.append(h1, &exec(3));
+    dir.run_apart();
+    dir.status()
+}
+
+/// The state of this Mac, what the rules judged, the coverage of program starts, and files the
+/// cap deleted and files deleted unread since the latest check.
+fn cap_judged(r: &Value) -> (&str, &str, Option<String>, Vec<i64>) {
+    (
+        r["this_mac"]["state"].as_str().unwrap(),
+        r["rules"]["judged"].as_str().unwrap(),
+        coverage_of(r),
+        since_check(
+            &r["event_level"],
+            &["files_removed_by_cap", "files_removed_unread"],
+        ),
+    )
+}
+
+#[test]
+fn a_log_file_the_cap_deleted_after_it_was_read_is_no_loss() {
+    // Every program start in it was judged: its deletion only shortens what can be read again,
+    // so the Mac stays watched whole and the count of the cap's deletions is still given.
+    let r = capped("cap-read", 0);
+    assert_eq!(
+        cap_judged(&r),
+        ("watched", "all", None, vec![1, 0]),
+        "{r:#}"
+    );
+}
+
+#[test]
+fn a_log_file_the_cap_deleted_before_it_was_read_to_its_end_is_a_loss() {
+    // No false calm: lines the reader never reached were judged by no rule, so the Mac is
+    // watched in part though a full check began after the deletion was read. A file shorter
+    // than where the reader left it is not the one it read, and is a loss the same way.
+    for (tag, unread) in [("cap-unread", 1), ("cap-shorter", -1)] {
+        let r = capped(tag, unread);
+        assert_eq!(
+            cap_judged(&r),
+            (
+                "watched_in_part",
+                "part",
+                Some(
+                    "not_given|over the last day, log files deleted before this reader read them to their end: 1"
+                        .into()
+                ),
+                vec![1, 1]
+            ),
+            "{tag}: {r:#}"
+        );
+    }
+}
+
+/// The state of this Mac, what the rules judged, and unreadable lines since the latest check
+/// and over the last day.
+fn unreadable_judged(dir: &Dir) -> (String, String, Value) {
+    let r = dir.status();
+    (
+        r["this_mac"]["state"].as_str().unwrap().to_string(),
+        r["rules"]["judged"].as_str().unwrap().to_string(),
+        r["event_level"]["unreadable_lines"].clone(),
+    )
+}
+
+#[test]
+fn an_unreadable_line_stops_keeping_this_mac_in_part_once_a_check_that_began_after_it_finished() {
+    // As every other loss: the check that read it holds this Mac in part, and the next one,
+    // which read again what the unseen start could have left, lets it go. The day still says it.
     let dir = Dir::new("unreadable-then-checked");
     dir.install();
-    dir.append(h, &(exec(1) + "not a message\n" + &exec(2)));
+    dir.append(
+        "exec-20261004T00.jsonl",
+        &(exec(1) + "not a message\n" + &exec(2)),
+    );
     dir.run();
+    assert_eq!(
+        unreadable_judged(&dir),
+        (
+            "watched_in_part".to_string(),
+            "part".to_string(),
+            json!({ "since_check": 1, "last_day": 1 })
+        )
+    );
     dir.run_apart();
-    assert_eq!(dir.status()["this_mac"]["state"], "watched_in_part");
-    let text = dir.immunity(&["status"]);
-    assert!(
-        text.contains("\n  ! 1 line of the event log could not be read in the last day\n"),
-        "{text}"
+    assert_eq!(
+        unreadable_judged(&dir),
+        (
+            "watched".to_string(),
+            "part".to_string(),
+            json!({ "since_check": 0, "last_day": 1 })
+        )
+    );
+}
+
+#[test]
+fn an_unreadable_line_after_the_latest_check_keeps_this_mac_in_part() {
+    // No false calm: a line read after a check that found the log whole is a loss since the
+    // latest check, whatever the check before it said.
+    let dir = Dir::new("unreadable-after-check");
+    dir.install();
+    let h = "exec-20261004T00.jsonl";
+    dir.append(h, &(exec(1) + &exec(2)));
+    dir.run();
+    assert_eq!(unreadable_judged(&dir).0, "watched");
+    dir.append(h, &("not a message\n".to_string() + &exec(3)));
+    dir.run_apart();
+    assert_eq!(
+        unreadable_judged(&dir),
+        (
+            "watched_in_part".to_string(),
+            "part".to_string(),
+            json!({ "since_check": 1, "last_day": 1 })
+        )
     );
 }

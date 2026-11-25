@@ -166,7 +166,7 @@ enum HeadlineBecause {
   HEADLINE_BECAUSE_WATCHER = 1;
   // `this_mac.state` is `watched_in_part`.
   HEADLINE_BECAUSE_THIS_MAC = 2;
-  // Not given since 1.32.0: a reading that failed or a machine not reached is a fault only by the
+  // Not given since 1.33.0: a reading that failed or a machine not reached is a fault only by the
   // rule of `Uncovered.fault`, and is said by `not_covered`.
   HEADLINE_BECAUSE_COVERAGE = 3;
   // An item of `not_covered` has `fault`.
@@ -359,9 +359,11 @@ enum ThisMacState {
   // failed that `not_covered` holds with `fault`, such as a file read here before; or the event
   // level is installed and records no program start (refused, failing or silent); or it runs and
   // lost part of what it was to record in a reading since the latest finished full check, or at
-  // any time when none has finished; or it could not read some lines over the last day, a failed
-  // reading. `not_covered`, or the counts `since_check` of `event_level`, say which. A reading
-  // that failed and is a limit, such as of a file never read here, leaves it `watched`.
+  // any time when none has finished: starts or file events missing from the numbering, a
+  // restart, lines it could not read, a log file deleted before it was read. A log file the cap
+  // deleted after it was read is no loss. `not_covered`, or the counts `since_check` of
+  // `event_level`, say which. A reading that failed and is a limit, such as of a file never read
+  // here, leaves it `watched`.
   THIS_MAC_STATE_WATCHED_IN_PART = 3;
 }
 
@@ -394,7 +396,10 @@ message EventLevel {
   // Lines that are not a message, and lines of other messages.
   Span unreadable_lines = 8;
   Span other_messages = 9;
-  // Log files deleted by the cap, and deleted before they were read.
+  // Log files deleted by the cap, and deleted before they were read. A file the cap deleted
+  // after it was read to its end is no loss: every program start in it was judged, and only
+  // `immunity matches` and a verdict can no longer read it again. One it deleted before that is
+  // counted in `files_removed_unread` too, and that is the loss.
   Span files_removed_by_cap = 10;
   Span files_removed_unread = 11;
   // The message version of the latest program start read.
@@ -523,7 +528,7 @@ message Uncovered {
   // A fault: something the core has reason to expect to work on this Mac now and that does not,
   // such as a file read here before that cannot be read now, or a download that failed. False for
   // a limit, such as a file never read on this Mac. A cause is listed twice when it is both, each
-  // item holding only its own things. Since 1.32.0.
+  // item holding only its own things. Since 1.33.0.
   bool fault = 15;
 }
 

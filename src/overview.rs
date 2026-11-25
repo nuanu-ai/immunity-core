@@ -603,23 +603,11 @@ fn event_faults(l: &v1::EventLevel, said_by_cause: bool) -> Vec<Fault> {
             ),
         ),
     ];
-    let mut out: Vec<Fault> = losses
+    losses
         .into_iter()
         .filter(|(n, _)| *n > 0)
         .map(|(_, said)| Fault::new(said).run("immunity run"))
-        .collect();
-    // Lines it could not read are a failed reading, which holds this Mac in part for the day.
-    if unreadable.since_check == 0 && unreadable.last_day > 0 {
-        out.push(Fault::new(format!(
-            "{} in the last day",
-            count(
-                unreadable.last_day,
-                "line of the event log could not be read",
-                "lines of the event log could not be read"
-            )
-        )));
-    }
-    out
+        .collect()
 }
 
 /// A cause that is a fault, as a line: what could not be read, by name, for one of this Mac or
@@ -950,10 +938,8 @@ pub(crate) fn answer(
         )
     };
     // In part never shows a bare ✓: a fault line says what was not read in full, or this one does
-    // where none says it and the message does not show that only a limit the design accepts
-    // holds it.
-    if said.starts_with('✓') && headline == Ok(H::InPart) && faults.is_empty() && !accepted_limit(s)
-    {
+    // where none says it. A limit never holds it in part (`fault.rs`).
+    if said.starts_with('✓') && headline == Ok(H::InPart) && faults.is_empty() {
         faults.push(Fault::new("Something was not read in full").run("immunity status --coverage"));
     }
     // A watcher watching live says so under a headline that says what was found.
@@ -987,20 +973,6 @@ pub(crate) fn answer(
         out.extend(fault_lines(screen, 2, f));
     }
     out
-}
-
-/// That the message shows an answer held in part only by the limit the design accepts, decided
-/// over every reason it gives: there is one, and each is `this_mac` held by log files of the
-/// event level the size cap deleted since the check, the cap itself read. A reason of any other
-/// kind, or one this build does not know, is never explained by it. A file deleted unread is a
-/// fault line of its own, and so is a reading that failed and holds this Mac in part as a fault,
-/// so neither reaches here.
-fn accepted_limit(s: &v1::Status) -> bool {
-    let capped = s.event_level.as_ref().is_some_and(|l| {
-        l.files_removed_by_cap.is_some_and(|c| c.since_check > 0) && l.log_cap_reason_text.is_none()
-    });
-    let explained = |b: &i32| *b == v1::HeadlineBecause::ThisMac as i32 && capped;
-    !s.headline_because.is_empty() && s.headline_because.iter().all(explained)
 }
 
 /// What needs a look, by rule as the message orders them, each on two lines: its level and what
@@ -3749,61 +3721,32 @@ mod tests {
     }
 
     #[test]
-    fn an_answer_held_in_part_only_by_the_limit_the_design_accepts_prints_no_line_and_a_gap_beside_it_prints_it()
+    fn an_answer_in_part_with_no_fault_line_says_something_was_not_read_in_full_and_a_fault_says_itself()
      {
+        // No limit holds an answer in part, so every reason with no line of its own, a reason
+        // this build does not know among them, is said by the one line; a fault says itself.
         use v1::HeadlineBecause as B;
         let line =
             vec!["! Something was not read in full   immunity status --coverage".to_string()];
-        // In part, with log files the cap deleted, the cap's own reading failed, and the reasons
-        // the message gives.
-        let status = |cap: bool, cap_failed: bool, because: &[i32]| {
+        let status = |because: &[i32]| {
             let mut s = calm_status();
             s.headline = v1::Headline::InPart as i32;
             s.headline_because = because.to_vec();
-            s.event_level = Some(v1::EventLevel {
-                state: v1::CollectorState::Running as i32,
-                files_removed_by_cap: cap.then_some(v1::Span {
-                    since_check: 3,
-                    last_day: 3,
-                }),
-                log_cap_reason_text: cap_failed.then(|| "Permission denied".to_string()),
-                ..Default::default()
-            });
             s
         };
         let (m, w) = (B::ThisMac as i32, B::Watcher as i32);
-        let none: Vec<String> = Vec::new();
-        for (case, s, expected) in [
-            ("the cap alone", status(true, false, &[m]), &none),
-            (
-                "the cap, a reason repeated",
-                status(true, false, &[m, m]),
-                &none,
-            ),
-            ("the cap not read", status(true, true, &[m]), &line),
-            (
-                "the cap, an unknown reason",
-                status(true, false, &[m, 99]),
-                &line,
-            ),
-            (
-                "the cap, another reason",
-                status(true, false, &[m, w]),
-                &line,
-            ),
-            (
-                "a reason the cap does not explain",
-                status(false, false, &[m]),
-                &line,
-            ),
-            ("no reason", status(true, false, &[]), &line),
+        for (case, s) in [
+            ("this Mac", status(&[m])),
+            ("a reason repeated", status(&[m, m])),
+            ("an unknown reason", status(&[m, 99])),
+            ("another reason", status(&[m, w])),
+            ("no reason", status(&[])),
         ] {
             let text = super::status(&s, &Screen::pipe(), false);
             assert!(text.starts_with("✓ Nothing needs a look"), "{case}\n{text}");
-            assert_eq!(&fault_lines_of(&text), expected, "{case}\n{text}");
+            assert_eq!(fault_lines_of(&text), line, "{case}\n{text}");
         }
-        // A reading that is a fault beside the cap is said by its own line.
-        let mut s = status(true, false, &[m, B::NotCovered as i32]);
+        let mut s = status(&[m, B::NotCovered as i32]);
         s.not_covered.push(v1::Uncovered {
             scope: "this_mac".to_string(),
             ..uncovered(
@@ -3817,18 +3760,6 @@ mod tests {
         assert_eq!(
             fault_lines_of(&super::status(&s, &Screen::pipe(), false)),
             ["! Could not read: ~/a"]
-        );
-        // Files the cap deleted in the last day but none since the check explain nothing now.
-        let mut s = status(true, false, &[m]);
-        if let Some(l) = s.event_level.as_mut() {
-            l.files_removed_by_cap = Some(v1::Span {
-                since_check: 0,
-                last_day: 3,
-            });
-        }
-        assert_eq!(
-            &fault_lines_of(&super::status(&s, &Screen::pipe(), false)),
-            &line
         );
     }
 
@@ -3992,9 +3923,9 @@ mod tests {
                 ),
             ]
         );
-        // Lines it could not read in the last day only, before the latest check: no command
-        // ends them. Losses over the last day before the check, files the cap deleted once they
-        // were read, and file events not collected say nothing.
+        // Losses of the last day that a finished check has covered, a line that could not be
+        // read among them, files the cap deleted once they were read, and file events not
+        // collected say nothing.
         s.event_level = Some(v1::EventLevel {
             lost: span(0, 9),
             unreadable_lines: span(0, 1),
@@ -4006,9 +3937,16 @@ mod tests {
             }),
             ..running
         });
+        assert!(faults_in(&s).is_empty(), "{:?}", faults_in(&s));
+        // The same line read since the latest check is said, with what ends it.
+        if let Some(l) = s.event_level.as_mut() {
+            l.unreadable_lines = span(1, 1);
+        }
         assert_eq!(
             faults_in(&s),
-            ["! 1 line of the event log could not be read in the last day"]
+            [format!(
+                "! 1 line of the event log could not be read since the latest check{run}"
+            )]
         );
     }
 

@@ -753,8 +753,8 @@ pub fn state(conn: &Connection, home: &Path, now: i64) -> Res<State> {
     // Mac after the loss was read has finished, which read again what the unseen moment could
     // have left; the day's caveats and `rules.judged` still say the loss. Such coverage names
     // the cause `not_given`, which the test of a failed reading does not count, so it is said
-    // here. Lines it could not read are a failed reading, which holds it for the day. Not
-    // installed is a limit the person can lift, and `not_covered` says it.
+    // here. A log file the cap deleted after it was read is no loss. Not installed is a limit
+    // the person can lift, and `not_covered` says it.
     if this_mac.state == "watched"
         && (events_failed.is_some()
             || full_check_failed

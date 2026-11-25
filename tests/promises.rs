@@ -10166,7 +10166,7 @@ fn a_status_whose_last_check_is_old_is_not_fresh_says_why_and_is_never_calm() {
         "{r:#}"
     );
     assert_eq!(r["this_mac"]["fresh_for_seconds"], 7200);
-    rewrite_journal(
+    common::rewrite_journal(
         &w.store(),
         "UPDATE journal SET at = at - 3 * 3600 WHERE entry IN ('run_started', 'run_finished')",
     );
@@ -10189,7 +10189,7 @@ fn a_status_whose_last_check_is_old_is_not_fresh_says_why_and_is_never_calm() {
     );
     assert!(!text.contains('✓'), "{text}");
     // A check dated ahead of this Mac's clock has no age, and is not fresh either.
-    rewrite_journal(
+    common::rewrite_journal(
         &w.store(),
         "UPDATE journal SET at = at + 3 * 3600 + 86400
          WHERE entry IN ('run_started', 'run_finished')",
@@ -10399,7 +10399,7 @@ fn unknown_is_never_given_as_zero_or_full() {
         .arg(fresh.0.join("absent"))
         .arg("--servers-input")
         .arg(fresh.0.join("absent")));
-    rewrite_journal(
+    common::rewrite_journal(
         &fresh.store(),
         "DELETE FROM journal WHERE entry IN ('run_finished', 'report')",
     );
@@ -10407,30 +10407,6 @@ fn unknown_is_never_given_as_zero_or_full() {
     assert!(r["last_run"]["finished_at"].is_null(), "{r}");
     for section in ["last_finished_run", "estate", "watched", "threats"] {
         assert!(r[section].is_null(), "{section}");
-    }
-}
-
-/// Changes the journal, which only grows, as time or a crash would: its two triggers are taken
-/// out for the change and put back exactly as they were, so the store keeps the schema of its
-/// format.
-fn rewrite_journal(store: &Path, sql: &str) {
-    let conn = Connection::open(store).unwrap();
-    let triggers: Vec<(String, String)> = conn
-        .prepare(
-            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'journal'",
-        )
-        .unwrap()
-        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .collect::<Result<_, _>>()
-        .unwrap();
-    assert_eq!(triggers.len(), 2, "{triggers:?}");
-    for (name, _) in &triggers {
-        conn.execute_batch(&format!("DROP TRIGGER {name}")).unwrap();
-    }
-    conn.execute_batch(sql).unwrap();
-    for (_, made) in &triggers {
-        conn.execute_batch(made).unwrap();
     }
 }
 
