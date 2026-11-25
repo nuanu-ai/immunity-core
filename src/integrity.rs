@@ -44,7 +44,6 @@ use std::io::ErrorKind;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -57,8 +56,6 @@ pub const APP_SUPPORT: &str =
     "code kept by applications not signed by Apple under ~/Library/Application Support";
 /// The raw copy: one line per thing with its path and facts, never content.
 pub const RAW: &str = "integrity.txt";
-/// The system's own tool for property lists, run by its absolute path.
-pub const PLUTIL: &str = "/usr/bin/plutil";
 /// Where Homebrew installs, Apple Silicon first, as paths from `/`.
 const PREFIXES: [&str; 2] = ["opt/homebrew", "usr/local"];
 /// Where Homebrew keeps kegs under a prefix.
@@ -559,18 +556,32 @@ fn same_place(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// One value of a property list, asked of the system's tool, or `None` when it has none.
-fn plist_value(plist: &Path, key: &str) -> Option<String> {
-    let out = Command::new(PLUTIL)
-        .args(["-extract", key, "raw", "-o", "-"])
-        .arg(plist)
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    let text = String::from_utf8(out.stdout).ok()?;
-    let text = text.strip_suffix('\n').unwrap_or(&text);
-    out.status.success().then(|| text.to_string())
+/// The keys of a bundle's `Info.plist` read: its identifier, short version and build.
+const INFO_KEYS: [&str; 3] = [
+    "CFBundleIdentifier",
+    "CFBundleShortVersionString",
+    "CFBundleVersion",
+];
+
+/// A bundle's identifier, short version and build, each where its `Info.plist` holds a string
+/// or a number there; all `None` when the bundle has no `Info.plist`. Its `Contents` is not
+/// followed when it is a link, as no link inside a place is. One that is there and cannot be
+/// read or is not a property list is the error, with why.
+fn info(bundle: &Path) -> Result<[Option<String>; 3], String> {
+    let contents = bundle.join("Contents");
+    if std::fs::symlink_metadata(&contents).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err("its Contents is a symbolic link, which is not followed".to_string());
+    }
+    let texts = crate::plist::texts_at(&contents.join("Info.plist"), &INFO_KEYS)
+        .map_err(|why| format!("its Info.plist: {why}"))?;
+    Ok(INFO_KEYS.map(|key| {
+        texts.iter().flatten().find_map(|(k, text)| match text {
+            crate::plist::Text::One(s) | crate::plist::Text::Number(s) if *k == key => {
+                Some(s.clone())
+            }
+            _ => None,
+        })
+    }))
 }
 
 /// The version as a bundle gives it: the short version, and the build in brackets when it
@@ -774,17 +785,20 @@ fn bundles(conn: &Connection, roots: &Roots, machine: &str) -> rusqlite::Result<
                 continue;
             }
         };
-        let plist = f.path.join("Contents/Info.plist");
+        let [identifier, short, build] = match info(&f.path) {
+            Ok(info) => info,
+            Err(why) => {
+                kind.failed(f.shown, why);
+                continue;
+            }
+        };
         let folder = f.path.file_name().unwrap_or_default().to_string_lossy();
-        let name = plist_value(&plist, "CFBundleIdentifier").unwrap_or_else(|| folder.to_string());
+        let name = identifier.unwrap_or_else(|| folder.to_string());
         if !names.insert(name.clone()) {
             kind.not_recorded(f.shown, Said::SameName, String::new());
             continue;
         }
-        let version = bundle_version(
-            plist_value(&plist, "CFBundleShortVersionString"),
-            plist_value(&plist, "CFBundleVersion"),
-        );
+        let version = bundle_version(short, build);
         let subject = format!("component:{machine}/macos-app/{name}");
         let before = previous(conn, &subject)?;
         // The Info.plist is in the digest: a new version is a new digest.
@@ -1756,6 +1770,166 @@ mod tests {
         assert_eq!(super::PART, 21_504);
         assert_eq!(c.changed.entries.len(), 457);
         assert_eq!(c.changed.entries[456].path, paths[456]);
+    }
+
+    /// An `Info.plist` of an invented app with these three values, each an XML element.
+    fn info_plist(identifier: &str, short: &str, build: &str) -> String {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\n<key>CFBundleIdentifier</key>{identifier}\n<key>CFBundleExecutable</key><string>Tiny</string>\n<key>CFBundleShortVersionString</key>{short}\n<key>CFBundleVersion</key>{build}\n</dict></plist>\n"
+        )
+    }
+
+    /// What `bundles` makes of apps under `/Applications` of a new system root, each a name and
+    /// what to put at its `Contents/Info.plist`: each app's id and version, and each one not
+    /// read with why. It runs on a thread of its own, so that a reading that waits fails the
+    /// test after ten seconds.
+    #[allow(clippy::type_complexity)]
+    fn read_apps(
+        apps: Vec<(&'static str, Box<dyn FnOnce(&Path) + Send>)>,
+    ) -> (Vec<(String, Option<String>)>, Vec<(String, String)>) {
+        let dir = crate::common::Scratch::new("integrity-info");
+        let (home, system) = (dir.join("home"), dir.join("system"));
+        for (app, put) in apps {
+            let contents = system.join("Applications").join(app).join("Contents");
+            std::fs::create_dir_all(&contents).unwrap();
+            put(&contents.join("Info.plist"));
+        }
+        std::fs::create_dir_all(&home).unwrap();
+        let store = dir.join("store.db");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let Ok(conn) = crate::store::open_or_make(&store) else {
+                panic!()
+            };
+            let roots = super::Roots {
+                home: &home,
+                system: &system,
+                store: &store,
+            };
+            let kind = super::bundles(&conn, &roots, "machine:mac").unwrap();
+            let read = kind.things.iter().map(|t| {
+                let version = t.facts.iter().find(|(p, _)| *p == "has_version");
+                (t.subject.clone(), version.map(|(_, v)| v.clone()))
+            });
+            let unread = kind
+                .look
+                .not_read()
+                .map(|u| (u.unit.path.clone(), u.why.clone()));
+            let _ = tx.send((read.collect(), unread.collect()));
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the reading of the apps waited")
+    }
+
+    #[test]
+    fn an_apps_identifier_version_and_build_are_read_by_the_core_itself_in_xml_and_in_binary() {
+        // The same values whichever form the file is in, a number as its text, and an app
+        // without an `Info.plist` named by its folder. No program is started: the values come
+        // from the file's bytes in this process (`plist::texts_at`).
+        let s = |v: &str| format!("<string>{v}</string>");
+        let xml =
+            |id: &str, short: &str, build: &str| info_plist(&s(id), short, build).into_bytes();
+        let binary = |bytes: Vec<u8>| crate::plist::binary_of(&bytes);
+        let put = |bytes: Vec<u8>| -> Box<dyn FnOnce(&Path) + Send> {
+            Box::new(move |p| std::fs::write(p, bytes).unwrap())
+        };
+        let (read, unread) = read_apps(vec![
+            ("A.app", put(xml("org.example.a", &s("2.1"), &s("2104")))),
+            (
+                "B.app",
+                put(binary(xml("org.example.b", &s("2.1"), &s("2104")))),
+            ),
+            (
+                "C.app",
+                put(xml(
+                    "org.example.c",
+                    "<integer>3</integer>",
+                    "<real>2.5</real>",
+                )),
+            ),
+            (
+                "D.app",
+                put(binary(xml(
+                    "org.example.d",
+                    "<integer>3</integer>",
+                    "<real>2.5</real>",
+                ))),
+            ),
+            (
+                "E.app",
+                put(xml(
+                    "org.example.e",
+                    "<date>2026-01-02T03:04:05Z</date>",
+                    "<array/>",
+                )),
+            ),
+            ("F.app", Box::new(|_| {})),
+        ]);
+        let app = |name: &str, version: Option<&str>| {
+            (
+                format!("component:machine:mac/macos-app/{name}"),
+                version.map(str::to_string),
+            )
+        };
+        let want = [
+            app("org.example.a", Some("2.1 (2104)")),
+            app("org.example.b", Some("2.1 (2104)")),
+            app("org.example.c", Some("3 (2.5)")),
+            app("org.example.d", Some("3 (2.5)")),
+            app("org.example.e", None),
+            app("F.app", None),
+        ];
+        assert_eq!(read, want);
+        assert_eq!(unread, []);
+    }
+
+    #[test]
+    fn an_info_plist_that_is_not_a_regular_file_does_not_hold_the_reading_and_that_app_failed() {
+        // A named pipe would hold a reader that waits for a writer to open it; a link in the
+        // last part or a `Contents` that is a link is not followed; a folder is not a file.
+        let target = crate::common::Scratch::new("integrity-info-target");
+        let elsewhere = target.join("Info.plist");
+        let s = "<string>x</string>";
+        std::fs::write(
+            &elsewhere,
+            info_plist("<string>org.example.x</string>", s, s),
+        )
+        .unwrap();
+        let (to_file, to_folder) = (elsewhere.clone(), target.to_path_buf());
+        let (read, unread) = read_apps(vec![
+            (
+                "Pipe.app",
+                Box::new(|p| {
+                    let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).unwrap();
+                    // SAFETY: a valid C path.
+                    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+                }),
+            ),
+            ("Folder.app", Box::new(|p| std::fs::create_dir(p).unwrap())),
+            (
+                "Link.app",
+                Box::new(move |p| std::os::unix::fs::symlink(to_file, p).unwrap()),
+            ),
+            (
+                "Contents.app",
+                Box::new(move |p| {
+                    let contents = p.parent().unwrap();
+                    std::fs::remove_dir(contents).unwrap();
+                    std::os::unix::fs::symlink(to_folder, contents).unwrap();
+                }),
+            ),
+        ]);
+        assert_eq!(read, []);
+        let failed: Vec<String> = unread.iter().map(|(path, _)| path.clone()).collect();
+        let apps = ["Contents.app", "Folder.app", "Link.app", "Pipe.app"];
+        assert_eq!(failed, apps.map(|a| format!("/Applications/{a}")));
+        assert!(
+            unread[0].1.contains("Contents is a symbolic link"),
+            "{unread:?}"
+        );
+        for (_, why) in &unread[1..] {
+            assert!(why.starts_with("its Info.plist: "), "{why}");
+        }
     }
 
     #[test]
