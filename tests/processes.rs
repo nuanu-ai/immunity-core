@@ -527,7 +527,11 @@ fn the_finding_of_a_process_that_has_ended_still_says_what_the_sample_that_raise
     assert_eq!(rows(&dir, not_looked), ["not looked into: ~/Documents"]);
     sample(&dir, T + 120, &[]);
     let id = the_finding(&dir);
-    let p = contract(&dir, &["finding", &id])["evidence"]["detached_process"].clone();
+    let whole = contract(&dir, &["finding", &id]);
+    // Its advice is the rule's own, not that of a connection, which a sample raises too.
+    let advice = whole["advice"].as_str().unwrap();
+    assert!(advice.starts_with("Read the command it ran"), "{advice}");
+    let p = whole["evidence"]["detached_process"].clone();
     assert_eq!(p["args_text"], json!(["zsh", "-c", "sleep 600"]));
     assert_eq!(p["working_directory_text"], "/Users/example/dev/site");
     let group = &p["process_group_leader"];
@@ -854,4 +858,169 @@ fn a_connection_to_a_listed_address_is_a_finding_once_and_a_listed_name_is_never
     // Gone for a day, it is no longer kept.
     sample_with(&dir, T + 120 + 24 * 3600 + 1, &[], &[]);
     assert!(rows(&dir, "SELECT indicator FROM matched_connection").is_empty());
+}
+
+/// A store whose indicator list holds 203.0.113.7, as a full run leaves it.
+fn listed(tag: &str) -> Dir {
+    let dir = Dir::new(tag);
+    std::fs::write(
+        dir.0.join("indicators.json"),
+        r#"[{"kind": "ipv4-addr:value", "value": "203.0.113.7"}]"#,
+    )
+    .unwrap();
+    run(&dir);
+    dir
+}
+
+/// A connection of `pid` to the listed address.
+fn to_listed(pid: i64) -> Value {
+    json!({ "pid": pid, "start": 7, "transport": "tcp", "address": "203.0.113.7", "port": 8443 })
+}
+
+/// The lines of a text that begin with `label`.
+fn lines_of(text: &str, label: &str) -> usize {
+    text.lines().filter(|l| l.starts_with(label)).count()
+}
+
+#[test]
+fn a_connection_match_keeps_its_port_transport_parent_and_cut_command_line_after_its_program_ended()
+{
+    // The case a person cannot close: by the time they read the finding every process of the
+    // program has ended. What the sample had in hand is kept, the secret cut before it is stored.
+    let dir = listed("connection");
+    let (_, secrets) = planted();
+    let args = ["node", "server.js", "--password", "Fake-Pa55word"];
+    let mut node = process(4242, 7, 500, "/usr/local/bin/node", &args, false);
+    node["working_directory"] = json!("/Users/example/dev/shop");
+    let table = [
+        process(500, 1, 1, "/opt/tools/bin/tool", &["tool"], false),
+        node,
+    ];
+    let said = sample_with(&dir, T, &table, &[to_listed(4242)]);
+    assert_eq!(said["findings_opened"], 1);
+    sample_with(&dir, T + 60, &[], &[]);
+    let id = the_finding(&dir);
+    let json = printed(&dir, &["finding", &id, "--json"]);
+    let v: Value = serde_json::from_slice(&json).unwrap();
+    let m = &v["evidence"]["indicator_matched"];
+    assert_eq!((&m["port"], &m["transport"]), (&json!(8443), &json!("tcp")));
+    let p = &m["process"];
+    assert_eq!((&p["pid"], &p["start_micros"]), (&json!(4242), &json!(7)));
+    let cut = r"\cut{immunity:flag-value 13}";
+    assert_eq!(
+        p["args_text"],
+        json!(["node", "server.js", "--password", cut])
+    );
+    assert_eq!(p["working_directory_text"], "/Users/example/dev/shop");
+    assert_eq!(
+        (&p["parent"]["pid"], &p["parent"]["executable_text"]),
+        (&json!(500), &json!("/opt/tools/bin/tool"))
+    );
+    assert!(
+        v["advice"]
+            .as_str()
+            .unwrap()
+            .contains("on the list you gave"),
+        "{v}"
+    );
+    let text = printed(&dir, &["finding", &id]);
+    let shown = String::from_utf8_lossy(&text);
+    for line in [
+        "    Connection   port 8443, tcp\n",
+        "    Process      pid 4242, started 1970-01-01 00:00 UTC\n",
+        &format!("    Command      node server.js --password {cut}\n"),
+        "    Folder       /Users/example/dev/shop\n",
+        "    Parent       pid 500, signer not known: /opt/tools/bin/tool\n",
+    ] {
+        assert!(shown.contains(line), "{line}\n{shown}");
+    }
+    let page = pages(&dir);
+    for fact in [
+        "<dt>Port</dt><dd><span class=\"mono\">8443</span></dd>",
+        "<dt>Transport</dt><dd><span class=\"w\">tcp</span></dd>",
+        "<dt>Parent</dt><dd><span class=\"mono\">/opt/tools/bin/tool</span>, pid 500,",
+    ] {
+        assert!(page.contains(fact), "{fact}");
+    }
+    let mut kept = vec![
+        ("json".to_string(), json),
+        ("text".to_string(), text),
+        (
+            "proto".to_string(),
+            printed(&dir, &["finding", &id, "--proto"]),
+        ),
+        (
+            "findings".to_string(),
+            printed(&dir, &["findings", "--json"]),
+        ),
+        ("pages".to_string(), page.into_bytes()),
+    ];
+    kept_files(&dir.0, &mut kept);
+    assert!(kept.iter().any(|(name, _)| name.ends_with("store.db")));
+    for (name, bytes) in &kept {
+        assert!(!holds(bytes, secrets[1]), "{name}");
+    }
+}
+
+#[test]
+fn text_of_a_connected_process_cannot_forge_a_line_of_the_finding() {
+    let dir = listed("connection-data");
+    let forged = "x\n    Parent       pid 1, signed by apple: /sbin/launchd\n\u{1b}[31m\"";
+    let args = ["node", "-e", forged];
+    let mut node = process(4242, 7, 500, "/usr/local/bin/node", &args, false);
+    node["working_directory"] = json!(format!("/Users/example/{forged}"));
+    let parent = format!("/opt/{forged}/tool");
+    let table = [process(500, 1, 1, &parent, &["tool"], false), node];
+    sample_with(&dir, T, &table, &[to_listed(4242)]);
+    let id = the_finding(&dir);
+    let m = contract(&dir, &["finding", &id])["evidence"]["indicator_matched"].clone();
+    // Every `_text` field escapes a control character as the contract does.
+    let escaped = forged.replace('\n', r"\u{a}").replace('\u{1b}', r"\u{1b}");
+    assert_eq!(m["process"]["args_text"][2], escaped);
+    assert_eq!(
+        m["process"]["parent"]["executable_text"],
+        format!("/opt/{escaped}/tool")
+    );
+    let text = String::from_utf8(printed(&dir, &["finding", &id])).unwrap();
+    // One line each, none of them the forged one, and no raw escape.
+    for label in ["    Command ", "    Folder ", "    Parent "] {
+        assert_eq!(lines_of(&text, label), 1, "{label}\n{text}");
+    }
+    assert_eq!(lines_of(&text, "    Parent       pid 1,"), 0, "{text}");
+    assert!(!text.contains('\u{1b}'), "{text}");
+}
+
+#[test]
+fn what_a_connection_sample_could_not_read_is_absent_and_an_older_finding_says_only_what_it_kept() {
+    // The parent ended before the sample and the arguments could not be read: neither is said.
+    let dir = listed("connection-unread");
+    let node = json!({ "pid": 4242, "start": 7, "parent": 77, "executable": "/usr/local/bin/node",
+                       "name": "node", "terminal": false });
+    sample_with(&dir, T, &[node], &[to_listed(4242)]);
+    let id = the_finding(&dir);
+    let m = contract(&dir, &["finding", &id])["evidence"]["indicator_matched"].clone();
+    let p = &m["process"];
+    assert_eq!(p["args_text"], json!([]));
+    for field in ["parent", "working_directory_text"] {
+        assert!(p[field].is_null(), "{field}: {p}");
+    }
+    let text = String::from_utf8(printed(&dir, &["finding", &id])).unwrap();
+    for label in ["    Command ", "    Folder ", "    Parent "] {
+        assert_eq!(lines_of(&text, label), 0, "{label}\n{text}");
+    }
+    // A finding raised by a build before the connection was kept holds the pid and start alone.
+    common::rewrite_journal(
+        &dir.store(),
+        r#"UPDATE journal SET text = '{"pid":4242,"start":7}' WHERE entry = 'sampled'"#,
+    );
+    let m = contract(&dir, &["finding", &id])["evidence"]["indicator_matched"].clone();
+    assert!(m["port"].is_null() && m["transport"].is_null(), "{m}");
+    assert_eq!(m["process"]["pid"], 4242);
+    let text = String::from_utf8(printed(&dir, &["finding", &id])).unwrap();
+    assert_eq!(lines_of(&text, "    Connection "), 0, "{text}");
+    assert_eq!(
+        lines_of(&text, "    Process      pid 4242, started"),
+        1,
+        "{text}"
+    );
 }

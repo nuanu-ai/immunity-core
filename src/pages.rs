@@ -828,6 +828,39 @@ fn dl(out: &mut String, facts: &[(&str, String)]) {
     out.push_str("</dl>\n");
 }
 
+/// A process a sample saw, as `DetachedProcess` gives it, each fact only where the finding has
+/// it.
+fn process_facts(p: &v1::DetachedProcess, facts: &mut Vec<(&str, String)>, now: i64) {
+    if let Some(pid) = p.pid {
+        facts.push(("Process id", data(&pid.to_string())));
+    }
+    if let Some(start) = p.start_micros {
+        facts.push(("Started", view::when(start.div_euclid(1_000_000), now)));
+    }
+    if !p.args_text.is_empty() {
+        facts.push(("Arguments", arguments(&p.args_text)));
+    }
+    if let Some(wd) = &p.working_directory_text {
+        facts.push(("Folder", data(wd)));
+    }
+    for (label, l) in [
+        ("Parent", &p.parent),
+        ("Session led by", &p.session_leader),
+        ("Group led by", &p.process_group_leader),
+    ] {
+        if let Some(l) = l {
+            let signed = l
+                .signed_by_text
+                .as_deref()
+                .map_or("signer not known".to_string(), |s| {
+                    format!("signed by {}", data(s))
+                });
+            let said = format!("{}, pid {}, {signed}", data(&l.executable_text), l.pid);
+            facts.push((label, said));
+        }
+    }
+}
+
 /// A finding's evidence as `immunity finding <id>` gives it, from the same message: what it rests
 /// on by its kind as facts, and as voices the rule's authors, the response layer's verdicts with
 /// their reasons quoted, and the person's answer with who gave it and why. Every value from the
@@ -890,36 +923,17 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
             if let Some(value) = &p.indicators_text {
                 facts.push(("Matched", data(value)));
             }
-        }
-        Some(Body::DetachedProcess(p)) => {
-            if let Some(pid) = p.pid {
-                facts.push(("Process id", data(&pid.to_string())));
+            if let Some(port) = p.port {
+                facts.push(("Port", data(&port.to_string())));
             }
-            if let Some(start) = p.start_micros {
-                facts.push(("Started", view::when(start.div_euclid(1_000_000), now)));
+            if let Some(transport) = &p.transport {
+                facts.push(("Transport", word(transport)));
             }
-            if !p.args_text.is_empty() {
-                facts.push(("Arguments", arguments(&p.args_text)));
-            }
-            if let Some(wd) = &p.working_directory_text {
-                facts.push(("Folder", data(wd)));
-            }
-            for (label, l) in [
-                ("Session led by", &p.session_leader),
-                ("Group led by", &p.process_group_leader),
-            ] {
-                if let Some(l) = l {
-                    let signed = l
-                        .signed_by_text
-                        .as_deref()
-                        .map_or("signer not known".to_string(), |s| {
-                            format!("signed by {}", data(s))
-                        });
-                    let said = format!("{}, pid {}, {signed}", data(&l.executable_text), l.pid);
-                    facts.push((label, said));
-                }
+            if let Some(p) = &p.process {
+                process_facts(p, facts, now);
             }
         }
+        Some(Body::DetachedProcess(p)) => process_facts(p, facts, now),
         Some(Body::VulnerablePackage(p)) => {
             if let Some(why) = p.no_longer_found {
                 let said = crate::finding_text::no_longer_found_said(why);

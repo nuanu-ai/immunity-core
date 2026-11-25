@@ -1,64 +1,71 @@
 {
-  "advice": "Do not open or run what is named here; find out how it got there, and treat this Mac as affected until you know.",
+  "advice": "The address is on the list you gave. Look at the process shown here: its command, the program that started it and the folder it ran in. Until you know why it reached that address, treat this Mac as affected; if nobody knows, ask your agent to look into it.",
   "answer": null,
-  "answered_at": 1795522661,
+  "answered_at": 1795588225,
   "answered_together": [],
   "answered_with": null,
   "answers_note": "Answer a finding only after the owner has agreed in this conversation, having been told what it is and what the options are. Pass --via agent and the reason the owner agreed to. The app shows every answer given this way.",
   "evidence": {
     "indicator_matched": {
-      "indicators_text": "[file:hashes.'SHA-256' = '128344f1f3352b53701662b12b748ff9df8ea044a2acf076d438e8f5a0a75911']"
+      "indicators_text": "[ipv4-addr:value = '203.0.113.7']",
+      "port": 443,
+      "process": {
+        "args_text": [
+          "node",
+          "server.js"
+        ],
+        "cuts": [],
+        "parent": {
+          "executable_text": "/Applications/Tool.app/Contents/MacOS/Tool",
+          "pid": 500,
+          "signed_by_text": null
+        },
+        "pid": 4300,
+        "process_group_leader": null,
+        "session_leader": null,
+        "start_micros": 1795584625123456,
+        "working_directory_text": null
+      },
+      "transport": "tcp"
     }
   },
   "finding": {
-    "about_text": "file:machine:mac/.zshrc",
+    "about_text": "file:machine:mac//opt/tools/bin/node",
     "confidence": "high",
-    "id": "f5738cc2fac",
+    "id": "f2eac2518a4",
     "rule": "indicator.match",
     "severity": "high",
     "state": "open",
     "urgent": true
   },
-  "first_seen_at": 1795522660,
+  "first_seen_at": 1795588095,
   "folder_text": null,
   "format": 1,
   "group": null,
-  "journal_seq": 45,
+  "journal_seq": 47,
   "kind": "match of an indicator from the list",
   "kind_title": "Indicator match",
-  "last_seen_at": 1795522660,
+  "last_seen_at": 1795588095,
   "meaning": "The list names files, sites and addresses that the attack is known to use, so a match is rarely chance; it is wrong only when the list itself is wrong.",
   "rests_on": [
     {
-      "entry": "changed",
-      "kind": "content of a watched file",
-      "new_value_text": "sha256:128344f1f3352b53701662b12b748ff9df8ea044a2acf076d438e8f5a0a75911",
-      "old_value_text": "sha256:5a2dd1f378a67a0883bfb4290feefd00d3e30811fb5d31f5bb605411de3f131a",
-      "predicate": "has_content",
-      "reader": "watched-places",
-      "recorded_at": 1795522660,
-      "run_id": "1795522660-950903000",
-      "seq": 32,
-      "subject_text": "file:machine:mac/.zshrc"
-    },
-    {
-      "entry": "added",
-      "kind": "indicators matched against watched files and texts read in checkouts",
-      "new_value_text": "[file:hashes.'SHA-256' = '128344f1f3352b53701662b12b748ff9df8ea044a2acf076d438e8f5a0a75911']",
+      "entry": "sampled",
+      "kind": "match of an indicator from the list",
+      "new_value_text": "[ipv4-addr:value = '203.0.113.7']",
       "old_value_text": null,
       "predicate": "matches_indicator",
-      "reader": "indicators",
-      "recorded_at": 1795522660,
-      "run_id": "1795522660-950903000",
-      "seq": 35,
-      "subject_text": "file:machine:mac/.zshrc"
+      "reader": "processes",
+      "recorded_at": 1795588095,
+      "run_id": "sample-1795588225-146052000",
+      "seq": 41,
+      "subject_text": "file:machine:mac//opt/tools/bin/node"
     }
   ],
   "short_title": "Matches a sign of attack from your list",
-  "store_id": "84bbae1d1fb371a64ed32c10e45504dd",
+  "store_id": "6b0e6b7c46a7a4e4c848a645396deff3",
   "technique_text": null,
   "thing": null,
   "title": "Something on this Mac matches a sign of a known attack from the list you gave.",
   "verdicts": null,
-  "where_text": "~/.zshrc"
+  "where_text": "/opt/tools/bin/node"
 }

@@ -105,3 +105,27 @@ pub fn next_second() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
+
+/// Changes the journal, which only grows, as time or a crash would: its two triggers are taken
+/// out for the change and put back exactly as they were, so the store keeps the schema of its
+/// format.
+pub fn rewrite_journal(store: &Path, sql: &str) {
+    let conn = rusqlite::Connection::open(store).unwrap();
+    let triggers: Vec<(String, String)> = conn
+        .prepare(
+            "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'journal'",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(triggers.len(), 2, "{triggers:?}");
+    for (name, _) in &triggers {
+        conn.execute_batch(&format!("DROP TRIGGER {name}")).unwrap();
+    }
+    conn.execute_batch(sql).unwrap();
+    for (_, made) in &triggers {
+        conn.execute_batch(made).unwrap();
+    }
+}

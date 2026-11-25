@@ -605,6 +605,10 @@ fn indicator_match() -> Rule {
     }
 }
 
+/// The advice of `indicator.match` about a connection a sample saw: what is named is a program
+/// that reached a listed address, and the finding shows the process.
+const CONNECTION_ADVICE: &str = "The address is on the list you gave. Look at the process shown here: its command, the program that started it and the folder it ran in. Until you know why it reached that address, treat this Mac as affected; if nobody knows, ask your agent to look into it.";
+
 // ---- End of what runs by itself and indicators. ----
 
 // ---- Processes: what samples of this user's processes saw, see `processes::take`. ----
@@ -1131,6 +1135,9 @@ pub struct Found {
     /// For a published rule's finding, the rule, its count and its evidence, as
     /// `events::finding_detail` gives them.
     pub detail: Option<Value>,
+    /// For a finding of a sample, a match of indicators by a connection or a detached script,
+    /// what the latest entry `sampled` it rests on keeps of the process (`processes::sampled`).
+    pub sampled: Option<Value>,
     /// What it carries of the response layer's verdicts (`verdict::attach`).
     pub verdicts: Option<crate::verdict::Summary>,
     /// Its latest occurrence is a place that could not be read, and nothing it rests on is a
@@ -1222,6 +1229,7 @@ pub fn all(conn: &Connection, now: i64) -> rusqlite::Result<Vec<Found>> {
             superseded: r.get(15)?,
             in_force: false,
             detail: None,
+            sampled: None,
             verdicts: None,
             unread_only: r.get::<_, Option<bool>>(16)?.unwrap_or(false),
         })
@@ -1255,6 +1263,12 @@ pub fn all(conn: &Connection, now: i64) -> rusqlite::Result<Vec<Found>> {
                     f.place = place;
                     f.became = Some(value);
                 }
+            }
+            // A finding a sample raised carries what the sample read of the process.
+            if let Some(r) = rule(&f.rule)
+                && [indicators::MATCHED, crate::processes::DETACHED_INLINE].contains(&r.kind)
+            {
+                f.sampled = crate::processes::sampled_note(conn, &f.id, r.kind)?;
             }
             // A published rule's finding carries the rule and the events it matched.
             if let Some(l) = published(&f.rule)
@@ -2196,6 +2210,11 @@ pub fn item(f: &Found) -> Item {
         last_seen: Some(f.last_seen.0),
         words: if f.unread_only {
             not_read_words(r.kind)
+        } else if r.kind == indicators::MATCHED && f.sampled.is_some() {
+            Words {
+                advice: CONNECTION_ADVICE,
+                ..r.words
+            }
         } else {
             r.words
         },
@@ -2402,6 +2421,7 @@ mod tests {
             became: None,
             thing: None,
             detail: None,
+            sampled: None,
             verdicts: None,
             unread_only: false,
         };
@@ -2448,6 +2468,7 @@ mod tests {
             became: None,
             thing: None,
             detail: None,
+            sampled: None,
             verdicts: None,
             unread_only: false,
         };
@@ -2488,6 +2509,7 @@ mod tests {
             became: None,
             thing: None,
             detail: None,
+            sampled: None,
             verdicts: Some(crate::verdict::Summary {
                 levels: Some((3, 2)),
                 ..Default::default()
@@ -2542,6 +2564,7 @@ mod tests {
             became: None,
             thing: None,
             detail: None,
+            sampled: None,
             verdicts: None,
             unread_only,
         };
