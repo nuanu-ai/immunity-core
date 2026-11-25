@@ -205,8 +205,6 @@ fn a_place_where_code_runs_by_itself_is_read_whole_with_what_changed_and_what_it
         whole["evidence"],
         json!({ "place_changed": { "change": "new", "presence_only": false } })
     );
-    // The part that runs by itself is still there, as the check that found it read it.
-    assert_eq!(whole["thing_now"]["presence"], "held");
     let rests = whole["rests_on"].as_array().unwrap();
     assert!(
         rests.iter().any(|r| r["predicate"] == "has_content"
@@ -485,8 +483,6 @@ fn an_indicator_match_of_a_file_names_the_indicators_it_matched_and_no_process_a
         whole["evidence"]["indicator_matched"]["indicators_text"],
         format!("[file:hashes.'SHA-256' = '{hash}']")
     );
-    // A watched file: the reading of its place read it.
-    assert_eq!(whole["thing_now"]["presence"], "held");
     assert_eq!(
         whole["evidence"]["indicator_matched"]["indicators_text"],
         item["value_text"]
@@ -661,21 +657,39 @@ fn a_finding_found_again_after_seen_names_the_earlier_one_its_answer_and_reason_
     // in every form; a first finding names none. The reason is the person's or the agent's
     // text: it stays inside its field and never forges a line of the finding or of the page.
     let (e, profile, first) = a_profile_changed("again");
+    // Closed findings before it, of its rule about another thing and of another rule about its
+    // thing: neither is an earlier occurrence of it.
+    let store = rusqlite::Connection::open(e.store()).unwrap();
+    let before = |id: &str, rule: &str, about: &str| {
+        store
+            .execute(
+                "INSERT INTO finding (id, rule, about, occurrence, state, first_seen_at,
+                                      first_seen_run, last_seen_at, last_seen_run)
+                 SELECT ?1, COALESCE(?2, rule), COALESCE(?3, about), 0, 'cleared', 1, 'r', 1, 'r'
+                 FROM finding WHERE id = ?4",
+                rusqlite::params![
+                    id,
+                    (!rule.is_empty()).then_some(rule),
+                    (!about.is_empty()).then_some(about),
+                    first
+                ],
+            )
+            .unwrap();
+    };
+    store
+        .execute(
+            "INSERT INTO entity (id, type) VALUES ('file:machine:mac/.bashrc', 'file')",
+            [],
+        )
+        .unwrap();
+    before("f00000000b1", "", "file:machine:mac/.bashrc");
+    before("f00000000b2", "watched.ssh-access", "");
     let whole = e.finding(&first);
     assert!(whole["earlier"].is_null(), "{whole:#}");
     assert!(!e.text(&first).contains("Earlier"));
     // An occurrence before it that the core closed, which nobody answered, as of a package
     // cleared by an upgrade: named in every form, with no answer.
-    rusqlite::Connection::open(e.store())
-        .unwrap()
-        .execute(
-            "INSERT INTO finding (id, rule, about, occurrence, state, first_seen_at,
-                                  first_seen_run, last_seen_at, last_seen_run)
-             SELECT 'f00000000aa', rule, about, 0, 'cleared', 1, 'r', 1, 'r' FROM finding
-             WHERE id = ?1",
-            [&first],
-        )
-        .unwrap();
+    before("f00000000aa", "", "");
     let closed = &e.finding(&first)["earlier"];
     assert_eq!(
         (&closed["finding"]["id"], &closed["answer"]),
@@ -744,9 +758,15 @@ fn a_finding_found_again_after_seen_names_the_earlier_one_its_answer_and_reason_
             "{text}"
         );
     }
+    // On the page the reason given then is the quote of that answer, escaped.
     let page = e.pages();
-    assert!(page.contains(&format!("Your agent before, to {first}")));
-    assert!(page.contains("the installer of a &lt;i&gt;tool&lt;/i&gt;"));
+    let voice = format!("<div class=\"vn\">Your agent before, to {first}</div>");
+    let quote = &page[page.find(&voice).expect(&voice)..];
+    let quote = &quote[quote.find("<blockquote").unwrap()..quote.find("</blockquote>").unwrap()];
+    assert!(
+        quote.starts_with("<blockquote class=\"quote\">the installer of a &lt;i&gt;tool&lt;/i&gt;"),
+        "{quote}"
+    );
     assert!(!page.contains(FORGED) && !page.contains("\n→ immunity finding f0"));
     // Found a third time, after a seen from the command line with no reason: only the latest
     // earlier one is named, and it came from the command line.
@@ -760,215 +780,6 @@ fn a_finding_found_again_after_seen_names_the_earlier_one_its_answer_and_reason_
         (&json!(again), &json!("command"))
     );
     assert!(third["answer"]["reason_text"].is_null());
-}
-
-#[test]
-fn a_watched_entry_is_there_only_as_the_latest_reading_of_its_place_read_it_and_never_gone_by_a_retraction()
- {
-    // A shell profile and a Git hook in the folder the checkout's configuration names, each
-    // changed after a first check. Then the profile is removed and the configuration names
-    // another folder, and then the checkout goes. No reading records that it looked for either and found nothing, so neither
-    // is ever said to be gone: not known, last found by the check that read them.
-    let e = Estate::new("now");
-    let (profile, hook) = (
-        e.home().join(".zshrc"),
-        e.home().join("dev/tree/first/pre-commit"),
-    );
-    e.put(
-        &e.home().join("dev/tree/.git/HEAD"),
-        "ref: refs/heads/main\n",
-    );
-    let config = e.home().join("dev/tree/.git/config");
-    e.put(&config, "[core]\n hooksPath = first\n");
-    // A hook in the checkout's own folder, still watched while the configuration names another.
-    let kept = e.home().join("dev/tree/.git/hooks/post-merge");
-    e.put(&kept, "# 1\n");
-    e.put(&e.home().join("dev/tree/second/pre-push"), "# other\n");
-    for path in [&profile, &hook] {
-        e.put(path, "# 1\n");
-    }
-    e.run();
-    common::next_second();
-    for path in [&profile, &hook, &kept] {
-        e.put(path, "# 2\n");
-    }
-    e.run();
-    let shell = id_of(&e, "watched.shell-profile");
-    let hooks = e.json(&["findings"])["findings"].clone();
-    let hook_of = |name: &str| {
-        let f = (hooks.as_array().unwrap().iter())
-            .find(|f| f["finding"]["about_text"].as_str().unwrap().ends_with(name))
-            .unwrap();
-        f["finding"]["id"].as_str().unwrap().to_string()
-    };
-    let (git, kept) = (hook_of("first/pre-commit"), hook_of("hooks/post-merge"));
-    let now = |id: &str| e.finding(id)["thing_now"].clone();
-    let found = now(&shell);
-    assert_eq!(found["presence"], "held", "{found}");
-    let at = found["at"].as_i64().unwrap();
-    assert_eq!(
-        (&now(&git)["presence"], &now(&git)["at"]),
-        (&json!("held"), &json!(at))
-    );
-    assert!(
-        e.text(&shell)
-            .contains("    Now          there when last read, ")
-    );
-    let page = e.pages();
-    assert!(page.contains("<dt>Now</dt><dd><span class=\"w\">found there by a reading, <time "));
-    assert!(!page.contains("still"), "{page}");
-    common::next_second();
-    std::fs::remove_file(&profile).unwrap();
-    e.put(&config, "[core]\n hooksPath = second\n");
-    e.run();
-    let unknown = (json!("unknown"), json!(at));
-    for id in [&shell, &git] {
-        let n = now(id);
-        assert_eq!((n["presence"].clone(), n["at"].clone()), unknown, "{id}");
-        let text = e.text(id);
-        assert!(text.contains("    Now          not known whether it is there; last found "));
-        assert!(!text.contains("no longer there"), "{text}");
-    }
-    common::next_second();
-    common::remove(&e.home().join("dev/tree/.git"));
-    e.run();
-    let n = now(&git);
-    assert_eq!((n["presence"].clone(), n["at"].clone()), unknown);
-    // The hook its own folder held was read until the checkout went, and no reading since.
-    let n = now(&kept);
-    assert_eq!(n["presence"], "unknown", "{n}");
-    assert!(n["at"].as_i64() > Some(at));
-    // The line decides nothing: each finding stays open until the person answers it.
-    for id in [&shell, &git] {
-        assert_eq!(e.finding(id)["finding"]["state"], "open");
-    }
-}
-
-#[test]
-fn a_startup_program_looked_for_and_not_found_is_no_longer_there_and_not_known_once_not_looked_at()
-{
-    // The one record of a thing found absent is a program a startup item names, looked for at
-    // its path at each check. A program recorded as not there is never said to be there.
-    let e = Estate::new("target");
-    let folder = e.system().join("usr/local/bin");
-    let runner = folder.join("runner");
-    e.put(&runner, "#!/bin/sh\nexit 0\n");
-    e.put(
-        &e.home().join("Library/LaunchAgents/org.example.item.plist"),
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
-         <key>Label</key><string>org.example.item</string><key>ProgramArguments</key>\
-         <array><string>/usr/local/bin/runner</string></array></dict></plist>\n",
-    );
-    e.run();
-    common::next_second();
-    e.put(&runner, "#!/bin/sh\nexit 1\n");
-    e.run();
-    let id = id_of(&e, "watched.startup-target");
-    let now = || e.finding(&id)["thing_now"].clone();
-    let there = now();
-    assert_eq!(there["presence"], "held", "{there}");
-    use std::os::unix::fs::PermissionsExt;
-    let mode = |path: &Path, mode| {
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
-    };
-    common::next_second();
-    mode(&runner, 0o000);
-    e.run();
-    mode(&runner, 0o644);
-    let unread = now();
-    assert_eq!(
-        (&unread["presence"], &unread["at"]),
-        (&json!("unknown"), &there["at"])
-    );
-    common::next_second();
-    std::fs::remove_file(&runner).unwrap();
-    e.run();
-    let gone = now();
-    assert_eq!(gone["presence"], "gone", "{gone}");
-    assert!(gone["at"].as_i64() > there["at"].as_i64());
-    assert!(e.text(&id).contains(
-        "    Now          no longer there: a reading that looked found nothing at its path, "
-    ));
-    assert!(
-        e.pages()
-            .contains("<span class=\"w\">a reading that looked found nothing at its path, <time ")
-    );
-    // Its folder shut: the latest check did not look, so whether it is there is not known, last
-    // found by the check that read it.
-    common::next_second();
-    mode(&folder, 0o000);
-    e.run();
-    mode(&folder, 0o755);
-    let unknown = now();
-    assert_eq!(
-        (&unknown["presence"], &unknown["at"]),
-        (&json!("unknown"), &there["at"])
-    );
-}
-
-#[test]
-fn an_indicator_match_of_a_file_no_reading_records_by_itself_says_nothing_of_what_is_there_now() {
-    // Nothing records a lockfile by itself, so nothing is said of whether it is there, also once
-    // the indicator it matched leaves the list.
-    let e = Estate::new("lockfile");
-    e.put(
-        &e.home().join("dev/shop/.git/HEAD"),
-        "ref: refs/heads/main\n",
-    );
-    e.put(
-        &e.home().join("dev/shop/package-lock.json"),
-        r#"{"name": "shop", "lockfileVersion": 3, "packages": {"": {"name": "shop"},
-            "node_modules/a": {"version": "1.0.0", "resolved": "https://relay.example/a.tgz"}}}"#,
-    );
-    let list = |entries: &str| e.put(&e.store().with_file_name("indicators.json"), entries);
-    list(r#"[{"kind": "domain-name:value", "value": "relay.example"}]"#);
-    e.run();
-    let id = id_of(&e, "indicator.match");
-    assert!(e.finding(&id)["thing_now"].is_null());
-    common::next_second();
-    list("[]");
-    e.run();
-    assert!(e.finding(&id)["thing_now"].is_null());
-    let text = e.text(&id);
-    assert!(
-        !text.contains("    Now ") && !text.contains("no longer there"),
-        "{text}"
-    );
-}
-
-#[test]
-fn a_finding_that_rests_on_events_only_says_nothing_of_what_is_there_now() {
-    // A verdict raises a finding of the response layer about what it judged: an event, which is
-    // over once it happened.
-    let (e, _, id) = a_profile_changed("events-only");
-    let store = e.finding(&id)["store_id"].clone();
-    let verdict = json!({
-        "format": 1, "store_id": store, "finding": { "id": id }, "kind": "suspicious",
-        "reason_text": "invented", "case_text": "case-1", "severity": "low", "confidence": "low",
-    });
-    let mut child = Command::new(env!("CARGO_BIN_EXE_immunity"))
-        .env("HOME", e.home())
-        .env("PATH", "/usr/bin:/bin")
-        .args(["verdict", "--json", "--store"])
-        .arg(e.store())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    use std::io::Write;
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(verdict.to_string().as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(out.status.success(), "{out:?}");
-    let recorded: Value = serde_json::from_slice(&out.stdout).unwrap();
-    let own = recorded["recorded"]["finding"]["id"].as_str().unwrap();
-    assert!(e.finding(&id)["thing_now"].is_object());
-    assert!(e.finding(own)["thing_now"].is_null());
-    assert!(!e.text(own).contains("    Now "), "{}", e.text(own));
 }
 
 #[test]

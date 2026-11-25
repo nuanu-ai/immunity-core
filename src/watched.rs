@@ -231,68 +231,6 @@ pub fn content_now(
     Ok(out)
 }
 
-/// Whether the watched entry `id` is there now, and when, from the one record the store keeps of
-/// this very entry at each reading, never from a retraction: its content reading, which a reading
-/// of a place writes in its own run for every entry it finds there (`read_watched` in `main.rs`).
-/// When that reading is the latest, by the store's order, of a place that holds the entry, a full
-/// one says it is there; of a program a startup item names, `not there` says a look found nothing
-/// at its path. Anything else is not known, with when a full one last found it. `None` when no
-/// content of it was ever read: nothing records this thing by itself.
-pub fn now_of(
-    conn: &rusqlite::Connection,
-    id: &str,
-) -> rusqlite::Result<Option<(crate::contract::v1::Presence, Option<i64>)>> {
-    use crate::contract::v1::Presence;
-    use rusqlite::OptionalExtension;
-    let missing = Content::Missing.literal();
-    let reading = rusqlite::params![READER, id, CONTENT, missing];
-    let latest: Option<(bool, i64, Option<bool>)> = conn
-        .query_row(
-            "SELECT c.completeness = 'full' AND EXISTS (
-                        SELECT 1 FROM assertion w
-                        WHERE w.layer = 'live' AND w.reader = ?1 AND w.subject = ?2
-                          AND w.predicate = 'watched_as'
-                          AND (SELECT p.run_id FROM coverage p
-                               WHERE p.reader = ?1 AND p.scope = w.scope AND p.kind = w.kind
-                               ORDER BY p.id DESC LIMIT 1) = c.run_id),
-                    c.observed_at,
-                    (SELECT object FROM assertion WHERE layer = 'live' AND reader = ?1
-                       AND scope = ?2 AND kind = ?3 AND predicate = 'has_content') = ?4
-             FROM coverage c WHERE c.reader = ?1 AND c.scope = ?2 AND c.kind = ?3
-             ORDER BY c.id DESC LIMIT 1",
-            reading,
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()?;
-    let Some((read_now, at, absent)) = latest else {
-        return Ok(None);
-    };
-    if read_now {
-        let presence = match absent {
-            Some(true) => Presence::Gone,
-            _ => Presence::Held,
-        };
-        return Ok(Some((presence, Some(at))));
-    }
-    // The latest full reading while a content other than `not there` was in force, each run
-    // placed by the first reading it wrote.
-    let found: Option<i64> = conn
-        .query_row(
-            "SELECT c.observed_at FROM coverage c JOIN assertion a
-                 ON a.reader = c.reader AND a.scope = c.scope AND a.kind = c.kind
-                AND a.predicate = 'has_content' AND a.object != ?4 AND a.layer != 'draft'
-             WHERE c.reader = ?1 AND c.scope = ?2 AND c.kind = ?3 AND c.completeness = 'full'
-               AND c.id >= (SELECT MIN(id) FROM coverage WHERE run_id = a.run_id)
-               AND (a.retracted_by IS NULL
-                    OR c.id < (SELECT MIN(id) FROM coverage WHERE run_id = a.retracted_by))
-             ORDER BY c.id DESC LIMIT 1",
-            reading,
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(Some((Presence::Unknown, found)))
-}
-
 /// The watched entries, by id, whose content is not hashed: only whether they are there is
 /// watched.
 pub fn presence_only(

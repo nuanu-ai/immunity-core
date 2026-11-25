@@ -736,31 +736,6 @@ pub fn sampled_note(
     Ok(Some(Value::Object(note)))
 }
 
-/// When a sample last saw the process a finding's entry `sampled` names, by its pid and start,
-/// tracked or connected to a listed address, and whether the latest sample, by the run of its
-/// reading of programs, saw it running: `None` once neither is kept (`KEEP`), or the entry does
-/// not name it. A sample that did not see it says nothing of whether it ended: a process is not a
-/// fact with a lifecycle.
-pub fn last_seen(
-    conn: &rusqlite::Connection,
-    note: &Value,
-) -> rusqlite::Result<Option<(i64, bool)>> {
-    let (Some(pid), Some(start)) = (note["pid"].as_i64(), note["start"].as_i64()) else {
-        return Ok(None);
-    };
-    let (at, latest): (Option<i64>, Option<bool>) = conn.query_row(
-        "SELECT MAX(at), MAX(run IS (SELECT run_id FROM coverage WHERE reader = ?3 AND kind = ?4
-                                     ORDER BY id DESC LIMIT 1)) FROM (
-             SELECT last_seen_at AS at, last_seen_run AS run FROM tracked_process
-             WHERE pid = ?1 AND start = ?2
-             UNION ALL
-             SELECT last_seen_at, NULL FROM matched_connection WHERE pid = ?1 AND start = ?2)",
-        params![pid, start, READER, PROGRAMS_KIND],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )?;
-    Ok(at.map(|at| (at, latest == Some(true))))
-}
-
 /// The journal entry a raise rests on: the program, what was derived or matched, and in `text`
 /// what the raise keeps of the process, its identity at least.
 #[allow(clippy::too_many_arguments)]

@@ -863,7 +863,7 @@ mod tests {
         conn.execute_batch(
             "INSERT INTO entity (id, type) VALUES ('machine:mac', 'machine'),
                  ('file:machine:mac/a', 'file'), ('file:machine:mac/b', 'file'),
-                 ('file:machine:mac/c', 'file');",
+                 ('file:machine:mac/c', 'file'), ('file:machine:mac/d', 'file');",
         )
         .unwrap();
         // A fact of `thing` in `kind`, made by `made` and retracted by `by` at `at`, `entry`
@@ -951,6 +951,25 @@ mod tests {
             "removed",
         );
         assert_eq!(presence("c"), Unknown);
+        // Set aside, found again, then removed by a full reading that looked: gone.
+        read(MATCH_KIND, &["run-8", "run-9", "run-10"]);
+        fact(
+            "file:machine:mac/d",
+            MATCH_KIND,
+            "run-8",
+            "run-9",
+            100,
+            "retired",
+        );
+        fact(
+            "file:machine:mac/d",
+            MATCH_KIND,
+            "run-9",
+            "run-10",
+            200,
+            "removed",
+        );
+        assert_eq!(presence("d"), Gone);
         drop(conn);
         std::fs::remove_file(&path).unwrap();
     }

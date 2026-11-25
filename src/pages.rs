@@ -1017,9 +1017,6 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
             });
         }
     }
-    for (label, said) in crate::finding_text::now_said(f, &|at| view::when(at, now), true) {
-        facts.push((label, format!("<span class=\"w\">{said}</span>")));
-    }
     // The earlier occurrence by its id, answered or not; the person's answer, then its answer.
     let earlier = (f.earlier.as_ref()).and_then(|e| Some((e.answer.as_ref(), e.finding.as_ref()?)));
     if let Some((_, r)) = earlier {
