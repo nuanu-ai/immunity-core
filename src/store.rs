@@ -1363,7 +1363,11 @@ fn machines_known(conn: &Connection) -> rusqlite::Result<BTreeSet<String>> {
     let entities = column("SELECT id FROM entity WHERE type = 'machine'")?;
     let mut named = column(&format!("{LATEST} SELECT DISTINCT scope FROM reading"))?;
     named.extend(column(
-        "SELECT DISTINCT subject FROM assertion WHERE layer = 'live' AND subject LIKE 'machine:%'",
+        // Every id from `machine:` up to, not including, the same with `;`, the character after
+        // `:`: a range of `assertion_subject`, where `LIKE` reads every live fact. It gives what
+        // `LIKE` would: an entity of the type `machine` has an id that begins with exactly that.
+        "SELECT DISTINCT subject FROM assertion
+         WHERE +layer = 'live' AND subject >= 'machine:' AND subject < 'machine;'",
     )?);
     named.extend(column(
         "SELECT DISTINCT object FROM assertion WHERE layer = 'live' AND object LIKE 'machine:%'",
