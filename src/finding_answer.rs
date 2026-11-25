@@ -344,22 +344,30 @@ pub fn evidence(conn: &Connection, f: &Found) -> rusqlite::Result<Option<v1::evi
     ))
 }
 
-/// When a reading read back the content a watched place held before a finding's first change,
-/// from the finding's own entries alone: the `has_content` value before the first of them and
-/// after the latest are one checksum, so the latest is a reading that read the content in full.
-/// A reading that could not read it writes no `has_content` entry, so the time is never later
-/// than the last reading that read it. `None` when anything else holds.
+/// The journal's time of a reading that read a file's whole content with the checksum it had
+/// before the first change of content the finding rests on, from the finding's own `has_content`
+/// entries alone. Only when they are of one file and form one chain of whole-content checksums
+/// (`sha256:`), each entry's value before being the one after the entry before it, so no change
+/// the finding does not hold lies between them; and when the value before the first is the
+/// value after the latest: then the time of the latest. A reading that could not read the file
+/// writes no `has_content` entry, so the time is never later than the last reading that read it.
+/// `None` when anything else holds, a `value sha256:` of one selected value among it.
 fn read_as_before(basis: &[findings::Basis]) -> Option<i64> {
-    let mut content = basis
+    let content: Vec<&findings::Basis> = basis
         .iter()
-        .filter(|b| b.predicate.as_deref() == Some("has_content"));
-    let first = content.next()?;
-    let latest = content.next_back().unwrap_or(first);
-    let read = |v: &Option<String>| {
-        v.clone()
-            .filter(|d| d.starts_with("sha256:") || d.starts_with("value sha256:"))
-    };
-    (read(&first.old_value)? == read(&latest.new_value)?).then_some(latest.at)
+        .filter(|b| b.predicate.as_deref() == Some("has_content"))
+        .collect();
+    let (first, latest) = (content.first()?, content.last()?);
+    let whole = |v: &Option<String>| v.clone().filter(|d| d.starts_with("sha256:"));
+    let subject = first.subject.as_deref()?;
+    let one_file = content
+        .iter()
+        .all(|b| b.subject.as_deref() == Some(subject));
+    let chained = content
+        .windows(2)
+        .all(|w| whole(&w[0].new_value).is_some() && w[0].new_value == w[1].old_value);
+    let back = whole(&first.old_value)? == whole(&latest.new_value)?;
+    (one_file && chained && back).then_some(latest.at)
 }
 
 /// What happened to the place a finding is about, for a rule whose evidence is a place that
@@ -539,8 +547,9 @@ mod tests {
     use super::{change, read_as_before, v1};
 
     #[test]
-    fn a_read_back_is_said_only_of_two_checksums_of_content_read_in_full_from_its_own_digests() {
-        let entry = |at: i64, predicate: &str, old: Option<&str>, new: Option<&str>| {
+    fn a_read_back_is_said_only_of_one_file_s_unbroken_chain_of_whole_content_checksums() {
+        type Value<'a> = Option<&'a str>;
+        let entry = |at: i64, predicate: &str, subject: Value, old: Value, new: Value| {
             crate::findings::Basis {
                 seq: at,
                 at,
@@ -549,35 +558,50 @@ mod tests {
                 reader: None,
                 kind: None,
                 predicate: Some(predicate.into()),
-                subject: None,
+                subject: subject.map(str::to_string),
                 old_value: old.map(str::to_string),
                 new_value: new.map(str::to_string),
             }
         };
-        let content = |at, old, new| entry(at, "has_content", old, new);
-        let (a, b) = (Some("sha256:aa"), Some("sha256:bb"));
-        // Changed and back; then another fact of the place changes, which says nothing of its
-        // content.
-        let back = [content(1, a, b), content(2, b, a)];
-        assert_eq!(read_as_before(&back), Some(2));
-        let signer = entry(3, "signed_by", Some("x"), Some("y"));
+        let file = Some("file:machine:mac/.zshrc");
+        let content = |at, old, new| entry(at, "has_content", file, old, new);
+        let (a, b, c) = (Some("sha256:aa"), Some("sha256:bb"), Some("sha256:cc"));
+        // A whole chain back to where it began: the latest reading's time, however long, and
+        // whatever else of the place changed beside it.
         assert_eq!(
-            read_as_before(&[content(1, a, b), content(2, b, a), signer]),
+            read_as_before(&[content(1, a, b), content(2, b, a)]),
             Some(2)
         );
-        // A key's value is a checksum too.
+        let long = [content(1, a, b), content(2, b, c), content(3, c, a)];
+        assert_eq!(read_as_before(&long), Some(3));
+        let signer = entry(3, "signed_by", file, Some("x"), Some("y"));
+        let beside = [content(1, a, b), content(2, b, a), signer];
+        assert_eq!(read_as_before(&beside), Some(2));
+        // A checksum of one selected value is not of the file's whole content.
         let (v, w) = (Some("value sha256:aa"), Some("value sha256:bb"));
+        assert_eq!(read_as_before(&[content(1, v, w), content(2, w, v)]), None);
+        // Two things, or a thing not named: nothing.
+        let other = entry(2, "has_content", Some("file:machine:mac/.bashrc"), b, a);
+        assert_eq!(read_as_before(&[content(1, a, b), other]), None);
+        let unnamed = entry(2, "has_content", None, b, a);
+        assert_eq!(read_as_before(&[content(1, a, b), unnamed]), None);
+        let unnamed = |at, old, new| entry(at, "has_content", None, old, new);
+        assert_eq!(read_as_before(&[unnamed(1, a, b), unnamed(2, b, a)]), None);
+        // A change the finding does not hold lay between two of its entries, first or later.
+        assert_eq!(read_as_before(&[content(1, a, b), content(2, c, a)]), None);
+        let later = [content(1, a, b), content(2, b, c), content(3, b, a)];
+        assert_eq!(read_as_before(&later), None);
+        // Removed and added again: no checksum links the two.
         assert_eq!(
-            read_as_before(&[content(1, v, w), content(2, w, v)]),
-            Some(2)
+            read_as_before(&[content(1, a, None), content(2, None, a)]),
+            None
         );
-        // What is not a checksum was not read in full, however equal.
+        // What is not a checksum, however equal; a first reading, with nothing before it.
         let link = Some("dangling link");
         assert_eq!(
             read_as_before(&[content(1, link, b), content(2, b, link)]),
             None
         );
-        // A first reading had nothing before it.
         assert_eq!(read_as_before(&[content(1, None, a)]), None);
     }
 

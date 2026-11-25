@@ -268,14 +268,16 @@ message PlaceChanged {
   // was there. False if it read the content the reader checks. Absent when the store has no
   // such observation. Neither value gives the coverage or freshness of a later reading.
   optional bool presence_only = 2;
-  // The time of a reading that read, by its checksum, the same content as before this finding's
-  // first change: the reading of its latest change of content. Decided from the `has_content`
-  // entries of `rests_on` alone: the value before the first of them and the value after the
-  // latest are the same SHA-256, each of content read in full. It is said of that reading and
-  // never of the place now: a later reading that could not read it, or read it unchanged, writes
-  // no entry and leaves this time as it is. Absent when the two differ or either is missing, as
-  // for a place added or removed, or is not a checksum. It changes nothing else of the finding.
-  // Since 1.35.0.
+  // The journal's time of a reading, which for a check is when the check began, that read the
+  // file's content with the checksum it had before the first change of content this finding
+  // rests on. Decided from the `has_content` entries of `rests_on` alone, when they are of one
+  // file and form one chain, each entry's value before being the value after the entry before
+  // it, every link a SHA-256 of the whole content (`sha256:`): the value before the first equals
+  // the value after the latest, and this is the time of the latest. It is said of that reading
+  // and says nothing of the file since: a later reading that could not read it, or read it
+  // unchanged, writes no entry and leaves this time as it is. Absent otherwise, as when a change
+  // the finding does not hold lies between its entries, or a value is the checksum of one
+  // selected value (`value sha256:`). It changes nothing else of the finding. Since 1.35.0.
   optional int64 read_as_before_at = 3;
 }
 

@@ -806,8 +806,7 @@ fn read_back_on_page(page: &str) -> &str {
 }
 
 /// What `immunity finding <id>` says of a reading that read a watched file as it was before.
-const READ_AS_BEFORE: &str =
-    "the content read then had the checksum it had before this finding's first change";
+const READ_AS_BEFORE: &str = "read the content with the checksum it had before the first change of content this finding rests on";
 
 impl Estate {
     /// `PlaceChanged.read_as_before_at` of a finding.
@@ -856,7 +855,7 @@ fn a_watched_file_read_back_as_before_its_first_change_names_that_reading_and_st
         assert_eq!(after[part], before[part], "{part}");
     }
     assert_eq!(whole["evidence"]["place_changed"]["change"], "changed");
-    let line = format!("{}: {READ_AS_BEFORE}", utc(back));
+    let line = format!("the reading of {} {READ_AS_BEFORE}", utc(back));
     let text = e.text(&id);
     assert!(
         text.lines()
@@ -866,8 +865,11 @@ fn a_watched_file_read_back_as_before_its_first_change_names_that_reading_and_st
     let page = e.pages();
     let dd = read_back_on_page(&page);
     assert!(
-        dd.contains(&format!("title=\"{}\"", utc(back)))
-            && dd.contains(&READ_AS_BEFORE.replace('\'', "&#39;")),
+        dd.contains(&format!("title=\"{}\"", utc(back))) && dd.contains(READ_AS_BEFORE),
+        "{dd}"
+    );
+    assert!(
+        dd.starts_with("<dt>Read back</dt><dd><span class=\"w\">the reading of</span> <time"),
         "{dd}"
     );
 }
@@ -984,6 +986,43 @@ fn a_place_not_read_then_read_again_unchanged_is_titled_by_the_time_it_was_not_r
     let latest = title(latest_entry(&e.finding(&id), "not_read", None));
     assert_ne!(latest, first);
     assert_eq!(e.finding(&id)["title"], latest);
+}
+
+#[test]
+fn a_place_not_read_is_titled_by_its_latest_reading_in_the_journal_s_order_after_a_clock_set_back()
+{
+    // Two readings that could not read the file, the later one made after the clock was set
+    // back two hours: the title names the later reading, at the time the clock gave it.
+    let e = Estate::new("unread-clock");
+    let profile = e.home().join(".zshrc");
+    e.put(&profile, "export A=1\n");
+    e.run();
+    for _ in 0..2 {
+        common::next_second();
+        e.run_unreadable(&profile);
+        common::next_second();
+        e.run();
+    }
+    common::rewrite_journal(
+        &e.store(),
+        "UPDATE journal SET at = at - 7200
+         WHERE seq = (SELECT MAX(seq) FROM journal WHERE entry = 'not_read')",
+    );
+    let id = id_of(&e, "watched.shell-profile");
+    let whole = e.finding(&id);
+    let unread: Vec<i64> = whole["rests_on"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["entry"] == "not_read")
+        .map(|r| r["recorded_at"].as_i64().unwrap())
+        .collect();
+    assert!(unread.len() == 2 && unread[1] < unread[0], "{whole:#}");
+    let title = whole["title"].as_str().unwrap();
+    assert!(
+        title.starts_with(&format!("At {} ", utc(unread[1]))),
+        "{title}"
+    );
 }
 
 #[test]

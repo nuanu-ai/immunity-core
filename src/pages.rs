@@ -875,8 +875,9 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
                 word(crate::finding_text::change_said(p.change)),
             ));
             if let Some(at) = p.read_as_before_at {
-                let said = word(crate::finding_text::READ_AS_BEFORE);
-                facts.push(("Read back", format!("{}: {said}", view::when(at, now))));
+                let (before, after) = crate::finding_text::READ_AS_BEFORE;
+                let said = format!("{} {} {}", word(before), view::when(at, now), word(after));
+                facts.push(("Read back", said));
             }
             if p.presence_only == Some(true) {
                 facts.push((

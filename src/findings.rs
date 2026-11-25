@@ -1143,8 +1143,8 @@ pub struct Found {
     /// What it carries of the response layer's verdicts (`verdict::attach`).
     pub verdicts: Option<crate::verdict::Summary>,
     /// Its latest occurrence is a place that could not be read, and nothing it rests on is a
-    /// change that was seen: its words say so (`not_read_words`), by the time of the latest
-    /// reading that could not read it, kept here. For a `verdict.suspicious` finding, the same of
+    /// change that was seen: its words say so (`not_read_words`), by the time of its latest
+    /// `not_read` entry in the journal's order, kept here. For a `verdict.suspicious` finding, the same of
     /// the finding its opening verdict named (`judged_as_read`). `None` otherwise.
     pub unread_at: Option<i64>,
 }
@@ -1197,9 +1197,10 @@ pub fn all(conn: &Connection, now: i64) -> rusqlite::Result<Vec<Found>> {
                        AND NOT EXISTS (SELECT 1 FROM finding_basis b
                                        JOIN journal j ON j.seq = b.journal
                                        WHERE b.finding = f.id AND j.entry != 'not_read')
-                     THEN (SELECT MAX(j.at) FROM finding_basis b
+                     THEN (SELECT j.at FROM finding_basis b
                            JOIN journal j ON j.seq = b.journal
-                           WHERE b.finding = f.id AND j.entry = 'not_read')
+                           WHERE b.finding = f.id AND j.entry = 'not_read'
+                           ORDER BY j.seq DESC LIMIT 1)
                 END,
                 {}
          FROM finding f ORDER BY last_seen_at DESC, id",
@@ -2175,8 +2176,8 @@ fn kept_item(f: &Found) -> Item {
 /// What a finding says when the place it is about could not be read and no change of it was
 /// seen: a rule's own words tell what changed, and here nothing is known to have changed. It
 /// stays a finding at the rule's levels, since a place that cannot be read can hide a change.
-/// `kind` is the rule's kind of place, and `at` the time of the latest reading that could not
-/// read it, from the finding's own `not_read` entry: a later check that reads it again unchanged
+/// `kind` is the rule's kind of place, and `at` the time of the finding's own `not_read` entry
+/// latest in the journal's order, whatever the clock said: a later check that reads it again unchanged
 /// is no event, so the title never says "the last check". Made once for each kind and time and
 /// kept while the program runs: a watcher makes one more for each such reading it shows.
 pub fn not_read_words(kind: &'static str, at: i64) -> Words {

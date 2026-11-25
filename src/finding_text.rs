@@ -518,10 +518,12 @@ pub fn change_said(change: i32) -> &'static str {
     }
 }
 
-/// What a reading at `PlaceChanged.read_as_before_at` read, after its time, in the text and on
-/// the page: said of that reading, never of the place now.
-pub const READ_AS_BEFORE: &str =
-    "the content read then had the checksum it had before this finding's first change";
+/// What `PlaceChanged.read_as_before_at` says, in the text and on the page, before and after its
+/// time: what the finding's two entries say of that reading, and nothing of the file since.
+pub const READ_AS_BEFORE: (&str, &str) = (
+    "the reading of",
+    "read the content with the checksum it had before the first change of content this finding rests on",
+);
 
 /// The evidence of a watched place: what happened to it in words, and when; how it is watched;
 /// that its content is not kept; why it could not be read; the places read for the first time.
@@ -544,10 +546,11 @@ fn place_lines(s: &Screen, f: &v1::Finding, p: &v1::PlaceChanged) -> Vec<String>
         }
     }
     if let Some(at) = p.read_as_before_at {
-        let at = s.time(at, f.answered_at);
+        let at = format!(" {} ", s.time(at, f.answered_at));
+        let (before, after) = READ_AS_BEFORE;
         out.extend(e(
             "Read back",
-            &[(&at, PLAIN), (": ", PLAIN), (READ_AS_BEFORE, PLAIN)],
+            &[(before, PLAIN), (&at, PLAIN), (after, PLAIN)],
         ));
     }
     if p.presence_only == Some(true) {
