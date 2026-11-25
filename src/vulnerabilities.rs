@@ -525,13 +525,14 @@ type LockfileReading = (
 /// The lockfiles reader's latest reading of each checkout that is still there.
 fn lockfile_readings(conn: &Connection) -> rusqlite::Result<Vec<LockfileReading>> {
     let readings: Vec<(i64, String, String, Option<String>, String)> = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT c.id, c.scope, c.completeness, c.reason, c.run_id FROM coverage c
              WHERE c.reader = ?1
                AND c.id = (SELECT MAX(l.id) FROM coverage l WHERE l.reader = c.reader AND l.scope = c.scope)
-               AND c.scope NOT IN (SELECT id FROM gone_entity)
+               AND NOT {}
              ORDER BY c.scope",
-        )?
+            crate::store::gone_entity("c.scope")
+        ))?
         .query_map([crate::lockfiles::READER], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })?
@@ -715,10 +716,10 @@ impl Matched {
         // one inside the other; the thing is known only when it is known in each. A thing the
         // store holds no such fact of has no checkout, so nothing is known of it.
         let checkouts: Vec<(String, bool)> = conn
-            .prepare(
-                "SELECT DISTINCT scope, scope IN (SELECT id FROM gone_entity) FROM assertion
-                 WHERE subject = ?1 AND reader = ?2",
-            )?
+            .prepare(&format!(
+                "SELECT DISTINCT a.scope, {} FROM assertion a WHERE a.subject = ?1 AND a.reader = ?2",
+                crate::store::gone_entity("a.scope")
+            ))?
             .query_map(params![about, crate::lockfiles::READER], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })?
@@ -1455,9 +1456,9 @@ pub fn ended(
         )
     };
     let (mut gone, mut still) = (true, false);
+    let query = format!("SELECT {}", crate::store::gone_entity("?1"));
     for c in &checkouts {
-        let query = "SELECT ?1 IN (SELECT id FROM gone_entity)";
-        gone &= conn.query_row(query, [c], |r| r.get::<_, bool>(0))?;
+        gone &= conn.query_row(&query, [c], |r| r.get::<_, bool>(0))?;
         if was.is_empty() {
             still |= declared(c, None)?;
         }
@@ -2043,14 +2044,15 @@ pub fn unread_places(conn: &Connection) -> rusqlite::Result<Vec<UnreadPlace>> {
         )
         .optional()?;
     let projects: Vec<(String, Option<String>, Option<String>)> = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT e.id, c.reason, c.run_id FROM entity e
              LEFT JOIN coverage c ON c.id = (SELECT MAX(l.id) FROM coverage l
                                              WHERE l.reader = ?2 AND l.scope = e.id)
-             WHERE e.type = ?1 AND e.id NOT IN (SELECT id FROM gone_entity)
+             WHERE e.type = ?1 AND NOT {}
                AND EXISTS (SELECT 1 FROM assertion a WHERE a.layer = 'live' AND a.subject = e.id)
              ORDER BY e.id",
-        )?
+            crate::store::gone_entity("e.id")
+        ))?
         .query_map([crate::checkouts::TYPE, crate::lockfiles::READER], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?
@@ -2137,13 +2139,14 @@ fn no_reader_places(
     rowed: &HashSet<(String, String)>,
 ) -> rusqlite::Result<Vec<(String, String, String)>> {
     let rows: Vec<(String, String)> = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT c.scope, l.name FROM coverage c JOIN coverage_lack l ON l.coverage = c.id
              WHERE c.reader = ?1 AND l.what = ?2 AND l.name IS NOT NULL
                AND c.id = (SELECT MAX(o.id) FROM coverage o WHERE o.reader = c.reader AND o.scope = c.scope)
-               AND c.scope NOT IN (SELECT id FROM gone_entity)
+               AND NOT {}
              ORDER BY c.scope, l.name",
-        )?
+            crate::store::gone_entity("c.scope")
+        ))?
         .query_map(
             [crate::lockfiles::READER, crate::lockfiles::LOCKFILE_KIND],
             |r| Ok((r.get(0)?, r.get(1)?)),

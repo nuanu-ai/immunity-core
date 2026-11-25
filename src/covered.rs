@@ -1719,9 +1719,9 @@ fn lacks(conn: &Connection) -> rusqlite::Result<Vec<(String, String, Option<Stri
     conn.prepare(&format!(
         "{}
          SELECT DISTINCT c.scope, l.what, l.name
-         FROM latest c CROSS JOIN coverage_lack l ON l.coverage = c.id
-         WHERE c.scope NOT IN (SELECT id FROM gone_entity)",
-        crate::store::LATEST
+         FROM latest c CROSS JOIN coverage_lack l ON l.coverage = c.id WHERE NOT {}",
+        crate::store::LATEST,
+        crate::store::gone_entity("c.scope")
     ))?
     .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
     .collect()
