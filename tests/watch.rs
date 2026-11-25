@@ -581,10 +581,10 @@ fn the_view_says_whether_a_watcher_watches_live() {
     };
     let before = summary(&mac.view());
     let fast = "<span class=\"wh2 t2\">within seconds</span>";
+    // No watcher is a fault the band says as the terminal does, with the command that starts one.
+    let none = "<p class=\"sub fault\">! No watcher runs: ";
     assert!(
-        before.contains(" · no watcher runs · ")
-            && before.contains(">at full checks<")
-            && !before.contains(fast),
+        before.contains(none) && before.contains(">at full checks<") && !before.contains(fast),
         "{before}"
     );
     let mut w = mac.watch().started();
@@ -592,7 +592,7 @@ fn the_view_says_whether_a_watcher_watches_live() {
     w.until("read", |v| count(v, "new") == 1);
     let now = summary(&mac.view_if_stale());
     assert!(
-        now.contains(" · watched live · ") && now.contains(fast),
+        now.contains(" · Watching live · ") && now.contains(fast) && !now.contains(none),
         "{now}"
     );
     // A watcher that stopped leaves the journal as it was; the page asked for says so all the
@@ -600,9 +600,9 @@ fn the_view_says_whether_a_watcher_watches_live() {
     drop(w);
     let after = summary(&mac.view_if_stale());
     assert!(
-        after.contains(" · no watcher runs · ")
+        after.contains(none)
             && after.contains(">at full checks<")
-            && !after.contains(" · watched live")
+            && !after.contains("Watching live")
             && !after.contains(fast),
         "{after}"
     );
@@ -1112,8 +1112,8 @@ fn a_place_left_unsubscribed_is_not_watched_live_until_a_later_subscription_take
     );
     let page = mac.view();
     assert!(
-        page.contains("the watcher's latest subscription to some watched places failed")
-            && !page.contains(" · watched live · "),
+        page.contains("! The watcher&#39;s latest subscription to some watched places failed")
+            && !page.contains("Watching live"),
         "the page says calm"
     );
     // The places it subscribed to are still watched.
@@ -2447,8 +2447,9 @@ fn a_failed_reading_or_sample_is_not_watched_live_with_its_reason_until_the_next
     let page = mac.view_if_stale();
     assert!(
         page.contains(
-            " · live watching is off · the watcher's latest reading of the watched places failed · "
-        ) && !page.contains(" · watched live"),
+            "<p class=\"sub fault\">! The watcher&#39;s latest reading of the watched places failed "
+        ) && !page.contains("Watching live")
+            && !page.contains("No watcher runs"),
         "{page}"
     );
     let text = within(mac.immunity().args(["status", "--store"]).arg(mac.store()));
@@ -2915,7 +2916,7 @@ fn a_failure_the_store_did_not_take_is_not_calm_and_live_comes_back_when_the_rea
     );
     let pages = mac.view();
     assert!(
-        pages.contains("write to the store failed") && !pages.contains(" · watched live · "),
+        pages.contains("write to the store failed") && !pages.contains("Watching live"),
         "the page says calm"
     );
 
@@ -3349,7 +3350,8 @@ fn a_watched_file_its_permissions_keep_closed_leaves_this_mac_watched_in_part_an
     let state = &page[page.find("<section id=\"this-mac\">").unwrap()..];
     let state = &state[..state.find("</section>").unwrap()];
     assert!(
-        state.contains(" · watched in part · ") && !state.contains("--green"),
+        state.contains("<p class=\"sub fault\">! Could not read: <span class=\"said\">~/.zprofile")
+            && !state.contains("--green"),
         "{state}"
     );
     let fix = &page[page.find("<section id=\"you-can-fix\"").unwrap()..];
@@ -3362,7 +3364,9 @@ fn a_watched_file_its_permissions_keep_closed_leaves_this_mac_watched_in_part_an
     let watched = &page[page.find("<section id=\"watched-here\"").unwrap()..];
     let watched = &watched[..watched.find("</section>").unwrap()];
     assert!(
-        watched.contains("1 can't be read · <a href=\"#you-can-fix\">you can fix</a>"),
+        watched.contains(
+            "<a href=\"#you-can-fix\" aria-label=\"You can fix: 1 can&#39;t be read now\">1 can&#39;t be read now</a>"
+        ),
         "{watched}"
     );
 }
@@ -3435,14 +3439,17 @@ fn the_watcher_writes_no_page_and_the_page_asked_for_after_a_change_shows_it() {
     let page = mac.view_if_stale();
     assert!(page.contains("<h1>1 to look at</h1>"), "{page}");
     // A watched file that can no longer be opened changes no fact, only what the reading
-    // covered: the page asked for says the Mac is watched in part.
+    // covered: the page asked for says the fault under its state.
     use std::os::unix::fs::PermissionsExt;
     let closed = mac.put(".zshrc.new", "two\n");
     std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
     std::fs::rename(&closed, mac.home().join(".zshrc")).unwrap();
     w.until("read", |_| true);
     let page = mac.view_if_stale();
-    assert!(page.contains(" · watched in part · "), "{page}");
+    assert!(
+        page.contains("<p class=\"sub fault\">! ") && page.contains(".zshrc"),
+        "{page}"
+    );
     let _ = std::fs::set_permissions(
         mac.home().join(".zshrc"),
         std::fs::Permissions::from_mode(0o644),

@@ -378,6 +378,18 @@ impl Fault {
         self.command = Some(command);
         self
     }
+
+    /// Its words, what the source said, the words after that, its command and its advice, whole.
+    pub(crate) fn parts(&self) -> (&str, Option<&str>, &str, Option<&'static str>, Option<&str>) {
+        let said = self.said.as_ref().map(|(t, _)| t.as_str());
+        (
+            &self.words,
+            said,
+            &self.tail,
+            self.command,
+            self.advice.as_deref(),
+        )
+    }
 }
 
 /// A sentence of the core's own with its first letter a capital.
@@ -773,19 +785,20 @@ fn checked(screen: &Screen, s: &v1::Status) -> Option<String> {
         .map(|at| format!("checked {}", screen.time(at, s.answered_at)))
 }
 
-/// The default text of `immunity status` and the text of `immunity run`, from the message alone:
-/// the headline in the words of the status's own `headline`, with `tail` after its words and
-/// `right` at its right edge, or the status's own time there without one; what needs a look by
-/// rule; the line that says the state, with its command; the lines the command adds of its own
-/// (`own`); then every fault. A value of `headline` this build does not know is said as not
-/// known, never as calm.
-pub(crate) fn answer(
-    s: &v1::Status,
-    screen: &Screen,
-    tail: &str,
+/// What the default status says of a message, decided once for its text and for the pages:
+/// the headline's words, style and what goes at its right; whether what needs a look is said;
+/// the state under the headline, its words and command; and every fault, in order.
+pub(crate) struct Told {
+    said: String,
+    style: Style,
     right: Option<String>,
-    own: &[String],
-) -> Vec<String> {
+    findings: bool,
+    pub(crate) state: Option<(String, Option<&'static str>)>,
+    pub(crate) faults: Vec<Fault>,
+}
+
+/// The decision `answer` lays out, from the message alone.
+pub(crate) fn told(s: &v1::Status, screen: &Screen) -> Told {
     use v1::Headline as H;
     let now = s.answered_at;
     let mut faults = faults(s, screen, true);
@@ -946,6 +959,38 @@ pub(crate) fn answer(
         };
         state = Some((format!("Watching live · {what}"), None));
     }
+    Told {
+        said,
+        style,
+        right: own_right,
+        findings,
+        state,
+        faults,
+    }
+}
+
+/// The default text of `immunity status` and the text of `immunity run`, from the message alone:
+/// the headline in the words of the status's own `headline`, with `tail` after its words and
+/// `right` at its right edge, or the status's own time there without one; what needs a look by
+/// rule; the line that says the state, with its command; the lines the command adds of its own
+/// (`own`); then every fault. A value of `headline` this build does not know is said as not
+/// known, never as calm.
+pub(crate) fn answer(
+    s: &v1::Status,
+    screen: &Screen,
+    tail: &str,
+    right: Option<String>,
+    own: &[String],
+) -> Vec<String> {
+    let Told {
+        said,
+        style,
+        right: own_right,
+        findings,
+        state,
+        faults,
+    } = told(s, screen);
+    let look = s.needs_a_look.as_ref();
     let mut out = screen.headline(
         &format!("{said}{tail}"),
         style,
