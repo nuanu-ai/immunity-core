@@ -563,25 +563,34 @@ const INFO_KEYS: [&str; 3] = [
     "CFBundleVersion",
 ];
 
-/// A bundle's identifier, short version and build, each where its `Info.plist` holds a string
-/// or a number there; all `None` when the bundle has no `Info.plist`. Its `Contents` is not
-/// followed when it is a link, as no link inside a place is. One that is there and cannot be
-/// read or is not a property list is the error, with why.
+/// A bundle's identifier, short version and build; all `None` when the bundle has no
+/// `Info.plist`, and the identifier `None` only when the file holds none. Its `Contents` is not
+/// followed when it is a link, as no link inside a place is. The error, with why, is an
+/// `Info.plist` that is there and cannot be read or is not a property list, an identifier that
+/// is not a string, and any of the three that cannot be told: a fallback to the folder's name
+/// would move the app to another subject with no failure said, and a number could be another
+/// app's identifier. A version or build of another type than a string or a number is none.
 fn info(bundle: &Path) -> Result<[Option<String>; 3], String> {
+    use crate::plist::Text;
     let contents = bundle.join("Contents");
     if std::fs::symlink_metadata(&contents).is_ok_and(|m| m.file_type().is_symlink()) {
         return Err("its Contents is a symbolic link, which is not followed".to_string());
     }
     let texts = crate::plist::texts_at(&contents.join("Info.plist"), &INFO_KEYS)
         .map_err(|why| format!("its Info.plist: {why}"))?;
-    Ok(INFO_KEYS.map(|key| {
-        texts.iter().flatten().find_map(|(k, text)| match text {
-            crate::plist::Text::One(s) | crate::plist::Text::Number(s) if *k == key => {
-                Some(s.clone())
-            }
-            _ => None,
-        })
-    }))
+    let mut out = [None, None, None];
+    for (slot, key) in out.iter_mut().zip(INFO_KEYS) {
+        let identifier = key == INFO_KEYS[0];
+        *slot = match texts.iter().flatten().find(|(k, _)| *k == key) {
+            None => None,
+            Some((_, Text::One(s))) => Some(s.clone()),
+            Some((_, Text::Number(s))) if !identifier => Some(s.clone()),
+            Some((_, Text::Untold)) => return Err(format!("its {key} cannot be told")),
+            Some(_) if identifier => return Err(format!("its {key} is not a string")),
+            Some(_) => None,
+        };
+    }
+    Ok(out)
 }
 
 /// The version as a bundle gives it: the short version, and the build in brackets when it
@@ -1874,8 +1883,8 @@ mod tests {
         let want = [
             app("org.example.a", Some("2.1 (2104)")),
             app("org.example.b", Some("2.1 (2104)")),
-            app("org.example.c", Some("3 (2.5)")),
-            app("org.example.d", Some("3 (2.5)")),
+            app("org.example.c", Some("3 (2.500000)")),
+            app("org.example.d", Some("3 (2.500000)")),
             app("org.example.e", None),
             app("F.app", None),
         ];
@@ -1920,16 +1929,54 @@ mod tests {
             ),
         ]);
         assert_eq!(read, []);
-        let failed: Vec<String> = unread.iter().map(|(path, _)| path.clone()).collect();
-        let apps = ["Contents.app", "Folder.app", "Link.app", "Pipe.app"];
-        assert_eq!(failed, apps.map(|a| format!("/Applications/{a}")));
-        assert!(
-            unread[0].1.contains("Contents is a symbolic link"),
-            "{unread:?}"
+        // Each is refused by what it is, before anything is opened.
+        let failed: Vec<String> = unread
+            .iter()
+            .map(|(p, why)| format!("{p}: {why}"))
+            .collect();
+        assert_eq!(
+            failed,
+            [
+                "/Applications/Contents.app: its Contents is a symbolic link, which is not followed",
+                "/Applications/Folder.app: its Info.plist: a folder, not a regular file",
+                "/Applications/Link.app: its Info.plist: a symbolic link, which is not followed",
+                "/Applications/Pipe.app: its Info.plist: a fifo, not a regular file",
+            ]
         );
-        for (_, why) in &unread[1..] {
-            assert!(why.starts_with("its Info.plist: "), "{why}");
-        }
+    }
+
+    #[test]
+    fn an_identifier_that_is_not_a_string_or_cannot_be_told_fails_that_app_and_never_names_it_by_its_folder()
+     {
+        // A fallback to the folder's name would move the app to another subject with no failure
+        // said, and a number could be another app's identifier. A version that cannot be told
+        // fails the reading too. The long strings are past what the reader tells of one value.
+        let long = format!("<string>{}</string>", "x".repeat(crate::plist::BYTES));
+        let s = "<string>1.0</string>";
+        let put = |text: String| -> Box<dyn FnOnce(&Path) + Send> {
+            Box::new(move |p| std::fs::write(p, text).unwrap())
+        };
+        let (read, unread) = read_apps(vec![
+            ("Number.app", put(info_plist("<integer>7</integer>", s, s))),
+            ("Long.app", put(info_plist(&long, s, s))),
+            (
+                "Version.app",
+                put(info_plist("<string>org.example.v</string>", &long, s)),
+            ),
+        ]);
+        assert_eq!(read, []);
+        let failed: Vec<String> = unread
+            .iter()
+            .map(|(p, why)| format!("{p}: {why}"))
+            .collect();
+        assert_eq!(
+            failed,
+            [
+                "/Applications/Long.app: its CFBundleIdentifier cannot be told",
+                "/Applications/Number.app: its CFBundleIdentifier is not a string",
+                "/Applications/Version.app: its CFBundleShortVersionString cannot be told",
+            ]
+        );
     }
 
     #[test]
