@@ -32,6 +32,9 @@ struct CFRange {
 const IMMUTABLE: usize = 0;
 /// `kCFPropertyListBinaryFormat_v1_0`.
 const BINARY: CFIndex = 200;
+/// `kCFNumberSInt64Type` and `kCFNumberFloat64Type`.
+const SINT64: CFIndex = 4;
+const FLOAT64: CFIndex = 6;
 /// How deep into arrays and dictionaries a value is followed. A login hook is one string; a
 /// value nested deeper is not read, and the reading says so, rather than run out of stack on a
 /// file written to do that.
@@ -63,6 +66,11 @@ unsafe extern "C" {
     fn CFDataGetTypeID() -> usize;
     fn CFDataCreate(allocator: CFTypeRef, bytes: *const u8, length: CFIndex) -> CFTypeRef;
     fn CFDataGetLength(data: CFTypeRef) -> CFIndex;
+    fn CFNumberGetTypeID() -> usize;
+    fn CFNumberIsFloatType(number: CFTypeRef) -> u8;
+    fn CFNumberGetValue(number: CFTypeRef, kind: CFIndex, value: *mut c_void) -> u8;
+    fn CFNumberCreate(allocator: CFTypeRef, kind: CFIndex, value: *const c_void) -> CFTypeRef;
+    fn CFNumberCompare(number: CFTypeRef, other: CFTypeRef, context: *mut c_void) -> CFIndex;
     fn CFPropertyListCreateWithData(
         allocator: CFTypeRef,
         data: CFTypeRef,
@@ -149,17 +157,47 @@ fn dictionary(bytes: &[u8]) -> Result<Owned, &'static str> {
     Ok(list)
 }
 
-/// A value at a top-level key as text, where it is text: a string, or an array with each
-/// element's string by its position.
+/// A value at a top-level key as text, where it is text: a string, a number, or an array with
+/// each element's string by its position.
 #[derive(Debug, PartialEq)]
 pub enum Text {
     One(String),
+    /// A number: an integer as its decimal digits, a real number with six decimals, as `plutil`
+    /// gives one and as the store of an earlier build holds an application's version.
+    Number(String),
     /// `None` for an element that is not a string.
     List(Vec<Option<String>>),
     /// Anything else.
     Other,
-    /// Text that cannot be told: past `BYTES`, an array past `NODES`, or not valid UTF-16.
+    /// Text that cannot be told: past `BYTES`, an array past `NODES`, not valid UTF-16, an
+    /// integer outside 64 bits, or a real number that is not finite.
     Untold,
+}
+
+/// `texts` of the property list at `path`, `None` when nothing is there. Anything there but a
+/// regular file (a link, a folder, a pipe, a device) is the error without being opened. The file
+/// is read as a stranger's file is (`autorun::read_capped_resolved`): a regular file only,
+/// opened without waiting and without following a link in its last part, at most
+/// `watched::CAP` bytes. Why it was not read, or not taken as a property list, is the error.
+#[allow(clippy::type_complexity)]
+pub fn texts_at<'k>(
+    path: &std::path::Path,
+    keys: &[&'k str],
+) -> Result<Option<Vec<(&'k str, Text)>>, String> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+        Ok(m) if m.file_type().is_symlink() => {
+            return Err("a symbolic link, which is not followed".to_string());
+        }
+        Ok(m) if !m.is_file() => {
+            let what = crate::watched::kind_of(m.file_type());
+            return Err(format!("a {what}, not a regular file"));
+        }
+        Ok(_) => {}
+    }
+    let bytes = crate::autorun::read_capped_resolved(path, crate::watched::CAP)?;
+    texts(&bytes, keys).map(Some).map_err(str::to_string)
 }
 
 /// For each of `keys` the file holds at its top, in the order given, the value there as text.
@@ -195,11 +233,44 @@ pub fn texts<'k>(bytes: &[u8], keys: &[&'k str]) -> Result<Vec<(&'k str, Text)>,
                     .filter(|items| items.len() <= NODES)
                     .map_or(Text::Untold, Text::List)
             }
-            None => Text::Other,
+            None => match number(value) {
+                Some(Some(n)) => Text::Number(n),
+                Some(None) => Text::Untold,
+                None => Text::Other,
+            },
         };
         out.push((*key, text));
     }
     Ok(out)
+}
+
+/// A live value as a number's text (`Text::Number`): `None` when it is not a number, and
+/// `Some(None)` when it is a real that is not finite or an integer outside 64 bits, as a
+/// property list may hold one past `i64::MAX`: CoreFoundation gives it cut to 64 bits and says
+/// it was exact, so the 64 bits are compared with it.
+fn number(value: CFTypeRef) -> Option<Option<String>> {
+    // SAFETY: plain functions of CoreFoundation on live objects; each value is written into, or
+    // read from, a variable of the size its type names. A real number is given whole.
+    unsafe {
+        if CFGetTypeID(value) != CFNumberGetTypeID() {
+            return None;
+        }
+        if CFNumberIsFloatType(value) != 0 {
+            let mut real = 0f64;
+            CFNumberGetValue(value, FLOAT64, (&raw mut real).cast());
+            return Some(real.is_finite().then(|| format!("{real:.6}")));
+        }
+        let mut whole = 0i64;
+        CFNumberGetValue(value, SINT64, (&raw mut whole).cast());
+        // Owned: `Create`.
+        let back = Owned::take(CFNumberCreate(
+            std::ptr::null(),
+            SINT64,
+            (&raw const whole).cast(),
+        ));
+        let same = back.is_some_and(|b| CFNumberCompare(value, b.0, std::ptr::null_mut()) == 0);
+        Some(same.then(|| whole.to_string()))
+    }
 }
 
 /// A live value as a string: `None` when it is not one, and `Some(None)` when it cannot be
@@ -353,9 +424,61 @@ fn binary(value: CFTypeRef) -> Option<Vec<u8>> {
     Some(unsafe { crate::codesign::data_bytes(data.0) })
 }
 
+/// A property list's dictionary written again by CoreFoundation in the binary form, as
+/// `plutil -convert binary1` writes one: for samples of that form made from XML.
+#[cfg(test)]
+pub fn binary_of(bytes: &[u8]) -> Vec<u8> {
+    binary(dictionary(bytes).unwrap().0).unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_number_is_told_as_its_text_in_xml_and_in_binary_and_other_values_are_not() {
+        // An integer is its digits, a real number six decimals, as `plutil` printed them and as
+        // a store holds a version they gave; a date, data, a boolean or a dictionary is no
+        // text, and an integer past 64 bits or a real that is not finite is not told rather
+        // than given clamped.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>i</key><integer>42</integer>
+<key>n</key><integer>-7</integer>
+<key>r</key><real>1.5</real>
+<key>w</key><real>3</real>
+<key>t</key><real>0.1</real>
+<key>s</key><real>1.25e-7</real>
+<key>M</key><integer>9223372036854775807</integer>
+<key>d</key><date>2026-01-02T03:04:05Z</date>
+<key>b</key><true/>
+<key>x</key><data>AAEC</data>
+<key>m</key><dict/>
+<key>u</key><integer>18446744073709551615</integer>
+<key>q</key><real>nan</real>
+<key>f</key><real>+infinity</real>
+</dict></plist>"#;
+        let keys = [
+            "i", "n", "r", "w", "t", "s", "M", "d", "b", "x", "m", "u", "q", "f",
+        ];
+        let n = |s: &str| Text::Number(s.to_string());
+        let want = [
+            n("42"),
+            n("-7"),
+            n("1.500000"),
+            n("3.000000"),
+            n("0.100000"),
+        ]
+        .into_iter()
+        .chain([n("0.000000"), n("9223372036854775807")])
+        .chain([Text::Other, Text::Other, Text::Other, Text::Other])
+        .chain([Text::Untold, Text::Untold, Text::Untold]);
+        let want: Vec<_> = keys.into_iter().zip(want).collect();
+        assert_eq!(texts(xml.as_bytes(), &keys).unwrap(), want);
+        let binary = binary_of(xml.as_bytes());
+        assert!(binary.starts_with(b"bplist00"));
+        assert_eq!(texts(&binary, &keys).unwrap(), want);
+    }
 
     const XML_HOOK: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

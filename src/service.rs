@@ -75,6 +75,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const LABEL: &str = "ai.nuanu.immunity.core.watch";
 /// launchd's tool, where every Mac has it.
 const LAUNCHCTL: &str = "/bin/launchctl";
+/// The system's own tool for property lists, which writes the job's.
+const PLUTIL: &str = "/usr/bin/plutil";
 /// The folder of the installed core inside the store's folder.
 const BIN: &str = "bin";
 /// The installed core's name in `BIN`.
@@ -380,20 +382,19 @@ fn unreadable(path: &Path, said: &str) -> Failed {
     )
 }
 
-/// The string at `key` of the property list at `path`, read by the system's plutil.
+/// The string at the top-level `key` of the property list at `path`, read as `plist::texts_at`
+/// reads a file. Nothing there, no value, or a value that is not a string is unreadable.
 fn plist_string(path: &Path, key: &str) -> Result<String, Failed> {
-    let out = Command::new(crate::integrity::PLUTIL)
-        .args(["-extract", key, "raw", "-expect", "string", "-n", "-o", "-"])
-        .arg(path)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|e| unreadable(path, &e.to_string()))?;
-    if !out.status.success() {
-        return Err(unreadable(path, &said(&out)));
+    let texts = match crate::plist::texts_at(path, &[key]) {
+        Ok(Some(texts)) => texts,
+        Ok(None) => return Err(unreadable(path, "nothing is there")),
+        Err(why) => return Err(unreadable(path, &why)),
+    };
+    match texts.into_iter().next() {
+        Some((_, crate::plist::Text::One(s))) => Ok(s),
+        Some(_) => Err(unreadable(path, &format!("its {key} is not a string"))),
+        None => Err(unreadable(path, &format!("it holds no {key}"))),
     }
-    // With `-n` plutil adds no line feed, so every byte is the value's own. `-expect string`
-    // refuses a value that is not a string: of a dictionary plutil would print the keys.
-    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// What a tool said when it failed, stderr first.
@@ -457,7 +458,7 @@ fn stop(launchctl: &Path, job: &str) -> Result<(), String> {
 
 /// Runs the system's plutil with `args` and then `path`.
 fn plutil(args: &[&str], path: &Path) -> Result<(), String> {
-    let out = Command::new(crate::integrity::PLUTIL)
+    let out = Command::new(PLUTIL)
         .args(args)
         .arg(path)
         .stdin(Stdio::null())
@@ -974,6 +975,30 @@ fn off(
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_string_of_the_job_s_property_list_is_read_in_xml_and_in_binary_and_anything_else_is_unreadable()
+     {
+        // As `write_plist` writes it, and in the binary form another program may leave; a
+        // label that is not a string, or none, is never taken as one.
+        let dir = crate::common::Scratch::new("service-plist-string");
+        let path = dir.join("job.plist");
+        write_plist(
+            &path,
+            Path::new("/Users/example/immunity"),
+            &dir,
+            "org.example",
+        )
+        .unwrap();
+        assert_eq!(plist_string(&path, "Label").ok().as_deref(), Some(LABEL));
+        let binary = crate::plist::binary_of(&fs::read(&path).unwrap());
+        fs::write(&path, binary).unwrap();
+        assert_eq!(plist_string(&path, "Label").ok().as_deref(), Some(LABEL));
+        for key in ["ProgramArguments", "ThrottleInterval", "Other"] {
+            let failed = plist_string(&path, key).err().unwrap();
+            assert_eq!(failed.code, "unreadable", "{key}");
+        }
+    }
+
     fn parsed(args: &[&str]) -> Result<ServiceArgs, String> {
         let mut options = Options::default();
         parse(Verb::On, args.iter().map(|a| a.to_string()), &mut options)
@@ -1095,8 +1120,12 @@ esac
         let m = done(|| on(&launchctl, Some(&home), |_| true));
         assert_eq!((m.in_place, m.loaded), (Some(true), true));
         assert_eq!(Path::new(&m.program_path_text), core);
-        let named = plist_string(&plist, "ProgramArguments.0").ok().unwrap();
-        assert_eq!(Path::new(&named), core);
+        let read = crate::plist::texts_at(&plist, &["ProgramArguments"]);
+        let Ok(Some(read)) = read else { panic!() };
+        let [(_, crate::plist::Text::List(arguments))] = &read[..] else {
+            panic!()
+        };
+        assert_eq!(arguments[0].as_deref().map(Path::new), Some(&*core));
         assert!(!copy.exists() && !folder.join(BIN).exists());
 
         let m = done(|| off(&launchctl, Some(&home), |_| true));
