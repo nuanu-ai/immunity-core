@@ -1831,22 +1831,26 @@ extern "C" fn on_signal(_: libc::c_int) {
 }
 
 /// `watching` of the contract's `Status`: absent unless a watcher holds its lock on this store
-/// now, so a watcher that died never shows as watching. What a failure said is whole.
-pub fn watcher(store: &Path) -> Option<crate::contract::v1::Watcher> {
+/// now, so a watcher that died never shows as watching. What a failure said is whole. `conn` is
+/// the status's read of `store`, `None` without a store.
+pub fn watcher(
+    store: &Path,
+    conn: Option<&Connection>,
+) -> rusqlite::Result<Option<crate::contract::v1::Watcher>> {
     use crate::contract::v1;
     let folder = crate::home(store);
-    let since = Some(responsive(&folder)?.0);
-    let conn = store::open_read_only(store).ok();
-    let last = conn
-        .as_ref()
-        .and_then(|conn| last_read(conn).ok().flatten())
-        .filter(|last| since.is_some_and(|since| *last >= since));
-    let failed = conn
-        .as_ref()
-        .and_then(|conn| failures(conn, &folder).ok())
-        .unwrap_or_default();
-    Some(v1::Watcher {
-        since_at: since,
+    let Some((since, _)) = responsive(&folder) else {
+        return Ok(None);
+    };
+    let (last, failed) = match conn {
+        Some(conn) => (
+            last_read(conn)?.filter(|last| *last >= since),
+            failures(conn, &folder)?,
+        ),
+        None => (None, Vec::new()),
+    };
+    Ok(Some(v1::Watcher {
+        since_at: Some(since),
         last_read_at: last,
         failed: failed
             .iter()
@@ -1863,7 +1867,7 @@ pub fn watcher(store: &Path) -> Option<crate::contract::v1::Watcher> {
             })
             .collect(),
         cannot_see: CANNOT_SEE.iter().map(|s| s.to_string()).collect(),
-    })
+    }))
 }
 
 /// What the pages of the view rest on about the watcher: when the one that holds the store
@@ -2827,8 +2831,9 @@ mod tests {
     fn the_view_after_ten_thousand_readings_is_made_with_no_more_work_than_on_the_first_day() {
         // The owner's pages are written when asked for after a change; they must not take
         // longer the longer the app has been open.
-        let (first, later) =
-            first_day_and_later("view-flat", |w, _| crate::write_view(&w.store).unwrap());
+        let (first, later) = first_day_and_later("view-flat", |w, _| {
+            crate::write_view(&w.store, false).unwrap()
+        });
         assert!(
             later < first + READINGS,
             "the view took {first} steps on the first day, {later} after {READINGS} readings"
@@ -3156,7 +3161,11 @@ mod tests {
         );
         let shown = |left: &BTreeMap<PathBuf, String>| {
             mark(&store_path, PLACES, unwatched(left).as_deref(), 0).unwrap();
-            watcher(&store_path).unwrap().failed[0].detail_text.clone()
+            store::read(&store_path, |c| Ok(watcher(&store_path, Some(c))?.unwrap()))
+                .unwrap()
+                .failed[0]
+                .detail_text
+                .clone()
         };
         let lines = |left: &BTreeMap<PathBuf, String>| -> Vec<String> {
             left.iter()
@@ -3260,7 +3269,11 @@ mod tests {
         // A detail that is not what this build keeps is a source's text, cut whole.
         let odd = format!("not kept by this build ?t={token}");
         mark(&store_path, PLACES, Some(&odd), 0).unwrap();
-        let shown = watcher(&store_path).unwrap().failed[0].detail_text.clone();
+        let shown = store::read(&store_path, |c| Ok(watcher(&store_path, Some(c))?.unwrap()))
+            .unwrap()
+            .failed[0]
+            .detail_text
+            .clone();
         assert_eq!(shown, crate::secrets::said(&odd));
         assert!(!shown.contains(&token));
     }

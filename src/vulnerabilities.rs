@@ -2217,7 +2217,7 @@ pub fn list(conn: Option<&Connection>, now: i64) -> rusqlite::Result<v1::Vulnera
     };
     let this = crate::findings::This::of(conn, crate::covered::this_machine(conn)?)?;
     let all = affecting(conn)?;
-    let listed = crate::threats::last_good(conn).unwrap_or(None).is_some();
+    let listed = crate::threats::last_good(conn)?.is_some();
     out.store_id = Some(crate::store::id(conn)?);
     // Matching runs in every check that finishes.
     if crate::status::latest_finished(conn)?.is_none() {
@@ -2329,16 +2329,14 @@ pub fn one(conn: Option<&Connection>, id: &str, now: i64) -> rusqlite::Result<v1
     let this = crate::findings::This::of(conn, crate::covered::this_machine(conn)?)?;
     let place_of = |c: &str| whole(&crate::findings::place(c, this.as_ref()));
     let records = held_records(conn, id)?;
-    // Not known while the catalogue was never read, nor when its table cannot be read.
-    out.in_catalogue = if crate::threats::last_good(conn).unwrap_or(None).is_some() {
-        conn.query_row(
+    // Not known while the catalogue was never read.
+    out.in_catalogue = match crate::threats::last_good(conn)?.is_some() {
+        true => Some(conn.query_row(
             "SELECT EXISTS (SELECT 1 FROM threat WHERE id = ?1 AND gone_at IS NULL)",
             [id],
             |r| r.get(0),
-        )
-        .ok()
-    } else {
-        None
+        )?),
+        false => None,
     };
     let in_catalogue = out.in_catalogue == Some(true);
     let places: Vec<Place> = conn
