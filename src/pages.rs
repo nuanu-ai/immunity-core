@@ -3086,7 +3086,6 @@ mod tests {
                 cause: None,
                 at,
                 last_full: Some(at),
-                run_id: "run-1".to_string(),
             };
             let ahead = [at(now + crate::store::AHEAD_ALLOWED + 1)];
             let said = unread(&readings_of(count, &ahead), Some(run), now, &[]);
@@ -3113,7 +3112,6 @@ mod tests {
             cause: None,
             at,
             last_full: Some(run - 86_400),
-            run_id: "run-1".to_string(),
         };
         let said = |readings: &[&Latest], extra: &[String]| {
             let mut out = String::new();

@@ -548,8 +548,6 @@ pub struct Latest {
     pub cause: Option<String>,
     pub at: i64,
     pub last_full: Option<i64>,
-    /// The run that made it.
-    pub run_id: String,
 }
 
 /// The latest record for each reader, scope and kind, and its latest full one.
@@ -562,7 +560,7 @@ pub fn latest_coverage(conn: &Connection) -> rusqlite::Result<Vec<Latest>> {
                 (SELECT MAX(f.observed_at) FROM coverage f
                  WHERE f.reader = c.reader AND f.scope = c.scope AND f.kind = c.kind
                    AND f.completeness = 'full'),
-                c.cause, c.run_id
+                c.cause
          FROM latest c
          WHERE c.scope NOT IN (SELECT id FROM gone_entity)
          ORDER BY c.completeness = 'full', c.completeness, c.reader, c.scope, c.kind",
@@ -578,7 +576,6 @@ pub fn latest_coverage(conn: &Connection) -> rusqlite::Result<Vec<Latest>> {
             at: r.get(5)?,
             last_full: r.get(6)?,
             cause: r.get(7)?,
-            run_id: r.get(8)?,
         })
     })?
     .collect()

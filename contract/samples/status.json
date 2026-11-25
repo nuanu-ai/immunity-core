@@ -1,11 +1,11 @@
 {
-  "answered_at": 1795588225,
+  "answered_at": 1795599796,
   "answered_outside_app": {
     "items": [
       {
         "answer": {
           "given": "expected",
-          "given_at": 1795588225,
+          "given_at": 1795599796,
           "in_force": true,
           "reason_cuts": [
             {
@@ -15,7 +15,7 @@
             }
           ],
           "reason_text": "invented: my own tool, started as tool --password=\\cut{immunity:flag-value 18}",
-          "until_at": 1798180225,
+          "until_at": 1798191796,
           "via": "agent"
         },
         "change": null,
@@ -28,12 +28,12 @@
           "state": "expected",
           "urgent": true
         },
-        "first_seen_at": 1795588165,
+        "first_seen_at": 1795599736,
         "folder_text": null,
         "group": null,
         "kind": "interpreter running code from its command line, detached",
         "kind_title": "Script running in the background",
-        "last_seen_at": 1795588165,
+        "last_seen_at": 1795599736,
         "package_text": null,
         "releases_text": [],
         "rule_title_text": null,
@@ -592,7 +592,7 @@
         0,
         2
       ],
-      "ends_at": 1795588225,
+      "ends_at": 1795599796,
       "step_seconds": 3600
     },
     "program_starts_by_minute": {
@@ -658,10 +658,10 @@
         0,
         2
       ],
-      "ends_at": 1795588225,
+      "ends_at": 1795599796,
       "step_seconds": 60
     },
-    "read_at": 1795588225,
+    "read_at": 1795599796,
     "reason_text": null,
     "said_by": null,
     "said_text": null,
@@ -675,7 +675,7 @@
       "last_day": 0,
       "since_check": 0
     },
-    "written_at": 1795588225
+    "written_at": 1795599796
   },
   "format": 1,
   "headline": "needs_a_look",
@@ -723,9 +723,9 @@
   "journal_seq": 47,
   "last_finished_run": {
     "check": {
-      "finished_at": 1795588225,
-      "id": "1795588225-058961000",
-      "started_at": 1795588225
+      "finished_at": 1795599796,
+      "id": "1795599796-078907000",
+      "started_at": 1795599796
     },
     "first_run": false,
     "readings": {
@@ -746,9 +746,9 @@
     ]
   },
   "last_run": {
-    "finished_at": 1795588225,
-    "id": "1795588225-058961000",
-    "started_at": 1795588225
+    "finished_at": 1795599796,
+    "id": "1795599796-078907000",
+    "started_at": 1795599796
   },
   "login_job_installed": null,
   "needs_a_look": {
@@ -824,12 +824,12 @@
             "state": "open",
             "urgent": true
           },
-          "first_seen_at": 1795588225,
+          "first_seen_at": 1795599796,
           "folder_text": null,
           "group": null,
           "kind": "verdict of the response layer",
           "kind_title": "Response layer",
-          "last_seen_at": 1795588225,
+          "last_seen_at": 1795599796,
           "package_text": null,
           "releases_text": [],
           "rule_title_text": null,
@@ -857,7 +857,7 @@
                     "length": 18
                   }
                 ],
-                "recorded_at": 1795588225,
+                "recorded_at": 1795599796,
                 "verdict": {
                   "case_text": "case-samples",
                   "confidence": "high",
@@ -868,7 +868,7 @@
                   "kind": "suspicious",
                   "reason_text": "invented: the package was published by an account taken over; it ran tool --password=\\cut{immunity:flag-value 18}",
                   "severity": "critical",
-                  "store_id": "6b0e6b7c46a7a4e4c848a645396deff3",
+                  "store_id": "6254460dfc48319477b581d36194ec39",
                   "verdict_id": null
                 }
               }
@@ -926,12 +926,12 @@
             "state": "open",
             "urgent": true
           },
-          "first_seen_at": 1795588224,
+          "first_seen_at": 1795599795,
           "folder_text": null,
           "group": null,
           "kind": "lockfile dependency",
           "kind_title": "Package in a project",
-          "last_seen_at": 1795588225,
+          "last_seen_at": 1795599796,
           "package_text": "ansi-regex",
           "releases_text": [
             "6.2.1"
@@ -981,12 +981,12 @@
             "state": "open",
             "urgent": true
           },
-          "first_seen_at": 1795588225,
+          "first_seen_at": 1795599796,
           "folder_text": null,
           "group": null,
           "kind": "installed package changed in place",
           "kind_title": "Package changed in place",
-          "last_seen_at": 1795588225,
+          "last_seen_at": 1795599796,
           "package_text": null,
           "releases_text": [],
           "rule_title_text": null,
@@ -1036,12 +1036,12 @@
             "state": "open",
             "urgent": true
           },
-          "first_seen_at": 1795588225,
+          "first_seen_at": 1795599796,
           "folder_text": null,
           "group": null,
           "kind": "match of an indicator from the list",
           "kind_title": "Indicator match",
-          "last_seen_at": 1795588225,
+          "last_seen_at": 1795599796,
           "package_text": null,
           "releases_text": [],
           "rule_title_text": null,
@@ -1056,7 +1056,7 @@
         "value_text": "[file:hashes.'SHA-256' = '128344f1f3352b53701662b12b748ff9df8ea044a2acf076d438e8f5a0a75911']"
       },
       {
-        "advice": "The address is on the list you gave. Look at the process shown here: its command, the program that started it and the folder it ran in. Until you know why it reached that address, treat this Mac as affected; if nobody knows, ask your agent to look into it.",
+        "advice": "The program named here reached an address on the list you gave. Look at what is shown here of the process that did. Until you know why it reached that address, treat this Mac as affected; if nobody knows, ask your agent to look into it.",
         "change": "new",
         "evidence": {
           "indicator_matched": {
@@ -1076,7 +1076,7 @@
               "pid": 4300,
               "process_group_leader": null,
               "session_leader": null,
-              "start_micros": 1795584625123456,
+              "start_micros": 1795596196123456,
               "working_directory_text": null
             },
             "transport": "tcp"
@@ -1094,12 +1094,12 @@
             "state": "open",
             "urgent": true
           },
-          "first_seen_at": 1795588095,
+          "first_seen_at": 1795599666,
           "folder_text": null,
           "group": null,
           "kind": "match of an indicator from the list",
           "kind_title": "Indicator match",
-          "last_seen_at": 1795588095,
+          "last_seen_at": 1795599666,
           "package_text": null,
           "releases_text": [],
           "rule_title_text": null,
@@ -1255,12 +1255,12 @@
             "state": "open",
             "urgent": false
           },
-          "first_seen_at": 1795588224,
+          "first_seen_at": 1795599795,
           "folder_text": null,
           "group": null,
           "kind": "program start matched by a published rule",
           "kind_title": "Program start",
-          "last_seen_at": 1795588225,
+          "last_seen_at": 1795599796,
           "package_text": null,
           "releases_text": [],
           "rule_title_text": "Binary Padding - MacOS",
@@ -1295,12 +1295,12 @@
             "state": "open",
             "urgent": false
           },
-          "first_seen_at": 1795588225,
+          "first_seen_at": 1795599796,
           "folder_text": null,
           "group": null,
           "kind": "shell profile",
           "kind_title": "Shell startup file",
-          "last_seen_at": 1795588225,
+          "last_seen_at": 1795599796,
           "package_text": null,
           "releases_text": [],
           "rule_title_text": null,
@@ -1365,7 +1365,7 @@
       "kind": "ways a project runs code by itself that are not read",
       "meaning": "None of the others is present in the projects that were looked at. Not every project was looked at, so the projects not looked at may hold some. Why: only the given folder was walked.",
       "scope": "projects",
-      "since_at": 1795588225,
+      "since_at": 1795599796,
       "title": "This version reads 19 of the 59 known ways a project can make code run by itself.",
       "value_text": null,
       "who": "nothing"
@@ -1382,7 +1382,7 @@
       "kind": "places in the home folder where a tool's settings run code by itself that are not read",
       "meaning": "None of the others is present on this Mac now.",
       "scope": "this_mac",
-      "since_at": 1795588225,
+      "since_at": 1795599796,
       "title": "This version reads 8 of the 12 known places where a developer tool's own settings can make code run by itself.",
       "value_text": null,
       "who": "nothing"
@@ -1416,8 +1416,8 @@
       "kind": "list of known vulnerabilities not current",
       "meaning": "Why: crates.io: the download failed; what failed is listed with this; npm: its newest record changed 2025-09-12T01:13:34Z, more than 7 days before this check; PyPI: the download failed; what failed is listed with this. It is downloaded again at every check. Until it is, a vulnerability published after that date is not known here. The download uses a proxy only when the environment names one; it does not read the macOS proxy settings.",
       "scope": "threats",
-      "since_at": 1795588225,
-      "title": "The list of known vulnerabilities could not be updated since 2026-11-25 06:30 UTC.",
+      "since_at": 1795599796,
+      "title": "The list of known vulnerabilities could not be updated since 2026-11-25 09:43 UTC.",
       "value_text": "crates.io: cannot read none: No such file or directory (os error 2); PyPI: cannot read none: No such file or directory (os error 2)",
       "who": "nothing"
     },
@@ -1595,9 +1595,9 @@
       }
     ]
   },
-  "store_id": "6b0e6b7c46a7a4e4c848a645396deff3",
+  "store_id": "6254460dfc48319477b581d36194ec39",
   "this_mac": {
-    "checked_at": 1795588225,
+    "checked_at": 1795599796,
     "fresh": true,
     "fresh_for_seconds": 7200,
     "live": false,
@@ -1638,7 +1638,7 @@
     ]
   },
   "threats": {
-    "checked_at": 1795588225,
+    "checked_at": 1795599796,
     "entries": null,
     "first_reading": null,
     "gone": null,
@@ -1683,7 +1683,7 @@
         "ecosystem": "npm",
         "matched": true,
         "not_current_why": "its newest record changed 2025-09-12T01:13:34Z, more than 7 days before this check",
-        "read_at": 1795588225,
+        "read_at": 1795599796,
         "source": "osv-npm"
       },
       {
@@ -1729,7 +1729,7 @@
       {
         "asked_this_run": true,
         "changed_at": null,
-        "checked_at": 1795588225,
+        "checked_at": 1795599796,
         "ecosystem": "crates.io",
         "first_reading": null,
         "malicious_records": null,
@@ -1744,14 +1744,14 @@
       },
       {
         "asked_this_run": true,
-        "changed_at": 1795588224,
-        "checked_at": 1795588225,
+        "changed_at": 1795599795,
+        "checked_at": 1795599796,
         "ecosystem": "npm",
         "first_reading": null,
         "malicious_records": 1,
         "matched": true,
         "outcome": "unchanged",
-        "read_at": 1795588225,
+        "read_at": 1795599796,
         "reason_text": null,
         "records": 1,
         "since_last_reading": null,
@@ -1761,7 +1761,7 @@
       {
         "asked_this_run": true,
         "changed_at": null,
-        "checked_at": 1795588225,
+        "checked_at": 1795599796,
         "ecosystem": "PyPI",
         "first_reading": null,
         "malicious_records": null,
@@ -1780,11 +1780,11 @@
   "watched": {
     "changes": [
       {
-        "at": 1795588225,
+        "at": 1795599796,
         "change": "changed",
         "kind": "shell profile",
         "path_text": ".zshrc",
-        "run_id": "1795588225-058961000"
+        "run_id": "1795599796-078907000"
       }
     ],
     "changes_total": 1,

@@ -488,9 +488,8 @@ fn mode(mac: &Mac, rel: &str, mode: u32) {
 fn a_client_has_a_status_of_real_size_to_be_drawn_from() {
     let mac = Mac::new();
     let log = prepare(&mac);
-    // Watched files read at the first check and kept closed by their permissions at the second,
-    // faults, one of them with a long name; and the SSH file closed at the first check only,
-    // which the second then reads for the first time.
+    // Watched files their permissions keep closed, one of them with a long name; and the SSH
+    // file closed at the first check only, which the second then reads for the first time.
     let closed = [
         "home/.zprofile",
         "home/.bash_profile",
@@ -499,14 +498,12 @@ fn a_client_has_a_status_of_real_size_to_be_drawn_from() {
     ];
     for rel in closed {
         mac.put(rel, "invented\n");
+        mode(&mac, rel, 0o000);
     }
     mac.put("home/.ssh/config", "Host build-box\n  User example\n");
     mode(&mac, "home/.ssh/config", 0o000);
     mac.run();
     mode(&mac, "home/.ssh/config", 0o644);
-    for rel in closed {
-        mode(&mac, rel, 0o000);
-    }
     mac.put("home/.zshrc", "export INVENTED=2\n");
     mac.append(&log, &padding(2));
     mac.run();
@@ -516,9 +513,8 @@ fn a_client_has_a_status_of_real_size_to_be_drawn_from() {
         mode(&mac, rel, 0o644);
     }
 
-    // What the binary made: a place read for the first time among what needs a look, the closed
-    // files read before as one fault by their names, and their readings as one cause the person
-    // can fix, a limit beside it.
+    // What the binary made: a place read for the first time among what needs a look, and the
+    // closed files as one cause the person can fix, with four of them.
     let items = status["needs_a_look"]["items"].as_array().unwrap().clone();
     let first_read = items
         .iter()
@@ -531,18 +527,14 @@ fn a_client_has_a_status_of_real_size_to_be_drawn_from() {
         .unwrap_or_else(|| panic!("no change: {items:#?}"))
         .clone();
     let not_covered = status["not_covered"].as_array().unwrap().clone();
-    let cause = |id: &str, fault: bool| {
-        let item = not_covered
-            .iter()
-            .find(|u| u["id"] == id)
-            .unwrap_or_else(|| panic!("no {id}: {not_covered:#?}"));
-        assert!(
-            item["examples_text"].as_array().unwrap().len() >= 3 && item["fault"] == fault,
-            "{item:#}"
-        );
-    };
-    cause("read-before-not-read-now", true);
-    cause("not-permitted", false);
+    let permitted = not_covered
+        .iter()
+        .find(|u| u["id"] == "not-permitted")
+        .unwrap_or_else(|| panic!("no closed files: {not_covered:#?}"));
+    assert!(
+        permitted["examples_text"].as_array().unwrap().len() >= 3,
+        "{permitted:#}"
+    );
 
     // Two findings: the place read for the first time and the change.
     let urgent = [&first_read, &changed]

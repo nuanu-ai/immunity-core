@@ -236,7 +236,9 @@ pub fn under(path: &str, unit: &str) -> bool {
 }
 
 /// Records the units a reading read in full and those it saw present; a unit recorded before
-/// keeps its first run.
+/// keeps its first run. A unit read ends the unread mark of every unit that holds it: of the
+/// file it is a part of, and of each folder it is inside, as the hooks a configured folder
+/// holds are read without the folder being listed.
 pub fn record(
     tx: &Transaction,
     reader: &str,
@@ -255,15 +257,24 @@ pub fn record(
             stmt.execute(params![reader, kind, unit.path, how, run_id, at])?;
         }
     }
+    let marked: Vec<String> = tx
+        .prepare("SELECT unit FROM unit_unread WHERE reader = ?1 AND kind = ?2")?
+        .query_map(params![reader, kind], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
     let mut again =
         tx.prepare("DELETE FROM unit_unread WHERE reader = ?1 AND kind = ?2 AND unit = ?3")?;
+    for mark in marked
+        .iter()
+        .filter(|m| read.iter().any(|u| under(&u.path, m)))
+    {
+        again.execute(params![reader, kind, mark])?;
+    }
     let mut part_again = tx.prepare(
         "DELETE FROM part_unread WHERE reader = ?1 AND kind = ?2 AND unit = ?3
            AND (?4 = '' OR part = ?4)",
     )?;
     for unit in read {
         // A readable part ends the whole-file failure without establishing full coverage.
-        again.execute(params![reader, kind, unit.path])?;
         if !unit.part.is_empty() {
             tx.execute(
                 "INSERT OR IGNORE INTO part_read (reader, kind, unit, part, run_id)
@@ -313,9 +324,10 @@ pub fn judged_unread(
 }
 
 /// Forgets the unread marks of units a reading shows are not there: inside a folder whose
-/// listing it read in full and met by none of its units, as the checkout walk shows a folder
-/// gone. Reading a unit again forgets its mark too (`record`). A watched file that is gone
-/// takes what was known of it with it, and `fault::lost` leaves out what is gone.
+/// listing it read in full, where the way to the unit leaves it by an entry none of its units
+/// met, as the checkout walk shows a folder gone with all it held. Reading a unit again
+/// forgets its mark too (`record`). A watched file that is gone takes what was known of it
+/// with it, and `fault::lost` leaves out what is gone.
 pub fn found_absent(
     tx: &Transaction,
     reader: &str,
@@ -334,16 +346,62 @@ pub fn found_absent(
         .query_map(params![reader, kind], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     for unit in marked {
-        let shown = listed
-            .iter()
-            .any(|l| l.part.is_empty() && l.path == parent(&unit));
-        if shown && !met.contains(unit.as_str()) {
+        // Each folder above the unit, nearest first, with the entry of it on the way down.
+        let mut step = unit.as_str();
+        let mut gone = false;
+        while parent(step) != step {
+            let up = parent(step);
+            if listed.iter().any(|l| l.part.is_empty() && l.path == up) {
+                gone = !met.contains(step);
+                break;
+            }
+            step = up;
+        }
+        if gone {
             for table in ["unit_unread", "part_unread"] {
                 tx.execute(
                     &format!("DELETE FROM {table} WHERE reader = ?1 AND kind = ?2 AND unit = ?3"),
                     params![reader, kind, unit],
                 )?;
             }
+        }
+    }
+    Ok(())
+}
+
+/// Forgets the unread marks of `kind` inside the checkout `within` that a reading of all of it
+/// did not make in its run, `run_id`, as when Git's configuration told where the checkout's
+/// hooks are and a folder marked before is no longer among them: what that reading did not
+/// reach there is no place of its kind now. A checkout inside it that the store ever knew on
+/// `machine` has a reading of its own, which the walk does not look into, so its marks stay.
+pub fn found_absent_within(
+    tx: &Transaction,
+    reader: &str,
+    kind: &str,
+    machine: &str,
+    within: &str,
+    run_id: &str,
+) -> rusqlite::Result<()> {
+    let known = past_checkouts(tx)?;
+    let nested: Vec<&str> = (known.iter())
+        .filter_map(|k| k.strip_prefix(machine)?.strip_prefix('/'))
+        .filter(|k| *k != within && under(k, within))
+        .collect();
+    for table in ["unit_unread", "part_unread"] {
+        let marked: Vec<String> = tx
+            .prepare(&format!(
+                "SELECT DISTINCT unit FROM {table} WHERE reader = ?1 AND kind = ?2 AND run_id != ?3"
+            ))?
+            .query_map(params![reader, kind, run_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let ours = |u: &String| under(u, within) && !nested.iter().any(|n| under(u, n));
+        for unit in marked.iter().filter(|u| ours(u)) {
+            tx.execute(
+                &format!(
+                    "DELETE FROM {table} WHERE reader = ?1 AND kind = ?2 AND unit = ?3 AND run_id != ?4"
+                ),
+                params![reader, kind, unit, run_id],
+            )?;
         }
     }
     Ok(())
@@ -591,7 +649,7 @@ impl Judge<'_> {
         let read = self.before(self.met(self.reader, self.kind, unit, "read")?);
         // A file read whole covers its parts; a part read covers the file it is a part of.
         let part_read = read.is_none() && self.part_read_before(observed)?;
-        let inside = read.is_none() && observed.part.is_empty() && self.inside_read_before(unit)?;
+        let inside = read.is_none() && self.inside_read_before(unit)?;
         let seen = self.met(self.reader, self.kind, unit, "seen")?;
         let listing = self.before(self.met(self.reader, self.kind, parent(unit), "read")?);
         let seen_before = seen.as_ref().filter(|s| s.run != self.run_id);

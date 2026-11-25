@@ -1,73 +1,40 @@
 //! Whether what was not read is a fault or a limit. A fault is a shortfall Immunity Core has
 //! reason to expect met on this Mac now: its own work (a full check, the watcher, the collector
-//! once installed, current downloads), which is said where that work is; or something read here
-//! before, which this file decides. What is left is a limit of this version here, as no reader
-//! and a source that does not give it are. Who can fix it chooses only the words, never the
-//! sort. Everything here is decided from the store's tables, never from a reading's reason.
+//! once installed, current downloads), which is said where that work is; a reading that failed;
+//! or something read here before and not read now, which this file finds. What is left is a
+//! limit of this version here, as no reader and a source that does not give it are. Who can
+//! fix it chooses only the words, never the sort.
 //!
-//! In a reader with units (the watched places, the checkout walk) every failure names a unit
-//! and marks it not read with its run (`unit_unread`, `part_unread`): a file or a folder not
-//! read, a folder the walk could not list, in every reading over checkouts too, what Git's
-//! configuration says of a checkout's hooks (`watched::hooks_told`), and what a startup item
-//! runs, the item standing for it. A unit belongs to the deepest checkout the store ever knew
-//! that holds it.
+//! The invariant: for every store, the faults of this build are a superset of what main calls
+//! failed, plus the units of rule 1. Every reading that failed is a fault (`covered::failed`),
+//! as it is a failure on main; a file of another account closed to this one and never read here
+//! is not given by its source, as on main (`watched::unread_cause`), and so is no failure.
 //!
-//! 1. A unit is a fault when it is marked not read now and was read here before by the
-//!    baseline's own predicate, the one that makes losing sight of it a finding
+//! 1. A unit of the watched places, the startup programs or the checkout walk is a fault when
+//!    the baseline marks it not read now (`unit_unread`, `part_unread`) and it was read here
+//!    before by the baseline's own predicate, the one that makes losing sight of it a finding
 //!    (`baseline::Judge::facts`), which counts what was read inside a folder: whatever the
-//!    cause, and whatever the latest reading of its kind says, so a later reading that did not
-//!    look at it again leaves it standing. It ends when the baseline forgets the mark, as a
-//!    reading reads it again or finds it absent (`baseline::record`, `baseline::found_absent`),
-//!    or when what holds it is gone (`gone_entity`): the file itself, or for a kind read in
-//!    projects, the deepest checkout that held it. The content of a watched file is a unit of
-//!    its own reading, which goes with the file, and is a fault when that reading is not full
-//!    and an earlier one was (`Latest::last_full`), whatever its cause.
-//! 2. What is left of a failed reading of a reader with units that marked no unit of its own
-//!    in its run is a failure that could name none: a fault, so that nothing goes unsaid. A
-//!    failed reading of any other reader reads a whole source present on this Mac: a fault.
-//! 3. A failed reading that marked a unit of its own is a limit as a reading: everything it
-//!    could not read is a unit, and rule 1 tells each read before once, by its name. The
-//!    reading of one file's content and the reading of the programs startup items run are
-//!    limits as readings for the same reason, though what they could not read is marked under
-//!    other kinds: the content is its own reading's unit, each program has a content reading of
-//!    its own, each item is a unit of its own kind and of the programs' kind for what it runs,
-//!    and what another kind watches is that kind's unit. What is left there has no reader.
-//!
-//! A server is judged by the machine where its causes are made (`server_read`).
+//!    cause, and whatever the latest reading of its kind says. A failure of these readings names its unit where it has one: a
+//!    file or a folder not read, a folder the walk could not list or its root, what Git's
+//!    configuration says of a checkout's hooks (`watched::hooks_told`), and what a startup item
+//!    runs, the item standing for it. The content of a watched file is a unit of its own
+//!    reading, lost when that reading is not full and an earlier one was (`Latest::last_full`).
+//!    A mark ends when its unit is read again, something inside it is read, it or a folder
+//!    holding it is found absent, or what holds it is gone: its file, or for a kind read in
+//!    projects the deepest checkout the store ever knew that held it.
+//! 2. One line for one thing: a unit of rule 1 is left out while a failed reading of its reader
+//!    and kind stands in the same answer, which tells it; the content of a file, while its own
+//!    reading failed. It is named where no such reading stands, as when a later, narrower
+//!    reading of its kind was full. It only ever removes a line beside another fault of the
+//!    same kind, never the last one.
 
 use crate::baseline::{self, Unit};
+use crate::covered::{self, Cause, Example, Uncovered};
+use crate::store;
 use crate::view::Latest;
-use crate::{checkouts, servers, targets, watched};
-use rusqlite::{Connection, params};
+use crate::watched;
+use rusqlite::Connection;
 use std::collections::BTreeSet;
-
-/// Whether `r`, a reading that failed, is a fault by rules 2 and 3.
-pub fn reading(conn: &Connection, r: &Latest) -> rusqlite::Result<bool> {
-    match r.reader.as_str() {
-        watched::READER if [watched::CONTENT, targets::KIND].contains(&r.kind.as_str()) => {
-            Ok(false)
-        }
-        watched::READER | checkouts::READER => Ok(!marked_unread(conn, r)?),
-        _ => Ok(true),
-    }
-}
-
-/// Whether the reading `r` marked a unit unread in its run: for a reading of one checkout, a
-/// unit whose deepest known checkout is that one, not one nested in it.
-fn marked_unread(conn: &Connection, r: &Latest) -> rusqlite::Result<bool> {
-    let own = r.scope.strip_prefix("checkout:");
-    let known = baseline::past_checkouts(conn)?;
-    let units: Vec<String> = conn
-        .prepare(
-            "SELECT unit FROM unit_unread WHERE reader = ?1 AND kind = ?2 AND run_id = ?3
-             UNION ALL SELECT unit FROM part_unread
-             WHERE reader = ?1 AND kind = ?2 AND run_id = ?3",
-        )?
-        .query_map(params![r.reader, r.kind, r.run_id], |row| row.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    let machine = own.and_then(|c| c.split_once('/')).map_or("", |(m, _)| m);
-    Ok((units.iter()).any(|u| own.is_none_or(|c| deepest(&known, machine, u) == Some(c))))
-}
 
 /// The deepest checkout the store ever knew on `machine` that holds `path`, as
 /// `<machine>/<path>`, the way `baseline::past_checkouts` names it.
@@ -104,14 +71,15 @@ fn read_before(
 pub struct Lost {
     /// The file it is, as ids name it: `file:<machine>/<unit>`.
     pub id: String,
-    /// Whether it is of a kind read in projects, as a checkout's hooks are, rather than of this
-    /// Mac's own places.
+    /// Whether the readings of its kind are of a checkout, as a checkout's hooks are, rather
+    /// than of this Mac (`covered::this_mac`).
     pub project: bool,
 }
 
-/// Every unit read here before and not read now, each once, by rule 1.
+/// Every unit read here before and not read now, each once, by rule 1, less those a failed
+/// reading in `latest` tells by rule 2.
 pub fn lost(conn: &Connection, latest: &[Latest]) -> rusqlite::Result<Vec<Lost>> {
-    let Some(machine) = crate::covered::this_machine(conn)? else {
+    let Some(machine) = covered::this_machine(conn)? else {
         return Ok(Vec::new());
     };
     let gone: Vec<String> = conn
@@ -139,19 +107,25 @@ pub fn lost(conn: &Connection, latest: &[Latest]) -> rusqlite::Result<Vec<Lost>>
             Ok((r.get(0)?, r.get(1)?, unit, r.get(4)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
+    let failed: BTreeSet<(&str, &str)> = (latest.iter())
+        .filter(|r| covered::failed(r))
+        .map(|r| (r.reader.as_str(), r.kind.as_str()))
+        .collect();
     let mut out = Vec::new();
     for (reader, kind, unit, run_id) in marks {
-        let project = crate::autorun::in_projects(&kind);
-        if held(project, &unit) && read_before(conn, &reader, &kind, &unit, &run_id)? {
+        let told = failed.contains(&(reader.as_str(), kind.as_str()));
+        let in_projects = crate::autorun::in_projects(&kind);
+        if !told && held(in_projects, &unit) && read_before(conn, &reader, &kind, &unit, &run_id)? {
             out.push(Lost {
                 id: format!("{file}{unit}"),
-                project,
+                project: kind == watched::HOOK_KIND,
             });
         }
     }
     let content = (latest.iter())
         .filter(|r| r.reader == watched::READER && r.kind == watched::CONTENT)
-        .filter(|r| r.completeness != "full" && r.last_full.is_some());
+        .filter(|r| r.completeness != "full" && r.last_full.is_some())
+        .filter(|r| !covered::failed(r));
     out.extend(content.map(|r| Lost {
         id: r.scope.clone(),
         project: false,
@@ -161,41 +135,49 @@ pub fn lost(conn: &Connection, latest: &[Latest]) -> rusqlite::Result<Vec<Lost>>
     Ok(out)
 }
 
-/// Whether the server check ever read something of a machine, `scope`.
-pub fn server_read(conn: &Connection, scope: &str) -> rusqlite::Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM coverage
-                        WHERE reader = ?1 AND scope = ?2 AND completeness != 'none')",
-        params![servers::READER, scope],
-        |r| r.get(0),
-    )
-}
+/// What was read here before and is not read now, by name, whatever the cause (`lost`).
+pub const NO_LONGER_READ: Cause = Cause {
+    id: "read-before-not-read-now",
+    who: covered::YOU,
+    class: store::Cause::Failed,
+    scope: "this_mac",
+    kind: "read here before, not read now",
+    title: [
+        "{n} thing read here before can no longer be read.",
+        "{n} things read here before can no longer be read.",
+    ],
+    meaning: "An earlier check read them and the latest could not, so a change in them goes unseen. They are listed by name.",
+    meaning_none: None,
+    advice: "If you did not change them on purpose, your agent can find out why. Each stays here until a check reads it again or finds it gone.",
+};
 
-/// `things` in two lists by whether each is a fault, the faults first, an empty one left out:
-/// a cause is told once for its faults and once for its limits, each holding only its own.
-pub fn split<T>(
-    things: Vec<T>,
-    fault: impl Fn(&T) -> rusqlite::Result<bool>,
-) -> rusqlite::Result<Vec<(bool, Vec<T>)>> {
-    let (mut faults, mut limits) = (Vec::new(), Vec::new());
-    for t in things {
-        match fault(&t)? {
-            true => faults.push(t),
-            false => limits.push(t),
-        }
-    }
-    Ok([(true, faults), (false, limits)]
-        .into_iter()
-        .filter(|(_, list)| !list.is_empty())
-        .collect())
+/// The item of rule 1: what was read here before and is not read now, each by its name as
+/// `place` gives it; `None` when nothing is.
+pub fn item(
+    conn: &Connection,
+    latest: &[Latest],
+    place: impl Fn(&str) -> String,
+) -> rusqlite::Result<Option<Uncovered>> {
+    let lost = lost(conn, latest)?;
+    let scope = match lost.iter().all(|l| l.project) {
+        true => "projects",
+        false => "this_mac",
+    };
+    Ok((!lost.is_empty()).then(|| Uncovered {
+        scope,
+        examples: lost.iter().map(|l| Example::named(place(&l.id))).collect(),
+        ..Uncovered::new(&NO_LONGER_READ, lost.len())
+    }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkouts;
     use crate::contract::v1::{Headline, ThisMacState};
-    use crate::covered::{self, NO_LONGER_READ, NOT_PERMITTED, OTHER_ACCOUNTS, READING_FAILED};
+    use crate::covered::{NOT_PERMITTED, OTHER_ACCOUNTS, READING_FAILED};
     use crate::store::{Cause, Gap, Reading};
+    use rusqlite::params;
 
     const MAC: &str = "machine:example-mac";
     const AGENTS: &str = "launch agents and daemons";
@@ -275,15 +257,6 @@ mod tests {
             .into_iter()
             .map(|l| l.id)
             .collect()
-    }
-
-    /// Whether the latest reading `of` is a fault by rules 2 and 3.
-    fn fault(conn: &Connection, of: Of) -> bool {
-        let latest = crate::view::latest_coverage(conn).unwrap();
-        let r = latest
-            .iter()
-            .find(|r| (r.reader.as_str(), r.scope.as_str(), r.kind.as_str()) == of);
-        reading(conn, r.unwrap()).unwrap()
     }
 
     /// The items of the causes of what was not read, each with its count and whether it is a
@@ -390,6 +363,9 @@ mod tests {
         assert_eq!(scope(&conn), "this_mac");
         record(&conn, AGENTS, "run-3", &[B], &[]);
         assert_eq!(scope(&conn), "projects");
+        // A project's hooks leave this Mac's own places watched, as their reading does.
+        let state = covered::this_mac(&conn, &latest, false).unwrap().state;
+        assert_eq!(state, "watched");
         let shop = format!("checkout:{MAC}/dev/shop");
         located(&conn, &shop, checkouts::READER, checkouts::KIND, false);
         assert!(!lost(&conn, &latest).unwrap().contains(&hook));
@@ -473,90 +449,45 @@ mod tests {
     }
 
     #[test]
-    fn a_unit_never_read_here_is_a_limit_and_leaves_calm() {
+    fn a_unit_never_read_here_or_read_only_in_the_run_that_marks_it_is_not_named() {
         let (_dir, conn) = store("fault-never");
         // Only seen, its name listed and what it holds never read; and never met.
         record(&conn, AGENTS, "run-1", &[], &[A]);
         unread(&conn, AGENTS, "run-2", &[A, B]);
-        put(&conn, PLACES, "run-2", Some((DENIED, Cause::Failed)));
-        let limit = (vec![(NOT_PERMITTED.id, 1, false)], "watched", "calm");
-        assert_eq!(sorted(&conn), limit);
-        // Read in the run that judged it unread is not read before it, and neither is a
-        // folder something inside which was read in that run.
-        record(&conn, AGENTS, "run-2", &[B], &[]);
-        unread(&conn, AGENTS, "run-2", &[B, "Library/LaunchAgents"]);
-        assert_eq!(sorted(&conn), limit);
-    }
-
-    #[test]
-    fn a_reading_that_failed_as_a_whole_after_a_full_one_is_a_fault_and_one_that_left_units_unread_a_limit()
-     {
-        let (_dir, conn) = store("fault-whole");
-        record(&conn, AGENTS, "run-1", &[A], &[]);
-        // No unit marked unread in its run, as when the source could not be walked or told.
         put(
             &conn,
             PLACES,
             "run-2",
-            Some(("could not be told", Cause::Failed)),
+            Some(("not looked into", Cause::NotGiven)),
         );
-        assert!(fault(&conn, PLACES));
-        assert_eq!(sorted(&conn).0, [(READING_FAILED.id, 1, true)]);
-        // A unit marked unread in an earlier run is not this reading's.
-        unread(&conn, AGENTS, "run-1", &[B]);
-        assert!(fault(&conn, PLACES));
-        // Its own unread unit, never read here: a limit.
-        unread(&conn, AGENTS, "run-2", &[B]);
-        assert!(!fault(&conn, PLACES));
-        // Beside one read before: still a limit as a reading, the unit told by its name alone.
+        assert!(lost_ids(&conn).is_empty());
+        // Read in the run that judged it unread is not read before it, and neither is a
+        // folder something inside which was read in that run.
+        record(&conn, AGENTS, "run-2", &[B], &[]);
+        unread(&conn, AGENTS, "run-2", &[B, "Library/LaunchAgents"]);
+        assert!(lost_ids(&conn).is_empty());
+        assert_eq!(sorted(&conn), (vec![], "watched", "calm"));
+    }
+
+    #[test]
+    fn a_unit_read_before_is_left_out_while_a_failed_reading_of_its_kind_tells_it_and_named_once_none_does()
+     {
+        let (_dir, conn) = store("fault-told");
+        record(&conn, AGENTS, "run-1", &[A], &[]);
         unread(&conn, AGENTS, "run-2", &[A]);
-        assert!(!fault(&conn, PLACES));
-        assert_eq!(lost_ids(&conn), [format!("file:{MAC}/{A}")]);
-        // A reading of one checkout is judged by the units whose deepest known checkout it is,
-        // not those of a checkout nested in it.
-        for rel in ["dev/shop", "dev/shop/vendor/lib"] {
-            let checkout = format!("checkout:{MAC}/{rel}");
-            located(&conn, &checkout, checkouts::READER, checkouts::KIND, true);
-        }
-        let hooks = (
-            watched::READER,
-            "checkout:machine:example-mac/dev/shop",
-            watched::HOOK_KIND,
+        put(&conn, PLACES, "run-2", Some((DENIED, Cause::Failed)));
+        let told = (
+            vec![(NOT_PERMITTED.id, 1, true)],
+            "watched_in_part",
+            "in_part",
         );
-        put(
-            &conn,
-            hooks,
-            "run-3",
-            Some(("could not be told", Cause::Failed)),
-        );
-        unread(
-            &conn,
-            watched::HOOK_KIND,
-            "run-3",
-            &["dev/shop/vendor/lib/.git/hooks/x"],
-        );
-        assert!(fault(&conn, hooks));
-        unread(
-            &conn,
-            watched::HOOK_KIND,
-            "run-3",
-            &["dev/shop/.git/hooks/x"],
-        );
-        assert!(!fault(&conn, hooks));
-        // The checkout walk the same: a folder it could not list is a unit of its own.
-        let walk = (checkouts::READER, MAC, checkouts::KIND);
-        put(
-            &conn,
-            walk,
-            "run-4",
-            Some(("could not list", Cause::Failed)),
-        );
-        assert!(fault(&conn, walk));
-        let tx = conn.unchecked_transaction().unwrap();
-        let folder = Unit::whole("dev/closed");
-        baseline::judged_unread(&tx, checkouts::READER, checkouts::KIND, &folder, "run-4").unwrap();
-        tx.commit().unwrap();
-        assert!(!fault(&conn, walk));
+        assert_eq!(sorted(&conn), told);
+        // A failed reading of another kind tells nothing of it.
+        let other = (watched::READER, MAC, watched::LOGIN_HOOK_KIND);
+        put(&conn, other, "run-2", Some((DENIED, Cause::Failed)));
+        put(&conn, PLACES, "run-3", None);
+        let named = vec![(NO_LONGER_READ.id, 1, true), (NOT_PERMITTED.id, 1, true)];
+        assert_eq!(sorted(&conn), (named, "watched_in_part", "in_part"));
     }
 
     #[test]
@@ -588,8 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn the_content_of_a_file_read_in_full_before_is_a_fault_whatever_its_cause_and_one_never_read_full_a_limit()
-     {
+    fn the_content_of_a_file_read_in_full_before_is_named_while_no_failed_reading_of_it_tells_it() {
         let (_dir, conn) = store("fault-content");
         fn of(scope: &str) -> Of<'_> {
             (watched::READER, scope, watched::CONTENT)
@@ -600,12 +530,12 @@ mod tests {
             "Users/example/.bashrc",
         ];
         let [read, theirs, linked] = paths.map(content);
-        // Another account's file closed here, never read: a limit, never the person's to fix.
+        // Another account's file closed here, never read: not given, never the person's to fix.
         put(
             &conn,
             of(&theirs),
             "run-1",
-            Some((watched::CLOSED, Cause::Failed)),
+            Some((watched::CLOSED, Cause::NotGiven)),
         );
         let closed = (vec![(OTHER_ACCOUNTS.id, 1, false)], "watched", "calm");
         assert_eq!(sorted(&conn), closed);
@@ -618,7 +548,7 @@ mod tests {
         );
         put(&conn, of(&linked), "run-2", Some((DENIED, Cause::Failed)));
         assert!(!lost_ids(&conn).contains(&linked));
-        // Read in full, then grown past what is read: no reader, and a fault.
+        // Read in full, then grown past what is read: no reader, and named.
         put(&conn, of(&read), "run-1", None);
         put(
             &conn,
@@ -627,75 +557,11 @@ mod tests {
             Some(("too large", Cause::NoReader)),
         );
         assert_eq!(lost_ids(&conn), std::slice::from_ref(&read));
-        // Then closed: told once, by its name; its failed reading is a limit beside the one
-        // read only through a link.
+        // Then closed: its failed reading tells it, once.
         put(&conn, of(&read), "run-3", Some((DENIED, Cause::Failed)));
+        assert!(lost_ids(&conn).is_empty());
         let (items, state, headline) = sorted(&conn);
         assert_eq!((state, headline), ("watched_in_part", "in_part"));
-        assert!(items.contains(&(NO_LONGER_READ.id, 1, true)), "{items:?}");
-        assert!(items.contains(&(NOT_PERMITTED.id, 2, false)), "{items:?}");
-    }
-
-    /// The reading of the programs startup items run, short of one it could not open, and that
-    /// program's own content reading, as a check stores them: closed, of another account.
-    fn startup_program(conn: &Connection, run: &str, read_before: bool) {
-        let program = content("Library/Example/helper");
-        let program = (watched::READER, program.as_str(), watched::CONTENT);
-        if read_before {
-            put(conn, program, "run-1", None);
-        }
-        put(conn, program, run, Some((watched::CLOSED, Cause::Failed)));
-        let short = "not read in full: startup programs that could not be opened: 1";
-        let targets = (watched::READER, MAC, targets::KIND);
-        put(conn, targets, run, Some((short, Cause::Failed)));
-    }
-
-    #[test]
-    fn a_startup_program_never_opened_here_is_a_limit_and_leaves_calm() {
-        let (_dir, conn) = store("fault-program-never");
-        startup_program(&conn, "run-2", false);
-        let (items, state, headline) = sorted(&conn);
-        assert_eq!((state, headline), ("watched", "calm"), "{items:?}");
-        assert!(items.iter().all(|(_, _, fault)| !fault), "{items:?}");
-    }
-
-    #[test]
-    fn a_startup_program_opened_before_and_closed_now_is_one_fault_by_its_name() {
-        let (_dir, conn) = store("fault-program-before");
-        startup_program(&conn, "run-2", true);
-        let (items, state, headline) = sorted(&conn);
-        assert_eq!((state, headline), ("watched_in_part", "in_part"));
-        let faults: Vec<_> = items.iter().filter(|(_, _, fault)| *fault).collect();
-        assert_eq!(faults, [&(NO_LONGER_READ.id, 1, true)], "{items:?}");
-        assert_eq!(lost_ids(&conn), [content("Library/Example/helper")]);
-    }
-
-    #[test]
-    fn a_server_read_before_and_not_reached_now_is_a_fault_and_one_never_opened_a_limit() {
-        let (_dir, conn) = store("fault-servers");
-        let visit = |m| (servers::READER, m, servers::VISIT);
-        let refused = Some(("connection refused", Cause::Failed));
-        put(&conn, visit("machine:example-server"), "run-1", None);
-        put(&conn, visit("machine:example-server"), "run-2", refused);
-        put(&conn, visit("machine:example-new"), "run-2", refused);
-        let opened = covered::SERVERS_NOT_OPENED.id;
-        assert_eq!(sorted(&conn).0, [(opened, 1, true), (opened, 1, false)]);
-        // Read in part before is read before.
-        let part = Some(("not looked into: /srv", Cause::NotGiven));
-        put(
-            &conn,
-            (servers::READER, "machine:example-part", "packages"),
-            "run-1",
-            part,
-        );
-        put(&conn, visit("machine:example-part"), "run-2", refused);
-        assert_eq!(sorted(&conn).0, [(opened, 2, true), (opened, 1, false)]);
-        // A check that did not finish on them is sorted the same way.
-        let unfinished = Some((servers::NOT_COMPLETE, Cause::Failed));
-        put(&conn, visit("machine:example-server"), "run-3", unfinished);
-        put(&conn, visit("machine:example-new"), "run-3", unfinished);
-        let checked = covered::SERVERS_NOT_CHECKED.id;
-        let all = [(checked, 1, true), (checked, 1, false), (opened, 1, true)];
-        assert_eq!(sorted(&conn).0, all);
+        assert!(items.contains(&(NOT_PERMITTED.id, 2, true)), "{items:?}");
     }
 }

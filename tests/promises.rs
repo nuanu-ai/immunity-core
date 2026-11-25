@@ -8305,27 +8305,21 @@ fn a_watched_folder_that_cannot_be_listed_retracts_nothing_and_reports_no_change
         printed.contains("0 new, 0 changed, 0 gone since the last reading; not read in full: launch agents and daemons (partial), programs that launch agents, daemons and login hooks run (nothing read)."),
         "{printed}"
     );
-    // Each place read before and not read now is a fault named once, on one fault line of the
-    // status, which the run prints too; why it was not read is in the full account, beside the
-    // reading, a limit as a reading.
+    // Each place not read is named with why where a fault is said: on a fault line of the
+    // status, which the run prints too, and among the faults of the full account.
     let (_, text, _) = status_out(&w.store(), &[]);
     let (_, whole, _) = status_out(&w.store(), &["--coverage"]);
-    let limits = &whole[whole
-        .find("\n  Limits of this version here\n")
-        .expect(&whole)..];
+    let faults = &whole[whole.find("\n  Faults\n").expect(&whole)..];
     for place in [
-        "~/Library/LaunchAgents/com.example.a.plist",
+        "Library/LaunchAgents/com.example.a.plist",
         "/Library/LaunchDaemons",
     ] {
-        let told: Vec<&str> = (text.lines())
-            .filter(|l| l.starts_with("  ! ") && l.contains(place))
-            .collect();
         assert!(
-            told.len() == 1 && told[0].starts_with("  ! Can no longer be read: "),
+            text.lines()
+                .any(|l| l.starts_with("  ! ") && l.contains(place) && l.contains(denied)),
             "{text}"
         );
-        let place = place.trim_start_matches("~/");
-        assert!(limits.contains(&format!("{place} ({denied})")), "{whole}");
+        assert!(faults.contains(&format!("{place} ({denied})")), "{whole}");
     }
     assert!(watched_rows(&w.store()).is_empty(), "{printed}");
 
@@ -10680,15 +10674,14 @@ fn a_machine_that_could_not_be_reached_is_named_once_and_what_it_leaves_unread_i
         rows[0].ends_with("2026-01-03 04:00 UTC  Permission denied (publickey)."),
         "{printed}"
     );
-    // The status names web-new, read before, on the fault line of the servers that could not be
-    // opened; db-1, never reached, is a limit it leaves to `--coverage`. It has no line of
-    // machines not reached of its own.
+    // The status names it once too, on the fault line of the servers that could not be opened,
+    // and has no line of machines not reached of its own.
     let (_, printed, _) = status_out(&h.store(), &[]);
-    assert_eq!(printed.matches("db-1").count(), 0, "{printed}");
+    assert_eq!(printed.matches("db-1").count(), 1, "{printed}");
     assert!(
-        printed.contains(&format!(
-            "\n  ! 1 server could not be opened at the last server check: web-new: {timed_out}\n"
-        )) && !printed.contains("not reached"),
+        printed.contains(
+            "\n  ! 2 servers could not be opened at the last server check: db-1: Permission denied (publickey).; "
+        ) && !printed.contains("not reached"),
         "{printed}"
     );
 }
@@ -12352,16 +12345,22 @@ fn a_server_that_cannot_be_opened_is_one_thing_the_owner_can_fix_with_its_reason
         (&2.into(), &1.into()),
         "{r:#}"
     );
-    // A server never opened here is a limit, though the owner can fix it: no fault line, and in
-    // the full account among the limits, the reason on the line under the cause. One read
-    // before is a fault (`a_machine_that_could_not_be_reached_is_named_once_…`).
+    // A server that could not be opened is a fault, though the owner can fix it: a fault line
+    // with the name and its reason, without quotes, and in the full account among the faults,
+    // the reason on the line under the cause.
     let (_, printed, _) = status_out(&h.store(), &[]);
-    assert!(!printed.contains("db-1"), "{printed}");
+    assert!(
+        printed.contains("\n  ! 1 server could not be opened at the last server check: db-1: Permission denied (publickey).\n"),
+        "{printed}"
+    );
     let (_, printed, _) = status_out(&h.store(), &["--coverage"]);
     let cause = "\n    1 server could not be opened at the last server check\n      \"db-1\": \"Permission denied (publickey).\"\n";
     let at = printed.find(cause).unwrap_or_else(|| panic!("{printed}"));
+    let faults = printed[..=at]
+        .rfind("\n  Faults\n")
+        .unwrap_or_else(|| panic!("{printed}"));
     assert!(
-        printed[..=at].contains("\n  Limits of this version here\n"),
+        !printed[faults..at].contains("\n  Limits of this version here\n"),
         "{printed}"
     );
 
@@ -12394,7 +12393,6 @@ fn a_server_that_cannot_be_opened_is_one_thing_the_owner_can_fix_with_its_reason
     );
     // A server that could not be opened is the owner's to fix, with its name and reason.
     let item = uncovered(&r, "servers-not-opened").remove(0);
-    assert_eq!(item["fault"], false, "{item:#}");
     assert_eq!(
         item["title"],
         "1 server could not be opened at the last server check."
@@ -12445,18 +12443,12 @@ fn a_name_and_what_its_source_said_stay_apart_as_data_and_a_secret_in_what_it_sa
     let servers = h.sweep();
     let name = "odd: <img src=x>\u{7}";
     let password = "Sd7fQ2pLx9Wm3Rt8";
-    // Two servers read before, so that the status says them on a fault line, and each reason is
-    // seen to stay with its own name.
-    for alias in [name, "db-1"] {
-        let read = format!("##taken_at\n1767323045\n{WEB_1}");
-        put(&servers, &format!("{alias}.txt"), &read);
-    }
-    h.run(&servers, &h.none());
     put(
         &servers,
         &format!("{name}.failed"),
         &format!("1767412800\n<i>refused</i>\u{1b} tool --password {password} done\n"),
     );
+    // A second, so that each reason is seen to stay with its own name.
     put(&servers, "db-1.failed", "1767412800\nConnection refused\n");
     h.run(&servers, &h.none());
     let r = status_json(&h.store());

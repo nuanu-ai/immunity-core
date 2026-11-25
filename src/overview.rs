@@ -425,8 +425,7 @@ fn times(n: u64) -> String {
 
 /// Every fault the message holds, in the order a person acts on them: a check that died, the
 /// watcher, the event level, every cause with `fault` (only `with_causes`, as `--coverage` lists
-/// them whole on their own), the downloads that failed. A limit of this version is none of them,
-/// a reading that failed of a file never read here among them.
+/// them whole on their own), the downloads that failed. A limit of this version is none of them.
 fn faults(s: &v1::Status, screen: &Screen, with_causes: bool) -> Vec<Fault> {
     let now = s.answered_at;
     let mut out = Vec::new();
@@ -635,7 +634,7 @@ fn cause_fault(u: &v1::Uncovered) -> Fault {
             .collect();
         // A place by its names alone; anything else by its title, and its names with what the
         // source said of the whole, as the full account gives them, where none has a reason.
-        let read = match u.id == crate::covered::NO_LONGER_READ.id {
+        let read = match u.id == crate::fault::NO_LONGER_READ.id {
             true => "Can no longer be read",
             false => "Could not read",
         };

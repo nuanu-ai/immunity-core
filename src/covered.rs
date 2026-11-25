@@ -185,9 +185,8 @@ fn on_this_mac(scope: &str, this: &str) -> bool {
 }
 
 /// Whether a reading failed: one not full whose cause is `failed`, or that kept none, as the
-/// schema says of a class it does not know (`status::class`). Whether it is a fault is
-/// `fault::reading`.
-fn failed(r: &Latest) -> bool {
+/// schema says of a class it does not know (`status::class`). Every one is a fault.
+pub(crate) fn failed(r: &Latest) -> bool {
     status::class(&r.completeness, r.reason.as_deref(), r.cause.as_deref()) == Some("failed")
 }
 
@@ -197,9 +196,8 @@ fn earlier_probe(r: &Latest) -> bool {
 }
 
 /// Is this Mac watched, and how: from the latest readings, `live` and when a watcher last
-/// read. `not_checked` before any reading of this Mac; `watched_in_part` when something of its
-/// own places read here before is not read now (`fault::lost`), or a reading of them failed and
-/// that is a fault (`fault::reading`); else `watched`, a place never read here a limit.
+/// read. `not_checked` before any reading of this Mac; `watched_in_part` when a reading of its
+/// own places failed or one read here before is not read now (`fault::lost`); else `watched`.
 pub fn this_mac(conn: &Connection, latest: &[Latest], live: bool) -> rusqlite::Result<ThisMac> {
     let this = this_machine(conn)?;
     let checked_at = status::latest_finished(conn)?.and_then(|r| r.finished_at);
@@ -215,16 +213,12 @@ pub fn this_mac(conn: &Connection, latest: &[Latest], live: bool) -> rusqlite::R
         .iter()
         .filter(|r| on_this_mac(&r.scope, &this))
         .collect();
-    let mut state = match crate::fault::lost(conn, latest)?.iter().any(|l| !l.project) {
-        true => "watched_in_part",
-        false => "watched",
+    let lost = crate::fault::lost(conn, latest)?;
+    let state = if mine.iter().any(|r| failed(r)) || lost.iter().any(|l| !l.project) {
+        "watched_in_part"
+    } else {
+        "watched"
     };
-    for r in mine.iter().filter(|r| failed(r)) {
-        if crate::fault::reading(conn, r)? {
-            state = "watched_in_part";
-            break;
-        }
-    }
     let counts = |sql: &str, reader: &str| -> rusqlite::Result<BTreeMap<String, i64>> {
         conn.prepare(sql)?
             .query_map([reader], |r| Ok((r.get(0)?, r.get(1)?)))?
@@ -372,22 +366,6 @@ pub const SERVERS_NOT_OPENED: Cause = Cause {
     advice: "If you still use them, check that you can log in to them yourself and run the server check again. If one is no longer yours, mark it as retired.",
 };
 
-/// What was read here before and is not read now, by name, whatever the cause (`fault::lost`).
-pub const NO_LONGER_READ: Cause = Cause {
-    id: "read-before-not-read-now",
-    who: YOU,
-    class: store::Cause::Failed,
-    scope: "this_mac",
-    kind: "read here before, not read now",
-    title: [
-        "{n} thing read here before can no longer be read.",
-        "{n} things read here before can no longer be read.",
-    ],
-    meaning: "An earlier check read them and the latest could not, so a change in them goes unseen. They are listed by name.",
-    meaning_none: None,
-    advice: "If you did not change them on purpose, your agent can find out why. Each stays here until a check reads it again or finds it gone.",
-};
-
 pub const NOT_PERMITTED: Cause = Cause {
     id: "not-permitted",
     who: YOU,
@@ -418,13 +396,13 @@ pub const READING_FAILED: Cause = Cause {
     advice: "Nothing to do for now: they are tried again at every check. If one stays, your agent can find out why.",
 };
 
-/// Files of another account whose permissions do not let this account open them: their reason
-/// is `watched::CLOSED`. A limit as a reading; one read here before is named by
-/// `NO_LONGER_READ` (`fault.rs`).
+/// Files of another account whose permissions do not let this account open them, never read on
+/// this Mac. One read here before is a reading that failed (`watched::unread_cause`), among
+/// `READING_FAILED`.
 pub const OTHER_ACCOUNTS: Cause = Cause {
     id: "other-accounts-files",
     who: NOTHING,
-    class: store::Cause::Failed,
+    class: store::Cause::NotGiven,
     scope: "this_mac",
     kind: "files of other accounts closed to this account",
     title: [
@@ -793,7 +771,7 @@ pub const NOT_CHECKED_ON_MACOS: Cause = Cause {
 pub const CAUSES: [&Cause; 29] = [
     &SERVERS_NOT_CHECKED,
     &SERVERS_NOT_OPENED,
-    &NO_LONGER_READ,
+    &crate::fault::NO_LONGER_READ,
     &NOT_PERMITTED,
     &READING_FAILED,
     &OTHER_ACCOUNTS,
@@ -882,7 +860,7 @@ pub struct Example {
 }
 
 impl Example {
-    fn named(name: impl Into<String>) -> Example {
+    pub(crate) fn named(name: impl Into<String>) -> Example {
         Example {
             name: name.into(),
             reason: None,
@@ -891,7 +869,7 @@ impl Example {
 }
 
 impl Uncovered {
-    fn new(cause: &'static Cause, count: usize) -> Uncovered {
+    pub(crate) fn new(cause: &'static Cause, count: usize) -> Uncovered {
         Uncovered {
             scope: cause.scope,
             cause,
@@ -994,9 +972,10 @@ fn scope_of(scope: &str, this: Option<&str>) -> &'static str {
 }
 
 /// Whether a reading that failed did because of permissions, which the owner can change. A file
-/// of another account closed to this one is not: its reason is `watched::CLOSED`, with no number
-/// of the system's. Readers keep the system's error as the reason, and Rust writes an error from
-/// the system with its number: EPERM is 1 and EACCES is 13 on macOS and on Linux (errno.h).
+/// of another account closed to this one is not, whether it failed or was not given: its
+/// reason is `watched::CLOSED`, with no number of the system's. Readers keep
+/// the system's error as the reason, and Rust writes an error from the system with its
+/// number: EPERM is 1 and EACCES is 13 on macOS and on Linux (errno.h).
 fn not_permitted(reason: Option<&str>) -> bool {
     reason.is_some_and(|r| r.contains("(os error 13)") || r.contains("(os error 1)"))
 }
@@ -1050,82 +1029,66 @@ pub fn not_covered(
             not_checked.push(&r.scope);
         }
     }
-    // Each cause of what failed is told twice where it is both: once for its faults, such as a
-    // server read before, and once for its limits (`fault.rs`).
-    let server_read = |s: &&str| crate::fault::server_read(conn, s);
-    for (fault, list) in crate::fault::split(not_checked, server_read)? {
+    if !not_checked.is_empty() {
         out.push(Uncovered {
-            fault,
             since: last_sweep,
-            examples: list.iter().map(|s| Example::named(place(s))).collect(),
-            ..Uncovered::new(&SERVERS_NOT_CHECKED, list.len())
+            examples: not_checked
+                .iter()
+                .map(|s| Example::named(place(s)))
+                .collect(),
+            ..Uncovered::new(&SERVERS_NOT_CHECKED, not_checked.len())
         });
     }
-    for (fault, list) in crate::fault::split(unopened, |u| server_read(&u.scope.as_str()))? {
+    if !unopened.is_empty() {
         out.push(Uncovered {
-            fault,
-            since: list.iter().map(|u| u.since).min(),
-            examples: list
+            since: unopened.iter().map(|u| u.since).min(),
+            examples: unopened
                 .iter()
                 .map(|u| with_reason(place(&u.scope), u.reason.as_deref()))
                 .collect(),
-            ..Uncovered::new(&SERVERS_NOT_OPENED, list.len())
+            ..Uncovered::new(&SERVERS_NOT_OPENED, unopened.len())
         });
     }
 
-    // What was read here before and is not read now, each by its name, whatever the readings
-    // of its kind say since (`fault::lost`).
-    let lost = crate::fault::lost(conn, latest)?;
-    if !lost.is_empty() {
-        out.push(Uncovered {
-            scope: if lost.iter().all(|l| l.project) {
-                "projects"
-            } else {
-                "this_mac"
-            },
-            examples: lost.iter().map(|l| Example::named(place(&l.id))).collect(),
-            ..Uncovered::new(&NO_LONGER_READ, lost.len())
-        });
-    }
+    out.extend(crate::fault::item(conn, latest, place)?);
 
-    // Readings that failed: those kept closed by permissions, which the owner can open, files of
-    // another account closed to this one, and the rest. On a server that could not be opened
-    // they are implied by it and told there. Each is a fault or a limit by `fault::reading`.
+    // Readings that failed: those kept closed by permissions, which the owner can open, and
+    // the rest. On a server that could not be opened they are implied by it and told there.
     let away: BTreeSet<&str> = p.unreached.iter().map(|u| u.scope.as_str()).collect();
-    let mut by_cause: [(&Cause, Vec<&Latest>); 3] = [
-        (&NOT_PERMITTED, Vec::new()),
-        (&READING_FAILED, Vec::new()),
-        (&OTHER_ACCOUNTS, Vec::new()),
-    ];
-    for r in latest
+    let (closed, other): (Vec<&Latest>, Vec<&Latest>) = latest
         .iter()
         .filter(|r| failed(r) && !earlier_probe(r))
         .filter(|r| !(r.reader == servers::READER && away.contains(r.scope.as_str())))
-    {
-        let i = match r.reason.as_deref() {
-            Some(watched::CLOSED) => 2,
-            reason if not_permitted(reason) => 0,
-            _ => 1,
-        };
-        by_cause[i].1.push(r);
-    }
-    for (cause, list) in by_cause {
-        for (fault, list) in crate::fault::split(list, |r| crate::fault::reading(conn, r))? {
-            let mut examples: Vec<Example> = Vec::new();
-            for r in &list {
-                let e = with_reason(place(&r.scope), r.reason.as_deref());
-                if !examples.contains(&e) {
-                    examples.push(e);
-                }
-            }
-            out.push(Uncovered {
-                fault,
-                scope: first_scope(list.iter().map(|r| r.scope.as_str()), this),
-                since: list.iter().map(|r| r.at).max(),
-                examples,
-                ..Uncovered::new(cause, list.len())
-            });
+        .partition(|r| not_permitted(r.reason.as_deref()));
+    // Files of another account closed to this one and never read here: their source does not
+    // give them, so the cause stored is `not_given`. One read here before failed, and is among
+    // `other`, said with what could not be read (`watched::unread_cause`).
+    let theirs: Vec<&Latest> = latest
+        .iter()
+        .filter(|r| r.cause.as_deref() == Some(store::Cause::NotGiven.literal()))
+        .filter(|r| r.reason.as_deref() == Some(watched::CLOSED))
+        .collect();
+    for (cause, list) in [
+        (&NOT_PERMITTED, closed),
+        (&READING_FAILED, other),
+        (&OTHER_ACCOUNTS, theirs),
+    ] {
+        if list.is_empty() {
+            continue;
         }
+        let mut examples: Vec<Example> = Vec::new();
+        for r in &list {
+            let e = with_reason(place(&r.scope), r.reason.as_deref());
+            if !examples.contains(&e) {
+                examples.push(e);
+            }
+        }
+        out.push(Uncovered {
+            scope: first_scope(list.iter().map(|r| r.scope.as_str()), this),
+            since: list.iter().map(|r| r.at).max(),
+            examples,
+            ..Uncovered::new(cause, list.len())
+        });
     }
 
     // The event level, as its latest reading left it: not installed, or installed and not
@@ -1771,7 +1734,7 @@ pub const EXAMPLES: usize = 3;
 /// are counted by way and named by each of a way's names, so a first three would leave a way
 /// out unsaid.
 const EVERY_EXAMPLE: [&str; 4] = [
-    NO_LONGER_READ.id,
+    crate::fault::NO_LONGER_READ.id,
     OTHER_MANAGERS.id,
     PROJECT_AUTORUN.id,
     HOME_AUTORUN.id,
@@ -1826,14 +1789,12 @@ mod tests {
 
     #[test]
     fn a_reading_or_a_download_that_failed_is_a_failure_whoever_can_fix_it() {
-        // The causes raised when a reading or a download was tried and did not succeed. Whether
-        // one is a fault, which keeps the status from calm, is decided apart (`fault.rs`).
+        // The causes raised when a reading or a download was tried and did not succeed (`fault.rs`).
         let failed = [
             "servers-not-checked",
             "servers-not-opened",
             "not-permitted",
             "could-not-read",
-            "other-accounts-files",
             "read-before-not-read-now",
             "eslogger-refused",
             "event-level-failing",
@@ -1867,6 +1828,67 @@ mod tests {
             assert_eq!(not_permitted(Some(&said(errno))), closed, "{}", said(errno));
         }
         assert!(!not_permitted(None));
+    }
+
+    #[test]
+    fn a_file_of_another_account_closed_here_is_never_the_persons_to_fix_and_once_read_here_is_among_what_could_not_be_read()
+     {
+        // Each as the reading of a watched file's content stores it, which no answer to a
+        // finding changes: one never read here is not given and leaves this Mac watched; one
+        // read here before failed, is said among what could not be read and leaves this Mac
+        // watched in part; neither is the person's to fix, as their own closed file is.
+        let dir = crate::common::Scratch::new("covered-closed");
+        let mut conn = store::open_or_make(&dir.join("store.db")).unwrap();
+        let tx = conn.transaction().unwrap();
+        let mac = "machine:example-mac";
+        store::put_entity(&tx, mac).unwrap();
+        tx.execute(
+            "INSERT OR IGNORE INTO coverage_kind (name) VALUES (?1)",
+            [watched::CONTENT],
+        )
+        .unwrap();
+        let r = store::Reading {
+            reader: watched::READER,
+            scope: mac,
+            kind: watched::CONTENT,
+            run_id: "run-1",
+            at: 1,
+            observed_at: 1,
+        };
+        store::put_coverage(&tx, &r, "full", None, &store::Gap::default()).unwrap();
+        tx.commit().unwrap();
+        let reading = |path: &str, reason: &str, cause: &str| Latest {
+            reader: watched::READER.to_string(),
+            scope: format!("file:{mac}/{path}"),
+            kind: watched::CONTENT.to_string(),
+            completeness: "none".to_string(),
+            reason: Some(reason.to_string()),
+            cause: Some(cause.to_string()),
+            at: 1,
+            last_full: None,
+        };
+        let said = |latest: &[Latest]| {
+            let p = status::problems(&conn, latest).unwrap();
+            let items = not_covered(&conn, latest, &p, None).unwrap();
+            let ids = [NOT_PERMITTED.id, READING_FAILED.id, OTHER_ACCOUNTS.id];
+            let items: Vec<(&str, usize)> = (items.iter())
+                .filter(|u| ids.contains(&u.cause.id))
+                .map(|u| (u.cause.id, u.count))
+                .collect();
+            (items, this_mac(&conn, latest, false).unwrap().state)
+        };
+        let never = || reading("Library/Example/helper", watched::CLOSED, "not_given");
+        assert_eq!(said(&[never()]), (vec![(OTHER_ACCOUNTS.id, 1)], "watched"));
+        let read_here = reading("Users/example/.zprofile", watched::CLOSED, "failed");
+        let own_closed = reading(
+            "Users/example/.zshrc",
+            "Permission denied (os error 13)",
+            "failed",
+        );
+        let in_part = vec![(READING_FAILED.id, 1), (OTHER_ACCOUNTS.id, 1)];
+        assert_eq!(said(&[never(), read_here]), (in_part, "watched_in_part"));
+        let own = vec![(NOT_PERMITTED.id, 1)];
+        assert_eq!(said(&[own_closed]), (own, "watched_in_part"));
     }
 
     #[test]

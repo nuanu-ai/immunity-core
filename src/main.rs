@@ -2474,8 +2474,7 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     let servers = args.servers_input.clone();
     read_servers(&mut run, servers.as_deref())?;
     stage(CheckStage::Projects);
-    let (walked, failure, not_told) = read_checkouts(&mut run, args)?;
-    let walk_failure = (failure.as_ref()).map(|(why, folders)| (*why, folders.as_slice()));
+    let (walked, walk_failure, not_told) = read_checkouts(&mut run, args)?;
     let from_agents = read_agent_folders(&mut run, args, agent_folders::LOOK_LIMIT)?;
     let any_checkouts = walked.is_some() || !from_agents.is_empty();
     // One checkout found by both readers is read once.
@@ -2507,7 +2506,7 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
         &mut run,
         args,
         &found,
-        walk_failure.map(|(why, _)| why),
+        walk_failure,
         &not_told,
     )?);
     opened += findings::detect(run.tx, run.run_id, run.at, &changed)?;
@@ -3016,17 +3015,13 @@ fn unlisted_note(folders: &[String]) -> String {
 }
 
 /// What the walk for checkouts gives the readings over checkouts: the checkouts it found, a
-/// reason when it failed with the folders it could not list, and the checkouts the store
-/// holds that it could not look at, by their paths as ids name them.
+/// reason when it failed, and the checkouts the store holds that it could not look at, by
+/// their paths as ids name them.
 type CheckoutWalk = (
     Option<Vec<checkouts::Checkout>>,
-    Option<(&'static str, Vec<String>)>,
+    Option<&'static str>,
     Vec<String>,
 );
-
-/// Why the walk failed and the folders it could not list, the units of that failure in every
-/// reading over checkouts (`fault.rs`).
-type WalkFailure<'a> = Option<(&'a str, &'a [String])>;
 
 /// Which checkouts are on this machine, with a reason if the walk failed. When its root is
 /// not a folder its reading failed. A walk closes a checkout the store holds only where it
@@ -3059,12 +3054,14 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
         );
         let gap = Gap::of(Cause::Failed);
         run.apply(&reading, checkouts::BASIS, "none", Some(&reason), &gap, &[])?;
-        // Its root is the unit of the failure, here and in every reading over checkouts.
-        let folder = checkouts::rel(&start.home, root);
-        let unit = Unit::whole(&folder);
+        // Its root is the unit of the failure (`fault.rs`).
+        let unit = Unit::whole(checkouts::rel(&start.home, root));
         baseline::judged_unread(run.tx, checkouts::READER, checkouts::KIND, &unit, &run_id)?;
-        let why = "the checkout walk could not open its root folder";
-        return Ok((None, Some((why, vec![folder])), Vec::new()));
+        return Ok((
+            None,
+            Some("the checkout walk could not open its root folder"),
+            Vec::new(),
+        ));
     }
     run.readers += 1;
     let mut walk = checkouts::walk(root, &start.home);
@@ -3104,8 +3101,8 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
         }
     }
     // A known checkout there that is not looked into, under a link, in a folder macOS protects
-    // or not told by the disk, has its hooks not read now: read before, a fault (`fault.rs`).
-    // A reading of them that reads them again ends it; none raises a finding.
+    // or not told by the disk, has its hooks not read now (`fault.rs`). A reading of them that
+    // reads them again ends it; none raises a finding.
     for rel in unknown.iter().chain(&linked).chain(&guarded) {
         let hooks = Unit::whole(format!("{rel}/.git/hooks"));
         baseline::judged_unread(run.tx, watched::READER, watched::HOOK_KIND, &hooks, &run_id)?;
@@ -3176,7 +3173,7 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
     let failure = (!walk.unlisted.is_empty()).then(|| {
         let folders: Vec<String> = walk.unlisted.iter().map(|(f, _)| f.clone()).collect();
         run.notes.push(unlisted_note(&folders));
-        ("the checkout walk could not list some folders", folders)
+        "the checkout walk could not list some folders"
     });
     let (completeness, reason) = look.completeness_noted(None);
     let gap = Gap::when(look.cause());
@@ -3190,9 +3187,9 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
     };
     run.apply_found(&reading, checkouts::BASIS, &applied, &statements)?;
     // A folder that could not be listed is a unit not read, and one a listing shows is gone
-    // is no longer one; whether it was read before decides whether it is a fault (`fault.rs`).
-    let unlisted = walk.unlisted.iter().map(|(folder, _)| folder);
-    for unit in unlisted.chain(&unknown).map(Unit::whole) {
+    // is no longer one (`fault.rs`).
+    for (folder, _) in &walk.unlisted {
+        let unit = Unit::whole(folder);
         baseline::judged_unread(run.tx, checkouts::READER, checkouts::KIND, &unit, &run_id)?;
     }
     let met: BTreeSet<&str> = (walk.listed.iter().chain(&walk.seen))
@@ -3822,10 +3819,10 @@ impl Visited {
 
     /// Why a reading over this machine's checkouts is not whole, with its cause: the walk that
     /// finds them failed, or checkouts the store holds were not looked into.
-    fn missed<'a>(&self, walk_failure: WalkFailure<'a>) -> Option<(&'a str, Cause)> {
+    fn missed<'a>(&self, walk_failure: Option<&'a str>) -> Option<(&'a str, Cause)> {
         let omitted = !self.held.is_subset(&self.looked);
         walk_failure
-            .map(|(why, _)| (why, Cause::Failed))
+            .map(|why| (why, Cause::Failed))
             .or(omitted.then_some(("known checkouts were not looked into", Cause::NotGiven)))
     }
 
@@ -3848,7 +3845,7 @@ fn watch_places(
     args: &Args,
     checkouts: &[checkouts::Checkout],
     only: Option<&BTreeSet<watch::Reading>>,
-    walk_failure: WalkFailure,
+    walk_failure: Option<&str>,
     parsed: &mut git_hooks::Parsed,
 ) -> Result<(Rows, usize), Box<dyn Error>> {
     let (rows, seen) = read_watched(run, args, checkouts, only, walk_failure, parsed)?;
@@ -3886,7 +3883,7 @@ fn read_watched(
     args: &Args,
     checkouts: &[checkouts::Checkout],
     only: Option<&BTreeSet<watch::Reading>>,
-    walk_failure: WalkFailure,
+    walk_failure: Option<&str>,
     parsed: &mut git_hooks::Parsed,
 ) -> Result<(Rows, Vec<findings::Observed>), Box<dyn Error>> {
     let (run_id, machine) = (run.run_id.to_string(), run.machine.to_string());
@@ -3951,7 +3948,7 @@ fn read_watched(
             .filter(|p| targets::runs_of(p.watched_as).is_some())
             .map(|p| &p.look)
             .collect();
-        let (look, read) = targets::read(run.tx, &machine, &roots, &items, &all)?;
+        let (look, read) = targets::read(run.tx, &run_id, &machine, &roots, &items, &all)?;
         // What each startup item runs, told or not, is a unit of its own (`fault.rs`).
         let (tx, kind) = (run.tx, targets::KIND);
         baseline::record(tx, watched::READER, kind, &run_id, run.at, &read.told, &[])?;
@@ -4034,13 +4031,7 @@ fn read_watched(
         if !wanted(&scope, watched::HOOK_KIND) {
             continue;
         }
-        let (mut look, elsewhere) = elsewhere(Cause::Failed, format!("{rel} {}", checkouts::MOVED));
-        let hooks = Unit::whole(format!("{rel}/.git/hooks"));
-        look.short_named(
-            [hooks],
-            Cause::Failed,
-            elsewhere.clone().unwrap_or_default(),
-        );
+        let (look, elsewhere) = elsewhere(Cause::Failed, format!("{rel} {}", checkouts::MOVED));
         placed.push(Placed {
             scope,
             watched_as: watched::HOOK,
@@ -4085,14 +4076,6 @@ fn read_watched(
         if let Some((why, cause)) = missed {
             let unvisited = visited.held.difference(&visited.looked).map(Unit::whole);
             looked.look.short_of(unvisited, cause, why.to_string());
-        }
-        if let Some((why, folders)) =
-            walk_failure.filter(|_| point.scope == autorun::Scope::Checkout)
-        {
-            let folders = folders.iter().map(Unit::whole);
-            looked
-                .look
-                .short_named(folders, Cause::Failed, why.to_string());
         }
         let (completeness, reason) = looked.coverage(point);
         let cause = looked.look.cause();
@@ -4392,6 +4375,13 @@ fn read_watched(
         for unit in p.look.named_units() {
             baseline::judged_unread(tx, watched::READER, &p.kind, unit, &run_id)?;
         }
+        // Told where Git runs the checkout's hooks from, the reading found absent what it did
+        // not reach in the checkout, as a folder no longer configured.
+        if let Some(c) = (p.checkouts.first()).filter(|c| {
+            p.kind == watched::HOOK_KIND && p.look.read_units().contains(&watched::hooks_told(c))
+        }) {
+            baseline::found_absent_within(tx, watched::READER, &p.kind, &machine, c, &run_id)?;
+        }
         for u in p.look.not_read() {
             let how = match u.cause {
                 Cause::NotGiven => guarded::NOT_LOOKED_INTO,
@@ -4429,7 +4419,7 @@ fn read_watched(
             let read_before =
                 store::read_before(tx, watched::READER, &id, watched::CONTENT, &run_id)?;
             let (completeness, reason, gap) =
-                watched::content_coverage(&e.content, e.link.is_some());
+                watched::content_coverage(&e.content, e.link.is_some(), read_before);
             let reading = Reading {
                 scope: &id,
                 kind: watched::CONTENT,
@@ -4805,7 +4795,7 @@ fn read_other_autoruns(
     run: &mut Run,
     home: &Path,
     found: &[checkouts::Checkout],
-    walk_failure: WalkFailure,
+    walk_failure: Option<&str>,
 ) -> Result<(), Box<dyn Error>> {
     let (run_id, machine, at) = (run.run_id.to_string(), run.machine.to_string(), run.at);
     let mut statements = Vec::new();
@@ -4858,12 +4848,6 @@ fn read_other_autoruns(
             .is_none_or(|rel| !visited.held.contains(rel) || visited.looked.contains(rel))
     };
     let missed = visited.missed(walk_failure);
-    // The folders the walk could not list are the units of its failure here (`fault.rs`).
-    for folder in walk_failure.into_iter().flat_map(|(_, folders)| folders) {
-        for kind in [autorun::PRESENT_KIND, autorun::OTHERS_KIND] {
-            baseline::judged_unread(run.tx, watched::READER, kind, &Unit::whole(folder), &run_id)?;
-        }
-    }
     let gap = Gap::when(missed.map(|(_, cause)| cause));
     let with_basis: Vec<(&str, &Statement)> =
         statements.iter().map(|s| (watched::BASIS, s)).collect();
