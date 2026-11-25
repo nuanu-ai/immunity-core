@@ -559,8 +559,9 @@ fn read_session(
     out: &mut Sessions,
 ) {
     let (mut whole, mut last) = (Parsed::of(source), Parsed::of(source));
-    let read = crate::watched::open_regular(path).and_then(|opened| {
-        let (mut file, meta) = opened.map_err(|what| std::io::Error::other(format!("a {what}")))?;
+    let open = crate::open::open(path, crate::open::Reach::Place, crate::open::UNCAPPED);
+    let read = open.map_err(std::io::Error::other);
+    let read = read.and_then(|(mut file, meta)| {
         let then = Then {
             stat: Stat::of(&meta),
             before,

@@ -17,12 +17,12 @@
 
 use crate::autorun::{Kind, Part, Point, Scope, places};
 use crate::baseline::Unit;
+use crate::closed::{By, Failure};
 use crate::git_hooks::{Folder, Unread};
 use crate::guarded::{self, Real};
 use crate::look::{Absent, Look};
-use std::fs::{File, FileType, Metadata, OpenOptions};
-use std::io::Read;
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+use crate::open::{Reach, Refused};
+use std::fs::Metadata;
 use std::path::{Path, PathBuf};
 
 use crate::store::{Cause, Gap, Lack};
@@ -348,8 +348,12 @@ pub struct Roots<'a> {
 
 /// The home folder by its names, as `guarded::real` takes them: as given and made real.
 pub fn homes(home: &Path) -> [PathBuf; 2] {
-    let real = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-    [home.to_path_buf(), real]
+    [home.to_path_buf(), real(home.to_path_buf())]
+}
+
+/// A root the readers start from, made real, or as given when it cannot be.
+pub fn real(root: PathBuf) -> PathBuf {
+    std::fs::canonicalize(&root).unwrap_or(root)
 }
 
 /// Looks at every place of one kind on this machine. A system place is named by its path
@@ -781,71 +785,24 @@ pub fn content_coverage(content: &Content, linked: bool) -> (&'static str, Optio
     ("none", Some(why), gap)
 }
 
-/// The bytes of what `meta` describes, at most `cap` of them, or what it is instead. Only a
-/// regular file is opened, and without waiting: a file swapped for a named pipe after it was
-/// looked at cannot hold the run, and is told by what was opened. A failure to read it is said
-/// with the file as `meta` found it before and as it is after the failure (`closed::By::file`),
-/// for `closed::cause`.
+/// The bytes of the file at `path`, at most `cap` of them, or what it is instead, read by
+/// `open::read` as a place on the Mac. A failure to read it is said with the file as `meta`
+/// found it before and as it is after the failure (`closed::By::file`), for `closed::cause`;
+/// a file that changed since it was looked at failed.
 pub fn bytes(path: &Path, meta: &Metadata, cap: u64) -> Result<Vec<u8>, Content> {
-    if !meta.is_file() {
-        return Err(Content::Special(kind_of(meta.file_type())));
-    }
-    let read = || -> std::io::Result<Result<Vec<u8>, &'static str>> {
-        let file = match open_regular(path)? {
-            Ok((file, _)) => file,
-            Err(what) => return Ok(Err(what)),
-        };
-        let mut bytes = Vec::new();
-        file.take(cap + 1).read_to_end(&mut bytes)?;
-        Ok(Ok(bytes))
-    };
-    match read() {
-        Err(e) => {
-            let by = crate::closed::By::file(path, meta);
-            let failed = crate::closed::Failure::of(&e, by, path, reason(&e));
-            Err(Content::Failed(failed))
+    let failed = |e: &std::io::Error, by| Content::Failed(Failure::of(e, by, path, reason(e)));
+    crate::open::read(path, Reach::Place, cap).map_err(|refused| match refused {
+        Refused::Kind("symbolic link") | Refused::Changed => {
+            Content::Unread(Cause::Failed, crate::open::CHANGED.to_string())
         }
-        Ok(Err(what)) => Err(Content::Special(what)),
+        Refused::Kind(what) => Content::Special(what),
         // The file is there and this build does not read a file that large.
-        Ok(Ok(bytes)) if bytes.len() as u64 > cap => Err(Content::Unread(
+        Refused::Over(cap) => Content::Unread(
             Cause::NoReader,
             format!("over the size cap of {} MiB", cap >> 20),
-        )),
-        Ok(Ok(bytes)) => Ok(bytes),
-    }
-}
-
-/// Opens `path` to read only when it is a regular file: without following a link in its last
-/// part and without waiting, so that a file swapped for a link or a named pipe after it was
-/// looked at is neither followed nor able to hold the reader. A link fails to open; anything
-/// else that is not a regular file is told by what it is. The file is returned with its
-/// metadata as opened.
-pub fn open_regular(path: &Path) -> std::io::Result<Result<(File, Metadata), &'static str>> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
-        .open(path)?;
-    let opened = file.metadata()?;
-    if !opened.is_file() {
-        return Ok(Err(kind_of(opened.file_type())));
-    }
-    Ok(Ok((file, opened)))
-}
-
-/// What a thing that is not a regular file is, after links are followed: then nothing else
-/// is left once the first four are ruled out.
-pub fn kind_of(t: FileType) -> &'static str {
-    if t.is_dir() {
-        "folder"
-    } else if t.is_fifo() {
-        "fifo"
-    } else if t.is_socket() {
-        "socket"
-    } else if t.is_block_device() {
-        "block device"
-    } else {
-        "character device"
-    }
+        ),
+        Refused::Look(e) | Refused::Failed(e) => failed(&e, By::file(path, meta)),
+    })
 }
 
 /// A field of the raw copy: one line per entry, fields apart by tabs.
@@ -989,7 +946,7 @@ mod tests {
         // Between looking at a regular file and opening it, it may become a named pipe, which
         // a plain open waits on for a writer forever.
         let dir =
-            std::env::temp_dir().join(format!("immunity-watched-swap-{}", std::process::id()));
+            crate::common::temp().join(format!("immunity-watched-swap-{}", std::process::id()));
         let _removed = crate::common::Scratch::at(dir.clone());
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("profile");
@@ -1006,5 +963,48 @@ mod tests {
         let got = rx.recv_timeout(std::time::Duration::from_secs(10));
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(got, Ok(Some(Content::Special("fifo"))));
+    }
+
+    #[test]
+    fn a_pipe_a_link_to_a_device_and_a_file_over_the_cap_are_said_as_they_are_and_never_as_content()
+    {
+        let dir = crate::common::Scratch::new("watched-refused");
+        let [pipe, zero, ..] = crate::open::tests::refusals(&dir);
+        let over = dir.join("over");
+        std::fs::File::create(&over)
+            .unwrap()
+            .set_len(CAP + 1)
+            .unwrap();
+        let examined = |p: PathBuf| {
+            let d = dir.to_path_buf();
+            crate::open::tests::within(move || {
+                let at = Where {
+                    homes: [&d, &d],
+                    home: &d,
+                    given: &[],
+                };
+                match examine(&p, &mut Look::default(), &at, None) {
+                    Examined::Present(content, link, _) => (content, link),
+                    _ => panic!("examined"),
+                }
+            })
+            .expect("the reading waited")
+        };
+        assert_eq!(examined(pipe), (Content::Special("fifo"), None));
+        let device = (
+            Content::Special("character device"),
+            Some("/dev/zero".into()),
+        );
+        assert_eq!(examined(zero), device);
+        let (over, _) = examined(over);
+        let why = "over the size cap of 8 MiB".to_string();
+        assert_eq!(over, Content::Unread(Cause::NoReader, why));
+        assert_eq!(content_coverage(&over, false).0, "none");
+        // A link where the reader made the path real and found a file: it changed since.
+        let link = dir.join("link");
+        std::os::unix::fs::symlink(dir.join("four"), &link).unwrap();
+        let looked = std::fs::metadata(&link).unwrap();
+        let changed = Content::Unread(Cause::Failed, crate::open::CHANGED.to_string());
+        assert_eq!(bytes(&link, &looked, CAP), Err(changed));
     }
 }

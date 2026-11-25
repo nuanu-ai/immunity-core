@@ -939,7 +939,7 @@ fn kegs(roots: &Roots, machine: &str) -> Kind {
 
 /// The version a package's `package.json`, `file`, gives, if it gives one.
 fn package_version(file: &Path) -> Option<String> {
-    let text = std::fs::read(file).ok()?;
+    let text = crate::open::read(file, crate::open::Reach::Place, crate::open::UNCAPPED).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&text).ok()?;
     v.get("version")?.as_str().map(str::to_string)
 }
@@ -1002,13 +1002,18 @@ fn npm(roots: &Roots, machine: &str) -> Kind {
                 ("part_of", machine.to_string()),
                 ("installed_at", here.clone()),
             ];
-            // Its `package.json` may be a link: not followed into a guarded folder.
-            match crate::guarded::followed(&path.join("package.json"), &[&homes[0], &homes[1]]) {
-                Ok(file) => facts.extend(package_version(&file).map(|v| ("has_version", v))),
-                Err(g) => {
+            // Its `package.json`, or a folder above it, may be a link: made real, so that the
+            // open, which passes no link, reads what the listing above read, and not followed
+            // into a guarded folder. A version lost to a link would read as an update.
+            match crate::guarded::real(&path.join("package.json"), &[&homes[0], &homes[1]]) {
+                crate::guarded::Real::At(file) => {
+                    facts.extend(package_version(&file).map(|v| ("has_version", v)));
+                }
+                crate::guarded::Real::Guarded(g) => {
                     let unit = Unit::whole(format!("{here}/package.json"));
                     kind.look.not_into(unit, g, roots.home);
                 }
+                crate::guarded::Real::Failed(_) => {}
             }
             facts.push(("has_digest", stat(&list)));
             kind.things.push(Thing {
@@ -1266,7 +1271,7 @@ pub fn files_changed(
     let folder = conn.path().map(Path::new).and_then(Path::parent);
     let kept = folder
         .and_then(|f| kept_file(f, &path, &input))
-        .and_then(|file| crate::autorun::read_capped_resolved(&file, CHANGES_CAP).ok())
+        .and_then(|file| crate::open::read(&file, crate::open::Reach::Own, CHANGES_CAP).ok())
         .and_then(|bytes| serde_json::from_slice::<Changes>(&bytes).ok())
         .filter(|c| c.from == from && c.to == to);
     // Entries never cover more files than their kind counts, so that what they leave out is

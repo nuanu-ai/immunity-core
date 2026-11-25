@@ -456,7 +456,7 @@ fn a_task_file_that_is_not_a_regular_file_or_is_too_large_is_a_failed_reading() 
     e.run();
     assert_eq!(
         e.coverage(TASKS_KIND),
-        "none|could not be read: dev/a/.vscode/tasks.json (not a regular file); dev/b/.vscode/tasks.json (over the size cap of 1024 KiB)"
+        "none|could not be read: dev/a/.vscode/tasks.json (a folder, not a regular file); dev/b/.vscode/tasks.json (over the size cap of 1024 KiB)"
     );
 }
 

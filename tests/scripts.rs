@@ -249,6 +249,38 @@ fn a_new_file_longer_than_one_read_of_an_agent_fails_the_lint_unless_copied_or_g
 }
 
 #[test]
+fn a_read_of_a_file_outside_the_opener_fails_the_lint_and_one_in_a_test_or_the_store_does_not() {
+    let t = Tools::new("reads");
+    t.checkout();
+    let put = |rel: &str, text: &str| {
+        let path = t.0.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+        t.git(&["add", rel]);
+    };
+    // The store's own file is copied with the files longer than the ceiling.
+    put(
+        "src/kept.rs",
+        "fn a() {}\n#[cfg(test)]\nmod tests {\n    fn b() { std::fs::read(\"x\"); }\n}\n",
+    );
+    put(
+        "src/kept/tests.rs",
+        "fn c() { std::fs::File::open(\"x\"); }\n",
+    );
+    assert_eq!(t.lint(), (true, String::new()));
+    for read in [
+        "std::fs::read(p)",
+        "File::open(p)",
+        "fs::read_to_string(p)",
+        "OpenOptions::new().read(true)",
+    ] {
+        put("src/a reader.rs", &format!("fn r() {{\n    {read};\n}}\n"));
+        let (passed, said) = t.lint();
+        assert!(!passed && said.contains("src/a reader.rs:2: "), "{said}");
+    }
+}
+
+#[test]
 fn a_listed_file_no_longer_over_the_ceiling_fails_the_lint_until_taken_off_the_list() {
     let t = Tools::new("ceiling-list");
     t.checkout();

@@ -53,9 +53,7 @@
 //! the whole file's checksum, `Bytes`, and the reading says why: a change in it is never
 //! "unchanged".
 
-use std::fs::OpenOptions;
-use std::io::{ErrorKind, Read};
-use std::os::unix::fs::OpenOptionsExt;
+use std::io::ErrorKind;
 use std::path::Path;
 
 use serde_json::Value;
@@ -1409,9 +1407,9 @@ fn look(p: &Point, path: &Path, shown: &str, out: &mut Looked, homes: &[&Path], 
         out.look.read(shown);
         return push(p, out, found, link, &[]);
     }
-    let bytes = match read_capped(&path, p.cap()) {
+    let bytes = match crate::open::read(&path, crate::open::Reach::Place, p.cap()) {
         Ok(bytes) => bytes,
-        Err(why) => return out.look.unread(shown, why),
+        Err(why) => return out.look.unread(shown, why.to_string()),
     };
     let whole = |bytes: &[u8]| Content::Hash(format!("sha256:{}", crate::sha256::hex(bytes)));
     let unit = shown.clone();
@@ -1649,35 +1647,6 @@ fn expand(v: &Value, rest: &str, done: String, out: &mut Vec<String>) {
     } else if let Some(inner) = v.pointer(&format!("/{segment}")) {
         expand(inner, tail, format!("{done}/{segment}"), out);
     }
-}
-
-/// A regular file's bytes, opened without waiting, up to the cap; else why not.
-pub fn read_capped(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
-    read_capped_with(path, cap, 0)
-}
-
-/// Read a path whose links have already been resolved, without following a replacement.
-pub fn read_capped_resolved(path: &Path, cap: u64) -> Result<Vec<u8>, String> {
-    read_capped_with(path, cap, libc::O_NOFOLLOW)
-}
-
-fn read_capped_with(path: &Path, cap: u64, flags: libc::c_int) -> Result<Vec<u8>, String> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | flags)
-        .open(path)
-        .map_err(|e| e.to_string())?;
-    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
-        return Err("not a regular file".to_string());
-    }
-    let mut bytes = Vec::new();
-    file.take(cap + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > cap {
-        return Err(format!("over the size cap of {} KiB", cap >> 10));
-    }
-    Ok(bytes)
 }
 
 /// Whether a file holds, anywhere in its tree, a property named `key` whose value is `holds` in
@@ -2409,7 +2378,7 @@ mod tests {
         // named such a place is neither read nor looked for, and is said not looked into.
         use std::os::unix::fs::PermissionsExt;
         let home = crate::common::Scratch::at(
-            std::env::temp_dir().join(format!("immunity-autorun-guard-{}", std::process::id())),
+            crate::common::temp().join(format!("immunity-autorun-guard-{}", std::process::id())),
         );
         std::fs::create_dir_all(home.join("Documents/tool")).unwrap();
         std::fs::write(home.join("Documents/tool/settings.json"), "{}").unwrap();
@@ -2465,7 +2434,7 @@ mod tests {
         // A row is data: what it lists is what is read, with nothing else to write. A key
         // watched apart holds a string here, not a list of strings: it is the row's kind too.
         let dir =
-            std::env::temp_dir().join(format!("immunity-autorun-keys-{}", std::process::id()));
+            crate::common::temp().join(format!("immunity-autorun-keys-{}", std::process::id()));
         let _removed = crate::common::Scratch::at(dir.clone());
         for p in POINTS.iter() {
             let Select(_, keys) = p.part else { continue };
@@ -2502,7 +2471,7 @@ mod tests {
     #[test]
     fn a_path_with_a_star_matches_entries_that_begin_and_end_as_it_does() {
         let dir = crate::common::Scratch::at(
-            std::env::temp_dir().join(format!("immunity-autorun-glob-{}", std::process::id())),
+            crate::common::temp().join(format!("immunity-autorun-glob-{}", std::process::id())),
         );
         std::fs::create_dir_all(dir.join(".venv/lib/python3.12/site-packages")).unwrap();
         std::fs::write(dir.join(".venv/lib/python3.12/site-packages/a.pth"), "").unwrap();
@@ -2530,7 +2499,7 @@ mod tests {
     fn a_row_of_each_extraction_reads_its_part_and_derives_its_kind_from_the_table() {
         // A hypothetical row of each extraction this version does not use in the table yet.
         let dir = crate::common::Scratch::at(
-            std::env::temp_dir().join(format!("immunity-autorun-row-{}", std::process::id())),
+            crate::common::temp().join(format!("immunity-autorun-row-{}", std::process::id())),
         );
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("hook.pth"), "# x\nimport a\nimport b\n").unwrap();
@@ -2586,6 +2555,48 @@ mod tests {
         assert_eq!(
             bytes.kind(),
             "hook.pth of each checkout, the part that runs by itself"
+        );
+    }
+
+    #[test]
+    fn a_file_of_a_row_that_is_a_pipe_a_link_to_a_device_or_over_the_cap_is_unread_never_absent() {
+        let dir = crate::common::Scratch::new("autorun-refused");
+        let [pipe, zero, ..] = crate::open::tests::refusals(&dir);
+        std::fs::rename(pipe, dir.join("a.pth")).unwrap();
+        std::fs::rename(zero, dir.join("b.pth")).unwrap();
+        std::fs::File::create(dir.join("c.pth"))
+            .unwrap()
+            .set_len(CAP + 1)
+            .unwrap();
+        let d = dir.to_path_buf();
+        let looked = crate::open::tests::within(move || {
+            let p = Point {
+                part: Bytes,
+                ..row(
+                    &["a.pth", "b.pth", "c.pth"],
+                    Present,
+                    InterpreterStart,
+                    "Python",
+                    Never,
+                    (EVENT, "high", "low"),
+                    "",
+                )
+            };
+            let l = look_all(&p, [(d.as_path(), "dev/a")].into_iter(), &d);
+            let unread = l.look.not_read().map(|u| (u.cause, u.why.clone()));
+            (l.look.entries.len(), unread.collect::<Vec<_>>())
+        });
+        let failed = |why: &str| (crate::store::Cause::Failed, why.to_string());
+        assert_eq!(
+            looked.expect("the reading waited"),
+            (
+                0,
+                vec![
+                    failed("a fifo, not a regular file"),
+                    failed("a character device, not a regular file"),
+                    failed("over the size cap of 1024 KiB"),
+                ]
+            )
         );
     }
 }

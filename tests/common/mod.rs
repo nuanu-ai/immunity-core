@@ -14,9 +14,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 /// A new folder `immunity-<tag>-<pid>-<nanos>` under the temporary folder, removed when dropped.
 pub struct Scratch(pub PathBuf);
 
+/// The temporary folder made real: macOS reaches it through the link `/var`, and the core opens
+/// a place on the Mac only by a path with no link in it (`open::Reach::Place`).
+pub fn temp() -> PathBuf {
+    std::fs::canonicalize(std::env::temp_dir()).unwrap()
+}
+
 impl Scratch {
     pub fn new(tag: &str) -> Scratch {
-        let path = std::env::temp_dir().join(unique(tag));
+        let path = temp().join(unique(tag));
         std::fs::create_dir_all(&path).unwrap();
         Scratch(path)
     }
