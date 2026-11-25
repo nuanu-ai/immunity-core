@@ -2437,10 +2437,12 @@ mod tests {
         assert_eq!(case(&m), Case::Starting);
         assert_ne!(m.headline, crate::contract::v1::Headline::Calm as i32);
         let terminal = crate::overview::watching(&m, &crate::screen::Screen::pipe()).0;
-        let page = crate::pages::watcher_said("not_checked", case(&m), "", now);
+        let (state, faults) = crate::pages::band(&m);
+        let page = format!("{} {faults}", state.unwrap_or_default());
         for said in [terminal, page] {
+            // Its first letter aside, which a sentence makes a capital.
             assert!(
-                said.contains(STARTING_WORDS) && !said.contains("off"),
+                said.contains(&STARTING_WORDS[1..]) && !said.contains("off"),
                 "{said}"
             );
         }

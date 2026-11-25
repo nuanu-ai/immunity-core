@@ -99,7 +99,7 @@ pub fn pages(
         ),
         (
             format!("{DETAILS}/{}.html", crate::pages::THIS_MAC),
-            crate::pages::this_mac(conn, st, now)?,
+            crate::pages::this_mac(conn, st, result, now)?,
         ),
         (
             format!("{DETAILS}/{}.html", crate::pages::BEYOND),
@@ -2141,6 +2141,11 @@ footer.licence { margin-top: 32px; }
 #this-mac:has(> .glyph.calm) { background: color-mix(in srgb, var(--calm) 10%, var(--fill)); }
 #this-mac h1 { margin: 0; }
 #this-mac .sub { font: var(--caption); color: var(--t2); margin: 4px 0 0; overflow-wrap: anywhere; }
+/* A fault, a block of its own: the core's words in the band's main colour, what the source said
+   as data, its command, and what the person can do on a line under them. */
+#this-mac .fault { color: var(--t1); margin-top: 8px; }
+#this-mac .fault .advice { display: block; }
+#this-mac .cmd { white-space: nowrap; }
 
 /* Findings: the tabs, a group for each, one row per thing that opens in place. */
 .tabs { display: inline-flex; padding: 2px; background: var(--fill); border-radius: var(--radius-row); }
@@ -2233,13 +2238,22 @@ dl.facts dd .w { font: 12px/20px var(--font); }
 .wr .wl { color: var(--t2); text-align: right; font-variant-numeric: tabular-nums; }
 .wr .wc { color: var(--t2); }
 .wg { font: 600 12px/16px var(--font); color: var(--t2); padding: 16px 12px 8px; margin: 0; }
-/* Green read in full; orange hollow read in part, not read or failed; grey none here; grey hollow
-   never checked. */
+/* Green read; orange hollow a fault; grey none here or a count; grey hollow never checked. */
 .dot { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: var(--quiet); vertical-align: 1px; margin-right: 4px; }
 .dot.calm { background: var(--calm); }
 .dot.off { background: transparent; box-shadow: inset 0 0 0 1px var(--quiet); }
 .dot.off.look { box-shadow: inset 0 0 0 1.5px var(--look); }
 .nj { display: block; padding: 12px; margin: 0; }
+
+/* What this version does not read here, src/not_read_here.rs: collapsed, its heading the control. */
+#not-read-here details { margin: 0; }
+#not-read-here summary { list-style: none; }
+#not-read-here summary::-webkit-details-marker { display: none; }
+#not-read-here summary::before { content: "\25B8"; color: var(--t3); }
+#not-read-here details[open] summary::before { content: "\25BE"; }
+ul.limits { list-style: none; padding: 0; margin: 0; }
+ul.limits li { padding: 8px 12px; border-bottom: 1px solid var(--sep); overflow-wrap: anywhere; }
+ul.limits .advice { display: block; }
 
 /* As it happens: src/happens.rs. */
 #as-it-happens .live { margin-left: auto; font: var(--caption); color: var(--t2); font-variant-numeric: tabular-nums; }
@@ -2780,10 +2794,15 @@ mod tests {
             page(&format!("{}/changes.html", super::DETAILS))
         );
         let summary = page(super::SUMMARY);
-        let hint = format!(
-            "<span title=\"Not read in full, so this list may not be whole: {PROFILE_KIND} (a tool answered: fetch https://example.invalid/?t={mark} refused; never read in full).\">not read in full</span>"
-        );
-        assert!(summary.contains(&hint), "{summary}");
+        // The reading that failed is a fault: the band says what its source said as data, as
+        // the terminal does, cut once.
+        let said =
+            format!("~/.zshrc: a tool answered: fetch https://example.invalid/?t={mark} refused");
+        let fault = summary
+            .split("<p class=\"sub fault\">! Could not read: <span class=\"said\">")
+            .nth(1)
+            .map_or("", |f| &f[..f.find("</span>").unwrap()]);
+        assert!(fault.contains(&super::esc_said(&said)), "{summary}");
         // What not covered says a source said, as the status gives it: cut once, where it was
         // put together.
         let value = download.and_then(|u| u.value_text.clone()).unwrap();

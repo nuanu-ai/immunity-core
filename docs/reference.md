@@ -27,7 +27,7 @@ A match of a rule marked below high, or of a rule whose set states no level, rai
 
 ## What this version does not see
 
-`immunity status` lists what is not covered, one item per cause, and says who can act on each (see [how-it-works.md](how-it-works.md#coverage)). Today the limits of this version include:
+`immunity status` lists what is not covered, one item per cause, and says who can act on each (see [how-it-works.md](how-it-works.md#coverage)). The summary `immunity view` writes lists each limit found here once, in its last section, which starts collapsed. Today the limits of this version include:
 
 - A connection at the moment it is made, and the name behind an address. Immunity Core samples connections every 30 seconds and sees addresses only; `eslogger` has no network event.
 - A file modified in place or removed. The collector records files created and renamed only.

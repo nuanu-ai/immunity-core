@@ -280,17 +280,6 @@ pub fn this_mac(conn: &Connection, latest: &[Latest], live: bool) -> rusqlite::R
     })
 }
 
-/// What has failed in the watcher, in words: "reading of the watched places and sample of
-/// running programs". The reasons are text from the failures and are not in it.
-pub fn watcher_failed(m: &ThisMac) -> String {
-    let words: Vec<&str> = m
-        .failed
-        .iter()
-        .map(|f| crate::watch::failed_words(&f.what))
-        .collect();
-    words.join(" and ")
-}
-
 /// Who can do something about a thing that is not covered: the owner, or nobody, because it
 /// is a limit of this version or passes by itself. Its words say which.
 pub const YOU: &str = "you";
