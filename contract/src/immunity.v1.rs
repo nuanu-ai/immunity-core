@@ -1922,7 +1922,7 @@ pub mod evidence {
 /// `has_content` (a SHA-256, never the content), `links_to` and `watched_as`.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PlaceChanged {
     /// What its latest occurrence was.
     #[prost(enumeration = "Change", tag = "1")]
@@ -1949,6 +1949,46 @@ pub struct PlaceChanged {
     /// selected value (`value sha256:`). It changes nothing else of the finding. Since 1.35.0.
     #[prost(int64, optional, tag = "3")]
     pub read_as_before_at: ::core::option::Option<i64>,
+    /// For `watched.autostart` and `watched.login-hook`, the program the item runs or ran: the
+    /// store's ties in force from it, by the item's id the finding is about; when none is in force,
+    /// the one the journal retracted or set aside last. Empty for other rules, and when the store
+    /// never tied the item to a program, as for a program not named by a full path. Since 1.36.0.
+    #[prost(message, repeated, tag = "4")]
+    pub runs: ::prost::alloc::vec::Vec<StartupTie>,
+    /// For `watched.startup-target`, the items that run the program, by the same rule from the
+    /// program's side: every tie in force; when none is, those the journal's latest entry retracted
+    /// or set aside. Who signed the program before and after is in `rests_on`, as `signed_by`.
+    /// Empty for other rules. Since 1.36.0.
+    #[prost(message, repeated, tag = "5")]
+    pub started_by: ::prost::alloc::vec::Vec<StartupTie>,
+}
+/// A tie between a startup item and the program it runs, as the store holds the fact
+/// `started_by`, whose subject is the program and whose object is the item. It says what the
+/// store holds and when, never whether the program is on the Mac now. It changes nothing of the
+/// finding: its state, levels and place in a list are as they are without it. Since 1.36.0.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StartupTie {
+    /// The other side of the tie, the program for an item and the item for a program, as
+    /// `where_text` names a finding's place. Whole.
+    #[prost(string, tag = "1")]
+    pub path_text: ::prost::alloc::string::String,
+    #[prost(enumeration = "TieState", tag = "2")]
+    #[serde(
+        serialize_with = "crate::enum_name::<TieState, _>",
+        deserialize_with = "crate::enum_from_name::<TieState, _>"
+    )]
+    pub state: i32,
+    /// The time of the journal entry that says so: of the reading that added the tie, for one in
+    /// force; of the reading that retracted it or set it aside, otherwise.
+    #[prost(int64, tag = "3")]
+    pub recorded_at: i64,
+    /// Who signed the program, as `ProcessLeader.signed_by_text` says a signer: the store's fact
+    /// `signed_by` in force from the latest reading of the program's content, which may be older
+    /// than this tie's entry. Absent when the store holds none in force, and always for an item.
+    #[prost(string, optional, tag = "4")]
+    pub signed_by_text: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// Installed software changed in place. The digests and verdicts before and after are in
 /// `rests_on`, as `has_digest`, `has_seal` and `signed_by`.
@@ -2321,6 +2361,50 @@ impl Via {
             "VIA_AGENT" => Some(Self::Agent),
             "VIA_COMMAND" => Some(Self::Command),
             "VIA_UNKNOWN" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+}
+/// How the store holds a tie. `UNSPECIFIED`, or a value the reader does not know, is read as
+/// `retracted`.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TieState {
+    #[serde(rename = "unspecified")]
+    Unspecified = 0,
+    /// In force since `recorded_at`.
+    #[serde(rename = "in_force")]
+    InForce = 1,
+    /// A reading that read the item retracted it at `recorded_at`: it no longer named the program
+    /// there, or was not there. That says nothing of whether the program is on the Mac.
+    #[serde(rename = "retracted")]
+    Retracted = 2,
+    /// A reading set it aside at `recorded_at` without reading it, as when this version no longer
+    /// reads what held it: nothing is said of whether the item still runs the program.
+    #[serde(rename = "set_aside")]
+    SetAside = 3,
+}
+impl TieState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TIE_STATE_UNSPECIFIED",
+            Self::InForce => "TIE_STATE_IN_FORCE",
+            Self::Retracted => "TIE_STATE_RETRACTED",
+            Self::SetAside => "TIE_STATE_SET_ASIDE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TIE_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "TIE_STATE_IN_FORCE" => Some(Self::InForce),
+            "TIE_STATE_RETRACTED" => Some(Self::Retracted),
+            "TIE_STATE_SET_ASIDE" => Some(Self::SetAside),
             _ => None,
         }
     }
