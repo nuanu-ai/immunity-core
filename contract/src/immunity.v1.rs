@@ -3429,7 +3429,10 @@ pub struct EventLevel {
     pub unreadable_lines: ::core::option::Option<Span>,
     #[prost(message, optional, tag = "9")]
     pub other_messages: ::core::option::Option<Span>,
-    /// Log files deleted by the cap, and deleted before they were read.
+    /// Log files deleted by the cap, and deleted before they were read. A file the cap deleted
+    /// after it was read to its end is no loss: every program start in it was judged, and only
+    /// `immunity matches` and a verdict can no longer read it again. One it deleted before that is
+    /// counted in `files_removed_unread` too, and that is the loss.
     #[prost(message, optional, tag = "10")]
     pub files_removed_by_cap: ::core::option::Option<Span>,
     #[prost(message, optional, tag = "11")]
@@ -4576,8 +4579,10 @@ pub enum ThisMacState {
     /// A place of its own is there and was not read whole: a reading of it failed; or the event
     /// level is installed and records no program start (refused, failing or silent); or it runs and
     /// lost part of what it was to record in a reading since the latest finished full check, or at
-    /// any time when none has finished; or it could not read some lines over the last day, a failed
-    /// reading. `not_covered`, or the counts `since_check` of `event_level`, say which.
+    /// any time when none has finished: starts or file events missing from the numbering, a
+    /// restart, lines it could not read, a log file deleted before it was read. A log file the cap
+    /// deleted after it was read is no loss. `not_covered`, or the counts `since_check` of
+    /// `event_level`, say which.
     #[serde(rename = "watched_in_part")]
     WatchedInPart = 3,
 }
