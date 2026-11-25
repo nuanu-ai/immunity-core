@@ -518,6 +518,11 @@ pub fn change_said(change: i32) -> &'static str {
     }
 }
 
+/// What a reading at `PlaceChanged.read_as_before_at` read, after its time, in the text and on
+/// the page: said of that reading, never of the place now.
+pub const READ_AS_BEFORE: &str =
+    "the content read then had the checksum it had before this finding's first change";
+
 /// The evidence of a watched place: what happened to it in words, and when; how it is watched;
 /// that its content is not kept; why it could not be read; the places read for the first time.
 fn place_lines(s: &Screen, f: &v1::Finding, p: &v1::PlaceChanged) -> Vec<String> {
@@ -537,6 +542,13 @@ fn place_lines(s: &Screen, f: &v1::Finding, p: &v1::PlaceChanged) -> Vec<String>
             Some(why) => out.extend(e("Why", &[(why, PLAIN)])),
             None => out.extend(e("Why", &[("the store gives no reason", PLAIN)])),
         }
+    }
+    if let Some(at) = p.read_as_before_at {
+        let at = s.time(at, f.answered_at);
+        out.extend(e(
+            "Read back",
+            &[(&at, PLAIN), (": ", PLAIN), (READ_AS_BEFORE, PLAIN)],
+        ));
     }
     if p.presence_only == Some(true) {
         out.extend(e("Watched", &[(crate::watched::PRESENCE_ONLY, PLAIN)]));
@@ -759,6 +771,22 @@ fn process_lines(s: &Screen, f: &v1::Finding, p: &v1::DetachedProcess) -> Vec<St
 /// made to read like one.
 fn files_lines(s: &Screen, p: &v1::FilesChanged) -> Vec<String> {
     let e = |label: &str, parts: &[(&str, Style)]| field(s, 4, EVIDENCE_LABEL, label, parts);
+    let (counts, entries) = files_said(p);
+    let mut out = e("Files", &[(&counts, PLAIN)]);
+    for (label, x) in entries {
+        let shown = match x.folder {
+            true => format!("{}/ ({})", x.path_text, count(x.files, "file", "files")),
+            false => x.path_text.clone(),
+        };
+        out.extend(e(label, &[(&shown, PLAIN)]));
+    }
+    out
+}
+
+/// The files of an installed thing that changed, as the text and the page say them: the line of
+/// counts, with how many of each kind the entries leave out, and every entry the message holds,
+/// in its order, the first of each kind with the kind's label.
+pub fn files_said(p: &v1::FilesChanged) -> (String, Vec<(&'static str, &v1::ChangedPath)>) {
     let n = crate::overview::grouped;
     let kinds = [
         ("added", "Added", p.added, &p.added_paths),
@@ -781,17 +809,14 @@ fn files_lines(s: &Screen, p: &v1::FilesChanged) -> Vec<String> {
         "changed while the version stayed the same, since the reading before: {}",
         counts.join(", ")
     );
-    let mut out = e("Files", &[(&counts, PLAIN)]);
-    for (_, label, _, paths) in kinds {
-        for (i, x) in paths.iter().enumerate() {
-            let shown = match x.folder {
-                true => format!("{}/ ({})", x.path_text, count(x.files, "file", "files")),
-                false => x.path_text.clone(),
-            };
-            out.extend(e(if i == 0 { label } else { "" }, &[(&shown, PLAIN)]));
-        }
-    }
-    out
+    let entries = kinds
+        .into_iter()
+        .flat_map(|(_, label, _, paths)| {
+            let labels = std::iter::once(label).chain(std::iter::repeat(""));
+            labels.zip(paths)
+        })
+        .collect();
+    (counts, entries)
 }
 
 /// What the finding rests on, by its kind; none for a kind this build does not shape.
@@ -1386,6 +1411,7 @@ mod tests {
                 Body::PlaceChanged(v1::PlaceChanged {
                     change: v1::Change::NotRead as i32,
                     presence_only: Some(true),
+                    read_as_before_at: None,
                 }),
             ),
             (
@@ -2263,6 +2289,7 @@ mod tests {
             with(Body::PlaceChanged(v1::PlaceChanged {
                 change: change as i32,
                 presence_only,
+                read_as_before_at: None,
             }))
         };
         let added = place(v1::Change::New, Some(false));

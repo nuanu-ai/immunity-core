@@ -1935,6 +1935,16 @@ pub struct PlaceChanged {
     /// such observation. Neither value gives the coverage or freshness of a later reading.
     #[prost(bool, optional, tag = "2")]
     pub presence_only: ::core::option::Option<bool>,
+    /// The time of a reading that read, by its checksum, the same content as before this finding's
+    /// first change: the reading of its latest change of content. Decided from the `has_content`
+    /// entries of `rests_on` alone: the value before the first of them and the value after the
+    /// latest are the same SHA-256, each of content read in full. It is said of that reading and
+    /// never of the place now: a later reading that could not read it, or read it unchanged, writes
+    /// no entry and leaves this time as it is. Absent when the two differ or either is missing, as
+    /// for a place added or removed, or is not a checksum. It changes nothing else of the finding.
+    /// Since 1.35.0.
+    #[prost(int64, optional, tag = "3")]
+    pub read_as_before_at: ::core::option::Option<i64>,
 }
 /// Installed software changed in place. The digests and verdicts before and after are in
 /// `rests_on`, as `has_digest`, `has_seal` and `signed_by`.

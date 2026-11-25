@@ -305,6 +305,7 @@ pub fn evidence(conn: &Connection, f: &Found) -> rusqlite::Result<Option<v1::evi
         return Ok(Some(Body::PlaceChanged(v1::PlaceChanged {
             change,
             presence_only: crate::watched::last_presence_only(conn, &f.about)?,
+            read_as_before_at: read_as_before(&findings::basis(conn, &f.id)?),
         })));
     }
     let became = || f.became.as_deref().map(whole);
@@ -341,6 +342,24 @@ pub fn evidence(conn: &Connection, f: &Found) -> rusqlite::Result<Option<v1::evi
             _ => return Ok(None),
         },
     ))
+}
+
+/// When a reading read back the content a watched place held before a finding's first change,
+/// from the finding's own entries alone: the `has_content` value before the first of them and
+/// after the latest are one checksum, so the latest is a reading that read the content in full.
+/// A reading that could not read it writes no `has_content` entry, so the time is never later
+/// than the last reading that read it. `None` when anything else holds.
+fn read_as_before(basis: &[findings::Basis]) -> Option<i64> {
+    let mut content = basis
+        .iter()
+        .filter(|b| b.predicate.as_deref() == Some("has_content"));
+    let first = content.next()?;
+    let latest = content.next_back().unwrap_or(first);
+    let read = |v: &Option<String>| {
+        v.clone()
+            .filter(|d| d.starts_with("sha256:") || d.starts_with("value sha256:"))
+    };
+    (read(&first.old_value)? == read(&latest.new_value)?).then_some(latest.at)
 }
 
 /// What happened to the place a finding is about, for a rule whose evidence is a place that
@@ -517,7 +536,50 @@ fn package_in(
 
 #[cfg(test)]
 mod tests {
-    use super::{change, v1};
+    use super::{change, read_as_before, v1};
+
+    #[test]
+    fn a_read_back_is_said_only_of_two_checksums_of_content_read_in_full_from_its_own_digests() {
+        let entry = |at: i64, predicate: &str, old: Option<&str>, new: Option<&str>| {
+            crate::findings::Basis {
+                seq: at,
+                at,
+                run_id: at.to_string(),
+                entry: "changed".into(),
+                reader: None,
+                kind: None,
+                predicate: Some(predicate.into()),
+                subject: None,
+                old_value: old.map(str::to_string),
+                new_value: new.map(str::to_string),
+            }
+        };
+        let content = |at, old, new| entry(at, "has_content", old, new);
+        let (a, b) = (Some("sha256:aa"), Some("sha256:bb"));
+        // Changed and back; then another fact of the place changes, which says nothing of its
+        // content.
+        let back = [content(1, a, b), content(2, b, a)];
+        assert_eq!(read_as_before(&back), Some(2));
+        let signer = entry(3, "signed_by", Some("x"), Some("y"));
+        assert_eq!(
+            read_as_before(&[content(1, a, b), content(2, b, a), signer]),
+            Some(2)
+        );
+        // A key's value is a checksum too.
+        let (v, w) = (Some("value sha256:aa"), Some("value sha256:bb"));
+        assert_eq!(
+            read_as_before(&[content(1, v, w), content(2, w, v)]),
+            Some(2)
+        );
+        // What is not a checksum was not read in full, however equal.
+        let link = Some("dangling link");
+        assert_eq!(
+            read_as_before(&[content(1, link, b), content(2, b, link)]),
+            None
+        );
+        // A first reading had nothing before it.
+        assert_eq!(read_as_before(&[content(1, None, a)]), None);
+    }
 
     #[test]
     fn every_change_the_store_words_is_a_value_of_the_contract_and_never_unspecified() {

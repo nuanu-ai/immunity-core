@@ -874,6 +874,10 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
                 "What happened",
                 word(crate::finding_text::change_said(p.change)),
             ));
+            if let Some(at) = p.read_as_before_at {
+                let said = word(crate::finding_text::READ_AS_BEFORE);
+                facts.push(("Read back", format!("{}: {said}", view::when(at, now))));
+            }
             if p.presence_only == Some(true) {
                 facts.push((
                     "Watched",
@@ -901,9 +905,26 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
             }
         }
         Some(Body::ChangedInPlace(p)) => {
-            match &p.became_text {
-                Some(value) => facts.push(("It became", data(value))),
-                None => {
+            match (&p.became_text, &p.files) {
+                (Some(value), _) => facts.push(("It became", data(value))),
+                // The files that changed, as the text names them; where a folder changed whole,
+                // its path is from the Mac and its number of files is Immunity Core's.
+                (None, Some(files)) => {
+                    let (counts, entries) = crate::finding_text::files_said(files);
+                    facts.push(("Files", word(&counts)));
+                    for (label, x) in entries {
+                        let shown = match x.folder {
+                            true => {
+                                let n = i64::try_from(x.files).unwrap_or(i64::MAX);
+                                let n = word(&format!("({})", counted(n, "file", "files")));
+                                format!("{} {n}", data(&format!("{}/", x.path_text)))
+                            }
+                            false => data(&x.path_text),
+                        };
+                        facts.push((label, shown));
+                    }
+                }
+                (None, None) => {
                     if let Some(b) = f.rests_on.iter().rev().find(|b| {
                         b.entry == "changed" && b.predicate.as_deref() == Some("has_digest")
                     }) {
