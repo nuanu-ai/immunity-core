@@ -112,26 +112,48 @@ impl Folder {
 /// parsed. Only a whole parse is kept, and only the files the pass met.
 #[derive(Default)]
 pub struct Parsed {
-    git: Option<PathBuf>,
+    git: Option<(PathBuf, Program)>,
     pub(crate) records: HashMap<String, Vec<u8>>,
+}
+
+/// The file a Git program is, as `stat` tells it: its size and its modified and changed times.
+/// A Git replaced at its path, or one that lost its execute permission, is another program,
+/// and what the earlier one parsed is not taken for its answers. The changed time moves with
+/// a new mode and with a file put in place of another, and no process sets it back.
+type Program = (u64, [i64; 4]);
+
+fn program(git: &Path) -> Option<Program> {
+    use std::os::unix::fs::MetadataExt;
+    let m = std::fs::metadata(git).ok()?;
+    let times = [m.mtime(), m.mtime_nsec(), m.ctime(), m.ctime_nsec()];
+    Some((m.size(), times))
 }
 
 /// The Git one pass runs, or why it runs none, with what the last pass and this one parsed.
 struct Git {
     binary: Result<PathBuf, String>,
+    program: Option<Program>,
     last: HashMap<String, Vec<u8>>,
     met: RefCell<HashMap<String, Vec<u8>>>,
 }
 
 impl Git {
     fn new(binary: Result<PathBuf, String>, last: Parsed) -> Self {
+        let program = binary.as_ref().ok().and_then(|git| program(git));
         // What another Git parsed is not taken for this one's.
-        let last = match (&binary, last.git) {
-            (Ok(binary), Some(git)) if *binary == git => last.records,
+        let last = match (&binary, program, last.git) {
+            (Ok(binary), Some(now), Some((git, then))) if *binary == git && now == then => {
+                last.records
+            }
             _ => HashMap::new(),
         };
         let met = RefCell::default();
-        Self { binary, last, met }
+        Self {
+            binary,
+            program,
+            last,
+            met,
+        }
     }
 
     /// Git's records of `bytes`: what this pass or the last parsed of the same bytes, or what
@@ -151,7 +173,7 @@ impl Git {
     fn parsed(self) -> Parsed {
         let records = self.met.into_inner();
         Parsed {
-            git: self.binary.ok(),
+            git: self.binary.ok().zip(self.program),
             records,
         }
     }
@@ -161,7 +183,7 @@ impl Git {
         let mut records = self.last;
         records.extend(self.met.into_inner());
         Parsed {
-            git: self.binary.ok(),
+            git: self.binary.ok().zip(self.program),
             records,
         }
     }
@@ -550,7 +572,9 @@ fn git_config(git: &Path, home: &Path, bytes: &[u8]) -> Result<Vec<u8>, String> 
         }
         let status = child.wait();
         let written = write.join().is_ok_and(|w| w.is_ok());
-        let parsed_whole = complete && written && status.is_ok_and(|s| s.success());
+        // With `--null` every record ends with a NUL: an output that does not was cut short.
+        let listing = parsed.is_empty() || parsed.ends_with(&[0]);
+        let parsed_whole = complete && written && listing && status.is_ok_and(|s| s.success());
         parsed_whole.then_some(parsed).ok_or(UNPARSED.into())
     })
 }
@@ -562,23 +586,15 @@ mod tests {
     use crate::common::Scratch;
     use std::os::unix::fs::PermissionsExt;
 
-    /// A stand-in for Git that adds a line to `<name>.starts` beside it each time it starts and
-    /// runs the real Git, failing instead at its first start when `fail_first`.
-    fn stand_in(dir: &Path, name: &str, fail_first: bool) -> PathBuf {
+    /// A stand-in for Git that adds a line to `<name>.starts` beside it each time it starts,
+    /// runs the shell lines `first`, then the real Git.
+    fn stand_in(dir: &Path, name: &str, first: &str) -> PathBuf {
         let home = Path::new("/");
         let git = git_in(developer_dir().as_deref(), home, &[home]).expect("Git is installed");
         let at = dir.join(name);
-        let (starts, failed) = (at.with_extension("starts"), at.with_extension("failed"));
-        let fail = if fail_first {
-            format!(
-                "[ -e '{0}' ] || {{ : > '{0}'; exit 1; }}\n",
-                failed.display()
-            )
-        } else {
-            String::new()
-        };
+        let starts = at.with_extension("starts");
         let script = format!(
-            "#!/bin/sh\necho >> '{}'\n{fail}exec '{}' \"$@\"\n",
+            "#!/bin/sh\necho >> '{}'\n{first}\nexec '{}' \"$@\"\n",
             starts.display(),
             git.display()
         );
@@ -609,7 +625,7 @@ mod tests {
     #[test]
     fn a_config_file_whose_bytes_did_not_change_is_not_given_to_git_again() {
         let dir = Scratch::new("git-cache-same");
-        let git = stand_in(&dir, "git", false);
+        let git = stand_in(&dir, "git", "");
         let (one, two) = (dir.join("one.config"), dir.join("two.config"));
         std::fs::write(&one, "[core]\n hooksPath = hooks\n").unwrap();
         std::fs::copy(&one, &two).unwrap();
@@ -625,7 +641,7 @@ mod tests {
     #[test]
     fn a_config_file_edited_in_place_is_parsed_again_though_its_size_and_times_are_the_same() {
         let dir = Scratch::new("git-cache-edited");
-        let git = stand_in(&dir, "git", false);
+        let git = stand_in(&dir, "git", "");
         let file = dir.join("config");
         std::fs::write(&file, "[core]\n hooksPath = first\n").unwrap();
         let before = std::fs::metadata(&file).unwrap();
@@ -651,7 +667,9 @@ mod tests {
     #[test]
     fn a_parse_that_failed_is_tried_again_at_the_next_pass() {
         let dir = Scratch::new("git-cache-failed");
-        let git = stand_in(&dir, "git", true);
+        let failed = dir.join("failed");
+        let fail_first = format!("[ -e '{0}' ] || {{ : > '{0}'; exit 1; }}", failed.display());
+        let git = stand_in(&dir, "git", &fail_first);
         let file = dir.join("config");
         std::fs::write(&file, "[core]\n hooksPath = hooks\n").unwrap();
         let (first, parsed) = pass(&git, Parsed::default(), &dir, &[&file]);
@@ -664,7 +682,7 @@ mod tests {
     #[test]
     fn the_cache_keeps_only_the_files_of_the_last_pass() {
         let dir = Scratch::new("git-cache-last");
-        let git = stand_in(&dir, "git", false);
+        let git = stand_in(&dir, "git", "");
         let (kept, dropped) = (dir.join("kept.config"), dir.join("dropped.config"));
         std::fs::write(&kept, "[core]\n hooksPath = kept\n").unwrap();
         std::fs::write(&dropped, "[core]\n hooksPath = dropped\n").unwrap();
@@ -679,12 +697,53 @@ mod tests {
     #[test]
     fn what_one_git_parsed_is_not_taken_for_another_git_s() {
         let dir = Scratch::new("git-cache-other-git");
-        let (one, other) = (stand_in(&dir, "one", false), stand_in(&dir, "other", false));
+        let (one, other) = (stand_in(&dir, "one", ""), stand_in(&dir, "other", ""));
         let file = dir.join("config");
         std::fs::write(&file, "[core]\n hooksPath = hooks\n").unwrap();
         let (_, parsed) = pass(&one, Parsed::default(), &dir, &[&file]);
         let (_, _) = pass(&other, parsed, &dir, &[&file]);
         assert_eq!((starts(&one), starts(&other)), (1, 1));
+    }
+
+    #[test]
+    fn a_git_replaced_at_its_path_is_not_taken_for_the_one_that_parsed() {
+        let dir = Scratch::new("git-cache-replaced");
+        let git = stand_in(&dir, "git", "");
+        let file = dir.join("config");
+        std::fs::write(&file, "[core]\n hooksPath = hooks\n").unwrap();
+        let (_, parsed) = pass(&git, Parsed::default(), &dir, &[&file]);
+        // The same file, rewritten in place: a program that fails every parse.
+        stand_in(&dir, "git", "exit 1");
+        let (second, _) = pass(&git, parsed, &dir, &[&file]);
+        assert_eq!(second, [UNPARSED]);
+        assert_eq!(starts(&git), 2);
+    }
+
+    #[test]
+    fn a_git_that_lost_its_execute_permission_is_not_taken_for_the_one_that_parsed() {
+        let dir = Scratch::new("git-cache-not-executable");
+        let git = stand_in(&dir, "git", "");
+        let file = dir.join("config");
+        std::fs::write(&file, "[core]\n hooksPath = hooks\n").unwrap();
+        let (_, parsed) = pass(&git, Parsed::default(), &dir, &[&file]);
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let (second, _) = pass(&git, parsed, &dir, &[&file]);
+        assert_eq!(second, ["Git could not be run"]);
+        assert_eq!(starts(&git), 1);
+    }
+
+    #[test]
+    fn an_output_of_git_cut_short_is_a_failed_parse_and_is_never_kept() {
+        let dir = Scratch::new("git-cache-cut-short");
+        // A listing whose last record has no NUL, from a Git that exits with zero.
+        let git = stand_in(&dir, "git", "printf 'core.hookspath\\nhooks'; exit 0");
+        let file = dir.join("config");
+        std::fs::write(&file, "[core]\n hooksPath = hooks\n").unwrap();
+        let (first, parsed) = pass(&git, Parsed::default(), &dir, &[&file]);
+        assert_eq!(first, [UNPARSED]);
+        let (second, _) = pass(&git, parsed, &dir, &[&file]);
+        assert_eq!(second, [UNPARSED]);
+        assert_eq!(starts(&git), 2);
     }
 
     /// The folder a resolution told, with its reason when unknown.

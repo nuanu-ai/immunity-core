@@ -1563,9 +1563,8 @@ fn places(
     for (place, folder, kind) in autorun::home_places() {
         add(home.join(place), folder, machine, &kind);
     }
-    if let Some(git) = git {
-        *parsed = git.parsed();
-    }
+    // The look decides what is kept, and one with no checkout keeps nothing: a reading only adds.
+    *parsed = git.map(|git| git.parsed()).unwrap_or_default();
     out
 }
 
@@ -2691,45 +2690,67 @@ mod tests {
         assert_eq!(read["gone"].as_u64(), Some(1));
     }
 
+    /// The keys of what Git parsed: the SHA-256 of each configuration's text.
+    fn parsed_keys(parsed: &crate::git_hooks::Parsed) -> BTreeSet<String> {
+        parsed.records.keys().cloned().collect()
+    }
+
+    fn keys(texts: &[&str]) -> BTreeSet<String> {
+        texts
+            .iter()
+            .map(|t| crate::sha256::hex(t.as_bytes()))
+            .collect()
+    }
+
+    /// The checkouts `names` under `dev/` of `home`, as the store holds them.
+    fn found(home: &Path, names: &[&str]) -> Vec<checkouts::Checkout> {
+        let checkout = |c: &&str| checkouts::Checkout {
+            rel: format!("dev/{c}"),
+            path: home.join(format!("dev/{c}")),
+        };
+        names.iter().map(checkout).collect()
+    }
+
     #[test]
     fn the_look_at_what_to_watch_and_the_reading_each_keep_what_git_parsed_for_the_next() {
         let dir = crate::common::Scratch::new("watch-keeps-parsed");
         let (w, folder) = watched_for_a_while(&dir);
-        let api = w.home.join("dev/api");
-        std::fs::write(api.join(".git/config"), "[core]\n hooksPath = /dev/null\n").unwrap();
-        let found = [checkouts::Checkout {
-            rel: "dev/api".into(),
-            path: api,
-        }];
-        let mut parsed = crate::git_hooks::Parsed::default();
-        places(
-            &w.home,
-            &w.system_root,
-            "mac",
-            &found,
-            &[&w.home],
-            &mut parsed,
+        let config = w.home.join("dev/api/.git/config");
+        let (before, after) = (
+            "[core]\n hooksPath = /dev/null\n",
+            "[core]\n hooksPath = x\n",
         );
-        assert_eq!(parsed.records.len(), 1);
+        let look = |parsed: &mut _| {
+            let found = found(&w.home, &["api"]);
+            places(&w.home, &w.system_root, "mac", &found, &[&w.home], parsed);
+        };
+        // One cache through a look, a reading of every place and the next look.
         let mut parsed = crate::git_hooks::Parsed::default();
+        std::fs::write(&config, before).unwrap();
+        look(&mut parsed);
+        assert_eq!(parsed_keys(&parsed), keys(&[before]));
+        std::fs::write(&config, after).unwrap();
         read_held(&w, &folder, None, &mut parsed).unwrap();
-        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed_keys(&parsed), keys(&[before, after]));
+        look(&mut parsed);
+        assert_eq!(parsed_keys(&parsed), keys(&[after]));
     }
 
     #[test]
     fn a_reading_of_some_places_keeps_what_git_parsed_for_the_others() {
         let dir = crate::common::Scratch::new("watch-reading-keeps-parsed");
         let (w, folder) = watched_for_a_while(&dir);
-        let config = |c: &str, to: &str| {
-            let text = format!("[core]\n hooksPath = {to}\n");
+        let config = |c: &str, text: &str| {
             std::fs::write(w.home.join(format!("dev/{c}/.git/config")), text).unwrap();
         };
-        config("api", "/dev/null");
-        config("site", "hooks");
-        let found = ["api", "site"].map(|c| checkouts::Checkout {
-            rel: format!("dev/{c}"),
-            path: w.home.join(format!("dev/{c}")),
-        });
+        let (api, site, api_now) = (
+            "[core]\n hooksPath = /dev/null\n",
+            "[core]\n hooksPath = hooks\n",
+            "[core]\n hooksPath = other\n",
+        );
+        config("api", api);
+        config("site", site);
+        let found = found(&w.home, &["api", "site"]);
         let mut parsed = crate::git_hooks::Parsed::default();
         places(
             &w.home,
@@ -2739,12 +2760,28 @@ mod tests {
             &[&w.home],
             &mut parsed,
         );
-        assert_eq!(parsed.records.len(), 2);
+        assert_eq!(parsed_keys(&parsed), keys(&[api, site]));
         // A reading of api's hooks alone adds what it parsed and keeps site's.
-        config("api", "other");
-        let api = reading("checkout:machine:mac/dev/api", watched::HOOK_KIND);
-        read_held(&w, &folder, Some(&[api].into()), &mut parsed).unwrap();
-        assert_eq!(parsed.records.len(), 3);
+        config("api", api_now);
+        let reading = reading("checkout:machine:mac/dev/api", watched::HOOK_KIND);
+        read_held(&w, &folder, Some(&[reading].into()), &mut parsed).unwrap();
+        assert_eq!(parsed_keys(&parsed), keys(&[api, site, api_now]));
+    }
+
+    #[test]
+    fn a_look_that_meets_no_checkout_drops_what_was_kept() {
+        let dir = crate::common::Scratch::new("watch-look-meets-none");
+        let (home, system) = (dir.join("home"), dir.join("system"));
+        let text = "[core]\n hooksPath = hooks\n";
+        std::fs::create_dir_all(home.join("dev/api/.git")).unwrap();
+        std::fs::create_dir_all(&system).unwrap();
+        std::fs::write(home.join("dev/api/.git/config"), text).unwrap();
+        let mut parsed = crate::git_hooks::Parsed::default();
+        let found = found(&home, &["api"]);
+        places(&home, &system, "mac", &found, &[&home], &mut parsed);
+        assert_eq!(parsed_keys(&parsed), keys(&[text]));
+        places(&home, &system, "mac", &[], &[&home], &mut parsed);
+        assert!(parsed.records.is_empty());
     }
 
     #[test]
