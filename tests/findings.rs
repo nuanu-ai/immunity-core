@@ -203,7 +203,7 @@ fn a_place_where_code_runs_by_itself_is_read_whole_with_what_changed_and_what_it
     assert_eq!(whole["where_text"], "~/dev/shop/.vscode/tasks.json");
     assert_eq!(
         whole["evidence"],
-        json!({ "place_changed": { "change": "new", "presence_only": false } })
+        json!({ "place_changed": { "change": "new", "presence_only": false, "read_as_before_at": null } })
     );
     let rests = whole["rests_on"].as_array().unwrap();
     assert!(
@@ -277,7 +277,7 @@ fn a_place_where_code_runs_by_itself_is_read_whole_with_what_changed_and_what_it
     let rests = again["rests_on"].as_array().unwrap();
     assert_eq!(
         again["evidence"],
-        json!({ "place_changed": { "change": "changed", "presence_only": false } })
+        json!({ "place_changed": { "change": "changed", "presence_only": false, "read_as_before_at": null } })
     );
     assert_eq!(again["first_seen_at"], rests[0]["recorded_at"]);
     assert_eq!(again["last_seen_at"], rests[rests.len() - 1]["recorded_at"]);
@@ -780,6 +780,293 @@ fn a_finding_found_again_after_seen_names_the_earlier_one_its_answer_and_reason_
         (&json!(again), &json!("command"))
     );
     assert!(third["answer"]["reason_text"].is_null());
+}
+
+/// UTC seconds as `date` writes them in this format.
+fn date(at: i64, format: &str) -> String {
+    let out = Command::new("/bin/date")
+        .args(["-u", "-r", &at.to_string(), format])
+        .output()
+        .unwrap();
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .trim_end()
+        .to_string()
+}
+
+/// UTC seconds as the text for a person writes them in a pipe.
+fn utc(at: i64) -> String {
+    date(at, "+%Y-%m-%d %H:%M UTC")
+}
+
+/// The `<dd>` of the fact a page labels `Read back`.
+fn read_back_on_page(page: &str) -> &str {
+    let dd = &page[page.find("<dt>Read back</dt><dd>").expect(page)..];
+    &dd[..dd.find("</dd>").unwrap()]
+}
+
+/// What `immunity finding <id>` says of a reading that read a watched file as it was before.
+const READ_AS_BEFORE: &str = "read the content with the checksum it had before the first change of content this finding rests on";
+
+impl Estate {
+    /// `PlaceChanged.read_as_before_at` of a finding.
+    fn read_as_before(&self, id: &str) -> Value {
+        self.finding(id)["evidence"]["place_changed"]["read_as_before_at"].clone()
+    }
+
+    /// A watched file unreadable for one run.
+    fn run_unreadable(&self, path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        self.run();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+}
+
+/// The `recorded_at` of the latest entry a finding rests on with this entry and predicate.
+fn latest_entry(whole: &Value, entry: &str, predicate: Option<&str>) -> i64 {
+    whole["rests_on"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|r| r["entry"] == entry && predicate.is_none_or(|p| r["predicate"] == p))
+        .unwrap_or_else(|| panic!("no {entry} in {whole:#}"))["recorded_at"]
+        .as_i64()
+        .unwrap()
+}
+
+#[test]
+fn a_watched_file_read_back_as_before_its_first_change_names_that_reading_and_stays_open() {
+    // A shell profile changed, then changed back a second later: the finding names the reading
+    // that read the content it had before, in the message, the text and the page, and stays as
+    // it was: open, at its levels, among what needs a look, with its title.
+    let (e, profile, id) = a_profile_changed("back");
+    let before = e.shown("watched.shell-profile");
+    common::next_second();
+    e.put(&profile, "export A=1\n");
+    e.run();
+    assert_eq!(id_of(&e, "watched.shell-profile"), id);
+    let whole = e.finding(&id);
+    let back = latest_entry(&whole, "changed", Some("has_content"));
+    assert_eq!(e.read_as_before(&id), json!(back), "{whole:#}");
+    let after = e.shown("watched.shell-profile");
+    for part in ["state", "severity", "confidence", "urgent", "title"] {
+        assert_eq!(after[part], before[part], "{part}");
+    }
+    assert_eq!(whole["evidence"]["place_changed"]["change"], "changed");
+    let line = format!("the reading of {} {READ_AS_BEFORE}", utc(back));
+    let text = e.text(&id);
+    assert!(
+        text.lines()
+            .any(|l| l.trim_start().starts_with("Read back") && l.ends_with(&line)),
+        "{text}"
+    );
+    let page = e.pages();
+    let dd = read_back_on_page(&page);
+    assert!(
+        dd.contains(&format!("title=\"{}\"", utc(back))) && dd.contains(READ_AS_BEFORE),
+        "{dd}"
+    );
+    assert!(
+        dd.starts_with("<dt>Read back</dt><dd><span class=\"w\">the reading of</span> <time"),
+        "{dd}"
+    );
+}
+
+#[test]
+fn a_watched_file_changed_back_and_changed_again_says_nothing_of_the_return() {
+    let (e, profile, id) = a_profile_changed("back-again");
+    for content in ["export A=1\n", "export A=3\n"] {
+        common::next_second();
+        e.put(&profile, content);
+        e.run();
+    }
+    assert_eq!(id_of(&e, "watched.shell-profile"), id);
+    assert!(e.read_as_before(&id).is_null());
+    assert!(!e.text(&id).contains("Read back"));
+    assert!(!e.pages().contains("Read back"));
+}
+
+#[test]
+fn a_reading_that_could_not_read_a_file_changed_back_never_moves_the_reading_named() {
+    // Changed back, then not read, then read again unchanged: neither later reading read
+    // anything new, so the reading named is still the one that read it back, and nothing says
+    // what the file holds now.
+    let (e, profile, id) = a_profile_changed("back-unread");
+    common::next_second();
+    e.put(&profile, "export A=1\n");
+    e.run();
+    // An hour ago, so that the minutes the text names tell the readings apart.
+    common::rewrite_journal(
+        &e.store(),
+        "UPDATE journal SET at = at - 3600 WHERE predicate = 'has_content'",
+    );
+    let back = e.read_as_before(&id);
+    assert!(back.is_i64(), "{:#}", e.finding(&id));
+    common::next_second();
+    e.run_unreadable(&profile);
+    let whole = e.finding(&id);
+    assert_eq!(whole["evidence"]["place_changed"]["change"], "not_read");
+    assert!(latest_entry(&whole, "not_read", None) > back.as_i64().unwrap());
+    assert_eq!(e.read_as_before(&id), back);
+    common::next_second();
+    e.run();
+    assert_eq!(e.read_as_before(&id), back);
+    let text = e.text(&id);
+    let line = text.lines().find(|l| l.contains(READ_AS_BEFORE)).unwrap();
+    assert!(line.contains(&utc(back.as_i64().unwrap())), "{line}");
+    assert!(!line.contains("now"), "{line}");
+    // The page names that reading to the second.
+    let iso = date(back.as_i64().unwrap(), "+%Y-%m-%dT%H:%M:%SZ");
+    let page = e.pages();
+    let dd = read_back_on_page(&page);
+    assert!(dd.contains(&format!("datetime=\"{iso}\"")), "{dd}");
+}
+
+#[test]
+fn a_file_never_read_before_its_first_change_says_nothing_of_a_return() {
+    // Added, then changed and changed back to what it was added with: there was no content
+    // before the finding's first change to read back.
+    let e = Estate::new("back-new");
+    e.run();
+    let profile = e.home().join(".zshrc");
+    for content in ["export A=1\n", "export A=2\n", "export A=1\n"] {
+        common::next_second();
+        e.put(&profile, content);
+        e.run();
+    }
+    let id = id_of(&e, "watched.shell-profile");
+    let whole = e.finding(&id);
+    let added = whole["rests_on"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["predicate"] == "has_content")
+        .unwrap()
+        .clone();
+    assert_eq!(added["entry"], "added", "{whole:#}");
+    assert!(e.read_as_before(&id).is_null(), "{whole:#}");
+}
+
+#[test]
+fn a_place_not_read_then_read_again_unchanged_is_titled_by_the_time_it_was_not_read() {
+    // Reading it again unchanged is no event, so the finding keeps its title; the title names
+    // the reading that could not read it, never "the last check", which read it. Not read
+    // again, it names the latest such reading.
+    let e = Estate::new("unread-title");
+    let profile = e.home().join(".zshrc");
+    e.put(&profile, "export A=1\n");
+    e.run();
+    common::next_second();
+    e.run_unreadable(&profile);
+    // An hour ago, so that the minutes a title names tell two readings apart.
+    common::rewrite_journal(
+        &e.store(),
+        "UPDATE journal SET at = at - 3600 WHERE entry = 'not_read'",
+    );
+    let id = id_of(&e, "watched.shell-profile");
+    let title = |at: i64| {
+        format!(
+            "At {} Immunity Core could not read a watched shell profile, so it is not known whether it was added, changed or removed.",
+            utc(at)
+        )
+    };
+    let first = title(latest_entry(&e.finding(&id), "not_read", None));
+    common::next_second();
+    e.run();
+    let whole = e.finding(&id);
+    assert_eq!(whole["title"], first, "{whole:#}");
+    assert_eq!(e.shown("watched.shell-profile")["title"], first);
+    assert!(e.text(&id).contains(&first));
+    assert!(!e.text(&id).contains("the last check"));
+    common::next_second();
+    e.run_unreadable(&profile);
+    assert_eq!(id_of(&e, "watched.shell-profile"), id);
+    let latest = title(latest_entry(&e.finding(&id), "not_read", None));
+    assert_ne!(latest, first);
+    assert_eq!(e.finding(&id)["title"], latest);
+}
+
+#[test]
+fn a_place_not_read_is_titled_by_its_latest_reading_in_the_journal_s_order_after_a_clock_set_back()
+{
+    // Two readings that could not read the file, the later one made after the clock was set
+    // back two hours: the title names the later reading, at the time the clock gave it.
+    let e = Estate::new("unread-clock");
+    let profile = e.home().join(".zshrc");
+    e.put(&profile, "export A=1\n");
+    e.run();
+    for _ in 0..2 {
+        common::next_second();
+        e.run_unreadable(&profile);
+        common::next_second();
+        e.run();
+    }
+    common::rewrite_journal(
+        &e.store(),
+        "UPDATE journal SET at = at - 7200
+         WHERE seq = (SELECT MAX(seq) FROM journal WHERE entry = 'not_read')",
+    );
+    let id = id_of(&e, "watched.shell-profile");
+    let whole = e.finding(&id);
+    let unread: Vec<i64> = whole["rests_on"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["entry"] == "not_read")
+        .map(|r| r["recorded_at"].as_i64().unwrap())
+        .collect();
+    assert!(unread.len() == 2 && unread[1] < unread[0], "{whole:#}");
+    let title = whole["title"].as_str().unwrap();
+    assert!(
+        title.starts_with(&format!("At {} ", utc(unread[1]))),
+        "{title}"
+    );
+}
+
+#[test]
+fn the_page_of_code_changed_outside_an_app_names_each_file_escaped() {
+    // The page names the files the text names, from the same message; a name holding markup is
+    // shown as text.
+    let e = Estate::new("outside-page");
+    application(&e);
+    let code = e
+        .home()
+        .join("Library/Application Support/org.example.ledger/app");
+    e.put(&code.join("main.js"), "start();\n");
+    e.put(&code.join("other.js"), "other();\n");
+    e.run();
+    common::next_second();
+    e.put(&code.join("main.js"), "start();\nsteal();\n");
+    let forged = "<img src=x onerror=alert(1)>.js";
+    e.put(&code.join(forged), "steal();\n");
+    // A folder all of whose files are new is one entry, with its number of files.
+    e.put(&code.join("vendor/a.js"), "a();\n");
+    e.put(&code.join("vendor/b.js"), "b();\n");
+    e.run();
+    let id = id_of(&e, "integrity.app-code-outside");
+    let files = &e.finding(&id)["evidence"]["changed_in_place"]["files"];
+    assert_eq!((&files["added"], &files["changed"]), (&json!(3), &json!(1)));
+    let text = e.text(&id);
+    assert!(text.contains("app/main.js") && text.contains("app/vendor/ (2 files)"));
+    let page = e.pages();
+    // Each kind's label once, on its first entry, as the text gives it.
+    let mono = |path: &str| format!("<span class=\"mono\">{path}</span>");
+    for (label, said) in [
+        ("Added", mono("app/&lt;img src=x onerror=alert(1)&gt;.js")),
+        (
+            "",
+            format!("{} <span class=\"w\">(2 files)</span>", mono("app/vendor/")),
+        ),
+        ("Changed", mono("app/main.js")),
+    ] {
+        let fact = format!("<dt>{label}</dt><dd>{said}</dd>");
+        assert!(page.contains(&fact), "{fact}\n{page}");
+    }
+    assert!(!page.contains(forged));
+    assert!(page.contains("3 added, 0 removed, 1 changed"), "{page}");
+    assert!(!page.contains("Digest before"));
 }
 
 #[test]

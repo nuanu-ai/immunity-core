@@ -1835,26 +1835,26 @@ extern "C" fn on_signal(_: libc::c_int) {
 }
 
 /// `watching` of the contract's `Status`: absent unless a watcher holds its lock on this store
-/// now, so a watcher that died never shows as watching. What a failure said is whole. `conn` is
-/// the status's read of `store`, `None` without a store.
+/// by `lock`, the status's one reading of its lock file, so a watcher that died never shows as
+/// watching. What a failure said is whole. `conn` is the status's read of the store, `None`
+/// without a store.
 pub fn watcher(
-    store: &Path,
+    lock: &Lock,
     conn: Option<&Connection>,
 ) -> rusqlite::Result<Option<crate::contract::v1::Watcher>> {
     use crate::contract::v1;
-    let folder = crate::home(store);
-    let Some((since, _)) = responsive(&folder) else {
+    let Some((since, _)) = lock.responsive() else {
         return Ok(None);
     };
     let (last, failed) = match conn {
         Some(conn) => (
-            last_read(conn)?.filter(|last| *last >= since),
-            failures(conn, &folder)?,
+            last_read(conn)?.filter(|last| since.is_some_and(|since| *last >= since)),
+            failures(conn, lock)?,
         ),
         None => (None, Vec::new()),
     };
     Ok(Some(v1::Watcher {
-        since_at: Some(since),
+        since_at: since,
         last_read_at: last,
         failed: failed
             .iter()
@@ -1874,10 +1874,12 @@ pub fn watcher(
     }))
 }
 
-/// What the pages of the view rest on about the watcher: when the one that holds the store
-/// started, and what has failed in it and not succeeded since; `none` while none holds it.
+/// What the pages of the view rest on about the watcher, by one reading of its lock file: when
+/// the one that holds the store started, and what has failed in it and not succeeded since;
+/// `none` while none holds it.
 pub fn basis(conn: &Connection, folder: &Path) -> rusqlite::Result<String> {
-    let Some((since, state)) = responsive(folder) else {
+    let lock = Lock::read(folder);
+    let Some((since, state)) = lock.responsive() else {
         return Ok("none".into());
     };
     let state = match state {
@@ -1886,39 +1888,93 @@ pub fn basis(conn: &Connection, folder: &Path) -> rusqlite::Result<String> {
         LockState::Unwatched { .. } => "unwatched",
         LockState::Unrecorded { .. } => "unrecorded",
     };
-    let failed: Vec<String> = failures(conn, folder)?
-        .into_iter()
-        .map(|f| f.what)
-        .collect();
-    Ok(format!("{since} {state} {}", failed.join(",")))
+    let failed: Vec<String> = failures(conn, &lock)?.into_iter().map(|f| f.what).collect();
+    Ok(format!("{since:?} {state} {}", failed.join(",")))
 }
 
-/// When the watcher that holds the lock took it, and what its lock file says of it. `None`
-/// while no watcher holds the lock, when the file is not a heartbeat lock (`read_lock`), and
-/// when the watcher has not touched it within `STALLED`.
-fn responsive(folder: &Path) -> Option<(i64, LockState)> {
-    if !store::watch_in_progress(folder).unwrap_or(false) {
-        return None;
+/// One reading of the watcher's lock file: whether a watcher holds the store, and what the file
+/// says. An answer about the watcher reads it once and passes it to every part that needs it, so
+/// that whether it is live, what failed in it and whether it is restarting are of one moment.
+pub struct Lock(Held);
+
+enum Held {
+    /// Whether a watcher holds the store could not be told.
+    Unknown,
+    /// None holds it; when the latest left for a new core, as its file says (`left_at`).
+    No(Option<i64>),
+    /// One holds it: when it took the lock, where the file says, and what its file says
+    /// (`heard`); `None` when it has not touched the file within `STALLED`.
+    Yes(Option<(Option<i64>, LockState)>),
+}
+
+impl Lock {
+    /// Reads the lock file of the store in `folder`, once.
+    pub fn read(folder: &Path) -> Lock {
+        #[cfg(test)]
+        tests::READS.with(|n| n.set(n.get() + 1));
+        let path = folder.join(store::WATCH_LOCK);
+        let text = || Some(String::from_utf8_lossy(&std::fs::read(&path).ok()?).into_owned());
+        Lock(match store::watch_in_progress(folder) {
+            Err(_) => Held::Unknown,
+            Ok(false) => Held::No(text().as_deref().and_then(left_at)),
+            Ok(true) => Held::Yes(heard(&path)),
+        })
     }
-    let path = folder.join(store::WATCH_LOCK);
-    let text = std::fs::read(&path).ok()?;
-    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+
+    /// When the watcher that holds the lock took it, where its file says, and what the file says
+    /// of it (`Held::Yes`).
+    fn responsive(&self) -> Option<(Option<i64>, &LockState)> {
+        match &self.0 {
+            Held::Yes(Some((since, state))) => Some((*since, state)),
+            _ => None,
+        }
+    }
+
+    /// Whether a watcher watches live with these failures standing: it is ready, and a failed
+    /// reading of program starts or full check does not stop it, any other failure does.
+    pub fn live(&self, failed: &[Failure]) -> bool {
+        matches!(self.responsive(), Some((_, LockState::Ready)))
+            && failed
+                .iter()
+                .all(|f| matches!(f.what.as_str(), EVENTS | FULL_CHECK))
+    }
+
+    /// When the latest watcher left because the file it was started from was replaced, while no
+    /// watcher holds the store and for `RESTARTING_FOR` after it left, at `now`.
+    pub fn restarting_since(&self, now: i64) -> Option<i64> {
+        match self.0 {
+            Held::No(Some(at)) if (now - at).abs() <= RESTARTING_FOR => Some(at),
+            _ => None,
+        }
+    }
+}
+
+/// What the lock file a watcher holds says of it: when it took the lock and its state, `None`
+/// when it has not touched the file within `STALLED`. The time is taken from the open file before
+/// its bytes are read, so a write between the two pairs newer bytes with an older time: the pair
+/// errs towards a stall, never towards bytes fresher than their time. A lock that is held is a
+/// watcher that runs, so a file that cannot be read, or that holds no heartbeat lock (empty, as a
+/// new watcher leaves it before its first write, or half written), is a watcher starting, with no
+/// start time.
+fn heard(path: &Path) -> Option<(Option<i64>, LockState)> {
+    let starting = Some((None, LockState::Starting));
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return starting;
+    };
+    let Ok(modified) = file.metadata().and_then(|m| m.modified()) else {
+        return starting;
+    };
     if modified.elapsed().ok()? >= STALLED {
         return None;
     }
-    read_lock(&String::from_utf8_lossy(&text))
-}
-
-pub fn watching_live(folder: &Path) -> bool {
-    responsive(folder).is_some_and(|(_, state)| state == LockState::Ready)
-}
-
-/// Whether a watcher that is ready watches live with these failures standing: a failed reading
-/// of program starts or full check does not stop it, any other failure does.
-pub fn live_with(failed: &[Failure]) -> bool {
-    failed
-        .iter()
-        .all(|f| matches!(f.what.as_str(), EVENTS | FULL_CHECK))
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return starting;
+    }
+    match read_lock(&String::from_utf8_lossy(&bytes)) {
+        Some((since, state)) => Some((Some(since), state)),
+        None => starting,
+    }
 }
 
 /// What the status says of the watcher on a store, as `seen` tells it.
@@ -1971,45 +2027,87 @@ impl Seen {
     }
 }
 
+/// The watcher's case as a status message says it, which the terminal and the pages each put in
+/// their own words (`case`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Case {
+    /// A watcher watches live and nothing failed in it.
+    Live,
+    /// A watcher watches live, and its reading of program starts or a full check failed.
+    LiveFailed,
+    /// A watcher runs and something failed in it, so it does not watch live.
+    Failing,
+    /// A watcher runs and has not completed its first reading.
+    Starting,
+    /// The latest watcher left for a new core a moment ago.
+    Restarting,
+    /// Off, and `immunity off` did not turn it off: turned on at this time, the latest of the
+    /// two, with whether the login job's property list is in place.
+    OffNotByCommand { on: i64, job: Option<bool> },
+    /// Off, turned off at this time with `immunity off`, and its job gone.
+    OffByCommand { off: i64 },
+    /// No watcher runs; the login job is in place.
+    JobInPlace,
+    /// No watcher runs; the login job is not installed.
+    NotInstalled,
+    /// No watcher runs, and whether the login job is in place is not said.
+    NoWatcher,
+}
+
+/// The watcher's case, from the message alone, in one order: a watcher that watches live (a
+/// live `this_mac` and a watcher on the store), then what failed in it, a watcher that starts,
+/// one restarting. With none of them the journal's latest of `turned_on` and `turned_off`
+/// decides: after `immunity on` it is off and not by `immunity off`, whatever the property list
+/// says; after `immunity off`, with the job gone, off by it. Else the login job says.
+pub fn case(s: &crate::contract::v1::Status) -> Case {
+    let failed = s.watching.as_ref().is_some_and(|w| !w.failed.is_empty());
+    let live = s.this_mac.as_ref().is_some_and(|m| m.live) && s.watching.is_some();
+    match (s.turned_on_latest, s.turned_on_at, s.turned_off_at) {
+        _ if live => match failed {
+            true => Case::LiveFailed,
+            false => Case::Live,
+        },
+        _ if failed => Case::Failing,
+        _ if s.watching.is_some() => Case::Starting,
+        _ if s.watcher_restarting_since_at.is_some() => Case::Restarting,
+        (Some(true), Some(on), _) => Case::OffNotByCommand {
+            on,
+            job: s.login_job_installed,
+        },
+        (_, _, Some(off)) if s.login_job_installed == Some(false) => Case::OffByCommand { off },
+        _ => match s.login_job_installed {
+            Some(true) => Case::JobInPlace,
+            Some(false) => Case::NotInstalled,
+            None => Case::NoWatcher,
+        },
+    }
+}
+
 /// What the status would say now of the watcher on `store`, by the liveness it uses
 /// (`ThisMac.live`). `None` when that cannot be told: the store's folder or, for a watcher that is
 /// ready, the store cannot be read.
 pub fn seen(store: &Path) -> Option<Seen> {
-    let folder = crate::home(store);
-    if !store::watch_in_progress(&folder).ok()? {
-        return Some(match restarting_since(&folder, crate::now_secs()) {
+    let lock = Lock::read(&crate::home(store));
+    Some(match &lock.0 {
+        Held::Unknown => return None,
+        Held::No(_) => match lock.restarting_since(crate::now_secs()) {
             Some(_) => Seen::Restarting,
             None => Seen::Absent,
-        });
-    }
-    // A watcher that stalled, or whose lock file is not a heartbeat lock, is no watcher.
-    let Some((_, state)) = responsive(&folder) else {
-        return Some(Seen::Absent);
-    };
-    if state == LockState::Starting {
-        return Some(Seen::Starting);
-    }
-    // Ready, places left unwatched or a failure the store did not take, which `failures` gives
-    // as one of `PLACES` or `STORE`.
-    let conn = store::open_read_only(store).ok()?;
-    let failed = failures(&conn, &folder).ok()?;
-    Some(if live_with(&failed) {
-        Seen::Live
-    } else {
-        Seen::Failing(failed.into_iter().map(|f| f.what).collect())
+        },
+        // A watcher that stalled, or whose lock file is not a heartbeat lock, is no watcher.
+        Held::Yes(None) => Seen::Absent,
+        Held::Yes(Some((_, LockState::Starting))) => Seen::Starting,
+        // Ready, places left unwatched or a failure the store did not take, which `failures`
+        // gives as one of `PLACES` or `STORE`.
+        Held::Yes(Some(_)) => {
+            let conn = store::open_read_only(store).ok()?;
+            let failed = failures(&conn, &lock).ok()?;
+            match lock.live(&failed) {
+                true => Seen::Live,
+                false => Seen::Failing(failed.into_iter().map(|f| f.what).collect()),
+            }
+        }
     })
-}
-
-/// When the latest watcher of the store in `folder` left because the file it was started from
-/// was replaced, while no watcher holds the store and for `RESTARTING_FOR` after it left, at
-/// `now`.
-pub fn restarting_since(folder: &Path, now: i64) -> Option<i64> {
-    if store::watch_in_progress(folder).ok()? {
-        return None;
-    }
-    let text = std::fs::read(folder.join(store::WATCH_LOCK)).ok()?;
-    let at = left_at(&String::from_utf8_lossy(&text))?;
-    ((now - at).abs() <= RESTARTING_FOR).then_some(at)
 }
 
 /// When a lock file says its watcher left for a new core: the start time, `heartbeat`, and the
@@ -2035,13 +2133,14 @@ pub struct Failure {
     pub detail: String,
 }
 
-/// What has failed in the watcher that holds its lock on this store now and not succeeded
+/// What has failed in the watcher that holds its lock on this store by `lock` and not succeeded
 /// since. Empty while no watcher runs; a failure recorded before this one started is a past
 /// watcher's and is left out. A failure the store did not take, which the lock file says, is
 /// one of the kind `STORE`; places the lock file says are left unwatched are one of `PLACES`.
 /// A failed full check is over once any full check has finished after it, by hand or not.
-pub fn failures(conn: &Connection, folder: &Path) -> rusqlite::Result<Vec<Failure>> {
-    let Some((since, state)) = responsive(folder) else {
+pub fn failures(conn: &Connection, lock: &Lock) -> rusqlite::Result<Vec<Failure>> {
+    // A watcher whose file says no start time is starting, and nothing of its own has failed.
+    let Some((Some(since), state)) = lock.responsive() else {
         return Ok(Vec::new());
     };
     let mut failed = conn
@@ -2060,11 +2159,11 @@ pub fn failures(conn: &Connection, folder: &Path) -> rusqlite::Result<Vec<Failur
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let said = match state {
-        LockState::Unrecorded { at, said } => Some((STORE, at, said)),
+        LockState::Unrecorded { at, said } => Some((STORE, *at, said.clone())),
         // Places left unwatched are the lock file's word, whatever the store holds; its row,
         // when there is one, says which.
         LockState::Unwatched { at } if !failed.iter().any(|f| f.what == PLACES) => {
-            Some((PLACES, at, UNWATCHED_SAID.to_string()))
+            Some((PLACES, *at, UNWATCHED_SAID.to_string()))
         }
         _ => None,
     };
@@ -2092,6 +2191,11 @@ pub fn last_read(conn: &Connection) -> rusqlite::Result<Option<i64>> {
 mod tests {
     use super::*;
 
+    thread_local! {
+        /// How many times this thread read a lock file (`Lock::read`).
+        pub(super) static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     /// A folder whose watcher's lock is held by the returned handle, as a watcher holds it.
     fn held(tag: &str) -> (crate::common::Scratch, std::fs::File) {
         let dir = crate::common::Scratch::new(tag);
@@ -2102,6 +2206,11 @@ mod tests {
     fn put_lock(lock: &std::fs::File, text: &str) {
         lock.write_all_at(text.as_bytes(), 0).unwrap();
         lock.set_len(text.len() as u64).unwrap();
+    }
+
+    /// Whether one reading of the lock file in `dir` says its watcher is ready.
+    fn watching_live(dir: &Path) -> bool {
+        Lock::read(dir).live(&[])
     }
 
     /// The status judges the lock file's time on the calendar, so after a sleep the first turn
@@ -2148,13 +2257,22 @@ mod tests {
             format!("1800000000\nheartbeat\ncore-replaced {left}"),
         )
         .unwrap();
-        assert_eq!(restarting_since(&dir, left + 5), Some(left));
-        assert_eq!(restarting_since(&dir, left + RESTARTING_FOR), Some(left));
-        assert_eq!(restarting_since(&dir, left + RESTARTING_FOR + 1), None);
+        assert_eq!(Lock::read(&dir).restarting_since(left + 5), Some(left));
+        assert_eq!(
+            Lock::read(&dir).restarting_since(left + RESTARTING_FOR),
+            Some(left)
+        );
+        assert_eq!(
+            Lock::read(&dir).restarting_since(left + RESTARTING_FOR + 1),
+            None
+        );
         // A time far ahead of the clock is not a watcher that left a moment ago.
-        assert_eq!(restarting_since(&dir, left - RESTARTING_FOR - 1), None);
+        assert_eq!(
+            Lock::read(&dir).restarting_since(left - RESTARTING_FOR - 1),
+            None
+        );
         let held = store::lock_watch(&dir).unwrap().unwrap();
-        assert_eq!(restarting_since(&dir, left + 5), None);
+        assert_eq!(Lock::read(&dir).restarting_since(left + 5), None);
         crate::common::release(held);
         for text in [
             "1800000000\nheartbeat\nready",
@@ -2165,7 +2283,11 @@ mod tests {
             "1800000000\nheartbeet\ncore-replaced 1800000100",
         ] {
             std::fs::write(&path, text).unwrap();
-            assert_eq!(restarting_since(&dir, left + 5), None, "{text:?}");
+            assert_eq!(
+                Lock::read(&dir).restarting_since(left + 5),
+                None,
+                "{text:?}"
+            );
         }
     }
 
@@ -2200,8 +2322,9 @@ mod tests {
             Some(Seen::Failing(vec![EVENTS.into(), STORE.into()]))
         );
         // A lock held with no heartbeat in it is no watcher.
+        // A lock held with no heartbeat lock in it is a watcher starting.
         put_lock(&lock, "damaged");
-        assert_eq!(seen(&store_path), Some(Seen::Absent));
+        assert_eq!(seen(&store_path), Some(Seen::Starting));
         // One that left for a new core a moment ago is restarting, until the time is over.
         let left = format!("{since}\nheartbeat\ncore-replaced {}", crate::now_secs());
         put_lock(&lock, &left);
@@ -2212,22 +2335,110 @@ mod tests {
         assert_eq!(seen(&store_path), Some(Seen::Absent));
     }
 
+    /// One status reads the watcher's lock file once: `live`, `watching`, the failures and
+    /// whether a watcher is restarting are all of the reading `status::state` made, however the
+    /// file and the lock change before `status::message` is built from it.
     #[test]
-    fn a_held_lock_without_a_heartbeat_line_or_with_a_damaged_one_is_not_a_watcher() {
+    fn one_status_reads_the_watchers_lock_file_once() {
+        let (dir, lock, conn) = watcher_of("watch-one-reading");
+        let now = crate::now_secs();
+        let since = now - 10;
+        put_lock(&lock, &format!("{since}\nheartbeat\nready"));
+        // Counted through `READS`: the answer's state reads the file once and its message none.
+        READS.with(|n| n.set(0));
+        let st = status::state(&conn, &dir, now).unwrap();
+        assert_eq!(READS.with(|n| n.get()), 1);
+        // The watcher says the store did not take a failure, then leaves for a new core.
+        put_lock(
+            &lock,
+            &format!("{since}\nheartbeat\nunrecorded {now}\ninvented"),
+        );
+        put_lock(&lock, &format!("{since}\nheartbeat\ncore-replaced {now}"));
+        crate::common::release(lock);
+        let m = status::message(Some(&conn), Some(&st), false, &dir.join("store.db"), now);
+        let m = m.unwrap();
+        assert_eq!(READS.with(|n| n.get()), 1);
+        let w = m.watching.unwrap();
+        assert!(m.this_mac.unwrap().live);
+        assert_eq!((w.since_at, w.failed.len()), (Some(since), 0));
+        assert_eq!(m.watcher_restarting_since_at, None);
+        // Without a store, the message reads it once itself.
+        READS.with(|n| n.set(0));
+        status::message(None, None, false, &dir.join("none.db"), now).unwrap();
+        assert_eq!(READS.with(|n| n.get()), 1);
+    }
+
+    /// Which of `turned_on` and `turned_off` came last is the journal's order, never the clock,
+    /// either way round, and is said as soon as either is there.
+    #[test]
+    fn turned_on_latest_is_the_journal_s_order_and_said_with_either_entry() {
+        let (dir, _lock, conn) = watcher_of("watch-turned-on-latest");
+        let latest = |conn: &Connection| {
+            let st = status::state(conn, &dir, 100).unwrap();
+            let m = status::message(Some(conn), Some(&st), false, &dir.join("store.db"), 100);
+            m.unwrap().turned_on_latest
+        };
+        assert_eq!(latest(&conn), None);
+        let run = crate::service::JOURNAL_RUN;
+        store::journal_note(&conn, 50, run, "turned_off", "").unwrap();
+        assert_eq!(latest(&conn), Some(false));
+        store::journal_note(&conn, 40, run, "turned_on", "").unwrap();
+        assert_eq!(latest(&conn), Some(true));
+        store::journal_note(&conn, 30, run, "turned_off", "").unwrap();
+        assert_eq!(latest(&conn), Some(false));
+    }
+
+    /// A lock that is held is a watcher that runs: with no heartbeat lock in its file, empty or
+    /// half written, it is starting, with no start time, and never live.
+    #[test]
+    fn a_held_lock_with_no_heartbeat_lock_in_its_file_is_a_watcher_starting_and_never_live() {
         let (dir, lock) = held("watch-lock-damaged");
         for text in [
             "1800000000",
             "1800000000\n",
+            "1800000000\nheart",
             "1800000000\nheartbeet\nready",
             "18OO000000\nheartbeat\nready",
             "",
         ] {
             put_lock(&lock, text);
-            assert!(responsive(&dir).is_none(), "{text:?}");
+            let starting = Some((None, &LockState::Starting));
+            assert_eq!(Lock::read(&dir).responsive(), starting, "{text:?}");
             assert!(!watching_live(&dir), "{text:?}");
         }
         put_lock(&lock, "1800000000\nheartbeat\nready");
         assert!(watching_live(&dir));
+    }
+
+    /// After `immunity on`, a new watcher that holds the lock and has not written its file yet is
+    /// starting on the terminal and on the page, never off and never calm.
+    #[test]
+    fn a_watcher_holding_an_empty_lock_after_immunity_on_is_starting_and_never_calm() {
+        let (dir, lock, conn) = watcher_of("watch-empty-lock");
+        let now = crate::now_secs();
+        store::journal_note(
+            &conn,
+            now - 60,
+            crate::service::JOURNAL_RUN,
+            "turned_on",
+            "",
+        )
+        .unwrap();
+        put_lock(&lock, "");
+        let st = status::state(&conn, &dir, now).unwrap();
+        let m = status::message(Some(&conn), Some(&st), false, &dir.join("store.db"), now);
+        let m = m.unwrap();
+        assert_eq!(m.watching.as_ref().map(|w| w.since_at), Some(None));
+        assert_eq!(case(&m), Case::Starting);
+        assert_ne!(m.headline, crate::contract::v1::Headline::Calm as i32);
+        let terminal = crate::overview::watching(&m, &crate::screen::Screen::pipe()).0;
+        let page = crate::pages::watcher_said("not_checked", case(&m), "", now);
+        for said in [terminal, page] {
+            assert!(
+                said.contains(STARTING_WORDS) && !said.contains("off"),
+                "{said}"
+            );
+        }
     }
 
     #[test]
@@ -2239,9 +2450,14 @@ mod tests {
         assert!(watching_live(&dir));
         let mut heartbeat =
             Heartbeat::start(&lock, 1_800_000_001, Duration::from_secs(3600)).unwrap();
-        assert!(responsive(&dir).is_none());
+        // Emptied: starting, with no start time.
+        let starting = Some((None, &LockState::Starting));
+        assert_eq!(Lock::read(&dir).responsive(), starting);
         heartbeat.write().unwrap();
-        assert_eq!(responsive(&dir), Some((1_800_000_001, LockState::Starting)));
+        assert_eq!(
+            Lock::read(&dir).responsive(),
+            Some((Some(1_800_000_001), &LockState::Starting))
+        );
         drop(heartbeat);
     }
 
@@ -2321,7 +2537,7 @@ mod tests {
     }
 
     fn told(conn: &Connection, dir: &Path) -> Vec<(String, String)> {
-        let failed = failures(conn, dir).unwrap().into_iter();
+        let failed = failures(conn, &Lock::read(dir)).unwrap().into_iter();
         failed.map(|f| (f.what, f.detail)).collect()
     }
 
@@ -2409,7 +2625,9 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        let told = store::read(&args.store, |c| Ok(watcher(&args.store, Some(c))?.unwrap()));
+        let told = store::read(&args.store, |c| {
+            Ok(watcher(&Lock::read(&crate::home(&args.store)), Some(c))?.unwrap())
+        });
         let failed = told.unwrap().failed.into_iter();
         failed.map(|f| (f.what, f.detail_text)).collect()
     }
@@ -2590,7 +2808,7 @@ mod tests {
             "17\nheartbeat\nunrecorded 19\nattempt to write a readonly database",
         );
         assert!(!watching_live(&dir));
-        let failed = failures(&conn, &dir).unwrap();
+        let failed = failures(&conn, &Lock::read(&dir)).unwrap();
         let failed: Vec<_> = failed
             .iter()
             .map(|f| (f.what.as_str(), f.at, f.detail.as_str()))
@@ -2604,7 +2822,7 @@ mod tests {
         );
         put_lock(&lock, "17\nheartbeat\nready");
         assert!(watching_live(&dir));
-        assert_eq!(failures(&conn, &dir).unwrap().len(), 1);
+        assert_eq!(failures(&conn, &Lock::read(&dir)).unwrap().len(), 1);
     }
 
     #[test]
@@ -3180,7 +3398,7 @@ mod tests {
             .unwrap();
         let standing = || -> Vec<String> {
             let conn = store::open_read_only(&store_path).unwrap();
-            failures(&conn, &dir)
+            failures(&conn, &Lock::read(&dir))
                 .unwrap()
                 .into_iter()
                 .map(|f| f.what)
@@ -3237,7 +3455,7 @@ mod tests {
         put_lock(&lock, &format!("{since}\nheartbeat\nready"));
         mark(&store_path, PLACES, Some("invented"), since).unwrap();
         let conn = store::open_read_only(&store_path).unwrap();
-        let failed: Vec<_> = failures(&conn, &dir)
+        let failed: Vec<_> = failures(&conn, &Lock::read(&dir))
             .unwrap()
             .into_iter()
             .map(|f| (f.what, f.at))
@@ -3264,9 +3482,11 @@ mod tests {
         );
         let shown = |left: &BTreeMap<PathBuf, String>| {
             mark(&store_path, PLACES, unwatched(left).as_deref(), 0).unwrap();
-            store::read(&store_path, |c| Ok(watcher(&store_path, Some(c))?.unwrap()))
-                .unwrap()
-                .failed[0]
+            store::read(&store_path, |c| {
+                Ok(watcher(&Lock::read(&crate::home(&store_path)), Some(c))?.unwrap())
+            })
+            .unwrap()
+            .failed[0]
                 .detail_text
                 .clone()
         };
@@ -3372,9 +3592,11 @@ mod tests {
         // A detail that is not what this build keeps is a source's text, cut whole.
         let odd = format!("not kept by this build ?t={token}");
         mark(&store_path, PLACES, Some(&odd), 0).unwrap();
-        let shown = store::read(&store_path, |c| Ok(watcher(&store_path, Some(c))?.unwrap()))
-            .unwrap()
-            .failed[0]
+        let shown = store::read(&store_path, |c| {
+            Ok(watcher(&Lock::read(&crate::home(&store_path)), Some(c))?.unwrap())
+        })
+        .unwrap()
+        .failed[0]
             .detail_text
             .clone();
         assert_eq!(shown, crate::secrets::said(&odd));

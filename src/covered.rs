@@ -998,12 +998,13 @@ fn with_reason(place: String, reason: Option<&str>) -> Example {
 }
 
 /// What the program does not cover, one item per cause, in the order of `CAUSES`: what the
-/// owner can fix first.
+/// owner can fix first. `level` is the event level as the answer serves it (`events::served`).
 pub fn not_covered(
     conn: &Connection,
     latest: &[Latest],
     p: &Problems,
     catalogue: Option<&Catalogue>,
+    level: Option<&crate::events::Level>,
 ) -> rusqlite::Result<Vec<Uncovered>> {
     let mac = findings::This::of(conn, this_machine(conn)?)?;
     let this = mac.as_ref().map(|m| m.id.as_str());
@@ -1052,10 +1053,11 @@ pub fn not_covered(
 
     out.extend(crate::fault::item(conn, latest, place)?);
 
+    let served = crate::events::served_readings(level, latest, this);
     // Readings that failed: those kept closed by permissions, which the owner can open, and
     // the rest. On a server that could not be opened they are implied by it and told there.
     let away: BTreeSet<&str> = p.unreached.iter().map(|u| u.scope.as_str()).collect();
-    let (closed, other): (Vec<&Latest>, Vec<&Latest>) = latest
+    let (closed, other): (Vec<&Latest>, Vec<&Latest>) = served
         .iter()
         .filter(|r| failed(r) && !earlier_probe(r))
         .filter(|r| !(r.reader == servers::READER && away.contains(r.scope.as_str())))
@@ -1091,10 +1093,8 @@ pub fn not_covered(
         });
     }
 
-    // The event level, as its latest reading left it: not installed, or installed and not
-    // recording, each with its own words. A reading of it that failed is among the readings
-    // that failed above.
-    if let Some(l) = crate::events::level(conn, crate::now_secs())? {
+    // The event level as served, each state with its own words; a failed reading of it is above.
+    if let Some(l) = level {
         let cause = match l.state.as_str() {
             crate::events::NOT_INSTALLED => Some(&EVENTS_OFF),
             crate::events::REFUSED => Some(&EVENTS_REFUSED),
@@ -1121,9 +1121,9 @@ pub fn not_covered(
         }
         // Recording program starts, not files: the rules for files do not watch. The collector
         // installed records less than this build reads, a fault while it stays so.
-        if l.state == crate::events::RUNNING && !l.files.collected {
+        if let Some(since) = l.files_not_collected() {
             out.push(Uncovered {
-                since: Some(l.read_at),
+                since: Some(since),
                 fault: true,
                 ..Uncovered::new(&FILES_NOT_COLLECTED, 1)
             });
@@ -1869,7 +1869,7 @@ mod tests {
         };
         let said = |latest: &[Latest]| {
             let p = status::problems(&conn, latest).unwrap();
-            let items = not_covered(&conn, latest, &p, None).unwrap();
+            let items = not_covered(&conn, latest, &p, None, None).unwrap();
             let ids = [NOT_PERMITTED.id, READING_FAILED.id, OTHER_ACCOUNTS.id];
             let items: Vec<(&str, usize)> = (items.iter())
                 .filter(|u| ids.contains(&u.cause.id))

@@ -11919,7 +11919,7 @@ fn a_change_in_a_watched_place_stays_open_through_quiet_runs_and_is_the_number_t
     assert_eq!(shown["technique_text"], item["technique_text"]);
     assert_eq!(
         shown["evidence"],
-        serde_json::json!({ "place_changed": { "change": "new", "presence_only": false } })
+        serde_json::json!({ "place_changed": { "change": "new", "presence_only": false, "read_as_before_at": null } })
     );
     assert_eq!(shown["answer"], serde_json::Value::Null);
     let (_, text, _) = finding_out(&w.store(), &[id]);
@@ -13108,7 +13108,7 @@ fn the_summary_page_says_what_status_says_with_each_item_in_full_and_no_markup_f
     let this_mac = section(page, "this-mac");
     assert!(
         this_mac.contains("<span class=\"name\">mac</span>")
-            && this_mac.contains(" · live watching is off · ")
+            && this_mac.contains(" · no watcher runs · ")
             && this_mac.contains("last check <time datetime=\"2"),
         "{this_mac}"
     );
