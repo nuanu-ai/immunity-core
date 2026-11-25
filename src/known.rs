@@ -398,7 +398,10 @@ type ReadingKey = (String, String, String);
 /// reading full: after a partial reading, what it did not read again is kept as it was, so a
 /// unit no longer held may only not have been read. Then the thing is `unknown`. A held thing
 /// whose owning reading was partial is held, and that reading comes with the answer, so it reads
-/// as not read now. A thing the store has no entity of is `unknown`.
+/// as not read now. A thing the store has no entity of is `unknown`. So is a unit whose latest
+/// retraction set a fact aside, closed with a journal entry `retired` by a reading that did not
+/// look at it (`lifecycle::retire`, `look::retire_facts`): that says nothing of whether it is
+/// there, whatever the latest reading of its kind was.
 fn presence<'a>(
     conn: &Connection,
     units: impl Iterator<Item = &'a String>,
@@ -412,7 +415,18 @@ fn presence<'a>(
         "SELECT DISTINCT reader, scope, kind FROM assertion
          WHERE subject = ?1 AND layer IN ('live', 'retracted')",
     )?;
+    let mut set_aside = conn.prepare(
+        "SELECT EXISTS (SELECT 1 FROM assertion a JOIN journal j
+                          ON j.run_id = a.retracted_by AND j.entry = 'retired'
+                         AND j.reader = a.reader AND j.scope = a.scope AND j.kind = a.kind
+                         AND j.subject = a.subject AND j.predicate = a.predicate
+                        WHERE a.subject = ?1 AND a.layer = 'retracted'
+                          AND a.retracted_at = (SELECT MAX(retracted_at) FROM assertion
+                                                WHERE subject = ?1))",
+    )?;
+    let mut aside = false;
     for unit in units {
+        aside = aside || set_aside.query_row([unit], |r| r.get::<_, bool>(0))?;
         held = held || live.query_row([unit], |r| r.get::<_, bool>(0))?;
         for row in owning.query_map([unit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))? {
             owners.insert(row?);
@@ -425,7 +439,7 @@ fn presence<'a>(
         "SELECT completeness FROM coverage WHERE reader = ?1 AND scope = ?2 AND kind = ?3
          ORDER BY id DESC LIMIT 1",
     )?;
-    let mut all_full = !owners.is_empty();
+    let mut all_full = !owners.is_empty() && !aside;
     for (reader, scope, kind) in &owners {
         let completeness: Option<String> = latest
             .query_row([reader, scope, kind], |r| r.get(0))
@@ -438,6 +452,48 @@ fn presence<'a>(
         v1::Presence::Unknown
     };
     Ok((presence, owners))
+}
+
+/// What the store holds now of the thing `id`, for a finding about it (`ThingNow`): whether it is
+/// there as `presence` decides it, and when. Held is there only when every reading of where it is
+/// that holds a fact of it in force was full at its latest, since a reading that was not keeps
+/// what it did not read as it was; otherwise it is not known. A reading scoped to the thing
+/// itself, as of a file's content, reads what it holds, not whether it is there: it counts only
+/// when no other holds a fact of it. The time is when it was found gone, or else the latest
+/// reading that found it: one that made a fact of it, or a full one while a fact was in force.
+/// `None` when the store never held a fact of it.
+pub fn now_of(
+    conn: &Connection,
+    id: &str,
+) -> rusqlite::Result<Option<(v1::Presence, Option<i64>)>> {
+    let (presence, owners) = presence(conn, std::iter::once(&id.to_string()), false)?;
+    if owners.is_empty() {
+        return Ok(None);
+    }
+    let (gone_at, seen_at, read_now): (Option<i64>, Option<i64>, bool) = conn.query_row(
+        "SELECT (SELECT MAX(retracted_at) FROM assertion WHERE subject = ?1),
+                (SELECT MAX(MAX(a.observed_at, COALESCE(
+                     (SELECT MAX(c.observed_at) FROM coverage c
+                      WHERE c.reader = a.reader AND c.scope = a.scope AND c.kind = a.kind
+                        AND c.completeness = 'full' AND c.observed_at >= a.observed_at
+                        AND (a.retracted_at IS NULL OR c.observed_at < a.retracted_at)), 0)))
+                 FROM assertion a WHERE a.subject = ?1 AND a.layer IN ('live', 'retracted')),
+                NOT EXISTS (SELECT 1 FROM assertion a WHERE a.subject = ?1 AND a.layer = 'live'
+                              AND (a.scope != ?1
+                                   OR NOT EXISTS (SELECT 1 FROM assertion p
+                                                  WHERE p.subject = ?1 AND p.layer = 'live'
+                                                    AND p.scope != ?1))
+                              AND (SELECT completeness FROM coverage c
+                                   WHERE c.reader = a.reader AND c.scope = a.scope
+                                     AND c.kind = a.kind ORDER BY c.id DESC LIMIT 1) IS NOT 'full')",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    Ok(Some(match presence {
+        v1::Presence::Held if read_now => (presence, seen_at),
+        v1::Presence::Gone => (presence, gone_at),
+        _ => (v1::Presence::Unknown, seen_at),
+    }))
 }
 
 /// What each entity was ever `part_of` or `located_on`, in force or retracted, by its id.
@@ -836,5 +892,132 @@ mod tests {
         ] {
             assert!(!super::named_in(at, own), "{at} in {own}");
         }
+    }
+
+    #[test]
+    fn a_thing_is_gone_only_when_a_reading_that_looked_retracted_it_and_read_its_place_last() {
+        // What a finding says of its thing now rests on the store's lifecycle alone. A fact a
+        // reading held back, or one set aside by a reading that did not look, is never gone.
+        use crate::contract::v1::Presence::{Gone, Held, Unknown};
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE assertion (id INTEGER PRIMARY KEY, layer TEXT, subject TEXT,
+                 predicate TEXT, object TEXT, reader TEXT, scope TEXT, kind TEXT,
+                 observed_at INTEGER, run_id TEXT, retracted_at INTEGER, retracted_by TEXT);
+             CREATE TABLE coverage (id INTEGER PRIMARY KEY, reader TEXT, scope TEXT, kind TEXT,
+                 completeness TEXT, observed_at INTEGER);
+             CREATE TABLE journal (seq INTEGER PRIMARY KEY, run_id TEXT, entry TEXT, reader TEXT,
+                 scope TEXT, kind TEXT, subject TEXT, predicate TEXT);",
+        )
+        .unwrap();
+        // One thing per case, each read by its own kind: found at 100, read in full at 200, and
+        // what the case says at 300 and after.
+        let case = |n: usize, at_300: &str, later: Option<&str>, retired: bool| {
+            let (thing, kind) = (format!("file:machine:mac/{n}"), format!("kind {n}"));
+            let gone = at_300 == "full" || retired;
+            conn.execute(
+                "INSERT INTO assertion (layer, subject, predicate, object, reader, scope, kind,
+                     observed_at, run_id, retracted_at, retracted_by)
+                 VALUES (?1, ?2, 'watched_as', 'shell profile', 'watched-places', 'machine:mac',
+                         ?3, 100, 'run-1', ?4, ?5)",
+                rusqlite::params![
+                    if gone { "retracted" } else { "live" },
+                    thing,
+                    kind,
+                    gone.then_some(300),
+                    gone.then_some("run-3")
+                ],
+            )
+            .unwrap();
+            let readings = [
+                (100, Some("full")),
+                (200, Some("full")),
+                (300, Some(at_300)),
+            ];
+            for (at, completeness) in readings.into_iter().chain([(400, later)]) {
+                if let Some(c) = completeness {
+                    conn.execute(
+                        "INSERT INTO coverage (reader, scope, kind, completeness, observed_at)
+                         VALUES ('watched-places', 'machine:mac', ?1, ?2, ?3)",
+                        rusqlite::params![kind, c, at],
+                    )
+                    .unwrap();
+                }
+            }
+            if retired {
+                conn.execute(
+                    "INSERT INTO journal (run_id, entry, reader, scope, kind, subject, predicate)
+                     VALUES ('run-3', 'retired', 'watched-places', 'machine:mac', ?1, ?2,
+                             'watched_as')",
+                    rusqlite::params![kind, thing],
+                )
+                .unwrap();
+            }
+            super::now_of(&conn, &thing).unwrap()
+        };
+        // Retracted by a full reading, the latest: gone since that reading.
+        assert_eq!(case(1, "full", None, false), Some((Gone, Some(300))));
+        // In force, its place not read in full at the latest: not known, last found at 200.
+        assert_eq!(case(2, "partial", None, false), Some((Unknown, Some(200))));
+        // In force, and read in full since: there, as that reading found it.
+        assert_eq!(
+            case(3, "none", Some("full"), false),
+            Some((Held, Some(400)))
+        );
+        // Retracted by a full reading, then a reading that did not read its place: not known.
+        assert_eq!(
+            case(4, "full", Some("partial"), false),
+            Some((Unknown, Some(200)))
+        );
+        // Set aside by a reading that did not look, its kind read in full since: not known.
+        assert_eq!(
+            case(5, "full", Some("full"), true),
+            Some((Unknown, Some(200)))
+        );
+        // Set aside, found again, then found gone by a reading that looked: the latest
+        // retraction speaks.
+        conn.execute_batch(
+            "INSERT INTO assertion (layer, subject, predicate, object, reader, scope, kind,
+                 observed_at, run_id, retracted_at, retracted_by)
+             VALUES ('retracted', 'file:machine:mac/5', 'watched_as', 'shell profile',
+                     'watched-places', 'machine:mac', 'kind 5', 450, 'run-4', 500, 'run-5');
+             INSERT INTO coverage (reader, scope, kind, completeness, observed_at)
+                 VALUES ('watched-places', 'machine:mac', 'kind 5', 'full', 500);",
+        )
+        .unwrap();
+        assert_eq!(
+            super::now_of(&conn, "file:machine:mac/5").unwrap(),
+            Some((Gone, Some(500)))
+        );
+        // Its content, a reading of the thing itself, not read at the latest: its place was read
+        // in full, so it is there. A content reading alone speaks for it.
+        let thing = "file:machine:mac/3";
+        conn.execute_batch(&format!(
+            "INSERT INTO assertion (layer, subject, predicate, object, reader, scope, kind,
+                 observed_at, run_id)
+             VALUES ('live', '{thing}', 'has_content', 'sha256:00', 'watched-places', '{thing}',
+                     'content', 100, 'run-1');
+             INSERT INTO coverage (reader, scope, kind, completeness, observed_at)
+             VALUES ('watched-places', '{thing}', 'content', 'none', 400);"
+        ))
+        .unwrap();
+        assert_eq!(
+            super::now_of(&conn, thing).unwrap(),
+            Some((Held, Some(400)))
+        );
+        conn.execute(
+            "DELETE FROM assertion WHERE subject = ?1 AND scope != ?1",
+            [thing],
+        )
+        .unwrap();
+        assert_eq!(
+            super::now_of(&conn, thing).unwrap(),
+            Some((Unknown, Some(100)))
+        );
+        // Never held: nothing to say.
+        assert_eq!(
+            super::now_of(&conn, "file:machine:mac/never").unwrap(),
+            None
+        );
     }
 }

@@ -736,6 +736,28 @@ pub fn sampled_note(
     Ok(Some(Value::Object(note)))
 }
 
+/// When a sample last saw the process a finding's entry `sampled` names, by its pid and start,
+/// tracked or connected to a listed address, and whether that was the latest sample: `None` once
+/// neither is kept (`KEEP`), or the entry does not name it. A sample that did not see it says
+/// nothing of whether it ended: a process is not a fact with a lifecycle.
+pub fn last_seen(
+    conn: &rusqlite::Connection,
+    note: &Value,
+) -> rusqlite::Result<Option<(i64, bool)>> {
+    let (Some(pid), Some(start)) = (note["pid"].as_i64(), note["start"].as_i64()) else {
+        return Ok(None);
+    };
+    let (at, latest): (Option<i64>, Option<bool>) = conn.query_row(
+        "SELECT MAX(at), MAX(at) = (SELECT at FROM last_sample WHERE id = 1) FROM (
+             SELECT last_seen_at AS at FROM tracked_process WHERE pid = ?1 AND start = ?2
+             UNION ALL
+             SELECT last_seen_at FROM matched_connection WHERE pid = ?1 AND start = ?2)",
+        params![pid, start],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(at.map(|at| (at, latest == Some(true))))
+}
+
 /// The journal entry a raise rests on: the program, what was derived or matched, and in `text`
 /// what the raise keeps of the process, its identity at least.
 #[allow(clippy::too_many_arguments)]
@@ -774,11 +796,7 @@ fn basis(
 /// indicator is not matched: a sample has addresses, not names, and names are not resolved.
 fn listed_addresses(tx: &Transaction, folder: &Path) -> rusqlite::Result<Vec<IpAddr>> {
     use crate::indicators;
-    let raw = crate::store::last_raw(tx, indicators::READER, indicators::LIST)?;
-    let list = raw
-        .and_then(|raw| std::fs::read(folder.join(raw)).ok())
-        .and_then(|bytes| indicators::parse(&bytes).ok());
-    Ok(list
+    Ok(indicators::last_list(tx, folder)?
         .iter()
         .flat_map(|l| &l.matched)
         .filter(|i| i.kind == indicators::IPV4)

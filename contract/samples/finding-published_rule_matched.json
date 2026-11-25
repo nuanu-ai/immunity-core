@@ -1,10 +1,11 @@
 {
   "advice": "Look at the program, its arguments and what started it, shown here. The finding keeps a few starts, and immunity matches --json gives every match the log still holds, each with its start. If you or a tool you use ran it, mark it expected; if nobody knows it, ask your agent to look into it.",
   "answer": null,
-  "answered_at": 1795588225,
+  "answered_at": 1795599165,
   "answered_together": [],
   "answered_with": null,
   "answers_note": "Answer a finding only after the owner has agreed in this conversation, having been told what it is and what the options are. Pass --via agent and the reason the owner agreed to. The app shows every answer given this way.",
+  "earlier": null,
   "evidence": {
     "published_rule_matched": {
       "events": [
@@ -141,14 +142,14 @@
     "state": "open",
     "urgent": false
   },
-  "first_seen_at": 1795588224,
+  "first_seen_at": 1795599164,
   "folder_text": null,
   "format": 1,
   "group": null,
   "journal_seq": 47,
   "kind": "program start matched by a published rule",
   "kind_title": "Program start",
-  "last_seen_at": 1795588225,
+  "last_seen_at": 1795599164,
   "meaning": "The rule, named with this finding, comes from SigmaHQ's rule set and was written from attacks seen elsewhere. Coding agents, build tools and people run the same commands for ordinary work, so a match is often harmless.",
   "rests_on": [
     {
@@ -158,16 +159,17 @@
       "old_value_text": null,
       "predicate": null,
       "reader": "events",
-      "recorded_at": 1795588224,
-      "run_id": "1795588224-927724000",
+      "recorded_at": 1795599164,
+      "run_id": "1795599164-598960000",
       "seq": 26,
       "subject_text": "machine:mac"
     }
   ],
   "short_title": "Program start a published rule marks risky",
-  "store_id": "6b0e6b7c46a7a4e4c848a645396deff3",
+  "store_id": "563a85edfbcf6b7f8a13ec96c944b11b",
   "technique_text": "T1027.001",
   "thing": null,
+  "thing_now": null,
   "title": "A program started on this Mac in a way that a published detection rule marks as high risk.",
   "verdicts": null,
   "where_text": "mac"

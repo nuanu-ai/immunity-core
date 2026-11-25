@@ -839,6 +839,101 @@ fn evidence_lines(s: &Screen, f: &v1::Finding) -> Vec<String> {
     };
     let mut out = vec![head(s, "Evidence")];
     out.extend(lines);
+    for (label, said) in now_said(f, &|at| s.time(at, f.answered_at)) {
+        out.extend(e(label, &[(&said, PLAIN)]));
+    }
+    out
+}
+
+/// What the store holds now of what a finding is about (`ThingNow`), as labelled sentences of the
+/// core's own, the same in the finding and on the pages, each time given by `time`. Gone is said
+/// only where the message says `GONE`, and a process is never said to have ended. Of a process
+/// and of an indicator, by the evidence, what the message does not hold is not known.
+pub fn now_said(f: &v1::Finding, time: &dyn Fn(i64) -> String) -> Vec<(&'static str, String)> {
+    let t = f.thing_now.unwrap_or_default();
+    let body = f.evidence.as_ref().and_then(|e| e.body.as_ref());
+    let at = |at: Option<i64>| at.map_or(String::new(), |a| format!(", {}", time(a)));
+    let mut out = Vec::new();
+    let presence = t
+        .presence
+        .map(|p| v1::Presence::try_from(p).unwrap_or_default());
+    out.extend(presence.map(|p| match p {
+        v1::Presence::Held => ("Now", format!("still there when last read{}", at(t.at))),
+        v1::Presence::Gone => (
+            "Now",
+            format!(
+                "no longer there: a reading that looked did not find it{}",
+                at(t.at)
+            ),
+        ),
+        _ => match t.at {
+            Some(a) => (
+                "Now",
+                format!(
+                    "not known whether it is still there; last found {}",
+                    time(a)
+                ),
+            ),
+            None => ("Now", "not known whether it is still there".to_string()),
+        },
+    }));
+    use v1::evidence::Body;
+    let process = matches!(
+        body,
+        Some(Body::DetachedProcess(_))
+            | Some(Body::IndicatorMatched(v1::IndicatorMatched {
+                process: Some(_),
+                ..
+            }))
+    );
+    out.extend(match (t.sampled_at, t.latest_sample) {
+        (Some(a), Some(true)) => {
+            Some(("Process", format!("seen by the latest sample, {}", time(a))))
+        }
+        (Some(a), _) => Some((
+            "Process",
+            format!(
+                "not known whether it still runs; a sample last saw it {}",
+                time(a)
+            ),
+        )),
+        (None, _) if process => Some(("Process", "not known whether it still runs".to_string())),
+        (None, _) => None,
+    });
+    if let Some(Body::IndicatorMatched(_)) = body {
+        out.push(match t.on_list {
+            Some(true) => (
+                "List",
+                "what it matched is still on the indicator list".to_string(),
+            ),
+            Some(false) => (
+                "List",
+                "what it matched is no longer all on the indicator list".to_string(),
+            ),
+            None => (
+                "List",
+                "not known whether what it matched is still on the indicator list".to_string(),
+            ),
+        });
+    }
+    out
+}
+
+/// The earlier occurrence of a finding: its id and state, and its answer with when and how it was
+/// given and its reason as source text.
+fn earlier_lines(s: &Screen, f: &v1::Finding) -> Vec<String> {
+    let Some(e) = &f.earlier else {
+        return Vec::new();
+    };
+    let r = e.finding.clone().unwrap_or_default();
+    let said = match &e.answer {
+        Some(a) => format!("{}, {}", r.id, given(s, a, f.answered_at)),
+        None => format!("{}, {}", r.id, words::<v1::FindingState>(r.state)),
+    };
+    let mut out = field(s, 2, LABEL, "Earlier", &[(&said, PLAIN)]);
+    if let Some(reason) = e.answer.as_ref().and_then(|a| a.reason_text.as_deref()) {
+        out.extend(field(s, 2, LABEL, "Said then", &[(reason, PLAIN)]));
+    }
     out
 }
 
@@ -991,23 +1086,33 @@ fn answer_said(s: &Screen, a: &v1::Answer, now: i64) -> String {
     }
 }
 
+/// An answer, when and how it was given. Who gave it follows when it was given; that it is not
+/// known is a clause of its own.
+fn given(s: &Screen, a: &v1::Answer, now: i64) -> String {
+    let by = match v1::Via::try_from(a.via) {
+        Ok(v1::Via::App | v1::Via::Agent | v1::Via::Command) => format!(" {}", given_by(a.via)),
+        _ => format!(", {}", given_by(a.via)),
+    };
+    format!(
+        "{}, given {}{by}",
+        answer_said(s, a, now),
+        s.time(a.given_at, now)
+    )
+}
+
 /// The person's answer: what it is, when and how it was given, its reason as source text, and
 /// that it no longer hides the finding when it does not.
 fn answer_lines(s: &Screen, f: &v1::Finding) -> Vec<String> {
     let Some(a) = &f.answer else {
         return Vec::new();
     };
-    // Who gave it follows when it was given; that it is not known is a clause of its own.
-    let by = match v1::Via::try_from(a.via) {
-        Ok(v1::Via::App | v1::Via::Agent | v1::Via::Command) => format!(" {}", given_by(a.via)),
-        _ => format!(", {}", given_by(a.via)),
-    };
-    let said = format!(
-        "{}, given {}{by}",
-        answer_said(s, a, f.answered_at),
-        s.time(a.given_at, f.answered_at),
+    let mut out = field(
+        s,
+        2,
+        LABEL,
+        "Your answer",
+        &[(&given(s, a, f.answered_at), PLAIN)],
     );
-    let mut out = field(s, 2, LABEL, "Your answer", &[(&said, PLAIN)]);
     if let Some(reason) = &a.reason_text {
         out.extend(field(s, 2, LABEL, "Reason", &[(reason, PLAIN)]));
     }
@@ -1149,10 +1254,12 @@ pub fn finding(f: &v1::Finding, s: &Screen) -> String {
     let mut top = first_line(s, f);
     top.extend(second_line(s, f));
     let mut answered = verdict_lines(s, f);
-    if !answered.is_empty() && f.answer.is_some() {
+    let mut own = answer_lines(s, f);
+    own.extend(earlier_lines(s, f));
+    if !answered.is_empty() && !own.is_empty() {
         answered.push(String::new());
     }
-    answered.extend(answer_lines(s, f));
+    answered.extend(own);
     parts_joined(vec![
         top,
         words_lines(s, f),
@@ -1547,6 +1654,28 @@ mod tests {
                 }),
             }),
             journal_seq: 57,
+            thing_now: Some(v1::ThingNow {
+                presence: Some(v1::Presence::Unknown as i32),
+                at: Some(NOW - 3600),
+                sampled_at: Some(NOW - 600),
+                latest_sample: Some(false),
+                on_list: Some(false),
+            }),
+            // Found before and seen through an agent, `odd` in the reason given then.
+            earlier: Some(v1::EarlierOccurrence {
+                finding: Some(v1::FindingRef {
+                    id: "f0e26d7c725".to_string(),
+                    state: v1::FindingState::Seen as i32,
+                    ..Default::default()
+                }),
+                answer: Some(v1::Answer {
+                    given: v1::AnswerKind::Seen as i32,
+                    via: v1::Via::Agent as i32,
+                    given_at: NOW - 86_400,
+                    reason_text: Some(format!("earlier reason {odd}")),
+                    ..Default::default()
+                }),
+            }),
             ..Default::default()
         }
     }

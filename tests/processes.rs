@@ -559,6 +559,54 @@ fn the_finding_of_a_process_that_has_ended_still_says_what_the_sample_that_raise
 }
 
 #[test]
+fn a_process_finding_says_the_last_sample_that_saw_it_and_never_that_it_ended() {
+    // A sample that does not see a process says nothing of whether it ended: it may not have
+    // been read. The finding says when a sample last saw it, and whether that was the latest.
+    let dir = Dir::new("seen-by");
+    let zsh = process(4242, 7, 1, "/bin/zsh", &["zsh", "-c", "sleep 600"], false);
+    sample(&dir, T, std::slice::from_ref(&zsh));
+    sample(&dir, T + 60, std::slice::from_ref(&zsh));
+    let id = the_finding(&dir);
+    let now = |dir: &Dir| contract(dir, &["finding", &id])["thing_now"].clone();
+    let seen = now(&dir);
+    assert_eq!(
+        (
+            &seen["sampled_at"],
+            &seen["latest_sample"],
+            &seen["presence"]
+        ),
+        (&json!(T + 60), &json!(true), &Value::Null)
+    );
+    let text = String::from_utf8(printed(&dir, &["finding", &id])).unwrap();
+    assert!(
+        text.contains("    Process      seen by the latest sample, "),
+        "{text}"
+    );
+    sample(&dir, T + 120, &[]);
+    let unseen = now(&dir);
+    assert_eq!(
+        (&unseen["sampled_at"], &unseen["latest_sample"]),
+        (&json!(T + 60), &json!(false))
+    );
+    let text = String::from_utf8(printed(&dir, &["finding", &id])).unwrap();
+    assert!(
+        text.contains("    Process      not known whether it still runs; a sample last saw it "),
+        "{text}"
+    );
+    // A day on, the store no longer keeps it: not known, and no time is made up.
+    sample(&dir, T + 60 + 24 * 3600 + 1, &[]);
+    assert!(now(&dir).is_null());
+    let text = String::from_utf8(printed(&dir, &["finding", &id])).unwrap();
+    assert!(
+        text.contains("    Process      not known whether it still runs\n"),
+        "{text}"
+    );
+    for said in ["ended", "no longer", "gone"] {
+        assert!(!text.contains(said), "{said}: {text}");
+    }
+}
+
+#[test]
 fn a_command_line_that_reads_like_an_instruction_or_a_mark_is_shown_as_data() {
     let dir = Dir::new("data");
     let args = [
@@ -1071,6 +1119,19 @@ fn a_finding_of_a_file_and_a_connection_shows_both_indicators_and_the_process_be
     assert!(
         advice.starts_with("The program named here reached an address"),
         "{advice}"
+    );
+    // Both indicators are on the list; once the hash leaves it, not all of them are.
+    let id = matched[0]["finding"]["id"].as_str().unwrap();
+    assert_eq!(
+        contract(&dir, &["finding", id])["thing_now"]["on_list"],
+        true
+    );
+    let list = json!([{ "kind": "ipv4-addr:value", "value": "203.0.113.7" }]);
+    std::fs::write(dir.0.join("indicators.json"), list.to_string()).unwrap();
+    run(&dir);
+    assert_eq!(
+        contract(&dir, &["finding", id])["thing_now"]["on_list"],
+        false
     );
 }
 

@@ -1017,7 +1017,14 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
             });
         }
     }
-    if let Some(a) = &f.answer {
+    for (label, said) in crate::finding_text::now_said(f, &|at| view::when(at, now)) {
+        facts.push((label, format!("<span class=\"w\">{said}</span>")));
+    }
+    // The person's answer, then the answer to the earlier occurrence, named by its id.
+    let earlier = f.earlier.as_ref();
+    let then = earlier.and_then(|e| Some((e.answer.as_ref()?, e.finding.as_ref()?)));
+    let answers = f.answer.as_ref().map(|a| (a, None));
+    for (a, before) in answers.into_iter().chain(then.map(|(a, r)| (a, Some(r)))) {
         let said = match a.until_at {
             Some(u) => format!("Expected until {}", view::when(u, now)),
             None => "Seen".to_string(),
@@ -1028,10 +1035,14 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
             Ok(v1::Via::Command) => findings::Via::Command,
             _ => findings::Via::Unknown,
         };
+        let name = match via {
+            findings::Via::Agent => "Your agent",
+            _ => "Your answer",
+        };
         voices.push(Voice {
-            name: match via {
-                findings::Via::Agent => "Your agent".to_string(),
-                _ => "Your answer".to_string(),
+            name: match before {
+                Some(r) => format!("{name} before, to {}", esc(&r.id)),
+                None => name.to_string(),
             },
             said,
             detail: format!(

@@ -205,6 +205,8 @@ fn a_place_where_code_runs_by_itself_is_read_whole_with_what_changed_and_what_it
         whole["evidence"],
         json!({ "place_changed": { "change": "new", "presence_only": false } })
     );
+    // The part that runs by itself is still there, as the check that found it read it.
+    assert_eq!(whole["thing_now"]["presence"], "held");
     let rests = whole["rests_on"].as_array().unwrap();
     assert!(
         rests.iter().any(|r| r["predicate"] == "has_content"
@@ -614,6 +616,291 @@ fn a_finding_the_person_answered_says_so_with_who_why_and_until_when_and_reopene
         (&old["given"], &old["in_force"]),
         (&json!("seen"), &json!(false))
     );
+}
+
+/// A reason a person or an agent may type: a line break, then lines shaped like a label of the
+/// finding and like one of its commands.
+const FORGED: &str = "the installer of a tool\nWhere        ~/.ssh/authorized_keys\n→ immunity finding f0000000000 seen";
+
+/// A shell profile read in full, then changed: the store holds it, and the change is a finding.
+fn a_profile_changed(tag: &str) -> (Estate, PathBuf, String) {
+    let e = Estate::new(tag);
+    let profile = e.home().join(".zshrc");
+    e.put(&profile, "export A=1\n");
+    e.run();
+    common::next_second();
+    e.put(&profile, "export A=2\n");
+    e.run();
+    let id = id_of(&e, "watched.shell-profile");
+    (e, profile, id)
+}
+
+impl Estate {
+    /// `immunity finding <id>` as a person reads it in a pipe.
+    fn text(&self, id: &str) -> String {
+        String::from_utf8(self.immunity(&["finding", id]).stdout).unwrap()
+    }
+
+    /// Every page `immunity view` writes, one after the other.
+    fn pages(&self) -> String {
+        let out = self.immunity(&["view", "--no-open"]);
+        assert!(out.status.success(), "{out:?}");
+        let paths = String::from_utf8(out.stdout).unwrap();
+        paths
+            .lines()
+            .map(|p| std::fs::read_to_string(p).unwrap())
+            .collect()
+    }
+}
+
+#[test]
+fn a_finding_found_again_after_seen_names_the_earlier_one_its_answer_and_reason_as_data() {
+    // The person reads that the same thing was found and closed before, when, by whom and why,
+    // in every form; a first finding names none. The reason is the person's or the agent's
+    // text: it stays inside its field and never forges a line of the finding or of the page.
+    let (e, profile, first) = a_profile_changed("again");
+    let whole = e.finding(&first);
+    assert!(whole["earlier"].is_null(), "{whole:#}");
+    assert!(!e.text(&first).contains("Earlier"));
+    let read = whole["journal_seq"].to_string();
+    let answer = [
+        "finding",
+        &first,
+        "seen",
+        "--reason",
+        FORGED,
+        "--via",
+        "agent",
+        "--journal-seq",
+        &read,
+    ];
+    assert!(e.immunity(&answer).status.success());
+    common::next_second();
+    e.put(&profile, "export A=3\n");
+    e.run();
+    let again = id_of(&e, "watched.shell-profile");
+    assert_ne!(again, first);
+    let earlier = &e.finding(&again)["earlier"];
+    assert_eq!(
+        (
+            &earlier["finding"]["id"],
+            &earlier["finding"]["state"],
+            &earlier["answer"]["given"],
+            &earlier["answer"]["via"],
+            &earlier["answer"]["reason_text"],
+        ),
+        (
+            &json!(first),
+            &json!("seen"),
+            &json!("seen"),
+            &json!("agent"),
+            &json!(FORGED.replace('\n', "\\u{a}"))
+        )
+    );
+    // The same answer the earlier finding gives, whole.
+    assert_eq!(earlier["answer"], e.finding(&first)["answer"]);
+    let text = e.text(&again);
+    let said = format!("  Earlier       {first}, seen, given ");
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with(&said) && l.ends_with(" through your agent")),
+        "{text}"
+    );
+    assert!(
+        text.contains("  Said then     the installer of a tool"),
+        "{text}"
+    );
+    for line in text.lines() {
+        assert!(
+            !line.trim_start().starts_with("Where        ~/.ssh"),
+            "{text}"
+        );
+        assert!(
+            !line.starts_with("→ immunity finding f0000000000"),
+            "{text}"
+        );
+    }
+    let page = e.pages();
+    assert!(page.contains(&format!("Your agent before, to {first}")));
+    assert!(page.contains("the installer of a tool"));
+    assert!(!page.contains(FORGED) && !page.contains("\n→ immunity finding f0"));
+    // Found a third time, after a seen from the command line with no reason: only the latest
+    // earlier one is named, and it came from the command line.
+    assert!(e.immunity(&["finding", &again, "seen"]).status.success());
+    common::next_second();
+    e.put(&profile, "export A=4\n");
+    e.run();
+    let third = e.finding(&id_of(&e, "watched.shell-profile"))["earlier"].clone();
+    assert_eq!(
+        (&third["finding"]["id"], &third["answer"]["via"]),
+        (&json!(again), &json!("command"))
+    );
+    assert!(third["answer"]["reason_text"].is_null());
+}
+
+#[test]
+fn a_watched_file_s_finding_says_it_is_still_there_gone_since_when_or_not_known_never_gone_unread()
+{
+    // A shell profile and an SSH file, each changed after a first check. The profile is then
+    // removed and the SSH folder shut, in one check: the one that looked found the profile gone,
+    // and the SSH file's place was not read, so whether it is there is not known.
+    let e = Estate::new("now");
+    let (profile, ssh) = (e.home().join(".zshrc"), e.home().join(".ssh/config"));
+    for path in [&profile, &ssh] {
+        e.put(path, "# 1\n");
+    }
+    e.run();
+    common::next_second();
+    for path in [&profile, &ssh] {
+        e.put(path, "# 2\n");
+    }
+    e.run();
+    let (shell, access) = (
+        id_of(&e, "watched.shell-profile"),
+        id_of(&e, "watched.ssh-access"),
+    );
+    let now = |id: &str| e.finding(id)["thing_now"].clone();
+    let found = now(&shell);
+    assert_eq!(found["presence"], "held", "{found}");
+    let at = found["at"].as_i64().unwrap();
+    assert_eq!(now(&access)["at"], at);
+    assert!(
+        e.text(&shell)
+            .contains("    Now          still there when last read, ")
+    );
+    assert!(
+        e.pages()
+            .contains("<dt>Now</dt><dd><span class=\"w\">still there when last read, <time ")
+    );
+    common::next_second();
+    std::fs::remove_file(&profile).unwrap();
+    let folder = e.home().join(".ssh");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
+    e.run();
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let whole = e.finding(&shell);
+    assert_eq!(whole["evidence"]["place_changed"]["change"], "gone");
+    let gone = &whole["thing_now"];
+    assert_eq!(
+        (&gone["presence"], &gone["at"]),
+        (&json!("gone"), &whole["last_seen_at"])
+    );
+    assert!(
+        e.text(&shell)
+            .contains("    Now          no longer there: a reading that looked did not find it, ")
+    );
+    // Not read: not known, last found by the check before, and never said to be gone.
+    let unread = now(&access);
+    assert_eq!(
+        (&unread["presence"], &unread["at"]),
+        (&json!("unknown"), &json!(at))
+    );
+    let text = e.text(&access);
+    assert!(text.contains("    Now          not known whether it is still there; last found "));
+    assert!(!text.contains("no longer there"), "{text}");
+    // The line decides nothing: each finding stays open until the person answers it.
+    for id in [&shell, &access] {
+        assert_eq!(e.finding(id)["finding"]["state"], "open");
+    }
+}
+
+#[test]
+fn an_indicator_match_says_whether_what_it_matched_is_still_on_the_list_or_that_it_is_not_known() {
+    let e = Estate::new("on-list");
+    let profile = e.home().join(".zshrc");
+    let sha = || {
+        let out = Command::new("/usr/bin/shasum")
+            .args(["-a", "256"])
+            .arg(&profile)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()[..64].to_string()
+    };
+    e.put(&profile, "export PATH=/opt/x:$PATH\n");
+    let hash = sha();
+    let list = |hash: &str| {
+        e.put(
+            &e.store().with_file_name("indicators.json"),
+            &format!(r#"[{{"kind": "file:hashes.'SHA-256'", "value": "{hash}"}}]"#),
+        )
+    };
+    list(&hash);
+    e.run();
+    let id = id_of(&e, "indicator.match");
+    let now = e.finding(&id)["thing_now"].clone();
+    assert_eq!(
+        (&now["on_list"], &now["presence"]),
+        (&json!(true), &json!("held"))
+    );
+    assert!(
+        e.text(&id)
+            .contains("    List         what it matched is still on the indicator list\n")
+    );
+    // Taken off the list: the file is still there, and what it matched is not on the list.
+    common::next_second();
+    list(&"0".repeat(64));
+    e.run();
+    let now = e.finding(&id)["thing_now"].clone();
+    assert_eq!(
+        (&now["on_list"], &now["presence"]),
+        (&json!(false), &json!("held"))
+    );
+    let text = e.text(&id);
+    assert!(
+        text.contains("    List         what it matched is no longer all on the indicator list\n")
+    );
+    assert_eq!(e.finding(&id)["finding"]["state"], "open");
+    // Seen, then the file changed to what a new list names: the new finding names only what it
+    // matched, which is on the list, and not what the one before it matched.
+    assert!(e.immunity(&["finding", &id, "seen"]).status.success());
+    common::next_second();
+    e.put(&profile, "export PATH=/opt/y:$PATH\n");
+    list(&sha());
+    e.run();
+    let id = id_of(&e, "indicator.match");
+    assert_eq!(e.finding(&id)["thing_now"]["on_list"], true);
+    // The kept copy of the list gone: not known.
+    common::remove(&e.0.join("raw"));
+    assert!(e.finding(&id)["thing_now"]["on_list"].is_null());
+    assert!(e.text(&id).contains(
+        "    List         not known whether what it matched is still on the indicator list\n"
+    ));
+}
+
+#[test]
+fn a_finding_that_rests_on_events_only_says_nothing_of_what_is_there_now() {
+    // A verdict raises a finding of the response layer about what it judged: an event, which is
+    // over once it happened.
+    let (e, _, id) = a_profile_changed("events-only");
+    let store = e.finding(&id)["store_id"].clone();
+    let verdict = json!({
+        "format": 1, "store_id": store, "finding": { "id": id }, "kind": "suspicious",
+        "reason_text": "invented", "case_text": "case-1", "severity": "low", "confidence": "low",
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_immunity"))
+        .env("HOME", e.home())
+        .env("PATH", "/usr/bin:/bin")
+        .args(["verdict", "--json", "--store"])
+        .arg(e.store())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(verdict.to_string().as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let recorded: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let own = recorded["recorded"]["finding"]["id"].as_str().unwrap();
+    assert!(e.finding(&id)["thing_now"].is_object());
+    assert!(e.finding(own)["thing_now"].is_null());
+    assert!(!e.text(own).contains("    Now "), "{}", e.text(own));
 }
 
 #[test]

@@ -1,10 +1,11 @@
 {
   "advice": "If you did not edit it yourself, reinstall that package and look for what else changed.",
   "answer": null,
-  "answered_at": 1795588225,
+  "answered_at": 1795599165,
   "answered_together": [],
   "answered_with": null,
   "answers_note": "Answer a finding only after the owner has agreed in this conversation, having been told what it is and what the options are. Pass --via agent and the reason the owner agreed to. The app shows every answer given this way.",
+  "earlier": null,
   "evidence": {
     "changed_in_place": {
       "became_text": null,
@@ -33,33 +34,40 @@
     "state": "open",
     "urgent": true
   },
-  "first_seen_at": 1795588225,
+  "first_seen_at": 1795599164,
   "folder_text": null,
   "format": 1,
   "group": null,
   "journal_seq": 47,
   "kind": "installed package changed in place",
   "kind_title": "Package changed in place",
-  "last_seen_at": 1795588225,
+  "last_seen_at": 1795599164,
   "meaning": "Package managers put in a new version rather than change an installed one, so this is rare; it happens when something adds code to a tool you run.",
   "rests_on": [
     {
       "entry": "changed",
       "kind": "Homebrew kegs",
-      "new_value_text": "stat:18923dcfbfd0a33ad39eafdc20d204784d7331b70e7c2e211947852b3d7f919e",
-      "old_value_text": "stat:16da6dc99068f43d42db880aee57114245b0407d6510c8af274f15b73cde28fc",
+      "new_value_text": "stat:31139fc121a40cb637ff971db2eea09b18a04f6ca1c5fb3f5cb03dd960c31049",
+      "old_value_text": "stat:94e549ceb44eaf31f12d574bfba2e0de682c262761460a30ab4dd8fd8d952bff",
       "predicate": "has_digest",
       "reader": "integrity",
-      "recorded_at": 1795588225,
-      "run_id": "1795588225-058961000",
+      "recorded_at": 1795599164,
+      "run_id": "1795599164-729558000",
       "seq": 34,
       "subject_text": "file:machine:mac//opt/homebrew/Cellar/tool/1.0"
     }
   ],
   "short_title": "Program files changed in place",
-  "store_id": "6b0e6b7c46a7a4e4c848a645396deff3",
+  "store_id": "563a85edfbcf6b7f8a13ec96c944b11b",
   "technique_text": "T1554",
   "thing": null,
+  "thing_now": {
+    "at": 1795599164,
+    "latest_sample": null,
+    "on_list": null,
+    "presence": "held",
+    "sampled_at": null
+  },
   "title": "Files of an installed command-line tool or package were changed in place, while its version stayed the same.",
   "verdicts": {
     "listed": [
@@ -82,7 +90,7 @@
             "length": 18
           }
         ],
-        "recorded_at": 1795588225,
+        "recorded_at": 1795599165,
         "verdict": {
           "case_text": "case-samples",
           "confidence": "high",
@@ -93,7 +101,7 @@
           "kind": "suspicious",
           "reason_text": "invented: the package was published by an account taken over; it ran tool --password=\\cut{immunity:flag-value 18}",
           "severity": "critical",
-          "store_id": "6b0e6b7c46a7a4e4c848a645396deff3",
+          "store_id": "563a85edfbcf6b7f8a13ec96c944b11b",
           "verdict_id": null
         }
       }

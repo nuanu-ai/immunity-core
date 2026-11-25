@@ -1818,6 +1818,65 @@ pub struct Finding {
     /// finding, and when it only read. Since 1.22.0.
     #[prost(message, repeated, tag = "25")]
     pub answered_together: ::prost::alloc::vec::Vec<FindingRef>,
+    /// What the store holds now of the thing the finding is about, which may have gone since. It
+    /// describes and decides nothing: the finding stays as it is until the person answers it.
+    /// Absent for a finding that rests on events only, of a published rule, of `verdict.suspicious`
+    /// and of `watched.first-read`, and for a package, whose evidence says it. Since 1.34.0.
+    #[prost(message, optional, tag = "26")]
+    pub thing_now: ::core::option::Option<ThingNow>,
+    /// The latest earlier occurrence of this finding: of the same rule about the same thing, which
+    /// the person had answered `seen` or the core had cleared. Absent for a finding found for the
+    /// first time. Since 1.34.0.
+    #[prost(message, optional, tag = "27")]
+    pub earlier: ::core::option::Option<EarlierOccurrence>,
+}
+/// What the store holds now of what a finding is about. Since 1.34.0.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ThingNow {
+    /// Whether the thing is there, as `Known.presence` decides it: for a file, an entry of one, an
+    /// app or a package installed (`watched.*`, `autorun.*`, `integrity.*`, the file of
+    /// `indicator.match`). `HELD` only when every reading that holds a fact of it in force was full
+    /// at its latest, so it was read there. `GONE` when every fact of it was retracted by a reading
+    /// that looked, and the latest reading of each was full. `UNKNOWN` otherwise: a reading did not
+    /// read it at its latest, or set its facts aside without looking. Absent when the store never
+    /// held a fact of it, as of a program only a sample saw.
+    #[prost(enumeration = "Presence", optional, tag = "1")]
+    #[serde(
+        serialize_with = "crate::optional_enum_name::<Presence, _>",
+        deserialize_with = "crate::optional_enum_from_name::<Presence, _>"
+    )]
+    pub presence: ::core::option::Option<i32>,
+    /// For `GONE`, when the reading that looked found it gone. For `HELD` and `UNKNOWN`, the latest
+    /// reading that found it there.
+    #[prost(int64, optional, tag = "2")]
+    pub at: ::core::option::Option<i64>,
+    /// For a process a sample saw (`processes.detached-inline-code`, a connection of
+    /// `indicator.match`): when a sample last saw it, and whether that was the latest sample taken.
+    /// Absent when the store no longer keeps it, a day after a sample last saw it. A sample that
+    /// did not see it says nothing of whether it ended.
+    #[prost(int64, optional, tag = "3")]
+    pub sampled_at: ::core::option::Option<i64>,
+    #[prost(bool, optional, tag = "4")]
+    pub latest_sample: ::core::option::Option<bool>,
+    /// For `indicator.match`: whether every indicator it names is on the indicator list as last
+    /// read, the address of its connection and what its file matched. Absent when the kept copy of
+    /// the list cannot be read, or the store holds none of the indicators it names.
+    #[prost(bool, optional, tag = "5")]
+    pub on_list: ::core::option::Option<bool>,
+}
+/// An earlier occurrence of a finding, as it stands now. Since 1.34.0.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EarlierOccurrence {
+    #[prost(message, optional, tag = "1")]
+    pub finding: ::core::option::Option<FindingRef>,
+    /// Its answer, with the reason as it was given and how it came. Absent when it has none, as one
+    /// the core cleared.
+    #[prost(message, optional, tag = "2")]
+    pub answer: ::core::option::Option<Answer>,
 }
 /// The person's answer to a finding.
 #[derive(serde::Serialize, serde::Deserialize)]
