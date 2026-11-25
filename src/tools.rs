@@ -116,6 +116,18 @@ mod tests {
     }
 
     #[test]
+    fn every_place_a_tool_read_before_was_looked_for_is_given_never_only_a_first_three() {
+        // Tailscale alone is looked for at four places: the item's words do not name them, so
+        // a first three would leave one unsaid.
+        use crate::covered::{EXAMPLES, Example, TOOL_LOST, Uncovered};
+        let places = crate::tailnet::places(Path::new("/Users/example"));
+        let mut lost = Uncovered::new(&TOOL_LOST, 1);
+        lost.examples = places.iter().map(Example::named).collect();
+        assert!(places.len() > EXAMPLES);
+        assert_eq!(lost.examples(), lost.examples.as_slice());
+    }
+
+    #[test]
     fn the_systems_own_tools_are_named_by_paths_every_mac_has() {
         // A system tool found through PATH could be any program named like it.
         for tool in [SCUTIL, HOSTNAME, OPEN, PS, crate::threats::CURL] {

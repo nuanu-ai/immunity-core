@@ -836,6 +836,32 @@ fn a_walk_given_a_folder_closes_the_known_projects_gone_from_it_and_none_outside
 }
 
 #[test]
+fn a_checkout_deleted_and_made_again_is_not_gone_and_a_run_that_does_not_read_it_says_so() {
+    // Made again at its path, it holds a retracted `located_on` and a live one. A run whose walk
+    // is pointed elsewhere reads nothing in it: its readings are counted as not repeated, in the
+    // run's line and on the page of changes, as those of a checkout that never went.
+    let e = Estate::new("made-again");
+    let make = || put(&e.checkout("dev/shop").join("package-lock.json"), LOCK);
+    make();
+    e.full();
+    std::fs::remove_dir_all(e.home().join("dev/shop")).unwrap();
+    e.full();
+    make();
+    e.full();
+    let line = e.run_in(&e.0.join("empty"));
+    assert!(
+        line.contains("2 earlier readings were not repeated."),
+        "{line}"
+    );
+    let latest = e.page("changes.html");
+    let latest = latest.split("<details").nth(1).unwrap();
+    assert!(
+        latest.contains("2 readings read before were not read in this run."),
+        "{latest}"
+    );
+}
+
+#[test]
 fn a_known_project_in_a_folder_macos_protects_is_kept_and_the_folder_named_without_entering_it() {
     let e = Estate::new("known-guarded");
     e.checkout("dev/shop");

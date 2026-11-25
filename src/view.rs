@@ -563,9 +563,10 @@ pub fn latest_coverage(conn: &Connection) -> rusqlite::Result<Vec<Latest>> {
                    AND f.completeness = 'full'),
                 c.cause
          FROM latest c
-         WHERE c.scope NOT IN (SELECT id FROM gone_entity)
+         WHERE NOT {gone}
          ORDER BY c.completeness = 'full', c.completeness, c.reader, c.scope, c.kind",
-        latest = crate::store::LATEST
+        latest = crate::store::LATEST,
+        gone = crate::store::gone_entity("c.scope")
     ))?
     .query_map([], |r| {
         Ok(Latest {
@@ -1730,8 +1731,9 @@ fn changes(conn: &Connection, out: &mut String) -> Out {
                 WHERE c.reader = r.reader AND c.scope = r.scope AND c.kind = r.kind
                 ORDER BY c.id LIMIT 1) < (SELECT MIN(id) FROM coverage WHERE run_id = ?1)
            AND r.scope NOT IN (SELECT scope FROM coverage WHERE run_id = ?1)
-           AND r.scope NOT IN (SELECT id FROM gone_entity)",
-        crate::store::LATEST
+           AND NOT {}",
+        crate::store::LATEST,
+        crate::store::gone_entity("r.scope")
     ))?;
     // What a watcher's reading read: the kinds its readings are of, a file's content aside.
     let mut kinds_stmt = conn.prepare(

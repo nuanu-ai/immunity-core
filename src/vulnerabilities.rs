@@ -475,8 +475,13 @@ fn freshness_of(
             [feed.source],
             |r| r.get(0),
         )?;
-        // The newest change is the source's time, compared as text in the same form.
+        // The newest change is the source's time, compared as text in the same form and said as
+        // every time in the core's words is.
         let ahead = crate::view::iso(now + crate::store::AHEAD_ALLOWED);
+        let changed = |t: &str| match record_time(t) {
+            Some(at) => crate::view::utc(at),
+            None => "at a time this version cannot read as a date".to_string(),
+        };
         let not_current = match reading.map(|(_, at)| (at, crate::store::age(at, now))) {
             None => Some("it has never been read".to_string()),
             Some((at, None)) => Some(format!(
@@ -491,12 +496,14 @@ fn freshness_of(
             )),
             _ => match newest {
                 Some(t) if t.as_str() > ahead.as_str() => Some(format!(
-                    "its newest record changed {t}, and {}",
+                    "its newest record changed {}, and {}",
+                    changed(&t),
                     crate::store::AHEAD
                 )),
                 Some(t) if t.as_str() >= crate::view::iso(now - NEWEST_CHANGE).as_str() => None,
                 Some(t) => Some(format!(
-                    "its newest record changed {t}, more than 7 days before this check"
+                    "its newest record changed {}, more than 7 days before this check",
+                    changed(&t)
                 )),
                 None => Some("it holds no record".to_string()),
             },
@@ -508,6 +515,15 @@ fn freshness_of(
         });
     }
     Ok(out)
+}
+
+/// A record's time as OSV writes it (`osv::parse`), in UTC seconds; `None` when it is no date,
+/// such as one of a thirteenth month. The C library reads it (`events::instant`), and it is
+/// taken only when the time it gives is said with the same date, hour and minute, since
+/// `timegm` carries a 31 February into March. The fraction of a second is never said.
+fn record_time(t: &str) -> Option<i64> {
+    let (secs, _) = crate::events::instant(&format!("{}Z", t.get(..19)?))?;
+    (crate::view::utc(secs).get(..16)? == t.get(..16)?.replace('T', " ")).then_some(secs)
 }
 
 /// A checkout's lockfiles reading: its scope, completeness, reason, run, the names of what it
@@ -525,13 +541,14 @@ type LockfileReading = (
 /// The lockfiles reader's latest reading of each checkout that is still there.
 fn lockfile_readings(conn: &Connection) -> rusqlite::Result<Vec<LockfileReading>> {
     let readings: Vec<(i64, String, String, Option<String>, String)> = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT c.id, c.scope, c.completeness, c.reason, c.run_id FROM coverage c
              WHERE c.reader = ?1
                AND c.id = (SELECT MAX(l.id) FROM coverage l WHERE l.reader = c.reader AND l.scope = c.scope)
-               AND c.scope NOT IN (SELECT id FROM gone_entity)
+               AND NOT {}
              ORDER BY c.scope",
-        )?
+            crate::store::gone_entity("c.scope")
+        ))?
         .query_map([crate::lockfiles::READER], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
         })?
@@ -715,10 +732,10 @@ impl Matched {
         // one inside the other; the thing is known only when it is known in each. A thing the
         // store holds no such fact of has no checkout, so nothing is known of it.
         let checkouts: Vec<(String, bool)> = conn
-            .prepare(
-                "SELECT DISTINCT scope, scope IN (SELECT id FROM gone_entity) FROM assertion
-                 WHERE subject = ?1 AND reader = ?2",
-            )?
+            .prepare(&format!(
+                "SELECT DISTINCT a.scope, {} FROM assertion a WHERE a.subject = ?1 AND a.reader = ?2",
+                crate::store::gone_entity("a.scope")
+            ))?
             .query_map(params![about, crate::lockfiles::READER], |r| {
                 Ok((r.get(0)?, r.get(1)?))
             })?
@@ -1455,9 +1472,9 @@ pub fn ended(
         )
     };
     let (mut gone, mut still) = (true, false);
+    let query = format!("SELECT {}", crate::store::gone_entity("?1"));
     for c in &checkouts {
-        let query = "SELECT ?1 IN (SELECT id FROM gone_entity)";
-        gone &= conn.query_row(query, [c], |r| r.get::<_, bool>(0))?;
+        gone &= conn.query_row(&query, [c], |r| r.get::<_, bool>(0))?;
         if was.is_empty() {
             still |= declared(c, None)?;
         }
@@ -2043,14 +2060,15 @@ pub fn unread_places(conn: &Connection) -> rusqlite::Result<Vec<UnreadPlace>> {
         )
         .optional()?;
     let projects: Vec<(String, Option<String>, Option<String>)> = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT e.id, c.reason, c.run_id FROM entity e
              LEFT JOIN coverage c ON c.id = (SELECT MAX(l.id) FROM coverage l
                                              WHERE l.reader = ?2 AND l.scope = e.id)
-             WHERE e.type = ?1 AND e.id NOT IN (SELECT id FROM gone_entity)
+             WHERE e.type = ?1 AND NOT {}
                AND EXISTS (SELECT 1 FROM assertion a WHERE a.layer = 'live' AND a.subject = e.id)
              ORDER BY e.id",
-        )?
+            crate::store::gone_entity("e.id")
+        ))?
         .query_map([crate::checkouts::TYPE, crate::lockfiles::READER], |r| {
             Ok((r.get(0)?, r.get(1)?, r.get(2)?))
         })?
@@ -2137,13 +2155,14 @@ fn no_reader_places(
     rowed: &HashSet<(String, String)>,
 ) -> rusqlite::Result<Vec<(String, String, String)>> {
     let rows: Vec<(String, String)> = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT c.scope, l.name FROM coverage c JOIN coverage_lack l ON l.coverage = c.id
              WHERE c.reader = ?1 AND l.what = ?2 AND l.name IS NOT NULL
                AND c.id = (SELECT MAX(o.id) FROM coverage o WHERE o.reader = c.reader AND o.scope = c.scope)
-               AND c.scope NOT IN (SELECT id FROM gone_entity)
+               AND NOT {}
              ORDER BY c.scope, l.name",
-        )?
+            crate::store::gone_entity("c.scope")
+        ))?
         .query_map(
             [crate::lockfiles::READER, crate::lockfiles::LOCKFILE_KIND],
             |r| Ok((r.get(0)?, r.get(1)?)),
