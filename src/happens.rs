@@ -439,12 +439,13 @@ fn stat(
 
 /// What was lost over the last day as the number says it. "0" only when nothing was lost,
 /// unreadable or deleted before it was read; a restart of the collector is a loss of unknown
-/// size, said as "some" or as "at least".
+/// size, said as "some" or as "at least". A file the size cap deleted after it was read lost
+/// nothing (`Tally::gaps`).
 fn lost_shown(d: &events::Tally) -> String {
     if d.whole() {
         return "0".to_string();
     }
-    let unknown = d.unknown_gaps + d.unreadable + d.removed_cap + d.removed_unread > 0;
+    let unknown = d.unknown_gaps + d.unreadable + d.removed_unread > 0;
     match (d.lost, unknown) {
         (0, _) => "some".to_string(),
         (n, true) => format!("{}+", num(n)),
@@ -1303,11 +1304,19 @@ detection:
             ..Tally::default()
         };
         assert_eq!(big(both), "1,204+");
+        // Files the cap deleted after they were read lost nothing: neither a loss nor an
+        // unknown one.
         let counted = Tally {
             lost: 12,
+            removed_cap: 3,
             ..Tally::default()
         };
         assert_eq!(big(counted), "12");
+        let capped = Tally {
+            removed_cap: 3,
+            ..Tally::default()
+        };
+        assert_eq!(big(capped), "0");
     }
 
     #[test]
