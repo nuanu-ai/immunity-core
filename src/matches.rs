@@ -271,7 +271,7 @@ fn answered(
             answer.stretch = Some(stretch(&s));
             answer.unevaluated = unevaluated(
                 rules,
-                &s.collects.clone().map_err(|(_, why)| why),
+                &s.collects.clone().map_err(|n| n.reason()),
                 Some(&held.arrivals),
                 Some(&s.lacked),
             );

@@ -3434,6 +3434,48 @@ fn a_group_the_collector_stops_filling_is_told_as_no_longer_arriving_with_since_
 }
 
 #[test]
+fn not_collected_reason_holds_the_cores_words_and_what_the_system_said_comes_with_the_failed_reading()
+ {
+    // A record of what the collector records that this account may not read: why file events
+    // are not collected is the core's words alone, and the system's words come with the reading
+    // that failed, as what its source said, cut, and with each rule for files that does not
+    // watch.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Dir::new("files-record-closed");
+    dir.install();
+    dir.append("exec-20261004T00.jsonl", &exec(1));
+    let collects = dir.root().join(COLLECTS);
+    std::fs::set_permissions(&collects, std::fs::Permissions::from_mode(0o000)).unwrap();
+    dir.run_apart();
+    let r = dir.status();
+    let root = dir.root().display().to_string();
+    let matches = dir.contract(&["matches", "--system-root", &root]);
+    std::fs::set_permissions(&collects, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let why = "what the collector records could not be read";
+    let f = &r["event_level"]["file_events"];
+    assert_eq!(
+        (&f["collected"], &f["not_collected_reason"]),
+        (&json!(false), &json!(why)),
+        "{f:#}"
+    );
+    let said = "Permission denied (os error 13)";
+    let reason = format!("{why}: {said}");
+    assert_eq!(files_coverage_of(&r), Some(format!("failed|{reason}")));
+    let item = not_covered(&r, "not-permitted").unwrap_or_else(|| panic!("{r:#}"));
+    assert_eq!(
+        item["examples"][0]["reason_text"],
+        json!(reason),
+        "{item:#}"
+    );
+    let unevaluated = matches["unevaluated"].as_array().unwrap();
+    assert!(
+        (unevaluated.iter())
+            .any(|u| u["reason"] == "not_collected" && u["detail_text"] == json!(reason)),
+        "{unevaluated:#?}"
+    );
+}
+
+#[test]
 fn no_rule_for_files_watches_until_the_collector_here_is_established_to_record_file_events() {
     // No false calm. The rules for files created and renamed count as watching only when the
     // install's record of what the collector records names both kinds and is no older than

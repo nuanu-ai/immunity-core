@@ -475,8 +475,13 @@ fn freshness_of(
             [feed.source],
             |r| r.get(0),
         )?;
-        // The newest change is the source's time, compared as text in the same form.
+        // The newest change is the source's time, compared as text in the same form and said as
+        // every time in the core's words is.
         let ahead = crate::view::iso(now + crate::store::AHEAD_ALLOWED);
+        let changed = |t: &str| match record_time(t) {
+            Some(at) => crate::view::utc(at),
+            None => "at a time this version cannot read as a date".to_string(),
+        };
         let not_current = match reading.map(|(_, at)| (at, crate::store::age(at, now))) {
             None => Some("it has never been read".to_string()),
             Some((at, None)) => Some(format!(
@@ -491,12 +496,14 @@ fn freshness_of(
             )),
             _ => match newest {
                 Some(t) if t.as_str() > ahead.as_str() => Some(format!(
-                    "its newest record changed {t}, and {}",
+                    "its newest record changed {}, and {}",
+                    changed(&t),
                     crate::store::AHEAD
                 )),
                 Some(t) if t.as_str() >= crate::view::iso(now - NEWEST_CHANGE).as_str() => None,
                 Some(t) => Some(format!(
-                    "its newest record changed {t}, more than 7 days before this check"
+                    "its newest record changed {}, more than 7 days before this check",
+                    changed(&t)
                 )),
                 None => Some("it holds no record".to_string()),
             },
@@ -508,6 +515,13 @@ fn freshness_of(
         });
     }
     Ok(out)
+}
+
+/// A record's time as OSV writes it (`osv::parse`), in UTC seconds; `None` when it is no date,
+/// such as one of a thirteenth month. The C library reads it (`events::instant`); the fraction
+/// of a second is never said.
+fn record_time(t: &str) -> Option<i64> {
+    crate::events::instant(&format!("{}Z", t.get(..19)?)).map(|(secs, _)| secs)
 }
 
 /// A checkout's lockfiles reading: its scope, completeness, reason, run, the names of what it
