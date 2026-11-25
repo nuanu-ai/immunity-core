@@ -5344,28 +5344,39 @@ fn match_dependencies(run: &Run) -> Result<usize, Box<dyn Error>> {
         rules.push((component, rule));
     }
     // What each rests on: the latest journal entry of the component's releases, and the latest
-    // reading of the data, in that order of the journal. Asked once for every component held,
-    // given as a JSON array: one pass over the journal, not one per component.
-    let latest: BTreeMap<String, i64> = {
-        let components: Vec<&String> = rules.iter().map(|(c, _)| *c).collect();
+    // reading of the data, in that order of the journal. One pass over the journal for every
+    // component held, not one per component; the components are looked up here and not given
+    // to the statement, which takes no value larger than SQLite's limit.
+    let mut latest: BTreeMap<&str, i64> = BTreeMap::new();
+    if !rules.is_empty() {
+        let held: BTreeSet<&str> = rules.iter().map(|(c, _)| c.as_str()).collect();
         let mut stmt = run.tx.prepare(
-            "SELECT subject, MAX(seq) FROM journal
-             WHERE entry IN ('added', 'changed') AND predicate = 'has_version'
-               AND subject IN (SELECT value FROM json_each(?1))
-             GROUP BY subject",
+            "SELECT subject, seq FROM journal
+             WHERE entry IN ('added', 'changed') AND predicate = 'has_version'",
         )?;
-        stmt.query_map([serde_json::to_string(&components)?], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?
-        .collect::<rusqlite::Result<_>>()?
-    };
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let subject = row.get_ref(0)?.as_str_or_null()?;
+            if let Some(component) = subject.and_then(|s| held.get(s)) {
+                let seq: i64 = row.get(1)?;
+                latest
+                    .entry(component)
+                    .and_modify(|at| *at = seq.max(*at))
+                    .or_insert(seq);
+            }
+        }
+    }
     let read: Option<i64> = run.tx.query_row(
         "SELECT MAX(seq) FROM journal WHERE entry = 'advisories_read'",
         [],
         |r| r.get(0),
     )?;
     for (component, rule) in rules {
-        let mut basis: Vec<i64> = latest.get(component).into_iter().copied().collect();
+        let mut basis: Vec<i64> = latest
+            .get(component.as_str())
+            .into_iter()
+            .copied()
+            .collect();
         basis.extend(read);
         basis.sort_unstable();
         held.entry(rule)
