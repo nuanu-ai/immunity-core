@@ -139,7 +139,7 @@ fn login_hook() -> Rule {
             title: "A script that this Mac runs with full control every time someone logs in or out was added, changed or removed.",
             short: "Script run at every login changed",
             meaning: "Apple replaced this way of running a script at login years ago, so apps rarely use it now; it is a known way for something unwanted to stay on a Mac.",
-            advice: "If neither you nor whoever manages this Mac set it, find out where the script it runs came from before you next log out or restart; the script is named here when the hook gives its full path.",
+            advice: "If neither you nor whoever manages this Mac set it, find out where its script came from before you next log out or restart; the script is named here, under Runs, when the hook gave its full path.",
         },
         fires: |o| changed_in(o, watched::LOGIN_HOOK),
     }

@@ -1502,6 +1502,8 @@ fn a_login_hook_removed_names_the_script_the_store_last_tied_to_it_as_retracted_
         let mut lines = text.lines().filter(|l| l.contains("hook.sh"));
         assert!(lines.all(|l| !l.contains(absent)), "{absent}\n{text}");
     }
+    // Nor that the hook runs it: no line of the finding, its advice among them, says so.
+    assert!(text.lines().all(|l| !l.contains("it runs")), "{text}");
     assert!(e.pages().contains(
         "<dd><span class=\"mono\">/usr/local/bin/hook.sh</span> <span class=\"w\">held until the reading of</span> "
     ));
@@ -1573,6 +1575,7 @@ fn a_startup_program_changed_names_every_item_that_runs_it_and_its_signer_before
     let id = e.id_at(TARGET, "/usr/local/bin/runner");
     let whole = e.finding(&id);
     let added = e.tie_entries("/usr/local/bin/runner")[0].1;
+    let signed = latest_entry(&whole, "changed", Some("signed_by"));
     let tie = |place: &str| json!({ "path_text": place, "state": "in_force", "recorded_at": added, "signed_by_text": null });
     assert_eq!(
         ties(&whole, "started_by"),
@@ -1589,15 +1592,21 @@ fn a_startup_program_changed_names_every_item_that_runs_it_and_its_signer_before
             "    Run by       held since the reading of {}: {b_place}\n",
             utc(added)
         ),
-        format!("    Signer       before the change: {TRUE_SIGNER}\n"),
-        "                 after the change: unsigned\n".to_string(),
+        format!(
+            "    Signer       until the reading of {}: {TRUE_SIGNER}\n",
+            utc(signed)
+        ),
+        format!(
+            "                 from the reading of {}: unsigned\n",
+            utc(signed)
+        ),
     ] {
         assert!(text.contains(&line), "{line}\n{text}");
     }
     let page = e.pages();
     for fact in [
-        format!("<dt>Signer before</dt><dd><span class=\"mono\">{TRUE_SIGNER}</span></dd>"),
-        "<dt>Signer after</dt><dd><span class=\"mono\">unsigned</span></dd>".to_string(),
+        format!("<dt>Signer before</dt><dd><span class=\"mono\">{TRUE_SIGNER}</span> <span class=\"w\">until the reading of</span> "),
+        "<dt>Signer after</dt><dd><span class=\"mono\">unsigned</span> <span class=\"w\">from the reading of</span> ".to_string(),
         format!("<dt>Run by</dt><dd><span class=\"mono\">{b_place}</span> "),
     ] {
         assert!(page.contains(&fact), "{fact}\n{page}");

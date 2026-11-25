@@ -939,10 +939,16 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
                     facts.push(("Signer", data(signer)));
                 }
             }
-            let (before, after) = crate::finding_text::signers(f);
-            for (label, signer) in [("Signer before", before), ("Signer after", after)] {
-                if let Some(signer) = signer {
-                    facts.push((label, data(signer)));
+            if let Some(b) = crate::finding_text::signer_entry(f) {
+                let (until, from) = crate::finding_text::SIGNER_SAID;
+                let when = view::when(b.recorded_at, now);
+                for (label, said, value) in [
+                    ("Signer before", until, &b.old_value_text),
+                    ("Signer after", from, &b.new_value_text),
+                ] {
+                    if let Some(value) = value {
+                        facts.push((label, format!("{} {} {when}", data(value), word(said))));
+                    }
                 }
             }
             for b in f.rests_on.iter().filter(|b| b.entry == "place_first_read") {
@@ -3032,6 +3038,77 @@ mod tests {
                 .contains("the project is no longer on this Mac; what follows")
         );
         assert!(facts[2].1.contains("&lt;b&gt;left-pad") && !facts[2].1.contains("<b>"));
+    }
+
+    #[test]
+    fn a_finding_with_two_signer_entries_says_the_latest_entry_s_two_values_with_its_time_and_nothing_of_the_first()
+     {
+        let (now, first, latest) = (1_800_000_000, 1_800_000_000 - 7200, 1_800_000_000 - 3600);
+        let signed = |at: i64, old: &str, new: &str| v1::JournalEntry {
+            recorded_at: at,
+            entry: "changed".to_string(),
+            predicate: Some("signed_by".to_string()),
+            old_value_text: Some(old.to_string()),
+            new_value_text: Some(new.to_string()),
+            ..Default::default()
+        };
+        let f = v1::Finding {
+            answered_at: now,
+            evidence: Some(v1::Evidence {
+                body: Some(v1::evidence::Body::PlaceChanged(v1::PlaceChanged {
+                    change: v1::Change::Changed as i32,
+                    ..Default::default()
+                })),
+            }),
+            rests_on: vec![
+                signed(first, "apple", "first signer"),
+                signed(latest, "second before", "second after"),
+            ],
+            ..Default::default()
+        };
+        let text = crate::finding_text::finding(&f, &crate::screen::Screen::pipe());
+        for line in [
+            format!(
+                "    Signer       until the reading of {}: second before\n",
+                view::utc(latest)
+            ),
+            format!(
+                "                 from the reading of {}: second after\n",
+                view::utc(latest)
+            ),
+        ] {
+            assert!(text.contains(&line), "{line}\n{text}");
+        }
+        let (mut facts, mut voices) = (Vec::new(), Vec::new());
+        evidence(&f, &mut facts, &mut voices, now);
+        let signers: Vec<(&str, String)> = (facts.iter())
+            .filter(|(k, _)| k.starts_with("Signer"))
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        let at = view::when(latest, now);
+        assert_eq!(
+            signers,
+            [
+                (
+                    "Signer before",
+                    format!(
+                        "{} <span class=\"w\">until the reading of</span> {at}",
+                        data("second before")
+                    )
+                ),
+                (
+                    "Signer after",
+                    format!(
+                        "{} <span class=\"w\">from the reading of</span> {at}",
+                        data("second after")
+                    )
+                ),
+            ]
+        );
+        for page_or_text in [text, format!("{signers:?}")] {
+            assert!(!page_or_text.contains("first signer") && !page_or_text.contains("apple"));
+            assert!(!page_or_text.contains(&view::utc(first)));
+        }
     }
 
     #[test]

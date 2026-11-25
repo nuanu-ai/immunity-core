@@ -536,17 +536,17 @@ pub fn tie_said(state: i32) -> &'static str {
     }
 }
 
-/// Who signed a startup program before the first change and after the latest, from the
-/// finding's own `signed_by` entries alone; each absent where they hold none.
-pub fn signers(f: &v1::Finding) -> (Option<&str>, Option<&str>) {
-    let mut signed = (f.rests_on.iter()).filter(|b| b.predicate.as_deref() == Some("signed_by"));
-    let first = signed.next();
-    let last = signed.next_back().or(first);
-    (
-        first.and_then(|b| b.old_value_text.as_deref()),
-        last.and_then(|b| b.new_value_text.as_deref()),
-    )
+/// The finding's latest `signed_by` entry in `rests_on`: the one statement of who signed a
+/// startup program that the text and the page make, its value before and its value after, each
+/// with that entry's time and nothing of an earlier entry.
+pub fn signer_entry(f: &v1::Finding) -> Option<&v1::JournalEntry> {
+    (f.rests_on.iter())
+        .rev()
+        .find(|b| b.predicate.as_deref() == Some("signed_by"))
 }
+
+/// What the signer's entry says of its value before and of its value after, before its time.
+pub const SIGNER_SAID: (&str, &str) = ("until the reading of", "from the reading of");
 
 /// The evidence of a watched place: what happened to it in words, and when; how it is watched;
 /// that its content is not kept; why it could not be read; the places read for the first time.
@@ -601,15 +601,18 @@ fn place_lines(s: &Screen, f: &v1::Finding, p: &v1::PlaceChanged) -> Vec<String>
             out.extend(e("Signer", &[(signer, PLAIN)]));
         }
     }
-    let (before, after) = signers(f);
-    let mut label = "Signer";
-    for (when, signer) in [
-        ("before the change: ", before),
-        ("after the change: ", after),
-    ] {
-        if let Some(signer) = signer {
-            out.extend(e(label, &[(when, PLAIN), (signer, PLAIN)]));
-            label = "";
+    if let Some(b) = signer_entry(f) {
+        let at = s.time(b.recorded_at, f.answered_at);
+        let mut label = "Signer";
+        for (said, value) in [
+            (SIGNER_SAID.0, &b.old_value_text),
+            (SIGNER_SAID.1, &b.new_value_text),
+        ] {
+            if let Some(value) = value {
+                let said = format!("{said} {at}: ");
+                out.extend(e(label, &[(&said, PLAIN), (value, PLAIN)]));
+                label = "";
+            }
         }
     }
     for b in f.rests_on.iter().filter(|b| b.entry == "place_first_read") {
