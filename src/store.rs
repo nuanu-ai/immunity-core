@@ -615,8 +615,23 @@ fn give_id(conn: &Connection) -> Res<()> {
     Ok(())
 }
 
-/// Opens an existing store so that nothing can be written to it. Creates nothing. Every
-/// command that only reads the store opens it here.
+/// One read of the store, as every command that only reads it reads: the store opened read-only
+/// (`open_read_only`) and `f` run in one read transaction, so that everything `f` reads is of one
+/// state of the store and a writer commits before it or after it, never between two of its
+/// reads. No store at the path is refused as `open` refuses it (`absent`). Every error, the
+/// opening's and each of `f`'s, is told by the one mapping (`outcome::of`): another process that
+/// holds the store past the busy timeout is `store_busy`, whichever read met it.
+pub fn read<T>(path: &Path, f: impl FnOnce(&Connection) -> Res<T>) -> Result<T, Outcome> {
+    if !exists(path).map_err(Outcome::from)? {
+        return Err(absent(path));
+    }
+    let conn = open_read_only(path)?;
+    let tx = conn.unchecked_transaction()?;
+    f(&tx).map_err(Outcome::from)
+}
+
+/// Opens an existing store so that nothing can be written to it. Creates nothing. A command
+/// that only reads the store reads it through `read`.
 ///
 /// A writer killed inside its transaction, a run or a watcher stopped by a crash or a forced
 /// restart, leaves its rollback journal hot, and a connection opened read-only cannot roll it
@@ -1661,7 +1676,7 @@ pub fn journal_threat(
 /// `counted` runs gets SQLite's progress handler, called at every step (an interval of one),
 /// through an automatic extension, which SQLite runs at every open. A connection opened on
 /// another thread, or outside `counted`, is left as it was, so tests running side by side do
-/// not count each other's work.
+/// not count each other's work. The connections opened are counted the same way (`opened_by`).
 #[cfg(test)]
 pub mod steps {
     use rusqlite::ffi;
@@ -1671,6 +1686,7 @@ pub mod steps {
     thread_local! {
         static COUNTING: Cell<bool> = const { Cell::new(false) };
         static STEPS: Cell<u64> = const { Cell::new(0) };
+        static OPENS: Cell<u64> = const { Cell::new(0) };
     }
 
     unsafe extern "C" fn step(_: *mut c_void) -> c_int {
@@ -1684,6 +1700,7 @@ pub mod steps {
         _: *const ffi::sqlite3_api_routines,
     ) -> c_int {
         if COUNTING.with(Cell::get) {
+            OPENS.with(|o| o.set(o.get() + 1));
             // SAFETY: `db` is the connection SQLite is opening, valid for this call.
             unsafe { ffi::sqlite3_progress_handler(db, 1, Some(step), std::ptr::null_mut()) };
         }
@@ -1703,6 +1720,13 @@ pub mod steps {
         let out = f();
         COUNTING.with(|c| c.set(false));
         (out, STEPS.with(Cell::get))
+    }
+
+    /// What `f` returns, and how many connections it opened.
+    pub fn opened_by<T>(f: impl FnOnce() -> T) -> (T, u64) {
+        OPENS.with(|o| o.set(0));
+        let (out, _) = counted(f);
+        (out, OPENS.with(Cell::get))
     }
 }
 
@@ -1848,16 +1872,18 @@ mod tests {
         (dir, path)
     }
 
-    /// Every way a command opens a store, to write, to read and to make one where no file is,
-    /// refuses the file at `path` in the same words, saying each of `said`, and leaves it byte for
-    /// byte as it was with nothing beside it, under the outcome `code`. The words.
+    /// Every way a command opens a store, to write, to read, in one read access and to make one
+    /// where no file is, refuses the file at `path` in the same words, saying each of `said`, and
+    /// leaves it byte for byte as it was with nothing beside it, under the outcome `code`. The
+    /// words.
     fn refused(path: &Path, code: Code, said: &[&str]) -> String {
         let before = std::fs::read(path).ok();
-        type Opens = fn(&Path) -> Result<Connection, Outcome>;
-        let ways: [(&str, Opens); 3] = [
-            ("open", open),
-            ("open_read_only", open_read_only),
-            ("open_or_make", open_or_make),
+        type Opens = fn(&Path) -> Result<(), Outcome>;
+        let ways: [(&str, Opens); 4] = [
+            ("open", |p| open(p).map(drop)),
+            ("open_read_only", |p| open_read_only(p).map(drop)),
+            ("read", |p| read(p, |_| Ok(()))),
+            ("open_or_make", |p| open_or_make(p).map(drop)),
         ];
         let words: Vec<String> = ways
             .iter()
@@ -2833,6 +2859,51 @@ mod tests {
         let refused = open_read_only(&path).unwrap_err();
         assert_eq!(refused.code, Code::HotJournal, "{refused}");
         assert!(dir.join("store.db-journal").exists());
+    }
+
+    // --- One read access. ---
+
+    #[test]
+    fn what_one_read_access_reads_is_of_one_state_and_no_write_commits_between_its_reads() {
+        let dir = crate::common::Scratch::new("one-read");
+        let path = dir.join("store.db");
+        drop(open_or_make(&path).unwrap());
+        let notes = |c: &Connection| -> rusqlite::Result<i64> {
+            c.query_row("SELECT COUNT(*) FROM journal", [], |r| r.get(0))
+        };
+        // A check that commits between two reads, without waiting for the reader.
+        let writer = Connection::open(&path).unwrap();
+        writer.busy_timeout(Duration::ZERO).unwrap();
+        let check = || journal_note(&writer, 1, "run-1", "run_started", "").is_ok();
+        let (first, committed, second) = read(&path, |c| {
+            let first = notes(c)?;
+            Ok((first, check(), notes(c)?))
+        })
+        .unwrap();
+        assert_eq!((committed, first), (false, second));
+        // Once the read is over the same write commits, and the next read sees it.
+        assert!(check());
+        assert_eq!(read(&path, |c| Ok(notes(c)?)).unwrap(), first + 1);
+    }
+
+    #[test]
+    fn a_store_held_by_another_process_when_a_read_access_reads_is_store_busy_exit_4() {
+        // Held after the store was opened and checked, at the first read of the transaction:
+        // the error is the read's own, and it is told by the one mapping.
+        let dir = crate::common::Scratch::new("read-busy");
+        let path = dir.join("store.db");
+        drop(open_or_make(&path).unwrap());
+        let holder = Connection::open(&path).unwrap();
+        let refused = read(&path, |c| {
+            holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+            Ok(id(c)?)
+        })
+        .unwrap_err();
+        assert_eq!(
+            (refused.code, refused.exit()),
+            (Code::StoreBusy, 4),
+            "{refused}"
+        );
     }
 
     #[test]
