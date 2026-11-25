@@ -1079,7 +1079,11 @@ impl Watcher<'_> {
             return Ok(None);
         };
         let read = self.read_locked(only);
-        self.mark_reading(READ, to_mark(&read, |_| None));
+        // A reading cut short, stdout gone while it said what is left unwatched, did not read:
+        // it clears no failure.
+        if !matches!(read, Ok(None)) {
+            self.mark_reading(READ, to_mark(&read, |_| None));
+        }
         read
     }
 
@@ -1175,9 +1179,9 @@ impl Watcher<'_> {
             self.check_result = Some(result);
         }
         // The reason of a failure said already, come after it: its row is written again with
-        // it, and no second problem line says the check failed again.
-        if let Some(why) = checks.late_reason(Instant::now()) {
-            self.check_result = Some(Err(why));
+        // it, or cleared when the check said it committed, and no second problem line is said.
+        if let Some(late) = checks.late_reason(Instant::now()) {
+            self.check_result = Some(late);
         }
         true
     }
@@ -2367,6 +2371,104 @@ mod tests {
         };
         (w.wanted, w.targets, _) = w.derive().unwrap();
         w
+    }
+
+    /// What `watching.failed` holds once a full check that printed the failure `error` and
+    /// exited 1 has ended and what it printed was read, each as what failed and what it said.
+    fn after_check(tag: &str, error: crate::contract::v1::Error) -> Vec<(String, String)> {
+        let (dir, lock) = held(tag);
+        let args = args_in(&dir);
+        let mut w = ready(&args, &lock);
+        let failure = crate::contract::v1::Failure {
+            operation: "run".into(),
+            ok: false,
+            errors: vec![error],
+        };
+        let mut check = std::process::Command::new("/bin/sh");
+        check
+            .args(["-c", "printf '%s\\n' \"$1\"; exit 1", "check"])
+            .arg(serde_json::to_string(&failure).unwrap());
+        w.checks = Some(crate::background::Checks::new(check));
+        // The failure said at once, before what the check printed is read.
+        let ended = Err("the full check ended with exit status: 1".to_string());
+        let end = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(w.progress());
+            let read = w.check_result.as_ref().is_some_and(|r| *r != ended);
+            w.mark_pending();
+            if read {
+                break;
+            }
+            assert!(
+                Instant::now() < end,
+                "what the check printed was never read"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let failed = watcher(&args.store).unwrap().failed.into_iter();
+        failed.map(|f| (f.what, f.detail_text)).collect()
+    }
+
+    #[test]
+    fn a_full_check_that_failed_stands_in_the_status_with_the_reason_it_printed() {
+        let error = crate::answer::error("run_failed", "the run failed", "", "held");
+        let why = "the full check failed (exit status: 1): run_failed: held";
+        assert_eq!(
+            after_check("watch-check-reason", error),
+            [(FULL_CHECK.to_string(), why.to_string())]
+        );
+    }
+
+    #[test]
+    fn a_full_check_that_committed_and_could_not_read_its_answer_back_is_no_failed_check() {
+        let (error, exit) = crate::unread(&Outcome::new(Code::StoreBusy, "database is locked"));
+        assert_eq!(exit, 1);
+        let failed = after_check("watch-check-committed", error);
+        assert!(failed.is_empty(), "{failed:?}");
+    }
+
+    #[test]
+    fn a_reading_cut_short_by_a_closed_stdout_clears_no_failure_of_the_reading() {
+        const CHILD: &str = "IMMUNITY_TEST_CUT_SHORT";
+        if std::env::var_os(CHILD).is_none() {
+            // In a process of its own, so that stdout is closed under this test alone.
+            let name = "watch::tests::a_reading_cut_short_by_a_closed_stdout_clears_no_failure_of_the_reading";
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let said = String::from_utf8_lossy(&out.stdout);
+            assert!(out.status.success() && said.contains("1 passed"), "{said}");
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, lock) = held("watch-cut-short");
+        let args = args_in(&dir);
+        // A place left unwatched, which the reading's look says first: there stdout is closed.
+        let etc = args.system_root.join("etc");
+        std::fs::create_dir_all(etc.join("ssh")).unwrap();
+        let mode = |m| std::fs::set_permissions(&etc, std::fs::Permissions::from_mode(m));
+        mode(0).unwrap();
+        let mut w = ready(&args, &lock);
+        w.mark_held(READ, Some("invented".into()));
+        // SAFETY: descriptors this test opens and closes; fd 1 is put back as it was.
+        let read = unsafe {
+            let (saved, mut ends) = (libc::dup(1), [0; 2]);
+            assert_eq!(libc::pipe(ends.as_mut_ptr()), 0);
+            libc::close(ends[0]);
+            libc::dup2(ends[1], 1);
+            libc::close(ends[1]);
+            let read = w.read(&Where::Anywhere);
+            libc::dup2(saved, 1);
+            libc::close(saved);
+            read
+        };
+        mode(0o755).unwrap();
+        assert!(matches!(read, Ok(None)), "{read:?}");
+        let conn = store::open_read_only(&args.store).unwrap();
+        let told = told(&conn, &dir);
+        assert!(told.contains(&(READ.into(), "invented".into())), "{told:?}");
     }
 
     #[test]
