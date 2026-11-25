@@ -272,7 +272,7 @@ mod tests {
             covered::SERVERS_NOT_OPENED.id,
             covered::SERVERS_NOT_CHECKED.id,
         ];
-        let items = covered::not_covered(conn, &latest, &p, None).unwrap();
+        let items = covered::not_covered(conn, &latest, &p, None, None).unwrap();
         let this_mac = covered::this_mac(conn, &latest, false).unwrap().state;
         // The headline by its own rule, all else as calm needs it.
         let mut status = crate::headline::tests::calm();
@@ -356,7 +356,7 @@ mod tests {
         // Told among the projects once nothing of this Mac's own places stands beside them.
         let scope = |conn: &Connection| {
             let p = crate::status::problems(conn, &latest).unwrap();
-            let items = covered::not_covered(conn, &latest, &p, None).unwrap();
+            let items = covered::not_covered(conn, &latest, &p, None, None).unwrap();
             let item = items.iter().find(|u| u.cause.id == NO_LONGER_READ.id);
             item.unwrap().scope
         };

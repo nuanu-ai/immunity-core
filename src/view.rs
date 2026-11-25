@@ -537,6 +537,7 @@ fn unfinished_latest_run(conn: &Connection) -> rusqlite::Result<Option<i64>> {
 }
 
 /// The latest coverage record of one reader, scope and kind.
+#[derive(Clone)]
 pub struct Latest {
     pub reader: String,
     pub scope: String,

@@ -3591,17 +3591,6 @@ pub fn read_up_to(conn: &Connection) -> rusqlite::Result<BTreeMap<String, (u64, 
         .collect()
 }
 
-/// The level's state as the latest reading left it, with when that reading was made: what
-/// `immunity status` serves. `None` before any reading.
-pub fn state_read(conn: &Connection) -> rusqlite::Result<Option<(String, i64)>> {
-    conn.query_row(
-        "SELECT state, read_at FROM event_level WHERE id = 1",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )
-    .optional()
-}
-
 /// The time eslogger gives an event, RFC 3339 in UTC as it writes it
 /// (`2026-10-04T00:00:02.000002Z`), as seconds since the epoch and the nanoseconds within the
 /// second; `None` for any other form. The date and time are read by the C library's
@@ -4039,6 +4028,47 @@ pub fn level(conn: &Connection, now: i64) -> rusqlite::Result<Option<Level>> {
         starts_by_hour: starts_by_hour(conn, now)?,
         starts_by_minute: starts_by_minute(conn, now)?,
     }))
+}
+
+/// The level as `immunity status` serves it at `now`: as its latest reading left it, and failed
+/// while the store says it runs and the watcher's latest reading of it failed. `failed` is what
+/// has failed in the watcher (`watch::failures`), of the answer's one reading of its lock file.
+/// `None` before any reading of the level.
+pub fn served(
+    conn: &Connection,
+    failed: &[crate::watch::Failure],
+    now: i64,
+) -> rusqlite::Result<Option<Level>> {
+    let mut level = level(conn, now)?;
+    if let Some(f) = failed.iter().find(|f| f.what == crate::watch::EVENTS)
+        && let Some(l) = level.as_mut().filter(|l| l.state == RUNNING)
+    {
+        l.state = FAILED.into();
+        l.read_at = f.at;
+        l.reason = Some(f.detail.clone());
+    }
+    Ok(level)
+}
+
+/// The store's reading of program starts in `latest` as `served` says it, when the two differ:
+/// failed, while the level is served failed and the store's own reading of it stands. So the
+/// watcher's failed reading is named among the readings that failed (`covered::not_covered`)
+/// as the store's own would be.
+pub fn served_reading(
+    level: Option<&Level>,
+    latest: &[crate::view::Latest],
+) -> Option<crate::view::Latest> {
+    let l = level.filter(|l| l.state == FAILED)?;
+    let r = latest
+        .iter()
+        .find(|r| r.reader == READER && r.kind == KIND)?;
+    (!crate::covered::failed(r)).then(|| crate::view::Latest {
+        completeness: "none".into(),
+        reason: l.reason.clone(),
+        cause: Some(Cause::Failed.literal().into()),
+        at: l.read_at,
+        ..r.clone()
+    })
 }
 
 /// The cap of the log, as the latest reading left it.

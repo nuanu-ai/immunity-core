@@ -200,7 +200,7 @@ fn cause_section(screen: &Screen, out: &mut Vec<String>, label: &str, list: &[&v
 
 /// The state of this Mac and of its watcher, in words, with the style it is shown in: a watcher
 /// that failed red, watched in part or not checked yellow.
-fn watching(s: &v1::Status, screen: &Screen) -> (String, Style) {
+pub(crate) fn watching(s: &v1::Status, screen: &Screen) -> (String, Style) {
     let Some(m) = &s.this_mac else {
         return ("whether it is watched is not said".to_string(), YELLOW);
     };
@@ -226,59 +226,34 @@ fn watching(s: &v1::Status, screen: &Screen) -> (String, Style) {
     } else {
         YELLOW
     };
-    let watcher = if m.live && failed.is_empty() {
-        "live".to_string()
-    } else if m.live {
-        format!("live, with a failed {}", failed.join(" and "))
-    } else if !failed.is_empty() {
-        crate::watch::failing_words(&failed)
-    } else if s.watching.is_some() {
-        crate::watch::STARTING_WORDS.to_string()
-    } else if s.watcher_restarting_since_at.is_some() {
-        crate::watch::RESTARTING_WORDS.to_string()
-    } else if let Some(on) = off_not_by_command(s) {
-        format!(
-            "Immunity Core is off, and immunity off did not turn it off. It was turned on {}; its job is gone. Turn it on with: immunity on",
-            screen.time(on, s.answered_at)
-        )
-    } else if let Some(off) = off_by_command(s) {
-        format!(
+    use crate::watch::Case;
+    let watcher = match crate::watch::case(s) {
+        Case::Live => "live".to_string(),
+        Case::LiveFailed => format!("live, with a failed {}", failed.join(" and ")),
+        Case::Failing => crate::watch::failing_words(&failed),
+        Case::Starting => crate::watch::STARTING_WORDS.to_string(),
+        Case::Restarting => crate::watch::RESTARTING_WORDS.to_string(),
+        Case::OffNotByCommand { on, job } => format!(
+            "Immunity Core is off, and immunity off did not turn it off. It was turned on {}{}. Turn it on with: immunity on",
+            screen.time(on, s.answered_at),
+            match job {
+                Some(true) => "; its job is in place and not running",
+                Some(false) => "; its job is gone",
+                None => "",
+            }
+        ),
+        Case::OffByCommand { off } => format!(
             "Immunity Core is off: turned off {} with immunity off",
             screen.time(off, s.answered_at)
-        )
-    } else {
-        match s.login_job_installed {
-            // Read from the property list alone: whether launchd has the job is not asked.
-            Some(true) => "installed, not running: the login job is in place and no watcher runs now, so changes are seen at each check".to_string(),
-            Some(false) => {
-                "not installed: no watcher runs now, so changes are seen at each check".to_string()
-            }
-            None => "no watcher runs now: changes are seen at each check".to_string(),
+        ),
+        // Read from the property list alone: whether launchd has the job is not asked.
+        Case::JobInPlace => "installed, not running: the login job is in place and no watcher runs now, so changes are seen at each check".to_string(),
+        Case::NotInstalled => {
+            "not installed: no watcher runs now, so changes are seen at each check".to_string()
         }
+        Case::NoWatcher => "no watcher runs now: changes are seen at each check".to_string(),
     };
     (format!("{state}; {watcher}"), style)
-}
-
-/// When Immunity Core was last turned on, if it went off since by something other than `immunity off`: no
-/// watcher holds the store or is restarting, the login job's property list is not there, and the
-/// journal's latest entry of the two, by its order and not by the clock, is `turned_on`.
-fn off_not_by_command(s: &v1::Status) -> Option<i64> {
-    let on = s.turned_on_at?;
-    let gone = s.watching.is_none()
-        && s.watcher_restarting_since_at.is_none()
-        && s.login_job_installed == Some(false);
-    (gone && s.turned_on_latest == Some(true)).then_some(on)
-}
-
-/// When Immunity Core was turned off with `immunity off`, while it stays off: no watcher holds
-/// the store or is restarting, the login job's property list is not there, and it did not go off
-/// by something else (`off_not_by_command`).
-fn off_by_command(s: &v1::Status) -> Option<i64> {
-    let off = s.turned_off_at?;
-    let gone = s.watching.is_none()
-        && s.watcher_restarting_since_at.is_none()
-        && s.login_job_installed == Some(false);
-    (gone && off_not_by_command(s).is_none()).then_some(off)
 }
 
 /// The downloads of public threat data that failed at the last check, in two sentences: those
@@ -483,7 +458,9 @@ fn watcher_faults(s: &v1::Status, screen: &Screen) -> Vec<Fault> {
             }
         })
         .collect();
-    let live = s.this_mac.as_ref().is_some_and(|m| m.live) && s.watching.is_some();
+    use crate::watch::Case;
+    let case = crate::watch::case(s);
+    let live = matches!(case, Case::Live | Case::LiveFailed);
     // A restart is said whatever else the message says: its parts can be read at other moments.
     if s.watcher_restarting_since_at.is_some() {
         out.push(Fault {
@@ -494,25 +471,35 @@ fn watcher_faults(s: &v1::Status, screen: &Screen) -> Vec<Fault> {
     if live || !out.is_empty() {
         return out;
     }
-    let fault = if s.watching.is_some() {
-        Fault::new(sentence(crate::watch::STARTING_WORDS))
-    } else if let Some(on) = off_not_by_command(s) {
-        Fault::new(format!(
-            "Immunity Core is off: its job, turned on {}, is gone, and immunity off did not turn it off",
-            screen.time(on, now)
-        ))
-        .run("immunity on")
-    } else if let Some(off) = off_by_command(s) {
-        Fault::new(format!(
+    let fault = match case {
+        Case::Starting => Fault::new(sentence(crate::watch::STARTING_WORDS)),
+        Case::OffNotByCommand { on, job } => Fault::new(match job {
+            Some(false) => format!(
+                "Immunity Core is off: its job, turned on {}, is gone, and immunity off did not turn it off",
+                screen.time(on, now)
+            ),
+            Some(true) => format!(
+                "Immunity Core is off: its job, turned on {}, is in place and not running, and immunity off did not turn it off",
+                screen.time(on, now)
+            ),
+            None => format!(
+                "Immunity Core is off: turned on {}, and immunity off did not turn it off",
+                screen.time(on, now)
+            ),
+        })
+        .run("immunity on"),
+        Case::OffByCommand { off } => Fault::new(format!(
             "Immunity Core is off: turned off {} with immunity off",
             screen.time(off, now)
         ))
-        .run("immunity on")
-    } else if s.login_job_installed == Some(true) {
+        .run("immunity on"),
         // Read from the property list alone: whether launchd has the job is not asked.
-        Fault::new("The watcher is not running: its login job is in place").run("immunity on")
-    } else {
-        Fault::new("No watcher runs: changes are seen only at a check you run").run("immunity on")
+        Case::JobInPlace => {
+            Fault::new("The watcher is not running: its login job is in place").run("immunity on")
+        }
+        _ => {
+            Fault::new("No watcher runs: changes are seen only at a check you run").run("immunity on")
+        }
     };
     vec![Fault {
         not_live: true,
@@ -825,7 +812,11 @@ pub(crate) fn answer(
         || look.is_some_and(|n| n.total > 0 || !n.items.is_empty() || !n.by_rule.is_empty());
     // Off is the headline only when it hides neither a finding nor a check that runs; otherwise
     // its own fault line says it.
-    let off = off_by_command(s).filter(|_| !findings && !s.running);
+    let off = match crate::watch::case(s) {
+        crate::watch::Case::OffByCommand { off } => Some(off),
+        _ => None,
+    }
+    .filter(|_| !findings && !s.running);
     // An answer that is not fresh is said beside what was found, by the reason the message gives.
     if findings && !fresh {
         let no_watcher = s.watching.is_none() && s.watcher_restarting_since_at.is_none();
