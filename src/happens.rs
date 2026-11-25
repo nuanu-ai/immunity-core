@@ -1185,6 +1185,7 @@ detection:
         Level {
             state: events::RUNNING.to_string(),
             read_at: 0,
+            stored: (events::RUNNING.to_string(), 0),
             written: None,
             said_by: None,
             said: None,

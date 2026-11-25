@@ -3591,17 +3591,6 @@ pub fn read_up_to(conn: &Connection) -> rusqlite::Result<BTreeMap<String, (u64, 
         .collect()
 }
 
-/// The level's state as the latest reading left it, with when that reading was made: what
-/// `immunity status` serves. `None` before any reading.
-pub fn state_read(conn: &Connection) -> rusqlite::Result<Option<(String, i64)>> {
-    conn.query_row(
-        "SELECT state, read_at FROM event_level WHERE id = 1",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )
-    .optional()
-}
-
 /// The time eslogger gives an event, RFC 3339 in UTC as it writes it
 /// (`2026-10-04T00:00:02.000002Z`), as seconds since the epoch and the nanoseconds within the
 /// second; `None` for any other form. The date and time are read by the C library's
@@ -3869,6 +3858,9 @@ fn left(tx: &Transaction) -> rusqlite::Result<Left> {
 pub struct Level {
     pub state: String,
     pub read_at: i64,
+    /// The state and the time of the latest reading as the store holds them, which `served`
+    /// leaves as they are when it says the level failed.
+    pub stored: (String, i64),
     pub written: Option<i64>,
     pub said_by: Option<String>,
     pub said: Option<crate::secrets::Text>,
@@ -3906,6 +3898,13 @@ pub struct Files {
 }
 
 impl Level {
+    /// Since when file events are not seen while the store says the level runs: the collector
+    /// installed records less than this build reads. Decided by the store's state, so a failed
+    /// reading by the watcher (`served`) never hides it.
+    pub fn files_not_collected(&self) -> Option<i64> {
+        (self.stored.0 == RUNNING && !self.files.collected).then_some(self.stored.1)
+    }
+
     /// The rules for file events watch: the level runs and its collector records file events.
     pub fn files_watched(&self) -> bool {
         self.state == RUNNING && self.files.collected
@@ -4025,6 +4024,7 @@ pub fn level(conn: &Connection, now: i64) -> rusqlite::Result<Option<Level>> {
         files,
         arrivals: arrivals(conn)?,
         cap: cap(conn)?,
+        stored: (state.clone(), read_at),
         state,
         read_at,
         written,
@@ -4039,6 +4039,67 @@ pub fn level(conn: &Connection, now: i64) -> rusqlite::Result<Option<Level>> {
         starts_by_hour: starts_by_hour(conn, now)?,
         starts_by_minute: starts_by_minute(conn, now)?,
     }))
+}
+
+/// The level as `immunity status` serves it at `now`: as its latest reading left it, and failed
+/// while the store says it runs and the watcher's latest reading of it failed. `failed` is what
+/// has failed in the watcher (`watch::failures`), of the answer's one reading of its lock file.
+/// `None` before any reading of the level.
+pub fn served(
+    conn: &Connection,
+    failed: &[crate::watch::Failure],
+    now: i64,
+) -> rusqlite::Result<Option<Level>> {
+    let mut level = level(conn, now)?;
+    if let Some(f) = failed.iter().find(|f| f.what == crate::watch::EVENTS)
+        && let Some(l) = level.as_mut().filter(|l| l.state == RUNNING)
+    {
+        l.state = FAILED.into();
+        l.read_at = f.at;
+        l.reason = Some(f.detail.clone());
+    }
+    Ok(level)
+}
+
+/// The latest readings as `served` says them: while the level is served failed, that failed
+/// reading stands for this Mac's reading of program starts, in place of the store's row, or
+/// beside the rest when the store has none. So `covered::not_covered` names it once, among the
+/// readings that failed. A stored row that failed already says it with its own reason and is
+/// kept as it is. `this` is this Mac; before the store knows it, the row of program starts is
+/// taken as its own, and with no row there is no scope to name the failure under, so the level
+/// and the headline alone say it.
+pub fn served_readings<'a>(
+    level: Option<&Level>,
+    latest: &'a [crate::view::Latest],
+    this: Option<&str>,
+) -> std::borrow::Cow<'a, [crate::view::Latest]> {
+    let kept = std::borrow::Cow::Borrowed(latest);
+    let Some(l) = level.filter(|l| l.state == FAILED) else {
+        return kept;
+    };
+    let mine = |r: &&crate::view::Latest| {
+        r.reader == READER && r.kind == KIND && this.is_none_or(|t| r.scope == t)
+    };
+    let stored = latest.iter().find(mine);
+    let failed = Cause::Failed.literal();
+    let Some(scope) = this.or(stored.map(|r| r.scope.as_str())) else {
+        return kept;
+    };
+    if stored.is_some_and(|r| r.cause.as_deref() == Some(failed)) {
+        return kept;
+    }
+    let said = crate::view::Latest {
+        reader: READER.into(),
+        scope: scope.into(),
+        kind: KIND.into(),
+        completeness: "none".into(),
+        reason: l.reason.clone(),
+        cause: Some(failed.into()),
+        at: l.read_at,
+        last_full: stored.and_then(|r| r.last_full),
+    };
+    let others = latest.iter().filter(|r| !mine(r)).cloned();
+    std::borrow::Cow::Owned(others.chain([said]).collect())
 }
 
 /// The cap of the log, as the latest reading left it.
@@ -5821,6 +5882,7 @@ mod tests {
         let mut l = Level {
             state: RUNNING.to_string(),
             read_at: 0,
+            stored: (RUNNING.to_string(), 0),
             written: None,
             said_by: None,
             said: None,
@@ -5869,6 +5931,7 @@ mod tests {
         let l = Level {
             state: RUNNING.to_string(),
             read_at: 1_000,
+            stored: (RUNNING.to_string(), 1_000),
             written: None,
             said_by: None,
             said: None,
@@ -5922,6 +5985,7 @@ mod tests {
         let l = Level {
             state: RUNNING.to_string(),
             read_at: 0,
+            stored: (RUNNING.to_string(), 0),
             written: None,
             said_by: None,
             said: None,

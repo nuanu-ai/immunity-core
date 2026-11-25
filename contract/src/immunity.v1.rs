@@ -1266,7 +1266,8 @@ pub struct Collector {
     #[prost(bool, tag = "5")]
     pub file_events_collected: bool,
     /// Its state as `immunity status` serves it now, from the core's own latest reading, and when
-    /// that reading was made. It speaks for the core's findings and for `raised`, not for the
+    /// that reading was made; failed, with when, while the store says it runs and the watcher's
+    /// latest reading of it failed. It speaks for the core's findings and for `raised`, not for the
     /// stretch. Absent when the store holds no reading of it.
     #[prost(enumeration = "CollectorState", optional, tag = "6")]
     #[serde(
@@ -3293,9 +3294,10 @@ pub struct Status {
     #[prost(int64, optional, tag = "31")]
     pub turned_off_at: ::core::option::Option<i64>,
     /// Whether the latest of the two in the journal's order, not by their times, is `turned_on`;
-    /// absent when there is neither. With no watcher on the store and `login_job_installed` false, it
-    /// says how Immunity Core went off: false, by `immunity off`; true, by something else, since the job
-    /// `immunity on` loaded is gone. Since 1.20.0.
+    /// absent when there is neither. With no watcher on the store and none restarting, true says
+    /// Immunity Core is off and not by `immunity off`, whatever `login_job_installed` says: something
+    /// else stopped the job `immunity on` loaded or removed its property list. False, with
+    /// `login_job_installed` false, says it was turned off by `immunity off`. Since 1.20.0.
     #[prost(bool, optional, tag = "32")]
     pub turned_on_latest: ::core::option::Option<bool>,
     /// The stage the full check that runs now is in, as the check noted it, and when that stage

@@ -234,20 +234,8 @@ fn state(
         ));
     }
     parts.extend(why);
-    let how = match (m.state, m.live) {
-        ("not_checked", _) => None,
-        ("watched_in_part", true) => Some("watched in part · live"),
-        ("watched_in_part", false) => Some("watched in part · live watching is off"),
-        (_, true) => Some("watched live"),
-        (_, false) => Some("live watching is off"),
-    };
-    parts.extend(how.map(str::to_string));
-    if !m.failed.is_empty() {
-        parts.push(format!(
-            "the watcher's latest {} failed",
-            covered::watcher_failed(m)
-        ));
-    }
+    let failed = covered::watcher_failed(m);
+    parts.push(watcher_said(m.state, crate::watch::case(r), &failed, now));
     parts.push(match m.checked_at {
         Some(t) => format!("last check {}", view::when(t, now)),
         None => "no full check yet".to_string(),
@@ -262,6 +250,49 @@ fn state(
         parts.join(" · ")
     )?;
     Ok(())
+}
+
+/// How this Mac is watched (`state`, as `ThisMac.state` says it) and the watcher's case, in the
+/// page's words: the case as the terminal's picks it (`watch::case`), then what failed in the
+/// watcher, `failed` in words, when anything did.
+pub(crate) fn watcher_said(
+    state: &str,
+    case: crate::watch::Case,
+    failed: &str,
+    now: i64,
+) -> String {
+    use crate::watch::Case;
+    let words = match case {
+        Case::Live | Case::LiveFailed => "live".to_string(),
+        Case::Failing => "live watching is off".to_string(),
+        Case::Starting => crate::watch::STARTING_WORDS.to_string(),
+        Case::Restarting => crate::watch::RESTARTING_WORDS.to_string(),
+        Case::OffNotByCommand { on, job } => format!(
+            "Immunity Core is off, and immunity off did not turn it off: turned on {}{}",
+            view::when(on, now),
+            match job {
+                Some(true) => ", its job is in place and not running",
+                Some(false) => ", its job is gone",
+                None => "",
+            }
+        ),
+        Case::OffByCommand { off } => format!(
+            "Immunity Core is off: turned off {} with immunity off",
+            view::when(off, now)
+        ),
+        Case::JobInPlace => "no watcher runs: its login job is in place and not running".into(),
+        Case::NotInstalled => "no watcher runs: the login job is not installed".to_string(),
+        Case::NoWatcher => "no watcher runs".to_string(),
+    };
+    let mut said = match state {
+        "watched_in_part" => format!("watched in part · {words}"),
+        "watched" if matches!(case, Case::Live | Case::LiveFailed) => format!("watched {words}"),
+        _ => words,
+    };
+    if !failed.is_empty() {
+        said.push_str(&format!(" · the watcher's latest {failed} failed"));
+    }
+    said
 }
 
 /// One row of the table of findings: one thing. Its finding, whether that is open, and the
@@ -3032,7 +3063,7 @@ mod tests {
 
     /// The band's glyph is the status's headline: the calm disc only for `calm`, the ring for
     /// `in_part`, the clock for `stale`, and the question mark for a headline not known. The line
-    /// under it says how this Mac is watched, whatever the headline.
+    /// under it says how this Mac is watched, whatever the headline, by the message's watcher.
     #[test]
     fn a_page_draws_the_calm_disc_only_for_a_calm_headline() {
         let dir = crate::common::Scratch::new("report-live");
@@ -3085,10 +3116,15 @@ mod tests {
                 "{headline:?}: {drawn}"
             );
         }
-        st.this_mac.live = false;
-        let stopped = band(&st, v1::Headline::InPart);
-        assert!(stopped.contains("live watching is off"), "{stopped}");
-        st.this_mac.live = true;
+        // The watcher's case is the message's: one that is not live is never said to be.
+        let mut stopped = calm.clone();
+        stopped.headline = v1::Headline::InPart as i32;
+        (stopped.this_mac.as_mut().unwrap().live, stopped.watching) = (false, None);
+        let stopped = draw(&st, &stopped);
+        assert!(
+            stopped.contains("no watcher runs") && !stopped.contains("live"),
+            "{stopped}"
+        );
         for (what, words) in [
             (crate::watch::FULL_CHECK, "full check"),
             (crate::watch::EVENTS, "reading of program starts"),
@@ -3104,6 +3140,142 @@ mod tests {
                 failed.contains(&format!("latest {words} failed")),
                 "{failed}"
             );
+        }
+    }
+
+    /// The page names the watcher's case: each case `watch::case` picks from a message gives the
+    /// page a sentence of its own, the terminal's words for the same message say the same case,
+    /// and a watcher that is starting is never said to be off. After `immunity on`, a job in
+    /// place with no watcher and none restarting is off and not by `immunity off` on both, and
+    /// never calm.
+    #[test]
+    fn the_page_names_the_watchers_case_as_the_terminal_does_and_a_starting_watcher_is_never_off() {
+        use crate::watch::{Case, EVENTS, READ};
+        let now = 1_800_000_000;
+        let on = now - 60;
+        let failed = |what: &str| v1::Watcher {
+            failed: vec![v1::WatcherFailure {
+                what: what.to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let calm = || v1::Status {
+            answered_at: now,
+            ..crate::headline::tests::calm()
+        };
+        let off = |job: Option<bool>, entries: (Option<i64>, Option<i64>, Option<bool>)| {
+            let mut s = calm();
+            (s.this_mac.as_mut().unwrap().live, s.watching) = (false, None);
+            s.login_job_installed = job;
+            (s.turned_on_at, s.turned_off_at, s.turned_on_latest) = entries;
+            s
+        };
+        let after_on = (Some(on), None, Some(true));
+        let after_off = (Some(on - 60), Some(on), Some(false));
+        let mut live_failed = calm();
+        live_failed.watching = Some(failed(EVENTS));
+        let mut failing = off(None, (None, None, None));
+        failing.watching = Some(failed(READ));
+        let mut starting = off(None, (None, None, None));
+        starting.watching = Some(v1::Watcher::default());
+        let mut restarting = off(Some(false), after_on);
+        restarting.watcher_restarting_since_at = Some(now - 5);
+        // Each case, the message that gives it, and words the page and the terminal both say.
+        let cases = [
+            (Case::Live, calm(), "live"),
+            (Case::LiveFailed, live_failed, "reading of program starts"),
+            (Case::Failing, failing, "reading of the watched places"),
+            (Case::Starting, starting, crate::watch::STARTING_WORDS),
+            (Case::Restarting, restarting, crate::watch::RESTARTING_WORDS),
+            (
+                Case::OffNotByCommand {
+                    on,
+                    job: Some(true),
+                },
+                off(Some(true), after_on),
+                "its job is in place and not running",
+            ),
+            (
+                Case::OffNotByCommand {
+                    on,
+                    job: Some(false),
+                },
+                off(Some(false), after_on),
+                "its job is gone",
+            ),
+            (
+                Case::OffNotByCommand { on, job: None },
+                off(None, after_on),
+                "immunity off did not turn it off",
+            ),
+            (
+                Case::OffByCommand { off: on },
+                off(Some(false), after_off),
+                "with immunity off",
+            ),
+            (
+                Case::JobInPlace,
+                off(Some(true), after_off),
+                "login job is in place",
+            ),
+            (
+                Case::NotInstalled,
+                off(Some(false), (None, None, None)),
+                "not installed",
+            ),
+            (
+                Case::NoWatcher,
+                off(None, (None, None, None)),
+                "no watcher runs",
+            ),
+        ];
+        // Live as `this_mac` says, with no watcher on the store, is no watcher.
+        let mut left = calm();
+        left.watching = None;
+        assert_eq!(crate::watch::case(&left), Case::NoWatcher);
+        // A watcher on the store, not live, beside a restart's time is starting: the terminal says
+        // that case alone, as the page does, and no restart.
+        let mut both = calm();
+        both.this_mac.as_mut().unwrap().live = false;
+        both.watcher_restarting_since_at = Some(now - 5);
+        both.store = Some(v1::StoreFile {
+            exists: true,
+            ..Default::default()
+        });
+        assert_eq!(crate::watch::case(&both), Case::Starting);
+        let text = crate::overview::status(&both, &crate::screen::Screen::pipe(), false);
+        // Its first letter aside, which a sentence makes a capital.
+        assert!(text.contains(&crate::watch::STARTING_WORDS[1..]), "{text}");
+        assert!(!text.contains("restarting"), "{text}");
+        let mut said = BTreeSet::new();
+        for (case, s, both) in &cases {
+            assert_eq!(crate::watch::case(s), *case);
+            let words: Vec<&str> = (s.watching.iter().flat_map(|w| &w.failed))
+                .map(|f| crate::watch::failed_words(&f.what))
+                .collect();
+            let page = watcher_said("watched", *case, &words.join(" and "), now);
+            let terminal = crate::overview::watching(s, &crate::screen::Screen::pipe()).0;
+            assert!(
+                page.contains(both) && terminal.contains(both),
+                "{page} | {terminal}"
+            );
+            assert!(
+                said.insert(page.clone()),
+                "{case:?} says what another says: {page}"
+            );
+            // Only a watcher that watches live is said to watch.
+            let live = matches!(case, Case::Live | Case::LiveFailed);
+            assert_eq!(page.starts_with("watched "), live, "{page}");
+            if let Case::OffNotByCommand { .. } = case {
+                assert!(page.contains("did not turn it off"), "{page}");
+                assert!(terminal.contains("did not turn it off"), "{terminal}");
+                let headline = crate::headline::headline(s).0;
+                assert_ne!(headline, v1::Headline::Calm, "{case:?}");
+            }
+            if *case == Case::Starting {
+                assert!(!page.contains("off") && !terminal.contains("off"), "{page}");
+            }
         }
     }
 
@@ -3270,6 +3442,7 @@ mod tests {
         let level_as = |state: &str, collected: bool, arrivals| Level {
             state: state.to_string(),
             read_at: 0,
+            stored: (state.to_string(), 0),
             written: None,
             said_by: None,
             said: None,
