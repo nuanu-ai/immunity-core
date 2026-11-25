@@ -499,7 +499,7 @@ pub const TOOL_LOST: Cause = Cause {
         "{what} was read before and is not found now, so it was not looked at since {date}.",
         "{what} were read before and are not found now, so they were not looked at since {date}.",
     ],
-    meaning: "An earlier check read it, and this version looks for it only where its installer puts it by default: {reasons}. What was known from it is kept as it was and nothing of it is said to be gone, but a change in it is not seen.",
+    meaning: "An earlier check read it, and this version looks for it only where its installer puts it by default. The places it looked are listed with it. What was known from it is kept as it was and nothing of it is said to be gone, but a change in it is not seen.",
     meaning_none: None,
     advice: "Nothing to do if it is installed somewhere else on purpose: this version does not look there. It is read again at the first check that finds it at one of these places.",
 };
@@ -1175,17 +1175,17 @@ pub fn not_covered(
                 what.push(name);
             }
         }
-        // The places each was looked for, after its name.
-        let reasons: Vec<String> = lost
-            .iter()
+        // The places each was looked for, after its name: names from the Mac, given apart.
+        let examples: Vec<Example> = (lost.iter())
             .filter_map(|r| r.reason.as_deref()?.split_once(crate::tools::READ_BEFORE))
-            .map(|(name, places)| format!("{name} at {places}"))
+            .flat_map(|(_, places)| paths(places))
+            .map(Example::named)
             .collect();
         let n = what.len();
         if n > 0 {
             out.push(Uncovered {
                 since: lost.iter().filter_map(|r| r.last_full).min(),
-                reasons,
+                examples,
                 what,
                 ..Uncovered::new(&TOOL_LOST, n)
             });
@@ -1442,26 +1442,27 @@ const GUARDED_WHAT: [(&[&str], &str); 7] = [
 ];
 
 /// The folders macOS protects that a reading of what a reader did not look into names, as a
-/// person names them. A disk's name comes from the Mac and may hold ", " but never "/": a
-/// folder begins only where a path does (`guarded::shown`), and the rest belongs to the one
-/// before.
+/// person names them.
 fn not_looked_into(r: &Latest) -> Vec<String> {
-    let named = r
-        .reason
-        .as_deref()
-        .and_then(|s| s.strip_prefix(guarded::NOT_LOOKED_INTO))
-        .unwrap_or_default();
-    let mut folders: Vec<String> = Vec::new();
-    for part in named.split(", ").filter(|f| !f.is_empty()) {
-        match folders.last_mut() {
+    let reason = r.reason.as_deref().unwrap_or_default();
+    let named = (reason.strip_prefix(guarded::NOT_LOOKED_INTO)).unwrap_or_default();
+    paths(named).iter().map(|f| plain_folder(f)).collect()
+}
+
+/// Places a reason joins with ", ". A name from the Mac, such as a disk's, may hold ", " but a
+/// place begins only where a path does (`guarded::shown`), so the rest belongs to the one before.
+fn paths(joined: &str) -> Vec<String> {
+    let mut places: Vec<String> = Vec::new();
+    for part in joined.split(", ").filter(|f| !f.is_empty()) {
+        match places.last_mut() {
             Some(last) if !part.starts_with('/') && !part.starts_with("~/") => {
                 last.push_str(", ");
                 last.push_str(part);
             }
-            _ => folders.push(part.to_string()),
+            _ => places.push(part.to_string()),
         }
     }
-    folders.iter().map(|f| plain_folder(f)).collect()
+    places
 }
 
 /// Why what is said of the ways present in projects is not whole, in the program's words;
@@ -1505,21 +1506,14 @@ pub fn projects_found(latest: &[Latest], this: Option<&str>) -> v1::ProjectsFoun
         }
         // Projects are found by walking and by reading sessions: a gap that is not a place
         // left out is a failure. Sessions this version has no reader for are a place it does
-        // not enter, said in the reading's own words.
+        // not enter. The why is the core's words alone: a reading's reason holds names.
         let (cause, reason) = (
             r.and_then(|r| r.cause.as_deref()),
             r.and_then(|r| r.reason.as_deref()),
         );
-        // A walk limited to the folder given says so in the program's own words.
         let why = match (cause, reason) {
             (_, Some(crate::checkouts::ONLY_GIVEN)) => crate::checkouts::ONLY_GIVEN.to_string(),
-            // The folders macOS protects come last and are named apart, never in the why.
-            (Some("no_reader"), Some(reason)) => reason
-                .split(crate::agent_folders::FILES_NOT_LOOKED_INTO)
-                .next()
-                .unwrap_or_default()
-                .trim_end_matches("; ")
-                .to_string(),
+            (Some("no_reader"), _) => SESSIONS_NOT_READ.to_string(),
             _ => format!("the reading of {kind} was not full"),
         };
         let cause = match cause {
@@ -1545,6 +1539,9 @@ pub fn projects_found(latest: &[Latest], this: Option<&str>) -> v1::ProjectsFoun
 
 /// Why, when the gap is a folder macOS protects: said by the folders' sentence in its place.
 const PROTECTED: &str = "projects inside folders macOS protects were not looked into";
+/// Why, when the reader of sessions met some it has no reader for: which agents' the status's
+/// item for what this version does not understand names (`plain_lack`).
+const SESSIONS_NOT_READ: &str = "some agent sessions here are not read by this version";
 
 /// How `plain_folder` begins a disk's name. The name comes from the Mac: a sentence says
 /// "other disks" in its place, and only the data holds it.
@@ -1730,12 +1727,13 @@ fn lacks(conn: &Connection) -> rusqlite::Result<Vec<(String, String, Option<Stri
 /// The most examples given with one item.
 pub const EXAMPLES: usize = 3;
 /// The causes whose examples are each given, however many: the package managers not read, which
-/// a person needs by name to know what is left out, and the ways and places not read, which
-/// are counted by way and named by each of a way's names, so a first three would leave a way
-/// out unsaid.
-const EVERY_EXAMPLE: [&str; 4] = [
+/// a person needs by name to know what is left out, the places a lost tool was looked for, and
+/// the ways and places not read, which are counted by way and named by each of a way's names,
+/// so a first three would leave a way out unsaid.
+const EVERY_EXAMPLE: [&str; 5] = [
     crate::fault::NO_LONGER_READ.id,
     OTHER_MANAGERS.id,
+    TOOL_LOST.id,
     PROJECT_AUTORUN.id,
     HOME_AUTORUN.id,
 ];
