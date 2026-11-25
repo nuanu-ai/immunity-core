@@ -238,10 +238,10 @@ fn no_reader_for(conn: &Connection) -> rusqlite::Result<Vec<NoReader>> {
         "{}
          SELECT l.what, l.name, COUNT(DISTINCT c.scope) AS places
          FROM latest c CROSS JOIN coverage_lack l ON l.coverage = c.id
-         WHERE c.scope NOT IN (SELECT id FROM gone_entity)
-         GROUP BY l.what, l.name
-         ORDER BY places DESC, l.what, l.name",
-        store::LATEST
+         WHERE NOT {}
+         GROUP BY l.what, l.name ORDER BY places DESC, l.what, l.name",
+        store::LATEST,
+        store::gone_entity("c.scope")
     ))?
     .query_map([], |r| {
         Ok(NoReader {
