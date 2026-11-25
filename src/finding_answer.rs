@@ -13,7 +13,7 @@ use crate::events::{self, Evidence, FileEvent, ProcessStart};
 use crate::findings::{self, Found, Item};
 use crate::known::{self, Refused, whole};
 use crate::secrets::Args;
-use crate::{matches, sigma, status, store, verdict, vulnerabilities};
+use crate::{matches, sigma, status, store, targets, verdict, vulnerabilities, watched};
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -302,10 +302,20 @@ pub fn evidence(conn: &Connection, f: &Found) -> rusqlite::Result<Option<v1::evi
         })));
     }
     if let Some(change) = place_change(&f.rule, f.change.as_deref()) {
+        // A startup item, of a kind whose files name a program, is the object of its ties; the
+        // program of the rule of startup programs is their subject.
+        let item = (findings::rules().iter())
+            .any(|r| r.id == f.rule && targets::runs_of(r.kind).is_some());
+        let of = |side| match side {
+            true => ties(conn, &f.about, item),
+            false => Ok(Vec::new()),
+        };
         return Ok(Some(Body::PlaceChanged(v1::PlaceChanged {
             change,
             presence_only: crate::watched::last_presence_only(conn, &f.about)?,
             read_as_before_at: read_as_before(&findings::basis(conn, &f.id)?),
+            runs: of(item)?,
+            started_by: of(f.rule == targets::RULE)?,
         })));
     }
     let became = || f.became.as_deref().map(whole);
@@ -369,6 +379,103 @@ fn read_as_before(basis: &[findings::Basis]) -> Option<i64> {
         .all(|w| whole(&w[0].new_value).is_some() && w[0].new_value == w[1].old_value);
     let back = whole(&first.old_value)? == whole(&latest.new_value)?;
     (one_file && chained && back).then_some(latest.at)
+}
+
+/// One tie `started_by` as the store holds it: the other side's id, whether it is in force, and
+/// the journal entry that says so, by its time and order and whether it set the tie aside.
+struct Tie {
+    other: String,
+    live: bool,
+    at: i64,
+    seq: i64,
+    aside: bool,
+}
+
+/// The ties `started_by` of the item `id` (`item`), whose object it is, or of the program `id`,
+/// whose subject it is, each with the time of the journal entry that says how the store holds
+/// it: for one in force the entry of the reading that added it, for one retracted the entry of
+/// the reading that retracted it, `retired` when it was set aside without being read. An item's
+/// ties are looked for in the reading of the scope its own `watched_as` is of, its machine, so
+/// the read takes the whole index of readings and not every fact of the reader the store ever
+/// held. For the item, the signer of each program is the store's `signed_by` in force of its
+/// content.
+fn ties(conn: &Connection, id: &str, item: bool) -> rusqlite::Result<Vec<v1::StartupTie>> {
+    let (other, side) = match item {
+        true => (
+            "a.subject",
+            "a.object = ?4 AND a.scope IN (SELECT w.scope FROM assertion w
+                                          WHERE w.subject = ?4 AND w.predicate = 'watched_as')",
+        ),
+        false => ("a.object", "a.subject = ?4"),
+    };
+    let rows = conn
+        .prepare(&format!(
+            "SELECT {other}, a.layer = 'live', j.at, j.seq, j.entry = 'retired'
+             FROM assertion a JOIN journal j
+               ON j.run_id = CASE a.layer WHEN 'live' THEN a.run_id ELSE a.retracted_by END
+              AND j.reader = a.reader AND j.scope = a.scope AND j.kind = a.kind
+              AND j.subject = a.subject AND j.predicate = a.predicate
+              AND j.entry IN ('changed', CASE a.layer WHEN 'live' THEN 'added' ELSE 'removed' END,
+                              CASE a.layer WHEN 'retracted' THEN 'retired' END)
+             WHERE a.layer IN ('live', 'retracted') AND a.reader = ?1 AND a.kind = ?2
+               AND a.predicate = ?3 AND {side}"
+        ))?
+        .query_map(
+            rusqlite::params![watched::READER, targets::KIND, targets::BY, id],
+            |r| {
+                Ok(Tie {
+                    other: r.get(0)?,
+                    live: r.get(1)?,
+                    at: r.get(2)?,
+                    seq: r.get(3)?,
+                    aside: r.get(4)?,
+                })
+            },
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut signer = conn.prepare(
+        "SELECT object FROM assertion WHERE layer = 'live' AND reader = ?1 AND scope = ?2
+           AND kind = ?3 AND predicate = 'signed_by'",
+    )?;
+    let mut out = Vec::new();
+    for t in shown(rows) {
+        let state = match (t.live, t.aside) {
+            (true, _) => v1::TieState::InForce,
+            (false, true) => v1::TieState::SetAside,
+            (false, false) => v1::TieState::Retracted,
+        };
+        let signed_by: Option<String> = match item {
+            true => signer
+                .query_row(
+                    rusqlite::params![watched::READER, t.other, watched::CONTENT],
+                    |r| r.get(0),
+                )
+                .optional()?,
+            false => None,
+        };
+        out.push(v1::StartupTie {
+            path_text: whole(&findings::place(&t.other, None)),
+            state: state as i32,
+            recorded_at: t.at,
+            signed_by_text: signed_by.as_deref().map(whole),
+        });
+    }
+    Ok(out)
+}
+
+/// Which ties are shown, one for each other side, by its id: every one in force; when none is,
+/// those the journal's latest entry retracted or set aside, and no history before it.
+fn shown(rows: Vec<Tie>) -> Vec<Tie> {
+    let live = rows.iter().any(|t| t.live);
+    let last = rows.iter().map(|t| t.seq).max();
+    let mut by: BTreeMap<String, Tie> = BTreeMap::new();
+    for t in rows
+        .into_iter()
+        .filter(|t| t.live || (!live && Some(t.seq) == last))
+    {
+        by.insert(t.other.clone(), t);
+    }
+    by.into_values().collect()
 }
 
 /// What happened to the place a finding is about, for a rule whose evidence is a place that
@@ -545,7 +652,28 @@ fn package_in(
 
 #[cfg(test)]
 mod tests {
-    use super::{change, read_as_before, v1};
+    use super::{Tie, change, read_as_before, shown, v1};
+
+    #[test]
+    fn a_tie_in_force_is_shown_alone_and_without_one_only_what_the_latest_entry_closed() {
+        let tie = |other: &str, live: bool, seq: i64| Tie {
+            other: other.to_string(),
+            live,
+            at: seq * 10,
+            seq,
+            aside: false,
+        };
+        let others =
+            |rows: Vec<Tie>| -> Vec<String> { shown(rows).into_iter().map(|t| t.other).collect() };
+        // An item that ran one program and runs another: the one in force, however late.
+        assert_eq!(others(vec![tie("a", true, 2), tie("b", false, 9)]), ["a"]);
+        // An item that ran two programs one after the other, then went: the last one only.
+        assert_eq!(others(vec![tie("a", false, 3), tie("b", false, 7)]), ["b"]);
+        // A program whose two items one entry closed, after an older one: those two.
+        let closed = vec![tie("c", false, 2), tie("a", false, 7), tie("b", false, 7)];
+        assert_eq!(others(closed), ["a", "b"]);
+        assert!(shown(Vec::new()).is_empty());
+    }
 
     #[test]
     fn a_read_back_is_said_only_of_one_file_s_unbroken_chain_of_whole_content_checksums() {

@@ -1,7 +1,7 @@
 {
   "advice": "Look at the program, its arguments and what started it, shown here. The finding keeps a few starts, and immunity matches --json gives every match the log still holds, each with its start. If you or a tool you use ran it, mark it expected; if nobody knows it, ask your agent to look into it.",
   "answer": null,
-  "answered_at": 1795604614,
+  "answered_at": 1795609149,
   "answered_together": [],
   "answered_with": null,
   "answers_note": "Answer a finding only after the owner has agreed in this conversation, having been told what it is and what the options are. Pass --via agent and the reason the owner agreed to. The app shows every answer given this way.",
@@ -142,14 +142,14 @@
     "state": "open",
     "urgent": false
   },
-  "first_seen_at": 1795604613,
+  "first_seen_at": 1795609148,
   "folder_text": null,
   "format": 1,
   "group": null,
   "journal_seq": 47,
   "kind": "program start matched by a published rule",
   "kind_title": "Program start",
-  "last_seen_at": 1795604613,
+  "last_seen_at": 1795609148,
   "meaning": "The rule, named with this finding, comes from SigmaHQ's rule set and was written from attacks seen elsewhere. Coding agents, build tools and people run the same commands for ordinary work, so a match is often harmless.",
   "rests_on": [
     {
@@ -159,14 +159,14 @@
       "old_value_text": null,
       "predicate": null,
       "reader": "events",
-      "recorded_at": 1795604613,
-      "run_id": "1795604613-425806000",
+      "recorded_at": 1795609148,
+      "run_id": "1795609148-359719000",
       "seq": 26,
       "subject_text": "machine:mac"
     }
   ],
   "short_title": "Program start a published rule marks risky",
-  "store_id": "4f17e5d6aebb567f744d546b08a649c1",
+  "store_id": "75a35fc20394b690500665e9a547b7a6",
   "technique_text": "T1027.001",
   "thing": null,
   "title": "A program started on this Mac in a way that a published detection rule marks as high risk.",

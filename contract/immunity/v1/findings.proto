@@ -280,6 +280,48 @@ message PlaceChanged {
   // otherwise, as when its entries do not follow one another, or a value is the checksum of one
   // selected value (`value sha256:`). It changes nothing else of the finding. Since 1.35.0.
   optional int64 read_as_before_at = 3;
+  // For `watched.autostart` and `watched.login-hook`, the program the item runs or ran: the
+  // store's ties in force from it, by the item's id the finding is about; when none is in force,
+  // the one the journal retracted or set aside last. Empty for other rules, and when the store
+  // never tied the item to a program, as for a program not named by a full path. Since 1.36.0.
+  repeated StartupTie runs = 4;
+  // For `watched.startup-target`, the items that run the program, by the same rule from the
+  // program's side: every tie in force; when none is, those the journal's latest entry retracted
+  // or set aside. Who signed the program before and after is in `rests_on`, as `signed_by`.
+  // Empty for other rules. Since 1.36.0.
+  repeated StartupTie started_by = 5;
+}
+
+// A tie between a startup item and the program it runs, as the store holds the fact
+// `started_by`, whose subject is the program and whose object is the item. It says what the
+// store holds and when, never whether the program is on the Mac now. It changes nothing of the
+// finding: its state, levels and place in a list are as they are without it. Since 1.36.0.
+message StartupTie {
+  // The other side of the tie, the program for an item and the item for a program, as
+  // `where_text` names a finding's place. Whole.
+  string path_text = 1;
+  TieState state = 2;
+  // The time of the journal entry that says so: of the reading that added the tie, for one in
+  // force; of the reading that retracted it or set it aside, otherwise.
+  int64 recorded_at = 3;
+  // Who signed the program, as `ProcessLeader.signed_by_text` says a signer: the store's fact
+  // `signed_by` in force from the latest reading of the program's content, which may be older
+  // than this tie's entry. Absent when the store holds none in force, and always for an item.
+  optional string signed_by_text = 4;
+}
+
+// How the store holds a tie. `UNSPECIFIED`, or a value the reader does not know, is read as
+// `retracted`.
+enum TieState {
+  TIE_STATE_UNSPECIFIED = 0;
+  // In force since `recorded_at`.
+  TIE_STATE_IN_FORCE = 1;
+  // A reading that read the item retracted it at `recorded_at`: it no longer named the program
+  // there, or was not there. That says nothing of whether the program is on the Mac.
+  TIE_STATE_RETRACTED = 2;
+  // A reading set it aside at `recorded_at` without reading it, as when this version no longer
+  // reads what held it: nothing is said of whether the item still runs the program.
+  TIE_STATE_SET_ASIDE = 3;
 }
 
 // What happened to a watched place. `UNSPECIFIED`, or a value the reader does not know, is read

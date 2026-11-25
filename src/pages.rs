@@ -899,6 +899,21 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
                     .and_then(|b| b.new_value_text.as_deref());
                 facts.push(("Why", why.map_or(word("the store gives no reason"), data)));
             }
+            let runs = p.runs.iter().map(|t| ("Runs", t));
+            for (label, t) in runs.chain(p.started_by.iter().map(|t| ("Run by", t))) {
+                let said = word(crate::finding_text::tie_said(t.state));
+                let when = view::when(t.recorded_at, now);
+                facts.push((label, format!("{} {said} {when}", data(&t.path_text))));
+                if let Some(signer) = &t.signed_by_text {
+                    facts.push(("Signer", data(signer)));
+                }
+            }
+            let (before, after) = crate::finding_text::signers(f);
+            for (label, signer) in [("Signer before", before), ("Signer after", after)] {
+                if let Some(signer) = signer {
+                    facts.push((label, data(signer)));
+                }
+            }
             for b in f.rests_on.iter().filter(|b| b.entry == "place_first_read") {
                 if let Some(place) = &b.subject_text {
                     facts.push(("First read", data(place)));

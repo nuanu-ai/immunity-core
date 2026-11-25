@@ -203,7 +203,7 @@ fn a_place_where_code_runs_by_itself_is_read_whole_with_what_changed_and_what_it
     assert_eq!(whole["where_text"], "~/dev/shop/.vscode/tasks.json");
     assert_eq!(
         whole["evidence"],
-        json!({ "place_changed": { "change": "new", "presence_only": false, "read_as_before_at": null } })
+        json!({ "place_changed": { "change": "new", "presence_only": false, "read_as_before_at": null, "runs": [], "started_by": [] } })
     );
     let rests = whole["rests_on"].as_array().unwrap();
     assert!(
@@ -277,7 +277,7 @@ fn a_place_where_code_runs_by_itself_is_read_whole_with_what_changed_and_what_it
     let rests = again["rests_on"].as_array().unwrap();
     assert_eq!(
         again["evidence"],
-        json!({ "place_changed": { "change": "changed", "presence_only": false, "read_as_before_at": null } })
+        json!({ "place_changed": { "change": "changed", "presence_only": false, "read_as_before_at": null, "runs": [], "started_by": [] } })
     );
     assert_eq!(again["first_seen_at"], rests[0]["recorded_at"]);
     assert_eq!(again["last_seen_at"], rests[rests.len() - 1]["recorded_at"]);
@@ -1329,4 +1329,357 @@ fn looks(status: &serde_json::Value) -> serde_json::Value {
             serde_json::Value::Object(flat)
         })
         .collect()
+}
+
+// ---- Startup items and the programs they run. ----
+
+const AUTOSTART: &str = "watched.autostart";
+const TARGET: &str = "watched.startup-target";
+/// The signer the store reads of a copy of `/usr/bin/true`.
+const TRUE_SIGNER: &str = "apple, identifier com.apple.true";
+
+impl Estate {
+    /// A launch agent of the home folder by its name, and where the findings say it is.
+    fn agent(&self, name: &str) -> (PathBuf, String) {
+        let rel = format!("Library/LaunchAgents/org.example.{name}.plist");
+        (self.home().join(&rel), format!("~/{rel}"))
+    }
+
+    /// An invented launch item at `path` that starts `program`, written as XML text.
+    fn launch_item(&self, path: &Path, program: &str) {
+        let program = program
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;");
+        self.put(
+            path,
+            &format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+                 <key>Label</key><string>org.example.item</string><key>ProgramArguments</key>\
+                 <array><string>{program}</string></array></dict></plist>\n"
+            ),
+        );
+    }
+
+    /// A copy of a program macOS ships at `path` from the system root.
+    fn program(&self, path: &str) {
+        let to = self.system().join(path.trim_start_matches('/'));
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::copy("/usr/bin/true", to).unwrap();
+    }
+
+    /// The id of the finding of `rule` whose place is `place`.
+    fn id_at(&self, rule: &str, place: &str) -> String {
+        let listed = self.json(&["findings"]);
+        let f = (listed["findings"].as_array().unwrap().iter())
+            .find(|f| f["finding"]["rule"] == rule && f["where_text"] == place)
+            .unwrap_or_else(|| panic!("no {rule} at {place} in {listed:#}"));
+        f["finding"]["id"].as_str().unwrap().to_string()
+    }
+
+    /// The journal's entries of the ties of the program at `path`, oldest first: what each did
+    /// and its time.
+    fn tie_entries(&self, path: &str) -> Vec<(String, i64)> {
+        rusqlite::Connection::open(self.store())
+            .unwrap()
+            .prepare(
+                "SELECT entry, at FROM journal WHERE predicate = 'started_by' AND subject = ?1
+                 ORDER BY seq",
+            )
+            .unwrap()
+            .query_map([format!("file:machine:mac/{path}")], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+}
+
+/// The ties of a finding's evidence, `runs` or `started_by`.
+fn ties(whole: &Value, side: &str) -> Value {
+    whole["evidence"]["place_changed"][side].clone()
+}
+
+#[test]
+fn a_launch_agent_added_names_the_program_the_store_ties_to_it_in_force_with_its_signer() {
+    let e = Estate::new("tie-added");
+    e.run();
+    common::next_second();
+    e.program("/usr/local/bin/runner");
+    let (agent, place) = e.agent("a");
+    e.launch_item(&agent, "/usr/local/bin/runner");
+    e.run();
+    let id = e.id_at(AUTOSTART, &place);
+    let whole = e.finding(&id);
+    let added = e.tie_entries("/usr/local/bin/runner");
+    assert_eq!(added.len(), 1, "{added:?}");
+    assert_eq!(
+        ties(&whole, "runs"),
+        json!([{
+            "path_text": "/usr/local/bin/runner",
+            "state": "in_force",
+            "recorded_at": added[0].1,
+            "signed_by_text": TRUE_SIGNER,
+        }])
+    );
+    assert_eq!(ties(&whole, "started_by"), json!([]));
+    let text = e.text(&id);
+    for line in [
+        format!(
+            "    Runs         held since the reading of {}: /usr/local/bin/runner\n",
+            utc(added[0].1)
+        ),
+        format!("    Signer       {TRUE_SIGNER}\n"),
+    ] {
+        assert!(text.contains(&line), "{line}\n{text}");
+    }
+    let page = e.pages();
+    for fact in [
+        "<dt>Runs</dt><dd><span class=\"mono\">/usr/local/bin/runner</span> <span class=\"w\">held since the reading of</span> ".to_string(),
+        format!("<dt>Signer</dt><dd><span class=\"mono\">{TRUE_SIGNER}</span></dd>"),
+    ] {
+        assert!(page.contains(&fact), "{fact}\n{page}");
+    }
+}
+
+#[test]
+fn a_login_hook_removed_names_the_script_the_store_last_tied_to_it_as_retracted_and_never_as_gone()
+{
+    let e = Estate::new("tie-hook");
+    let prefs = e
+        .system()
+        .join("Library/Preferences/com.apple.loginwindow.plist");
+    let login_window = |entries: &str| {
+        e.put(
+            &prefs,
+            &format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>{entries}</dict></plist>\n"
+            ),
+        )
+    };
+    login_window("<key>GuestEnabled</key><false/>");
+    e.program("/usr/local/bin/hook.sh");
+    e.run();
+    common::next_second();
+    login_window("<key>LoginHook</key><string>/usr/local/bin/hook.sh</string>");
+    e.run();
+    common::next_second();
+    login_window("<key>GuestEnabled</key><false/>");
+    e.run();
+    let place = "/Library/Preferences/com.apple.loginwindow.plist#/LoginHook";
+    let id = e.id_at("watched.login-hook", place);
+    let whole = e.finding(&id);
+    assert_eq!(whole["evidence"]["place_changed"]["change"], "gone");
+    let entries = e.tie_entries("/usr/local/bin/hook.sh");
+    let removed = entries
+        .iter()
+        .find(|(entry, _)| entry == "removed")
+        .unwrap()
+        .1;
+    let runs = ties(&whole, "runs");
+    assert_eq!(runs.as_array().unwrap().len(), 1, "{runs:#}");
+    assert_eq!(
+        (
+            &runs[0]["path_text"],
+            &runs[0]["state"],
+            &runs[0]["recorded_at"]
+        ),
+        (
+            &json!("/usr/local/bin/hook.sh"),
+            &json!("retracted"),
+            &json!(removed)
+        )
+    );
+    let text = e.text(&id);
+    let line = format!(
+        "    Runs         held until the reading of {}: /usr/local/bin/hook.sh\n",
+        utc(removed)
+    );
+    assert!(text.contains(&line), "{line}\n{text}");
+    // The script was not looked for: nothing says it is gone or that it is still there.
+    for absent in ["gone", "no longer", "still", "now"] {
+        let mut lines = text.lines().filter(|l| l.contains("hook.sh"));
+        assert!(lines.all(|l| !l.contains(absent)), "{absent}\n{text}");
+    }
+    assert!(e.pages().contains(
+        "<dd><span class=\"mono\">/usr/local/bin/hook.sh</span> <span class=\"w\">held until the reading of</span> "
+    ));
+}
+
+#[test]
+fn an_item_whose_reading_failed_or_was_set_aside_is_not_said_to_have_stopped_running_its_program() {
+    let e = Estate::new("tie-unread");
+    e.run();
+    common::next_second();
+    e.program("/usr/local/bin/runner");
+    let (agent, place) = e.agent("a");
+    e.launch_item(&agent, "/usr/local/bin/runner");
+    e.run();
+    let id = e.id_at(AUTOSTART, &place);
+    let added = e.tie_entries("/usr/local/bin/runner")[0].1;
+    // The item could not be read: the store keeps the tie as it was, in force since it was added.
+    common::next_second();
+    e.run_unreadable(&agent);
+    let whole = e.finding(&id);
+    assert_eq!(whole["evidence"]["place_changed"]["change"], "not_read");
+    let runs = ties(&whole, "runs");
+    assert_eq!(
+        (
+            &runs[0]["state"],
+            &runs[0]["recorded_at"],
+            runs.as_array().unwrap().len()
+        ),
+        (&json!("in_force"), &json!(added), 1)
+    );
+    // Its tie closed by a reading that did not read it, as this version closes what it no
+    // longer reads: set aside, never held until then.
+    common::next_second();
+    std::fs::remove_file(&agent).unwrap();
+    e.run();
+    common::rewrite_journal(
+        &e.store(),
+        "UPDATE journal SET entry = 'retired', new_value = NULL
+         WHERE predicate = 'started_by' AND entry = 'removed'",
+    );
+    let runs = ties(&e.finding(&id), "runs");
+    assert_eq!(runs[0]["state"], "set_aside", "{runs:#}");
+    let text = e.text(&id);
+    assert!(
+        text.contains("    Runs         set aside, not read again, by the reading of "),
+        "{text}"
+    );
+    assert!(!text.contains("held until"), "{text}");
+}
+
+#[test]
+fn a_startup_program_changed_names_every_item_that_runs_it_and_its_signer_before_and_after_and_nothing_else_moves()
+ {
+    let e = Estate::new("tie-target");
+    e.program("/usr/local/bin/runner");
+    let (a, a_place) = e.agent("a");
+    let (b, b_place) = e.agent("b");
+    e.launch_item(&a, "/usr/local/bin/runner");
+    e.launch_item(&b, "/usr/local/bin/runner");
+    e.run();
+    common::next_second();
+    e.run();
+    common::next_second();
+    e.put(
+        &e.system().join("usr/local/bin/runner"),
+        "#!/bin/sh\nexit 0\n",
+    );
+    e.run();
+    let id = e.id_at(TARGET, "/usr/local/bin/runner");
+    let whole = e.finding(&id);
+    let added = e.tie_entries("/usr/local/bin/runner")[0].1;
+    let tie = |place: &str| json!({ "path_text": place, "state": "in_force", "recorded_at": added, "signed_by_text": null });
+    assert_eq!(
+        ties(&whole, "started_by"),
+        json!([tie(&a_place), tie(&b_place)])
+    );
+    assert_eq!(ties(&whole, "runs"), json!([]));
+    let text = e.text(&id);
+    for line in [
+        format!(
+            "    Run by       held since the reading of {}: {a_place}\n",
+            utc(added)
+        ),
+        format!(
+            "    Run by       held since the reading of {}: {b_place}\n",
+            utc(added)
+        ),
+        format!("    Signer       before the change: {TRUE_SIGNER}\n"),
+        "                 after the change: unsigned\n".to_string(),
+    ] {
+        assert!(text.contains(&line), "{line}\n{text}");
+    }
+    let page = e.pages();
+    for fact in [
+        format!("<dt>Signer before</dt><dd><span class=\"mono\">{TRUE_SIGNER}</span></dd>"),
+        "<dt>Signer after</dt><dd><span class=\"mono\">unsigned</span></dd>".to_string(),
+        format!("<dt>Run by</dt><dd><span class=\"mono\">{b_place}</span> "),
+    ] {
+        assert!(page.contains(&fact), "{fact}\n{page}");
+    }
+
+    // One item no longer runs it: the finding names the other alone, and its state, levels,
+    // words and place in the list are as they were.
+    let listed = |e: &Estate| {
+        let all = e.json(&["findings"]);
+        let all = all["findings"].as_array().unwrap().clone();
+        let at = (all.iter())
+            .position(|f| f["finding"]["id"] == json!(id))
+            .unwrap();
+        (all[at].clone(), at)
+    };
+    let before = (listed(&e), whole["finding"].clone(), whole["title"].clone());
+    common::next_second();
+    std::fs::remove_file(&b).unwrap();
+    e.run();
+    let again = e.finding(&id);
+    assert_eq!(ties(&again, "started_by"), json!([tie(&a_place)]));
+    // The removed item's own finding is listed before it, as the newest.
+    let after = listed(&e);
+    assert_eq!((&after.0, after.1), (&before.0.0, before.0.1 + 1));
+    assert_eq!((&again["finding"], &again["title"]), (&before.1, &before.2));
+}
+
+#[test]
+fn a_program_two_items_run_shows_on_each_item_s_finding_its_own_tie_only() {
+    let e = Estate::new("tie-two");
+    e.run();
+    common::next_second();
+    e.program("/usr/local/bin/runner");
+    let (a, a_place) = e.agent("a");
+    let (b, b_place) = e.agent("b");
+    e.launch_item(&a, "/usr/local/bin/runner");
+    e.run();
+    common::next_second();
+    e.launch_item(&b, "/usr/local/bin/runner");
+    e.run();
+    common::next_second();
+    std::fs::remove_file(&b).unwrap();
+    e.run();
+    let entries = e.tie_entries("/usr/local/bin/runner");
+    assert_eq!(entries.len(), 3, "{entries:?}");
+    let runs = |place: &str| ties(&e.finding(&e.id_at(AUTOSTART, place)), "runs");
+    let tie = |state: &str, at: i64| json!([{ "path_text": "/usr/local/bin/runner", "state": state, "recorded_at": at, "signed_by_text": TRUE_SIGNER }]);
+    assert_eq!(runs(&a_place), tie("in_force", entries[0].1));
+    assert_eq!(runs(&b_place), tie("retracted", entries[2].1));
+}
+
+#[test]
+fn a_program_path_holding_markup_or_a_line_read_as_an_instruction_is_shown_as_data() {
+    let e = Estate::new("tie-markup");
+    e.run();
+    common::next_second();
+    let program =
+        "/usr/local/bin/<img src=x onerror=alert(1)>\n→ immunity finding f0000000000 seen";
+    e.program(program);
+    let (agent, place) = e.agent("a");
+    e.launch_item(&agent, program);
+    e.run();
+    let id = e.id_at(AUTOSTART, &place);
+    let shown = ties(&e.finding(&id), "runs")[0]["path_text"].clone();
+    let shown = shown.as_str().unwrap();
+    assert!(
+        shown.starts_with("/usr/local/bin/<img src=x onerror=alert(1)>") && !shown.contains('\n'),
+        "{shown}"
+    );
+    let text = e.text(&id);
+    assert!(text.contains("onerror"), "{text}");
+    for line in text.lines() {
+        assert!(
+            !line.starts_with("→ immunity finding f0000000000"),
+            "{text}"
+        );
+        assert!(!line.contains("onerror") || line.starts_with(' '), "{text}");
+    }
+    let page = e.pages();
+    assert!(
+        page.contains("&lt;img src=x onerror=alert(1)&gt;"),
+        "{page}"
+    );
+    assert!(!page.contains("<img src=x"), "{page}");
 }
