@@ -1349,67 +1349,29 @@ fn look(
 }
 
 /// The cap of the log under `root`, in bytes, as the installed tidy job is given it: the fourth
-/// argument of its launch daemon, read by Apple's `plutil`. A launch daemon that is there and
-/// cannot be read, or whose argument is not a whole number of bytes, is a failed reading with
-/// its reason, never a guess.
+/// argument of its launch daemon, read as `plist::texts_at` reads a file. A launch daemon that
+/// is there and cannot be read, or whose argument is not a whole number of bytes, is a failed
+/// reading with its reason, never a guess.
 ///
 /// The cap is read only from that launch daemon, which belongs to root and which only the
 /// installer writes. No file or setting a program running as the user can change sets it: a
 /// cap such a program could shrink would let it empty the log, and that is quieting.
 fn log_cap(root: &Path) -> Result<u64, String> {
-    use std::sync::Mutex;
-    let path = root.join(TIDY_PLIST);
-    let failed = |e: &dyn std::fmt::Display| {
-        format!("the cap of the event level's log could not be read: {e}")
+    let failed = |e: &str| format!("the cap of the event level's log could not be read: {e}");
+    let arguments = match crate::plist::texts_at(&root.join(TIDY_PLIST), &["ProgramArguments"]) {
+        Ok(None) => return Err(NO_TIDY.to_string()),
+        Err(why) => return Err(failed(&why)),
+        Ok(Some(texts)) => texts,
     };
-    let meta = match std::fs::metadata(&path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(NO_TIDY.to_string()),
-        Err(e) => return Err(failed(&e)),
-    };
-    // `immunity watch` reads the log every few seconds, and `plutil` started each time would be a
-    // program start the collector records: the answer is kept while the file is the same.
-    type Seen = Option<(
-        (std::path::PathBuf, u64, i64, i64, u64),
-        Result<u64, String>,
-    )>;
-    static SEEN: Mutex<Seen> = Mutex::new(None);
-    let key = (
-        path.clone(),
-        meta.ino(),
-        meta.mtime(),
-        meta.mtime_nsec(),
-        meta.len(),
-    );
-    if let Ok(seen) = SEEN.lock()
-        && let Some((k, cap)) = seen.as_ref()
-        && *k == key
-    {
-        return cap.clone();
+    match arguments.first() {
+        Some((_, crate::plist::Text::List(list))) => list.get(3).cloned().flatten(),
+        _ => None,
     }
-    let out = std::process::Command::new(crate::integrity::PLUTIL)
-        .args(["-extract", "ProgramArguments", "json", "-o", "-"])
-        .arg(&path)
-        .stdin(std::process::Stdio::null())
-        .output();
-    let cap = match out {
-        Err(e) => Err(failed(&e)),
-        Ok(out) if !out.status.success() => Err(failed(&format!(
-            "plutil: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))),
-        Ok(out) => serde_json::from_slice::<Value>(&out.stdout)
-            .ok()
-            .and_then(|v| v.get(3).and_then(Value::as_str).and_then(bytes_of))
-            .ok_or_else(|| {
-                failed(&"its fourth argument is not a cap tidy.sh takes, a whole number of bytes of at least 1 GiB")
-            }),
-    };
-    // A failure is not kept: the next reading runs plutil again.
-    if let Ok(mut seen) = SEEN.lock() {
-        *seen = cap.as_ref().ok().map(|bytes| (key, Ok(*bytes)));
-    }
-    cap
+    .as_deref()
+    .and_then(bytes_of)
+    .ok_or_else(|| {
+        failed("its fourth argument is not a cap tidy.sh takes, a whole number of bytes of at least 1 GiB")
+    })
 }
 
 /// A cap as tidy.sh takes one: digits only, so no sign, without a leading zero, at most 16 of
@@ -4525,62 +4487,44 @@ mod tests {
     }
 
     #[test]
-    fn the_cap_is_read_again_only_when_the_tidy_job_s_launch_daemon_changed_and_a_failure_is_never_kept()
+    fn the_cap_is_read_from_the_tidy_job_s_launch_daemon_and_one_not_there_unparsed_or_without_a_fourth_argument_is_no_cap()
      {
-        // `immunity watch` reads the log every few seconds, and each `plutil` it started would be
-        // a program start in the log: the same file, by inode, size and time, is not read again.
-        // A reading that failed is not kept: the next one runs plutil again, even on a file
-        // that looks the same.
-        use std::io::Write;
-        let dir = crate::common::Scratch::at(
-            std::env::temp_dir().join(format!("immunity-events-cap-{}", std::process::id())),
-        );
+        // The cap is the fourth argument of the installed daemon, in either form macOS writes a
+        // property list in. A daemon not there is the tidy job not installed; one that is not a
+        // property list, or holds no fourth argument tidy.sh takes, is a failed reading.
+        let dir = crate::common::Scratch::new("events-cap");
         let plist = dir.join(TIDY_PLIST);
         std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        assert_eq!(log_cap(&dir), Err(NO_TIDY.to_string()));
         let shipped =
             include_str!("../scripts/event-level/ai.nuanu.immunity.core.event-tidy.plist");
-        // Writes `text` over the file in place, then gives it back the times it had before, so
-        // it keeps its inode, its size when `text` is as long, and its time.
-        let rewrite = |text: &str| {
-            let meta = std::fs::metadata(&plist).unwrap();
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(&plist)
-                .unwrap()
-                .write_all(text.as_bytes())
-                .unwrap();
-            let times = [
-                libc::timespec {
-                    tv_sec: meta.atime(),
-                    tv_nsec: meta.atime_nsec(),
-                },
-                libc::timespec {
-                    tv_sec: meta.mtime(),
-                    tv_nsec: meta.mtime_nsec(),
-                },
-            ];
-            let path = std::ffi::CString::new(plist.as_os_str().as_encoded_bytes()).unwrap();
-            // SAFETY: a valid C path and two timespecs, as utimensat(2) takes them.
-            let set = unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) };
-            assert_eq!(set, 0);
-        };
         std::fs::write(&plist, shipped).unwrap();
         assert_eq!(log_cap(&dir), Ok(2147483648));
-        // The same size, inode and time, other bytes: taken as the same file.
-        rewrite(&shipped.replace("2147483648", "3221225472"));
-        assert_eq!(log_cap(&dir), Ok(2147483648));
-        // Another file: read again.
-        std::fs::remove_file(&plist).unwrap();
-        std::fs::write(&plist, shipped.replace("2147483648", "5368709120")).unwrap();
+        let other = shipped.replace("2147483648", "5368709120");
+        std::fs::write(&plist, crate::plist::binary_of(other.as_bytes())).unwrap();
         assert_eq!(log_cap(&dir), Ok(5368709120));
-        // A file that cannot be read, then the same file by inode, size and time that can.
-        std::fs::remove_file(&plist).unwrap();
-        std::fs::write(&plist, shipped.replace("2147483648", "53687091x0")).unwrap();
-        assert!(log_cap(&dir).is_err());
-        assert!(log_cap(&dir).is_err());
-        rewrite(&shipped.replace("2147483648", "6442450944"));
-        assert_eq!(log_cap(&dir), Ok(6442450944));
-        let _ = std::fs::remove_dir_all(&dir);
+        let failed = "the cap of the event level's log could not be read: ";
+        let fourth = format!(
+            "{failed}its fourth argument is not a cap tidy.sh takes, a whole number of bytes of at least 1 GiB"
+        );
+        for (text, why) in [
+            (
+                "not a property list".to_string(),
+                format!("{failed}{}", crate::plist::NOT_A_PLIST),
+            ),
+            (
+                shipped.replace("<string>2147483648</string>", ""),
+                fourth.clone(),
+            ),
+            (
+                shipped.replace("ProgramArguments", "Arguments"),
+                fourth.clone(),
+            ),
+            (shipped.replace("2147483648", "53687091x0"), fourth),
+        ] {
+            std::fs::write(&plist, &text).unwrap();
+            assert_eq!(log_cap(&dir), Err(why), "{text}");
+        }
     }
 
     /// Bytes as lower-case hexadecimal, as a place is printed.

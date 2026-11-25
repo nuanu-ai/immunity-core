@@ -4793,11 +4793,11 @@ fn the_status_gives_the_cap_the_tidy_job_was_installed_with_and_never_a_guess() 
     dir.run();
     let l = &dir.status()["event_level"];
     assert_eq!(l.get("log_cap_bytes"), Some(&Value::Null), "{l:#}");
-    assert!(
-        l["log_cap_reason_text"]
-            .as_str()
-            .unwrap()
-            .starts_with("the cap of the event level's log could not be read: plutil:"),
+    assert_eq!(
+        l["log_cap_reason_text"].as_str(),
+        Some(
+            "the cap of the event level's log could not be read: not a property list macOS can read"
+        ),
         "{l:#}"
     );
     tidy_plist(

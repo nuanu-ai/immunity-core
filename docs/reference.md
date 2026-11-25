@@ -188,7 +188,7 @@ Types and predicates are rows in the store, not code. A reader cannot create a n
 | `located_on` | checkout or container → machine; a watched file → machine, or → its checkout for a git hook; a keg or an application's folder under Application Support → machine |
 | `part_of` | component → machine, container or checkout |
 | `has_lockfile` | checkout → the path, relative to the checkout, of a lockfile found in it, of any kind, opened or not |
-| `has_version` | component → version string, exactly as the source gives it. An application's is `CFBundleShortVersionString`, with `CFBundleVersion` in brackets when it differs |
+| `has_version` | component → version string, exactly as the source gives it. An application's is `CFBundleShortVersionString`, with `CFBundleVersion` in brackets when it differs; each is a string, or a number as its text (`3`, `2.500000`) |
 | `installed_at` | application or global npm package → its path |
 | `signed_by` | application or a program a startup item runs → `apple`, `app store`, `developer id` or `other certificate`, each with `, team <id>` where the signature names one; `ad hoc, cdhash <hex>`; or `unsigned`. For a program, `, identifier <id>` follows where its code names one |
 | `has_seal` | application or a program a startup item runs → `verifies`, or `does not verify: <why>` |
@@ -241,6 +241,8 @@ Every failure met on the store carries `outcome`, one word of a closed list, dec
 | `failed` | `command_failed` | 1 | anything else, SQLite's `LOCKED` included |
 
 `immunity owner` without a store keeps its code `no_store`, and `immunity sample` and `immunity run` keep `sample_failed` and `run_failed` for a failure of their work. `immunity run` waits up to 60 seconds for the store, once for the run lock and once at its commit for the readings that hold the store to leave. When the wait runs out, or the store is held past five seconds anywhere else in the run, nothing the check read is committed and it ends as a skip, with `run_lock_held` or `store_busy` and exit code 4. A watcher's full check is then tried again within five minutes. While the commit waits, a command that starts to read the store waits its own five seconds and then ends with `store_busy` and exit code 4.
+
+A command that only reads the store reads everything its answer says in one read transaction, so the answer is of one state of the store and a check commits before it or after it. The pages `immunity view` writes, and what it keeps to tell whether they are current, are read the same way. `immunity matches` reads the store twice, with no lock held while it reads the event log in between: before the log, what the time awake is counted from and the store's id, and after it, everything else. A store replaced in between is refused with `moved`. A store held past five seconds at any read of such a command is `store_busy` with exit code 4.
 
 | Command | Does |
 |---|---|

@@ -25,7 +25,7 @@ use crate::contract::{v1, value_of};
 use crate::events::{
     self, Arrival, Arrivals, Evidence, Hit, Lacked, LineAt, Place, Queue, Stretch,
 };
-use crate::outcome::{self, Code, Outcome};
+use crate::outcome::{Code, Outcome};
 use crate::secrets::Args;
 use crate::sigma::{Kind, Meta, Placement, Reason, Rules};
 use crate::{answer, findings, known, store, verdict};
@@ -141,10 +141,6 @@ fn read(args: &MatchesArgs, now: i64) -> Result<v1::Matches, Failure> {
     read_with(Rules::shipped(), args, now)
 }
 
-fn unreadable(e: &(dyn std::error::Error + 'static)) -> Failure {
-    Failure::Store(outcome::of(e))
-}
-
 /// `read`, naming in `unevaluated` these rules. Matching itself is the shipped rules'.
 fn read_with(rules: &Rules, args: &MatchesArgs, now: i64) -> Result<v1::Matches, Failure> {
     read_through(rules, args, now, |awake| {
@@ -169,24 +165,36 @@ fn read_through(
     if !args.store.is_file() {
         return Err(Failure::Store(crate::store::absent(&args.store)));
     }
-    let (awake, id) = {
-        let conn = store::open_read_only(&args.store).map_err(Failure::Store)?;
-        let tx = conn.unchecked_transaction().map_err(|e| unreadable(&e))?;
-        let awake = events::Awake::read(&tx).map_err(|e| unreadable(&e))?;
-        (awake, store::id(&tx).map_err(|e| unreadable(&e))?)
-    };
+    let (awake, id) = store::read(&args.store, |tx| {
+        Ok((events::Awake::read(tx)?, store::id(tx)?))
+    })
+    .map_err(Failure::Store)?;
     let queue = log(&awake);
-    let conn = store::open_read_only(&args.store).map_err(Failure::Store)?;
-    let tx = conn.unchecked_transaction().map_err(|e| unreadable(&e))?;
-    if store::id(&tx).map_err(|e| unreadable(&e))? != id {
+    store::read(&args.store, |tx| answered(rules, args, now, tx, id, queue))
+        .map_err(Failure::Store)?
+        .map_err(Failure::Log)
+}
+
+/// The answer of `read_through` from `queue`, the event log read, and `tx`, a read of the store
+/// opened after it; `Err` with why the log could not be read. `id` is the store's id read before
+/// the log.
+fn answered(
+    rules: &Rules,
+    args: &MatchesArgs,
+    now: i64,
+    tx: &Connection,
+    id: String,
+    queue: Queue,
+) -> Result<Result<v1::Matches, String>, Box<dyn std::error::Error>> {
+    if store::id(tx)? != id {
         let why = "the store was replaced while the event log was read; ask again";
-        return Err(Failure::Store(Outcome::new(Code::Moved, why)));
+        return Err(Outcome::new(Code::Moved, why).into());
     }
     let held = Held {
-        read_to: events::read_up_to(&tx).map_err(|e| unreadable(&e))?,
-        state: events::state_read(&tx).map_err(|e| unreadable(&e))?,
-        findings: finding_refs(&tx, now).map_err(|e| unreadable(&e))?,
-        arrivals: events::arrivals(&tx).map_err(|e| unreadable(&e))?,
+        read_to: events::read_up_to(tx)?,
+        state: events::state_read(tx)?,
+        findings: finding_refs(tx, now)?,
+        arrivals: events::arrivals(tx)?,
     };
     let after = args.after.as_ref();
     let mut answer = v1::Matches {
@@ -204,7 +212,7 @@ fn read_through(
         c.status_read_at = held.state.as_ref().map(|(_, at)| *at);
     };
     match queue {
-        Queue::Failed(why) => return Err(Failure::Log(why)),
+        Queue::Failed(why) => return Ok(Err(why)),
         Queue::NotInstalled { gone } => {
             let mut collector = v1::Collector {
                 state: v1::CollectorState::NotInstalled as i32,
@@ -224,17 +232,15 @@ fn read_through(
             for hit in &s.hits {
                 let event = event(&hit.event);
                 for (file, meta) in &hit.matched {
-                    let (raised, mut findings) =
-                        raised(&tx, &held, hit, meta).map_err(|e| unreadable(&e))?;
+                    let (raised, mut findings) = raised(tx, &held, hit, meta)?;
                     let position = hit.at.to_string();
                     // The response layer's verdicts about the match, read by the match; the
                     // finding its latest suspicious one went to is named after the core's.
                     let said = verdict::listed(
-                        &tx,
+                        tx,
                         "position = ?1 AND rule = ?2",
                         &[&position, &meta.name],
-                    )
-                    .map_err(|e| unreadable(&e))?;
+                    )?;
                     if let Some(f) = said.2.iter().rev().find_map(|v| v.finding.as_ref())
                         && let Some(r) = held.findings.get(f)
                     {
@@ -267,7 +273,7 @@ fn read_through(
             answer.more = s.more;
         }
     }
-    Ok(answer)
+    Ok(Ok(answer))
 }
 
 /// What became of a match among the findings, and the findings it went to.

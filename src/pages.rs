@@ -2223,8 +2223,7 @@ fn old_feeds(conn: &Connection, now: i64) -> rusqlite::Result<Vec<String>> {
 /// What "none used in attacks" lacks while the list of them was never downloaded; `None` once
 /// it was read.
 fn exploited_gap(conn: &Connection, now: i64) -> rusqlite::Result<Option<String>> {
-    // A store made before the list was kept has no table of its readings: never read.
-    if crate::threats::last_good(conn).unwrap_or(None).is_some() {
+    if crate::threats::last_good(conn)?.is_some() {
         return Ok(None);
     }
     let never = ["the list of vulnerabilities used in attacks (never downloaded)".to_string()];
