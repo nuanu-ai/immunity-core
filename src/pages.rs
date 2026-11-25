@@ -1341,10 +1341,13 @@ fn watched_table(
             let t = crate::vulnerabilities::totals(conn, now)?;
             // At every check only where every project was compared in full; why one was not is
             // a fault above or a limit at the end.
-            read = Some(match (t.matched, whole && map.projects_open() == 0) {
-                (false, _) => Standing::never("not compared yet"),
-                (true, true) => Standing::read("compared at every check"),
-                (true, false) => Standing::read("compared"),
+            // And compared at all only where a project was: with none, nothing is said read.
+            let all = whole && map.projects_open() == 0;
+            read = Some(match (t.matched, t.projects_compared, all) {
+                (false, ..) => Standing::never("not compared yet"),
+                (true, 0, _) => Standing::never("no project compared"),
+                (true, _, true) => Standing::read("compared at every check"),
+                (true, _, false) => Standing::read("compared"),
             });
             if t.matched {
                 let known: usize = t
