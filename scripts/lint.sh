@@ -31,6 +31,24 @@ absent "a command run inside a container, or a rule for one product, in the prob
 absent "a library target, whose tests neither half of ./check runs" -nF '[lib]' Cargo.toml
 [ ! -e src/lib.rs ] || fail "src/lib.rs, a library target whose tests neither half of ./check runs"
 
+# Every file the core reads is opened one way, by src/open.rs. Left out: the store (SQLite and
+# its locks), the install (service.rs), tests (a test module, or a `#[cfg(test)]` module, which
+# rustfmt closes at the first column), and src/events.rs, whose readers of the collector's log,
+# written by root and read by offset, are not yet moved and are their own change.
+sources=$(git -c core.quotePath=false ls-files 'src/*.rs') ||
+  fail "could not list the sources, whose reads of files are checked"
+if reads=$(printf '%s\n' "$sources" | /usr/bin/grep -vxE \
+  'src/(open|store|service|events)\.rs|src/.*/tests(\.rs|/.*)' | /usr/bin/tr '\n' '\0' |
+  /usr/bin/xargs -0 /usr/bin/awk '
+  skip { if ($0 ~ /^}/) skip = 0; next }
+  test { test = 0; if ($0 ~ /^(pub(\([a-z]+\))? )?mod [a-z0-9_]+ \{$/) { skip = 1; next } }
+  /^#\[cfg\(test\)\]$/ { test = 1 }
+  /File::open|fs::read\(|fs::read_to_string|\.read\(true\)/ { print FILENAME ":" FNR ": " $0 }'); then
+  [ -z "$reads" ] || fail "a read of a file outside src/open.rs: $reads"
+else
+  fail "could not read the sources, whose reads of files are checked"
+fi
+
 # The rules in the header of the check's workflow. Comments may name what is refused.
 # A pull request from a fork never runs with the base repository's token and secrets.
 absent "pull_request_target in a workflow" -rnE '^[^#]*pull_request_target' .github/workflows

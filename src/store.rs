@@ -946,14 +946,17 @@ pub fn lock_waiting(handle: File) -> std::io::Result<Option<File>> {
     }
 }
 
-/// Whether a process holds the lock taken by `lock_waiting` on the file or folder at `path`
-/// now. It opens it only to read, creates nothing, and holds the lock shared for a moment,
-/// which a process taking it meanwhile waits out. Nothing at the path is no lock held.
+/// Whether a process holds the lock taken by `lock_waiting` on the file at `path` now. It opens
+/// it only to read (`open::open`), creates nothing, and holds the lock shared for a moment,
+/// which a process taking it meanwhile waits out. Nothing at the path is no lock held; anything
+/// but a regular file there is an error.
 pub fn held(path: &Path) -> std::io::Result<bool> {
-    let handle = match File::open(path) {
-        Ok(handle) => handle,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e),
+    use crate::open::Refused;
+    let handle = match crate::open::open(path, crate::open::Reach::Own, crate::open::UNCAPPED) {
+        Ok((handle, _)) => handle,
+        Err(Refused::Look(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(Refused::Look(e) | Refused::Failed(e)) => return Err(e),
+        Err(refused) => return Err(std::io::Error::other(refused)),
     };
     match handle.try_lock_shared() {
         Ok(()) => Ok(false),
@@ -2916,5 +2919,15 @@ mod tests {
         let missing = dir.join("store.db");
         assert!(roll_back(&missing).is_err());
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn a_pipe_or_a_link_to_a_device_in_place_of_a_lock_file_is_an_error_and_never_holds_a_status() {
+        let dir = crate::common::Scratch::new("store-held-refused");
+        let [pipe, zero, ..] = crate::open::tests::refusals(&dir);
+        for path in [pipe, zero] {
+            let held = crate::open::tests::within(move || held(&path).is_err());
+            assert_eq!(held, Some(true));
+        }
     }
 }

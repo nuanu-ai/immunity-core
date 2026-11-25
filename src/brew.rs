@@ -14,6 +14,7 @@
 //! Homebrew. The raw copy keeps only what facts are made of: one line per package, a JSON
 //! array of its kind, its full name, its tap and its versions. Facts are made from that copy.
 
+use crate::open::{Reach, UNCAPPED};
 use crate::store::Statement;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -58,7 +59,10 @@ pub enum Found {
 /// to look for brew instead of the standard places. `home` is the home folder.
 pub fn read(input: Option<&Path>, brew: Option<&Path>, home: &Path) -> Found {
     let json = match input {
-        Some(path) => match std::fs::read_to_string(path) {
+        Some(path) => match crate::open::read(path, Reach::Given, UNCAPPED)
+            .map_err(|e| e.to_string())
+            .and_then(|b| String::from_utf8(b).map_err(|e| e.to_string()))
+        {
             Ok(text) => text,
             Err(e) => return Found::Failed(format!("cannot read {}: {e}", path.display())),
         },

@@ -79,7 +79,8 @@ fn head_commit(
             crate::guarded::Real::Failed(_) => continue,
         }
     }
-    let packed = crate::autorun::read_capped_resolved(&common.join("packed-refs"), cap).ok();
+    let packed = crate::open::read(&common.join("packed-refs"), crate::open::Reach::Place, cap);
+    let packed = packed.ok();
     let Some(packed) = packed.and_then(|bytes| String::from_utf8(bytes).ok()) else {
         return Ok(None);
     };
@@ -132,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn a_pipe_or_a_device_in_place_of_a_file_of_git_leaves_the_commit_unknown_and_never_holds_the_run()
+    fn a_pipe_a_device_or_a_file_of_git_over_its_cap_leaves_the_commit_unknown_and_never_holds_the_run()
      {
         // Any `.git` makes a folder a checkout, and a cloned or unpacked one can hold a named
         // pipe, which a plain read waits on forever, or a link to a device that never ends.
@@ -155,6 +156,10 @@ mod tests {
         assert_eq!(within(&shop, CAP), Some(Ok(None)));
         let (_dir, shop) = checkout("commit-dotgit-fifo", &[]);
         fifo(&shop.join(".git"));
+        assert_eq!(within(&shop, CAP), Some(Ok(None)));
+        let (_dir, shop) = checkout("commit-head-over", &files);
+        let over = format!("ref: refs/heads/main\n{}", " ".repeat(4096));
+        std::fs::write(shop.join(".git/HEAD"), over).unwrap();
         assert_eq!(within(&shop, CAP), Some(Ok(None)));
         // Last: a plain read of a device that never ends does not return to fail the test.
         let (_dir, shop) = checkout("commit-head-device", &files);

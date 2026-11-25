@@ -453,15 +453,13 @@ fn config(
             )));
         }
     };
-    // Do not open a special file. The capped reader also checks what it opened and
-    // uses O_NONBLOCK in case the file is replaced between the check and the open.
-    if !std::fs::symlink_metadata(&at).is_ok_and(|m| m.is_file() && m.len() <= CAP) {
-        return Err(failed(
+    use crate::open::Refused;
+    let bytes = crate::open::read(&at, crate::open::Reach::Place, CAP).map_err(|e| match e {
+        Refused::Look(_) | Refused::Kind(_) | Refused::Over(_) => failed(
             "a Git configuration file is not a regular file within the size cap of 1 MiB".into(),
-        ));
-    }
-    let bytes = crate::autorun::read_capped_resolved(&at, CAP)
-        .map_err(|e| failed(format!("a Git configuration file could not be read: {e}")))?;
+        ),
+        e => failed(format!("a Git configuration file could not be read: {e}")),
+    })?;
     // A NUL in a value would read as a record of its own in Git's `--null` listing.
     if bytes.contains(&0) {
         return Err(failed(UNPARSED.into()));
@@ -823,5 +821,24 @@ mod tests {
             why,
             "Git is in ~/Documents, which macOS asks permission for"
         );
+    }
+
+    #[test]
+    fn a_git_configuration_file_that_is_a_pipe_a_device_or_over_the_cap_is_never_read_and_fails() {
+        let dir = Scratch::new("git-config-refused");
+        let git = stand_in(&dir, "git", "");
+        let [pipe, zero, ..] = crate::open::tests::refusals(&dir);
+        let over = dir.join("over");
+        std::fs::File::create(&over)
+            .unwrap()
+            .set_len(CAP + 1)
+            .unwrap();
+        let (home, stand_in) = (dir.to_path_buf(), git.clone());
+        let told = crate::open::tests::within(move || {
+            pass(&stand_in, Parsed::default(), &home, &[&pipe, &zero, &over]).0
+        });
+        let refused = "a Git configuration file is not a regular file within the size cap of 1 MiB";
+        assert_eq!(told.expect("the reading waited"), [refused; 3]);
+        assert_eq!(starts(&git), 0);
     }
 }

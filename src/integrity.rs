@@ -939,7 +939,7 @@ fn kegs(roots: &Roots, machine: &str) -> Kind {
 
 /// The version a package's `package.json`, `file`, gives, if it gives one.
 fn package_version(file: &Path) -> Option<String> {
-    let text = std::fs::read(file).ok()?;
+    let text = crate::open::read(file, crate::open::Reach::Place, crate::open::UNCAPPED).ok()?;
     let v: serde_json::Value = serde_json::from_slice(&text).ok()?;
     v.get("version")?.as_str().map(str::to_string)
 }
@@ -1266,7 +1266,7 @@ pub fn files_changed(
     let folder = conn.path().map(Path::new).and_then(Path::parent);
     let kept = folder
         .and_then(|f| kept_file(f, &path, &input))
-        .and_then(|file| crate::autorun::read_capped_resolved(&file, CHANGES_CAP).ok())
+        .and_then(|file| crate::open::read(&file, crate::open::Reach::Own, CHANGES_CAP).ok())
         .and_then(|bytes| serde_json::from_slice::<Changes>(&bytes).ok())
         .filter(|c| c.from == from && c.to == to);
     // Entries never cover more files than their kind counts, so that what they leave out is

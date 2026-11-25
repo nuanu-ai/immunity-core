@@ -54,9 +54,12 @@ pub fn read(home: &Path) -> Found {
         Ok(path) => path,
         Err(found) => return *found,
     };
-    let text = match std::fs::read(config) {
+    use crate::open::{Reach, Refused, UNCAPPED};
+    let text = match crate::open::read(&config, Reach::Place, UNCAPPED) {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Found::Absent(NOT_PRESENT),
+        Err(Refused::Look(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Found::Absent(NOT_PRESENT);
+        }
         Err(e) => return Found::Failed(format!("cannot read ~/.ssh/config: {e}")),
     };
     let real_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
@@ -174,11 +177,16 @@ impl Parser<'_> {
             self.unread.push(label);
         }
         for path in paths {
-            // A file the pattern matched may be a link into a guarded folder.
-            if let crate::guarded::Real::Guarded(g) = crate::guarded::real(&path, &self.homes) {
-                self.guard(at, arg, g);
-                continue;
-            }
+            // A file the pattern matched may be a link into a guarded folder. It is opened by
+            // its path made real.
+            let real = match crate::guarded::real(&path, &self.homes) {
+                crate::guarded::Real::Guarded(g) => {
+                    self.guard(at, arg, g);
+                    continue;
+                }
+                crate::guarded::Real::At(real) => Ok(real),
+                crate::guarded::Real::Failed(e) => Err(e),
+            };
             // ssh reads a folder as an empty file.
             if path.is_dir() {
                 continue;
@@ -191,15 +199,19 @@ impl Parser<'_> {
                 ));
                 continue;
             }
-            match std::fs::read(&path) {
+            use crate::open::{Reach, Refused, UNCAPPED};
+            match real
+                .map_err(Refused::Look)
+                .and_then(|r| crate::open::read(&r, Reach::Place, UNCAPPED))
+            {
                 Ok(bytes) => {
                     let text = String::from_utf8_lossy(&bytes).into_owned();
                     self.lines.push(Line::Enter);
                     self.file(&label, &text, depth + 1);
                     self.lines.push(Line::Leave);
                 }
-                // ssh skips an include that is not there.
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                // ssh skips an include that is not there, a link to nothing among them.
+                Err(Refused::Look(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => self.unread.push(label),
             }
         }
@@ -842,6 +854,27 @@ mod tests {
                 *expected,
                 "{input:?} against {pattern:?}"
             );
+        }
+    }
+
+    #[test]
+    fn an_ssh_file_that_is_a_pipe_or_a_link_to_a_device_fails_and_never_holds_the_reading() {
+        type Reader = fn(&Path) -> Found;
+        let readers: [(&str, Reader); 2] = [
+            (".ssh/config", read),
+            (".ssh/known_hosts", crate::known_hosts::read),
+        ];
+        for (rel, read) in readers {
+            for which in 0..2 {
+                let home = crate::common::Scratch::new("ssh-refused");
+                std::fs::create_dir(home.join(".ssh")).unwrap();
+                let refused = crate::open::tests::refusals(&home);
+                std::fs::rename(&refused[which], home.join(rel)).unwrap();
+                let h = home.to_path_buf();
+                let found = crate::open::tests::within(move || read(&h));
+                let found = found.expect("the reading waited");
+                assert!(matches!(found, Found::Failed(_)), "{rel} {which}");
+            }
         }
     }
 }

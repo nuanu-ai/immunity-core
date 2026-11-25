@@ -6,6 +6,7 @@
 //! `##end`. `##taken_at` is when the probe ran, in UTC seconds. A visit that failed leaves
 //! `<name>.failed` next to it, and the earlier `<name>.txt` as it was.
 
+use crate::open::{Reach, UNCAPPED};
 use crate::store::{Cause, Gap, Lack, Statement};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -140,7 +141,8 @@ const FAILED_BLANK: u64 = 1 << 20;
 /// than `FAILED_TAIL` bytes.
 fn ends(path: &Path, len: u64) -> std::io::Result<String> {
     use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path)?;
+    let (mut file, _) =
+        crate::open::open(path, Reach::Own, UNCAPPED).map_err(std::io::Error::other)?;
     let mut head = Vec::new();
     (&mut file).take(FAILED_WHOLE).read_to_end(&mut head)?;
     if len <= FAILED_WHOLE {
@@ -236,7 +238,7 @@ pub fn inputs(dir: &Path) -> Result<Vec<Input>, String> {
         });
         if txt {
             input.file = Some(File {
-                raw: std::fs::read(&path).ok(),
+                raw: crate::open::read(&path, Reach::Own, UNCAPPED).ok(),
                 modified: seconds(entry.metadata().and_then(|m| m.modified()).ok()),
             });
         } else {
