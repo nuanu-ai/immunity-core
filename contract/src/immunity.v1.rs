@@ -1942,8 +1942,9 @@ pub struct PlaceChanged {
     /// it, every link a SHA-256 of the whole content (`sha256:`): the value before the first equals
     /// the value after the latest, and this is the time of the latest. It is said of that reading
     /// and says nothing of the file since: a later reading that could not read it, or read it
-    /// unchanged, writes no entry and leaves this time as it is. Absent otherwise, as when a change
-    /// the finding does not hold lies between its entries, or a value is the checksum of one
+    /// unchanged, writes no entry and leaves this time as it is; and nothing of what the file held
+    /// between the finding's entries, where a change the finding does not rest on may lie. Absent
+    /// otherwise, as when its entries do not follow one another, or a value is the checksum of one
     /// selected value (`value sha256:`). It changes nothing else of the finding. Since 1.35.0.
     #[prost(int64, optional, tag = "3")]
     pub read_as_before_at: ::core::option::Option<i64>,

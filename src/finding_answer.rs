@@ -347,9 +347,10 @@ pub fn evidence(conn: &Connection, f: &Found) -> rusqlite::Result<Option<v1::evi
 /// The journal's time of a reading that read a file's whole content with the checksum it had
 /// before the first change of content the finding rests on, from the finding's own `has_content`
 /// entries alone. Only when they are of one file and form one chain of whole-content checksums
-/// (`sha256:`), each entry's value before being the one after the entry before it, so no change
-/// the finding does not hold lies between them; and when the value before the first is the
-/// value after the latest: then the time of the latest. A reading that could not read the file
+/// (`sha256:`), each entry's value before being the one after the entry before it; and when the
+/// value before the first is the value after the latest: then the time of the latest. It is said
+/// of that reading alone: a change the journal holds and the finding does not (one the rule
+/// stays quiet on, a removal and a return) may lie between two entries whose values still meet. A reading that could not read the file
 /// writes no `has_content` entry, so the time is never later than the last reading that read it.
 /// `None` when anything else holds, a `value sha256:` of one selected value among it.
 fn read_as_before(basis: &[findings::Basis]) -> Option<i64> {
