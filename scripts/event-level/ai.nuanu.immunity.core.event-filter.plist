@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- The event level's filter: /bin/sh runs collect.sh, which pipes the FIFO through Apple's
+<!-- The event level's filter: immunity-event-filter, named so that macOS lists the job by
+     that name, runs collect.sh with /bin/sh. collect.sh pipes the FIFO through Apple's
      jq and rotatelogs into the log, a new file at each hour and at 128 MiB; at each new file
      rotatelogs runs rotated.sh, which runs tidy.sh. Every file named here was copied by the
      installer into a folder only root can write. launchd starts it again when it stops, no sooner than
@@ -11,7 +12,7 @@
 	<string>ai.nuanu.immunity.core.event-filter</string>
 	<key>ProgramArguments</key>
 	<array>
-		<string>/bin/sh</string>
+		<string>/Library/Application Support/ai.nuanu.immunity.core/event-level/immunity-event-filter</string>
 		<string>/Library/Application Support/ai.nuanu.immunity.core/event-level/collect.sh</string>
 		<string>/Library/Application Support/ai.nuanu.immunity.core/event-level</string>
 		<string>/Library/Application Support/ai.nuanu.immunity.core/event-level/run/events.fifo</string>

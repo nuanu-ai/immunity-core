@@ -425,11 +425,23 @@ fn files(dir: &Path) -> Vec<String> {
 
 /// The scripts the install copies into the folder the daemons run them from, each with the mode
 /// it gives it.
-const INSTALLED: [(&str, u32); 4] = [
+const INSTALLED: [(&str, u32); 6] = [
     ("collect.sh", 0o644),
     ("filter.jq", 0o644),
     ("tidy.sh", 0o644),
     ("rotated.sh", 0o755),
+    ("immunity-event-filter", 0o755),
+    ("immunity-log-cleanup", 0o755),
+];
+
+/// The program each job of the core's that runs a script names: a file of the core's own,
+/// named for what the job does, so that macOS lists the job by that name.
+const NAMED: [(&str, &str); 2] = [
+    (
+        "ai.nuanu.immunity.core.event-filter",
+        "immunity-event-filter",
+    ),
+    ("ai.nuanu.immunity.core.event-tidy", "immunity-log-cleanup"),
 ];
 
 /// Lays out a system root under `top` as the install lays out the collector's side: its scripts
@@ -463,9 +475,14 @@ fn with_cap(path: &Path, cap: &str) {
     let mut args = tidy_args(path);
     args.truncate(3);
     args.push(cap.to_string());
+    with_args(path, &args);
+}
+
+/// Makes the launch daemon at `path` give exactly `args`, written as one list.
+fn with_args(path: &Path, args: &[String]) {
     let out = Command::new("/usr/bin/plutil")
         .args(["-replace", "ProgramArguments", "-json"])
-        .arg(serde_json::to_string(&args).unwrap())
+        .arg(serde_json::to_string(args).unwrap())
         .arg(path)
         .output()
         .unwrap();
@@ -1592,14 +1609,22 @@ fn plist(label: &str) -> Value {
 }
 
 #[test]
-fn the_daemons_run_only_what_macos_ships_from_a_folder_only_root_can_write_and_never_spin() {
+fn each_job_that_runs_a_script_names_a_program_of_the_core_s_own_named_for_it_and_only_the_sensor_one_of_the_system()
+ {
     // A program of ours run as root from a place the owner's account can write would make any
-    // program running as the owner root. eslogger subscribes to program starts and to files
-    // created and renamed, and to nothing else: a file closed is four fifths of the events. A
-    // daemon that fails at once is started again no sooner than launchd's throttle. The tidy
-    // job is given the cap the install states.
+    // program running as the owner root. macOS lists a job no signed app owns by the file name
+    // of its program, so a job that runs a script names a file of the core's own, installed
+    // executable beside the scripts, whose name says what the job is; only eslogger, whose Full
+    // Disk Access counts only when launchd starts it itself, is a program of the system.
+    // eslogger subscribes to program starts and to files created and renamed, and to nothing
+    // else: a file closed is four fifths of the events. A daemon that fails at once is started
+    // again no sooner than launchd's throttle. The tidy job is given the cap the install states.
     let install = std::fs::read_to_string(Path::new(SCRIPTS).join("install")).unwrap();
     let listed = install.lines().find(|l| l.starts_with("SCRIPTS=")).unwrap();
+    let executed = install
+        .lines()
+        .find(|l| l.starts_with("EXECUTED="))
+        .unwrap();
     for label in LABELS {
         let p = plist(label);
         assert_eq!(p["Label"], label);
@@ -1611,9 +1636,19 @@ fn the_daemons_run_only_what_macos_ships_from_a_folder_only_root_can_write_and_n
             .iter()
             .map(|a| a.as_str().unwrap())
             .collect();
-        match args[0] {
-            "/usr/bin/eslogger" => assert_eq!(args[1..], ["exec", "create", "rename"]),
-            "/bin/sh" => {
+        let named = NAMED.iter().find(|(l, _)| *l == label).map(|(_, n)| *n);
+        match (args[0].strip_prefix(&format!("{LIB}/")), named) {
+            (None, None) => {
+                assert_eq!(label, "ai.nuanu.immunity.core.eslogger");
+                assert_eq!(args, ["/usr/bin/eslogger", "exec", "create", "rename"]);
+            }
+            (Some(program), Some(named)) => {
+                assert_eq!(program, named, "{label}");
+                assert!(Path::new(SCRIPTS).join(program).is_file(), "{program}");
+                assert!(
+                    executed.split(['\'', ' ']).any(|w| w == program),
+                    "{program}"
+                );
                 let script = args[1].strip_prefix(&format!("{LIB}/")).unwrap();
                 // The script is one the install copies there, from this folder.
                 assert!(Path::new(SCRIPTS).join(script).is_file(), "{script}");
@@ -1624,7 +1659,7 @@ fn the_daemons_run_only_what_macos_ships_from_a_folder_only_root_can_write_and_n
                     assert!(args[2..].iter().all(|a| a.starts_with(LIB)), "{args:?}");
                 }
             }
-            other => panic!("{label} runs {other}"),
+            _ => panic!("{label} runs {}", args[0]),
         }
         for key in ["StandardOutPath", "StandardErrorPath"] {
             let path = p[key].as_str().unwrap();
@@ -1641,6 +1676,40 @@ fn the_daemons_run_only_what_macos_ships_from_a_folder_only_root_can_write_and_n
     }
     // What collect.sh reads is installed beside it.
     assert!(listed.split(['\'', ' ']).any(|w| w == "filter.jq"));
+}
+
+#[test]
+fn the_program_a_job_names_runs_its_script_with_the_job_s_arguments_unchanged() {
+    // launchd executes the named file with the job's arguments, and it runs /bin/sh on the
+    // script with the rest exactly as given: spaces, an empty argument, a pattern and a leading
+    // hyphen stay as they are, and the script reads its own path as $0, as under /bin/sh. The
+    // script runs in the process launchd started, so what launchd sends the job reaches it.
+    let dir = Dir::new("named-program");
+    let script = dir.0.join("a script.sh");
+    std::fs::write(&script, "printf '<%s>\\n' \"$$\" \"$0\" \"$@\"\nexit 3\n").unwrap();
+    let args = ["a b", "", "*", "-x", "$HOME"];
+    for (_, program) in NAMED {
+        let child = Command::new(Path::new(SCRIPTS).join(program))
+            .env_clear()
+            .env("PATH", "/nonexistent")
+            .current_dir(&dir.0)
+            .arg(&script)
+            .args(args)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.status.code(), Some(3), "{program}");
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            format!(
+                "<{pid}>\n<{}>\n<a b>\n<>\n<*>\n<-x>\n<$HOME>\n",
+                script.display()
+            ),
+            "{program}"
+        );
+    }
 }
 
 #[test]
@@ -3871,7 +3940,7 @@ fn install_steps(dir: &Dir, fail_at: &str, running: bool, account: &str) -> (i32
 TOP="$T/top"; LIB="$TOP/event-level"; RUN="$LIB/run"; LOG="$LIB/log"; FIFO="$RUN/events.fifo"
 DAEMONS="$T/daemons"; TIDY="$DAEMONS/ai.nuanu.immunity.core.event-tidy.plist"; here="$T/here"
 LABELS='ai.nuanu.immunity.core.event-filter ai.nuanu.immunity.core.eslogger ai.nuanu.immunity.core.event-tidy'
-SCRIPTS='collect.sh filter.jq tidy.sh'; HOOK=rotated.sh; cap=2147483648
+{files}cap=2147483648
 {fail}
 {account}
 step() {{
@@ -3890,6 +3959,7 @@ echo "left=[$left]" >>"$T/log"
 "#,
         t = t.display(),
         running = u8::from(running),
+        files = install_files(),
     );
     let out = Command::new("/bin/sh")
         .env_clear()
@@ -3912,6 +3982,11 @@ fn install_part(from: &str, to: &str) -> String {
     let a = install.find(from).expect(from);
     let b = a + install[a..].find(to).expect(to);
     install[a..b].to_string()
+}
+
+/// The install's lists of the files it copies, `SCRIPTS` and `EXECUTED`, as it sets them.
+fn install_files() -> String {
+    install_part("# Run by /bin/sh, so read, not executed.\n", "\nhere=")
 }
 
 /// The account that may read the log, for the install's steps that do not choose it.
@@ -4015,21 +4090,21 @@ fn an_account_name_an_access_control_entry_cannot_take_as_it_is_is_refused_with_
 }
 
 #[test]
-fn a_scripts_folder_without_the_removal_script_is_refused_before_the_collector_is_stopped() {
-    // The install leaves the removal script on the Mac, so a folder of scripts without it is
-    // refused up front, like one without any script the daemons run, before the collector that
-    // runs is stopped.
+fn a_scripts_folder_without_a_file_the_install_copies_is_refused_before_the_collector_is_stopped() {
+    // A folder of scripts without the removal script, a script the daemons run or a program a
+    // job names is refused up front, before the collector that runs is stopped.
     let dir = Dir::new("install-files");
     let here = dir.0.join("here");
     std::fs::create_dir_all(&here).unwrap();
-    let check = install_part("for f in $SCRIPTS $HOOK", "\nfor l in $LABELS");
+    let check = install_part("for f in $SCRIPTS $EXECUTED", "\nfor l in $LABELS");
     let fail = install_part("left=\nfail() {", "# BEGIN the arguments\n");
     let install = std::fs::read_to_string(Path::new(SCRIPTS).join("install")).unwrap();
     assert!(install.find(&check).unwrap() < install.find("/bin/launchctl bootout").unwrap());
     let run = || {
         let code = format!(
-            "here='{}'; SCRIPTS='collect.sh filter.jq tidy.sh'; HOOK=rotated.sh\n{fail}\n{check}\necho checked",
-            here.display()
+            "here='{}'\n{}{fail}\n{check}\necho checked",
+            here.display(),
+            install_files()
         );
         Command::new("/bin/sh")
             .env_clear()
@@ -4038,18 +4113,26 @@ fn a_scripts_folder_without_the_removal_script_is_refused_before_the_collector_i
             .output()
             .unwrap()
     };
-    for name in ["collect.sh", "filter.jq", "tidy.sh", "rotated.sh"] {
+    let names: Vec<&str> = INSTALLED
+        .iter()
+        .map(|(n, _)| *n)
+        .chain(["uninstall"])
+        .collect();
+    for name in &names {
         std::fs::copy(Path::new(SCRIPTS).join(name), here.join(name)).unwrap();
     }
     let out = run();
-    assert_eq!(out.status.code(), Some(1));
-    assert_eq!(
-        String::from_utf8(out.stderr).unwrap(),
-        format!("install: {}/uninstall is missing\n", here.display())
-    );
-    std::fs::copy(Path::new(SCRIPTS).join("uninstall"), here.join("uninstall")).unwrap();
-    let out = run();
     assert_eq!(String::from_utf8(out.stdout).unwrap(), "checked\n");
+    for name in &names {
+        std::fs::rename(here.join(name), dir.0.join(name)).unwrap();
+        let out = run();
+        assert_eq!(out.status.code(), Some(1), "{name}");
+        assert_eq!(
+            String::from_utf8(out.stderr).unwrap(),
+            format!("install: {}/{name} is missing\n", here.display())
+        );
+        std::fs::rename(dir.0.join(name), here.join(name)).unwrap();
+    }
 }
 
 #[test]
@@ -4118,11 +4201,12 @@ fn a_reader_that_is_not_a_person_s_own_account_is_refused_with_nothing_changed()
 }
 
 #[test]
-fn the_install_leaves_its_removal_script_and_run_from_there_it_removes_everything_itself_included()
-{
+fn the_install_leaves_its_removal_script_and_run_from_there_it_removes_everything_the_jobs_programs_and_itself_included()
+ {
     // Removing the collector needs no checkout: the install copies the removal script into the
     // collector's folder, root's and not writable by others. Run from there, it deletes that
-    // folder, itself in it, and still finishes and says what it did.
+    // folder, the programs the jobs name and itself in it, and still finishes and says what it
+    // did.
     let dir = Dir::new("uninstall-in-place");
     let t = dir.0.join("steps").display().to_string();
     let (code, err, log) = install_steps(&dir, "nothing fails", false, SOMEONE);
@@ -4141,6 +4225,9 @@ fn the_install_leaves_its_removal_script_and_run_from_there_it_removes_everythin
     std::fs::create_dir_all(lib.join("log")).unwrap();
     std::fs::create_dir_all(lib.join("run")).unwrap();
     std::fs::create_dir_all(&daemons).unwrap();
+    for (name, _) in INSTALLED {
+        std::fs::copy(Path::new(SCRIPTS).join(name), lib.join(name)).unwrap();
+    }
     std::fs::write(
         lib.join("log/exec-20260101T000000-20260101T000000.jsonl"),
         "{}\n",
@@ -4193,6 +4280,9 @@ fn the_install_leaves_its_removal_script_and_run_from_there_it_removes_everythin
         ),
         "{said}"
     );
+    for (_, program) in NAMED {
+        assert!(!lib.join(program).exists(), "{program}");
+    }
     assert!(!top.exists());
     assert_eq!(std::fs::read_dir(&daemons).unwrap().count(), 0);
     let calls = std::fs::read_to_string(calls).unwrap();
@@ -4418,7 +4508,7 @@ fn tidy_plist(dir: &Dir, name: &str, cap: &str) -> PathBuf {
     path
 }
 
-/// The arguments a tidy job's launch daemon gives tidy.sh, as Apple's plutil reads them.
+/// The arguments a launch daemon gives, the tidy job's among them, as Apple's plutil reads them.
 fn tidy_args(path: &Path) -> Vec<String> {
     let out = Command::new("/usr/bin/plutil")
         .args(["-extract", "ProgramArguments", "json", "-o", "-"])
@@ -4523,13 +4613,7 @@ fn the_ten_minute_job_the_install_installs_runs_the_retention_with_the_cap_the_i
     std::fs::copy(&template, &broken).unwrap();
     let mut five = shipped[..3].to_vec();
     five.extend([GIB.to_string(), CAP.to_string()]);
-    let out = Command::new("/usr/bin/plutil")
-        .args(["-replace", "ProgramArguments", "-json"])
-        .arg(serde_json::to_string(&five).unwrap())
-        .arg(&broken)
-        .output()
-        .unwrap();
-    assert!(out.status.success());
+    with_args(&broken, &five);
     for (plist, given, stated) in [
         (&fresh, "--log-gib 1", "1073741824 given"),
         (&broken, "", "1073741824 kept"),
@@ -4561,8 +4645,8 @@ fn the_ten_minute_job_the_install_installs_runs_the_retention_with_the_cap_the_i
         );
         let moved: Vec<String> = args
             .iter()
-            .map(|a| a.replace(&format!("{LIB}/tidy.sh"), &format!("{SCRIPTS}/tidy.sh")))
             .map(|a| a.replace(&format!("{LIB}/log"), &log.display().to_string()))
+            .map(|a| a.replace(LIB, SCRIPTS))
             .collect();
         let from = now_secs();
         let ran = Command::new(&moved[0])
@@ -4590,33 +4674,30 @@ fn the_ten_minute_job_the_install_installs_runs_the_retention_with_the_cap_the_i
     let set = |name: &str, args: &[&str]| {
         let path = dir.0.join(name);
         std::fs::copy(&template, &path).unwrap();
-        let out = Command::new("/usr/bin/plutil")
-            .args(["-replace", "ProgramArguments", "-json"])
-            .arg(serde_json::to_string(args).unwrap())
-            .arg(&path)
-            .output()
-            .unwrap();
-        assert!(out.status.success());
+        with_args(
+            &path,
+            &args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+        );
         path
     };
-    let [sh, job, folder] = [&shipped[0], &shipped[1], &shipped[2]].map(String::as_str);
+    let [program, job, folder] = [&shipped[0], &shipped[1], &shipped[2]].map(String::as_str);
     let written = |cap: &str, args: &[&str]| {
         let path = set("written.plist", args);
         cap_code(&format!(
-            "cap_written {cap} '{}' '{sh}' '{job}' '{folder}'",
+            "cap_written {cap} '{}' '{program}' '{job}' '{folder}'",
             path.display()
         ))
         .0
     };
     let gib = GIB.to_string();
-    assert_eq!(written(&gib, &[sh, job, folder, &gib]), 0);
+    assert_eq!(written(&gib, &[program, job, folder, &gib]), 0);
     for args in [
-        vec![sh, job, folder, &gib, CAP],
-        vec![sh, job, folder, CAP],
-        vec![sh, job, folder],
+        vec![program, job, folder, &gib, CAP],
+        vec![program, job, folder, CAP],
+        vec![program, job, folder],
         vec![job, job, folder, &gib],
-        vec![sh, sh, folder, &gib],
-        vec![sh, job, job, &gib],
+        vec![program, program, folder, &gib],
+        vec![program, job, job, &gib],
     ] {
         assert_eq!(written(&gib, &args), 1, "{args:?}");
     }
@@ -4628,8 +4709,8 @@ fn the_ten_minute_job_the_install_installs_runs_the_retention_with_the_cap_the_i
     // list would read otherwise, is refused, with why, and left as it was.
     for args in [
         vec!["/bin/sh"],
-        vec![sh, job, r#"/Library/a"b"#, CAP],
-        vec![sh, r"/Library/a\b", folder, CAP],
+        vec![program, job, r#"/Library/a"b"#, CAP],
+        vec![program, r"/Library/a\b", folder, CAP],
     ] {
         let odd = set("odd.plist", &args);
         let (code, _, err) = cap_code(&format!("write_cap {CAP} '{}'", odd.display()));
@@ -4760,6 +4841,133 @@ fn installing_again_keeps_the_installed_cap_and_never_one_that_is_broken_or_too_
         "the default",
     ] {
         assert!(install.contains(from), "{from}");
+    }
+}
+
+/// The install's choice of the cap and its steps that put the scripts and the launch daemons in
+/// place, run by /bin/sh as an ordinary user over the system root `root`, with the shipped
+/// scripts as the checkout and `given` as its arguments: each step runs as written, but for who
+/// owns what it writes, which only root can set. Its exit code and stderr.
+fn placed(root: &Path, given: &str) -> (i32, String) {
+    let lib = root.join(LIB.trim_start_matches('/'));
+    let daemons = root.join("Library/LaunchDaemons");
+    for d in [&lib, &daemons] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    let steps = install_part(
+        "for f in $SCRIPTS; do",
+        "\n# A record an earlier install wrote",
+    );
+    assert!(steps.contains("step /usr/bin/install -o root -g wheel -m "));
+    let code = format!(
+        r#"{lists}LIB='{lib}'; DAEMONS='{daemons}'; here='{SCRIPTS}'
+{fail}
+{args}
+parse_args {given}
+step() {{
+    case $1 in
+    /usr/bin/install) shift 5 && /usr/bin/install "$@" ;;
+    /usr/sbin/chown) ;;
+    *) "$@" ;;
+    esac || fail "this step failed, and the install stopped here: $*"
+}}
+{chosen}
+{steps}"#,
+        lists = install_part("# In the order they are started", "\nhere="),
+        lib = lib.display(),
+        daemons = daemons.display(),
+        fail = install_part("left=\nfail() {", "# BEGIN the arguments\n"),
+        args = install_part("# BEGIN the arguments\n", "# END the arguments\n"),
+        chosen = install_part("TIDY=\"$DAEMONS/", "\ncapw="),
+    );
+    let out = Command::new("/bin/sh")
+        .env_clear()
+        .env("PATH", "/nonexistent")
+        .args(["-c", &code])
+        .output()
+        .unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8(out.stderr).unwrap(),
+    )
+}
+
+/// Lays the launch daemons out under the system root `root` as an install before the jobs named
+/// programs of their own did: the filter and the tidy job start /bin/sh, and the tidy job holds
+/// `cap`.
+fn earlier(root: &Path, cap: &str) {
+    let daemons = root.join("Library/LaunchDaemons");
+    std::fs::create_dir_all(&daemons).unwrap();
+    for label in LABELS {
+        let path = daemons.join(format!("{label}.plist"));
+        std::fs::copy(Path::new(SCRIPTS).join(format!("{label}.plist")), &path).unwrap();
+        let mut args = tidy_args(&path);
+        if NAMED.iter().any(|(l, _)| *l == label) {
+            args[0] = "/bin/sh".to_string();
+        }
+        if label.ends_with("event-tidy") {
+            args[3] = cap.to_string();
+        }
+        with_args(&path, &args);
+    }
+}
+
+#[test]
+fn the_cap_is_the_tidy_job_s_fourth_argument_after_an_install_one_with_log_gib_and_one_over_an_earlier_layout_and_the_status_reads_it()
+ {
+    // The tidy job names its own program at the first argument, and the cap stays the fourth,
+    // where rotated.sh, the install and the status read it: after a first install, the default;
+    // after one with --log-gib, that; after one over the layout before, whose tidy job started
+    // /bin/sh with a cap the person chose, the cap kept.
+    let dir = Dir::new("placed-cap");
+    std::fs::create_dir_all(dir.log()).unwrap();
+    for (given, before, cap) in [
+        ("", None, CAP),
+        ("--log-gib 3", None, "3221225472"),
+        ("", Some("5368709120"), "5368709120"),
+    ] {
+        if let Some(chosen) = before {
+            earlier(&dir.root(), chosen);
+        }
+        let (code, err) = placed(&dir.root(), given);
+        assert_eq!((code, err.as_str()), (0, ""), "{given}");
+        assert_eq!(
+            tidy_args(&dir.root().join(TIDY)),
+            [
+                format!("{LIB}/immunity-log-cleanup"),
+                format!("{LIB}/tidy.sh"),
+                format!("{LIB}/log"),
+                cap.to_string()
+            ],
+            "{given} {before:?}"
+        );
+        dir.run();
+        let l = &dir.status()["event_level"];
+        assert_eq!(l["log_cap_bytes"], cap.parse::<u64>().unwrap(), "{l:#}");
+    }
+}
+
+#[test]
+fn an_install_over_the_layout_before_leaves_no_job_starting_through_bin_sh() {
+    // The install replaces each launch daemon with the one it ships, so after it the filter and
+    // the tidy job start the programs named for them, installed executable beside the scripts,
+    // and nothing keeps /bin/sh from the launch daemons it replaced.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Dir::new("placed-over");
+    let root = dir.root();
+    earlier(&root, CAP);
+    let (code, err) = placed(&root, "");
+    assert_eq!((code, err.as_str()), (0, ""));
+    for label in LABELS {
+        let args = tidy_args(&root.join(format!("Library/LaunchDaemons/{label}.plist")));
+        assert_ne!(args[0], "/bin/sh", "{label}");
+    }
+    for (label, program) in NAMED {
+        let args = tidy_args(&root.join(format!("Library/LaunchDaemons/{label}.plist")));
+        assert_eq!(args[0], format!("{LIB}/{program}"), "{label}");
+        let installed = root.join(LIB.trim_start_matches('/')).join(program);
+        let mode = std::fs::metadata(&installed).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7777, 0o755, "{program}");
     }
 }
 
