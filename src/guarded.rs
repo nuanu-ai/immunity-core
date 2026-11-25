@@ -113,10 +113,22 @@ pub fn real(path: &Path, homes: &[&Path]) -> Real {
     real_in(path, homes, &[])
 }
 
-/// Like `real`, with the part it could not look at when that is where it failed: the folder
-/// it reached, made real, joined with the part's name (`closed::By::walk`).
-pub fn real_to(path: &Path, homes: &[&Path]) -> (Real, Option<PathBuf>) {
-    let mut stopped = None;
+/// Where a walk stopped, for `closed::By::stopped` to tell what refused.
+#[derive(Debug, Default)]
+pub struct Stopped {
+    /// The part it could not look at, when that is where it failed: the folder it reached,
+    /// made real, joined with the part's name.
+    pub part: Option<PathBuf>,
+    /// Whether any part it passed belongs to the account walking: each folder it entered and
+    /// each link it followed, by its own `lstat`, the folder it stopped in included. The Mac's
+    /// root, where every walk starts, is not looked at: it is root's.
+    pub own_on_the_way: bool,
+}
+
+/// Like `real`, with where it stopped: a reader that asks this is told what refused by the
+/// walk it made, never by another one.
+pub fn real_to(path: &Path, homes: &[&Path]) -> (Real, Stopped) {
+    let mut stopped = Stopped::default();
     (walk(path, homes, &[], &mut stopped), stopped)
 }
 
@@ -148,10 +160,10 @@ fn identities(homes: &[&Path]) -> (Option<Id>, Vec<(Id, PathBuf, PathBuf)>) {
 /// Like `real`, with the given checkout allowed under both its supplied and resolved names.
 /// Its guarded ancestors may be traversed to reach it.
 pub fn real_in(path: &Path, homes: &[&Path], given: &[&Path]) -> Real {
-    walk(path, homes, given, &mut None)
+    walk(path, homes, given, &mut Stopped::default())
 }
 
-fn walk(path: &Path, homes: &[&Path], given: &[&Path], stopped: &mut Option<PathBuf>) -> Real {
+fn walk(path: &Path, homes: &[&Path], given: &[&Path], stopped: &mut Stopped) -> Real {
     let exempt = |p: &Path, on_the_way: bool| {
         given
             .iter()
@@ -186,6 +198,8 @@ fn walk(path: &Path, homes: &[&Path], given: &[&Path], stopped: &mut Option<Path
     let mut done_id: Option<Id> = None;
     let mut ids = None;
     let mut links = 0;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let us = unsafe { libc::geteuid() };
     while let Some(part) = todo.pop_front() {
         if part == "." {
             continue;
@@ -212,9 +226,14 @@ fn walk(path: &Path, homes: &[&Path], given: &[&Path], stopped: &mut Option<Path
         {
             return Real::Guarded(name.clone());
         }
-        match std::fs::symlink_metadata(&next) {
+        let found = std::fs::symlink_metadata(&next);
+        if let Ok(m) = &found {
+            use std::os::unix::fs::MetadataExt;
+            stopped.own_on_the_way |= m.uid() == us;
+        }
+        match found {
             Err(e) => {
-                *stopped = Some(next);
+                stopped.part = Some(next);
                 return Real::Failed(e);
             }
             Ok(m) if m.file_type().is_symlink() => {

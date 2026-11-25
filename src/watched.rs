@@ -670,10 +670,11 @@ fn examine(
             };
         }
     };
-    let target = match crate::guarded::followed(path, &at.homes) {
-        Ok(target) => target,
-        Err(guarded) if keys.is_some() => return Examined::Unreached(guarded),
-        Err(guarded) => {
+    // The link is made real once, and a refusal on the way is told by that same walk.
+    let (target, stopped) = match guarded::real_to(path, &at.homes) {
+        (Real::At(target), _) => (Ok(target), None),
+        (Real::Guarded(guarded), _) if keys.is_some() => return Examined::Unreached(guarded),
+        (Real::Guarded(guarded), _) => {
             let why = format!(
                 "{}{}",
                 crate::guarded::NOT_LOOKED_INTO,
@@ -682,9 +683,10 @@ fn examine(
             look.met(guarded);
             return Examined::Present(Content::Unread(Cause::NotGiven, why), Some(link), None);
         }
+        (Real::Failed(e), stopped) => (Err(e), Some(stopped)),
     };
-    match std::fs::metadata(&target) {
-        Ok(meta) => counted(&target, &meta, keys, Some(link)),
+    match target.and_then(|t| std::fs::metadata(&t).map(|meta| (t, meta))) {
+        Ok((target, meta)) => counted(&target, &meta, keys, Some(link)),
         // A link to nothing holds no part: what reads the file reads nothing there.
         Err(e) if Absent::of(&e).is_some() && keys.is_some() => {
             Examined::Parts(Vec::new(), Vec::new(), Some(link), None)
@@ -693,10 +695,11 @@ fn examine(
             Examined::Present(Content::Dangling, Some(link), None)
         }
         Err(e) if keys.is_some() => Examined::Unread(reason(&e)),
-        // What refused is told by the link walked as the guard made it real (`closed::By::walk`).
+        // A target that failed after its walk reached it is not told by any walk.
         Err(e) => {
-            let by = crate::closed::By::walk(path, &at.homes);
-            let failed = crate::closed::Failure::of(&e, by, &target, reason(&e));
+            let by =
+                (stopped.as_ref()).map_or(crate::closed::By::Untold, crate::closed::By::stopped);
+            let failed = crate::closed::Failure::of(&e, by, path, reason(&e));
             Examined::Present(Content::Failed(failed), Some(link), None)
         }
     }
@@ -781,7 +784,8 @@ pub fn content_coverage(content: &Content, linked: bool) -> (&'static str, Optio
 /// The bytes of what `meta` describes, at most `cap` of them, or what it is instead. Only a
 /// regular file is opened, and without waiting: a file swapped for a named pipe after it was
 /// looked at cannot hold the run, and is told by what was opened. A failure to read it is said
-/// with whose the file is, taken after the failure (`closed::By::file`), for `closed::cause`.
+/// with the file as `meta` found it before and as it is after the failure (`closed::By::file`),
+/// for `closed::cause`.
 pub fn bytes(path: &Path, meta: &Metadata, cap: u64) -> Result<Vec<u8>, Content> {
     if !meta.is_file() {
         return Err(Content::Special(kind_of(meta.file_type())));
@@ -797,7 +801,7 @@ pub fn bytes(path: &Path, meta: &Metadata, cap: u64) -> Result<Vec<u8>, Content>
     };
     match read() {
         Err(e) => {
-            let by = crate::closed::By::file(path);
+            let by = crate::closed::By::file(path, meta);
             let failed = crate::closed::Failure::of(&e, by, path, reason(&e));
             Err(Content::Failed(failed))
         }
@@ -858,14 +862,15 @@ mod tests {
     {
         // No reader picks the calm cause: a file its permissions keep closed is a failure with
         // what `closed::cause` weighs, and until it is weighed its content reading failed.
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        use crate::closed::Object;
+        use std::os::unix::fs::PermissionsExt;
         let dir = crate::common::Scratch::new("watched-closed");
         let path = dir.join("helper");
         std::fs::write(&path, "invented\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         let meta = std::fs::metadata(&path).unwrap();
-        // Whose it is is taken after the refusal, not from what was looked at before the open,
-        // which may have been another file: here one of root's.
+        // The file as looked at before the open and as it is after the refusal, which may be
+        // two objects: here one of root's was looked at.
         let before = std::fs::metadata("/usr/bin/true").unwrap();
         let Err(Content::Failed(f)) = bytes(&path, &before, CAP) else {
             panic!("read");
@@ -873,7 +878,7 @@ mod tests {
         let why = "Permission denied (os error 13)";
         let said = crate::closed::Failure {
             errno: Some(libc::EACCES),
-            by: crate::closed::By::File(meta.uid()),
+            by: crate::closed::By::File(Object::of(&before), Some(Object::of(&meta))),
             // SAFETY: geteuid has no preconditions and cannot fail.
             us: unsafe { libc::geteuid() },
             real: path.clone(),
@@ -889,7 +894,8 @@ mod tests {
     }
 
     #[test]
-    fn a_link_whose_target_a_folder_on_its_path_keeps_closed_is_said_failed_with_that_folder() {
+    fn a_link_whose_target_a_folder_on_its_path_keeps_closed_is_said_failed_with_that_folder_by_its_walk()
+     {
         use std::os::unix::fs::PermissionsExt;
         let dir = crate::common::Scratch::new("watched-closed-folder");
         let shut = std::fs::canonicalize(&*dir).unwrap().join("shut");
@@ -911,7 +917,16 @@ mod tests {
         assert_eq!(to, "shut/helper");
         // SAFETY: geteuid has no preconditions and cannot fail.
         let us = unsafe { libc::geteuid() };
-        assert_eq!(f.by, crate::closed::By::Folder(shut, us));
+        // The walk that refused is the one that made the link real, and it passed folders and
+        // a link of this account's own.
+        let found = crate::closed::Folder {
+            path: shut,
+            owner: us,
+            dir: true,
+            own_on_the_way: true,
+            search: false,
+        };
+        assert_eq!(f.by, crate::closed::By::Folder(found));
         assert_eq!(f.errno, Some(libc::EACCES));
         assert_eq!(f.why, "Permission denied (os error 13)");
     }
