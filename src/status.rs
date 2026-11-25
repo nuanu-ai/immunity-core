@@ -1862,6 +1862,7 @@ mod tests {
         Level {
             state: RUNNING.to_string(),
             read_at: 0,
+            stored: (RUNNING.to_string(), 0),
             written: None,
             said_by: None,
             said: None,

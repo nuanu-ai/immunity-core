@@ -1053,13 +1053,12 @@ pub fn not_covered(
 
     out.extend(crate::fault::item(conn, latest, place)?);
 
-    let unread = crate::events::served_reading(level, latest);
+    let served = crate::events::served_readings(level, latest, this);
     // Readings that failed: those kept closed by permissions, which the owner can open, and
     // the rest. On a server that could not be opened they are implied by it and told there.
     let away: BTreeSet<&str> = p.unreached.iter().map(|u| u.scope.as_str()).collect();
-    let (closed, other): (Vec<&Latest>, Vec<&Latest>) = latest
+    let (closed, other): (Vec<&Latest>, Vec<&Latest>) = served
         .iter()
-        .chain(&unread)
         .filter(|r| failed(r) && !earlier_probe(r))
         .filter(|r| !(r.reader == servers::READER && away.contains(r.scope.as_str())))
         .partition(|r| not_permitted(r.reason.as_deref()));
@@ -1122,9 +1121,9 @@ pub fn not_covered(
         }
         // Recording program starts, not files: the rules for files do not watch. The collector
         // installed records less than this build reads, a fault while it stays so.
-        if l.state == crate::events::RUNNING && !l.files.collected {
+        if let Some(since) = l.files_not_collected() {
             out.push(Uncovered {
-                since: Some(l.read_at),
+                since: Some(since),
                 fault: true,
                 ..Uncovered::new(&FILES_NOT_COLLECTED, 1)
             });

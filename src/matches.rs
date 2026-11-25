@@ -1292,10 +1292,13 @@ mod tests {
     }
 
     /// The watcher's failed reading makes failed only a level the store says runs: a level that
-    /// records nothing keeps its own state and words. A reading the store itself holds as failed
-    /// is named once, by its own row, and a full one is said failed while the level is served so.
+    /// records nothing keeps its own state and words. A failed reading, the watcher's or the
+    /// store's own, is named once among the readings that failed, in place of this Mac's row of
+    /// program starts or with none there. File events not collected stay named, by what the
+    /// store says of the level and since its reading, beside the failure.
     #[test]
-    fn a_level_is_served_failed_only_over_running_and_a_failed_reading_is_named_once() {
+    fn a_level_is_served_failed_only_over_running_and_its_failure_is_named_once_with_or_without_a_row()
+     {
         let dir = crate::common::Scratch::new("matches-served");
         let conn = store::open_or_make(&dir.join("store.db")).unwrap();
         let watcher = [crate::watch::Failure {
@@ -1309,21 +1312,52 @@ mod tests {
             events::served(&conn, &watcher, 10).unwrap().unwrap()
         };
         assert_eq!(put(events::SILENT).state, events::SILENT);
+        let own = put(events::FAILED);
         let failed = put(events::RUNNING);
         assert_eq!((failed.state.as_str(), failed.read_at), (events::FAILED, 5));
-        let row = |completeness: &str, cause: Option<&str>| crate::view::Latest {
+        let row = |scope: &str, completeness: &str| crate::view::Latest {
             reader: events::READER.to_string(),
-            scope: "machine:mac".to_string(),
+            scope: scope.to_string(),
             kind: events::KIND.to_string(),
             completeness: completeness.to_string(),
             reason: None,
-            cause: cause.map(str::to_string),
+            cause: None,
             at: 1,
-            last_full: None,
+            last_full: Some(1),
         };
-        let served = |row| events::served_reading(Some(&failed), &[row]).map(|r| r.at);
-        assert_eq!(served(row("full", None)), Some(5));
-        assert_eq!(served(row("none", Some("failed"))), None);
+        let this = Some("machine:mac");
+        // Each row as (scope, completeness, at).
+        let served = |level: &events::Level, rows: &[crate::view::Latest]| {
+            let rows = events::served_readings(Some(level), rows, this);
+            let told = rows
+                .iter()
+                .map(|r| (r.scope.clone(), r.completeness.clone(), r.at));
+            told.collect::<Vec<_>>()
+        };
+        let other = || row("machine:other", "full");
+        let failure = ("machine:mac".to_string(), "none".to_string(), 5);
+        let kept = ("machine:other".to_string(), "full".to_string(), 1);
+        let mine = [other(), row("machine:mac", "full")];
+        assert_eq!(served(&failed, &mine), [kept.clone(), failure.clone()]);
+        assert_eq!(served(&failed, &[other()]), [kept.clone(), failure]);
+        // A level whose own reading failed is named once too, with its row or without.
+        let failed_row = [row("machine:mac", "none")];
+        let own_failure = ("machine:mac".to_string(), "none".to_string(), 1);
+        assert_eq!(
+            served(&own, &failed_row),
+            std::slice::from_ref(&own_failure)
+        );
+        assert_eq!(served(&own, &[]), [own_failure]);
+        // With no row at all, both the failure and file events not collected are listed.
+        let p = crate::status::problems(&conn, &[]).unwrap();
+        let items = crate::covered::not_covered(&conn, &[], &p, None, Some(&failed)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|u| u.cause.id).collect();
+        assert!(ids.contains(&crate::covered::READING_FAILED.id), "{ids:?}");
+        let files = items
+            .iter()
+            .find(|u| u.cause.id == crate::covered::FILES_NOT_COLLECTED.id);
+        // Since the store's reading, not the watcher's failure.
+        assert_eq!(files.map(|u| u.since), Some(Some(1)), "{ids:?}");
     }
 
     #[test]

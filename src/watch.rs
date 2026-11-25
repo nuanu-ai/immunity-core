@@ -1848,13 +1848,13 @@ pub fn watcher(
     };
     let (last, failed) = match conn {
         Some(conn) => (
-            last_read(conn)?.filter(|last| *last >= since),
+            last_read(conn)?.filter(|last| since.is_some_and(|since| *last >= since)),
             failures(conn, lock)?,
         ),
         None => (None, Vec::new()),
     };
     Ok(Some(v1::Watcher {
-        since_at: Some(since),
+        since_at: since,
         last_read_at: last,
         failed: failed
             .iter()
@@ -1889,7 +1889,7 @@ pub fn basis(conn: &Connection, folder: &Path) -> rusqlite::Result<String> {
         LockState::Unrecorded { .. } => "unrecorded",
     };
     let failed: Vec<String> = failures(conn, &lock)?.into_iter().map(|f| f.what).collect();
-    Ok(format!("{since} {state} {}", failed.join(",")))
+    Ok(format!("{since:?} {state} {}", failed.join(",")))
 }
 
 /// One reading of the watcher's lock file: whether a watcher holds the store, and what the file
@@ -1902,30 +1902,28 @@ enum Held {
     Unknown,
     /// None holds it; when the latest left for a new core, as its file says (`left_at`).
     No(Option<i64>),
-    /// One holds it: when it took the lock and what its file says, `None` when the file is not
-    /// a heartbeat lock (`read_lock`) or the watcher has not touched it within `STALLED`.
-    Yes(Option<(i64, LockState)>),
+    /// One holds it: when it took the lock, where the file says, and what its file says
+    /// (`heard`); `None` when it has not touched the file within `STALLED`.
+    Yes(Option<(Option<i64>, LockState)>),
 }
 
 impl Lock {
     /// Reads the lock file of the store in `folder`, once.
     pub fn read(folder: &Path) -> Lock {
+        #[cfg(test)]
+        tests::READS.with(|n| n.set(n.get() + 1));
         let path = folder.join(store::WATCH_LOCK);
         let text = || Some(String::from_utf8_lossy(&std::fs::read(&path).ok()?).into_owned());
         Lock(match store::watch_in_progress(folder) {
             Err(_) => Held::Unknown,
             Ok(false) => Held::No(text().as_deref().and_then(left_at)),
-            Ok(true) => Held::Yes(text().and_then(|text| {
-                let modified = std::fs::metadata(&path).ok()?.modified().ok()?;
-                (modified.elapsed().ok()? < STALLED)
-                    .then(|| read_lock(&text))
-                    .flatten()
-            })),
+            Ok(true) => Held::Yes(heard(&path)),
         })
     }
 
-    /// When the watcher that holds the lock took it, and what its file says of it (`Held::Yes`).
-    fn responsive(&self) -> Option<(i64, &LockState)> {
+    /// When the watcher that holds the lock took it, where its file says, and what the file says
+    /// of it (`Held::Yes`).
+    fn responsive(&self) -> Option<(Option<i64>, &LockState)> {
         match &self.0 {
             Held::Yes(Some((since, state))) => Some((*since, state)),
             _ => None,
@@ -1948,6 +1946,34 @@ impl Lock {
             Held::No(Some(at)) if (now - at).abs() <= RESTARTING_FOR => Some(at),
             _ => None,
         }
+    }
+}
+
+/// What the lock file a watcher holds says of it: when it took the lock and its state, `None`
+/// when it has not touched the file within `STALLED`. The time is taken from the open file before
+/// its bytes are read, so a write between the two pairs newer bytes with an older time: the pair
+/// errs towards a stall, never towards bytes fresher than their time. A lock that is held is a
+/// watcher that runs, so a file that cannot be read, or that holds no heartbeat lock (empty, as a
+/// new watcher leaves it before its first write, or half written), is a watcher starting, with no
+/// start time.
+fn heard(path: &Path) -> Option<(Option<i64>, LockState)> {
+    let starting = Some((None, LockState::Starting));
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return starting;
+    };
+    let Ok(modified) = file.metadata().and_then(|m| m.modified()) else {
+        return starting;
+    };
+    if modified.elapsed().ok()? >= STALLED {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return starting;
+    }
+    match read_lock(&String::from_utf8_lossy(&bytes)) {
+        Some((since, state)) => Some((Some(since), state)),
+        None => starting,
     }
 }
 
@@ -2113,7 +2139,8 @@ pub struct Failure {
 /// one of the kind `STORE`; places the lock file says are left unwatched are one of `PLACES`.
 /// A failed full check is over once any full check has finished after it, by hand or not.
 pub fn failures(conn: &Connection, lock: &Lock) -> rusqlite::Result<Vec<Failure>> {
-    let Some((since, state)) = lock.responsive() else {
+    // A watcher whose file says no start time is starting, and nothing of its own has failed.
+    let Some((Some(since), state)) = lock.responsive() else {
         return Ok(Vec::new());
     };
     let mut failed = conn
@@ -2163,6 +2190,11 @@ pub fn last_read(conn: &Connection) -> rusqlite::Result<Option<i64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    thread_local! {
+        /// How many times this thread read a lock file (`Lock::read`).
+        pub(super) static READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
 
     /// A folder whose watcher's lock is held by the returned handle, as a watcher holds it.
     fn held(tag: &str) -> (crate::common::Scratch, std::fs::File) {
@@ -2290,8 +2322,9 @@ mod tests {
             Some(Seen::Failing(vec![EVENTS.into(), STORE.into()]))
         );
         // A lock held with no heartbeat in it is no watcher.
+        // A lock held with no heartbeat lock in it is a watcher starting.
         put_lock(&lock, "damaged");
-        assert_eq!(seen(&store_path), Some(Seen::Absent));
+        assert_eq!(seen(&store_path), Some(Seen::Starting));
         // One that left for a new core a moment ago is restarting, until the time is over.
         let left = format!("{since}\nheartbeat\ncore-replaced {}", crate::now_secs());
         put_lock(&lock, &left);
@@ -2311,7 +2344,10 @@ mod tests {
         let now = crate::now_secs();
         let since = now - 10;
         put_lock(&lock, &format!("{since}\nheartbeat\nready"));
+        // Counted through `READS`: the answer's state reads the file once and its message none.
+        READS.with(|n| n.set(0));
         let st = status::state(&conn, &dir, now).unwrap();
+        assert_eq!(READS.with(|n| n.get()), 1);
         // The watcher says the store did not take a failure, then leaves for a new core.
         put_lock(
             &lock,
@@ -2321,14 +2357,19 @@ mod tests {
         crate::common::release(lock);
         let m = status::message(Some(&conn), Some(&st), false, &dir.join("store.db"), now);
         let m = m.unwrap();
+        assert_eq!(READS.with(|n| n.get()), 1);
         let w = m.watching.unwrap();
         assert!(m.this_mac.unwrap().live);
         assert_eq!((w.since_at, w.failed.len()), (Some(since), 0));
         assert_eq!(m.watcher_restarting_since_at, None);
+        // Without a store, the message reads it once itself.
+        READS.with(|n| n.set(0));
+        status::message(None, None, false, &dir.join("none.db"), now).unwrap();
+        assert_eq!(READS.with(|n| n.get()), 1);
     }
 
     /// Which of `turned_on` and `turned_off` came last is the journal's order, never the clock,
-    /// and is said as soon as either is there.
+    /// either way round, and is said as soon as either is there.
     #[test]
     fn turned_on_latest_is_the_journal_s_order_and_said_with_either_entry() {
         let (dir, _lock, conn) = watcher_of("watch-turned-on-latest");
@@ -2343,24 +2384,61 @@ mod tests {
         assert_eq!(latest(&conn), Some(false));
         store::journal_note(&conn, 40, run, "turned_on", "").unwrap();
         assert_eq!(latest(&conn), Some(true));
+        store::journal_note(&conn, 30, run, "turned_off", "").unwrap();
+        assert_eq!(latest(&conn), Some(false));
     }
 
+    /// A lock that is held is a watcher that runs: with no heartbeat lock in its file, empty or
+    /// half written, it is starting, with no start time, and never live.
     #[test]
-    fn a_held_lock_without_a_heartbeat_line_or_with_a_damaged_one_is_not_a_watcher() {
+    fn a_held_lock_with_no_heartbeat_lock_in_its_file_is_a_watcher_starting_and_never_live() {
         let (dir, lock) = held("watch-lock-damaged");
         for text in [
             "1800000000",
             "1800000000\n",
+            "1800000000\nheart",
             "1800000000\nheartbeet\nready",
             "18OO000000\nheartbeat\nready",
             "",
         ] {
             put_lock(&lock, text);
-            assert!(Lock::read(&dir).responsive().is_none(), "{text:?}");
+            let starting = Some((None, &LockState::Starting));
+            assert_eq!(Lock::read(&dir).responsive(), starting, "{text:?}");
             assert!(!watching_live(&dir), "{text:?}");
         }
         put_lock(&lock, "1800000000\nheartbeat\nready");
         assert!(watching_live(&dir));
+    }
+
+    /// After `immunity on`, a new watcher that holds the lock and has not written its file yet is
+    /// starting on the terminal and on the page, never off and never calm.
+    #[test]
+    fn a_watcher_holding_an_empty_lock_after_immunity_on_is_starting_and_never_calm() {
+        let (dir, lock, conn) = watcher_of("watch-empty-lock");
+        let now = crate::now_secs();
+        store::journal_note(
+            &conn,
+            now - 60,
+            crate::service::JOURNAL_RUN,
+            "turned_on",
+            "",
+        )
+        .unwrap();
+        put_lock(&lock, "");
+        let st = status::state(&conn, &dir, now).unwrap();
+        let m = status::message(Some(&conn), Some(&st), false, &dir.join("store.db"), now);
+        let m = m.unwrap();
+        assert_eq!(m.watching.as_ref().map(|w| w.since_at), Some(None));
+        assert_eq!(case(&m), Case::Starting);
+        assert_ne!(m.headline, crate::contract::v1::Headline::Calm as i32);
+        let terminal = crate::overview::watching(&m, &crate::screen::Screen::pipe()).0;
+        let page = crate::pages::watcher_said("not_checked", case(&m), "", now);
+        for said in [terminal, page] {
+            assert!(
+                said.contains(STARTING_WORDS) && !said.contains("off"),
+                "{said}"
+            );
+        }
     }
 
     #[test]
@@ -2372,11 +2450,13 @@ mod tests {
         assert!(watching_live(&dir));
         let mut heartbeat =
             Heartbeat::start(&lock, 1_800_000_001, Duration::from_secs(3600)).unwrap();
-        assert!(Lock::read(&dir).responsive().is_none());
+        // Emptied: starting, with no start time.
+        let starting = Some((None, &LockState::Starting));
+        assert_eq!(Lock::read(&dir).responsive(), starting);
         heartbeat.write().unwrap();
         assert_eq!(
             Lock::read(&dir).responsive(),
-            Some((1_800_000_001, &LockState::Starting))
+            Some((Some(1_800_000_001), &LockState::Starting))
         );
         drop(heartbeat);
     }

@@ -1233,17 +1233,21 @@ fn a_job_whose_process_never_took_the_lock_is_never_reported_as_started() {
             Some("no watcher runs on the store now")
         )
     );
-    // A lock held with no heartbeat in it is no watcher's either.
+    // A lock that is held is a watcher that runs: with no heartbeat lock in its file, as a new
+    // watcher leaves it before its first write, it is starting, as the status says, and not
+    // watching.
     login.watcher = Some(login.hold_watcher(""));
     let held = login.watcher.as_ref().unwrap();
     held.set_len(0).unwrap();
     std::os::unix::fs::FileExt::write_all_at(held, b"damaged", 0).unwrap();
-    let text = String::from_utf8(login.immunity(Path::new(CORE), &["on"], &[]).stdout).unwrap();
-    assert!(
-        text.starts_with("Immunity Core is on, but its watcher has not started")
-            && text.contains("Not started")
-            && !text.contains("✓ Started"),
-        "{text}"
+    let m = service(&login.run("on", &[]));
+    assert_eq!(
+        (m.started, m.watching, m.watcher_note.as_deref()),
+        (
+            Some(true),
+            Some(false),
+            Some("a watcher runs and has not completed its first reading")
+        )
     );
 }
 

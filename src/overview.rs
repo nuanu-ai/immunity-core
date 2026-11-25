@@ -441,7 +441,7 @@ fn faults(s: &v1::Status, screen: &Screen, with_causes: bool) -> Vec<Fault> {
 /// and no failure.
 fn watcher_faults(s: &v1::Status, screen: &Screen) -> Vec<Fault> {
     let now = s.answered_at;
-    let mut out: Vec<Fault> = s
+    let out: Vec<Fault> = s
         .watching
         .iter()
         .flat_map(|w| &w.failed)
@@ -458,20 +458,12 @@ fn watcher_faults(s: &v1::Status, screen: &Screen) -> Vec<Fault> {
             }
         })
         .collect();
+    // Every sentence of the watcher is its case's (`watch::case`), as on the pages.
     use crate::watch::Case;
-    let case = crate::watch::case(s);
-    let live = matches!(case, Case::Live | Case::LiveFailed);
-    // A restart is said whatever else the message says: its parts can be read at other moments.
-    if s.watcher_restarting_since_at.is_some() {
-        out.push(Fault {
-            not_live: !live && out.is_empty(),
-            ..Fault::new(sentence(crate::watch::RESTARTING_WORDS))
-        });
-    }
-    if live || !out.is_empty() {
-        return out;
-    }
-    let fault = match case {
+    let fault = match crate::watch::case(s) {
+        // Each failure that stands is said above.
+        Case::Live | Case::LiveFailed | Case::Failing => return out,
+        Case::Restarting => Fault::new(sentence(crate::watch::RESTARTING_WORDS)),
         Case::Starting => Fault::new(sentence(crate::watch::STARTING_WORDS)),
         Case::OffNotByCommand { on, job } => Fault::new(match job {
             Some(false) => format!(
@@ -497,7 +489,7 @@ fn watcher_faults(s: &v1::Status, screen: &Screen) -> Vec<Fault> {
         Case::JobInPlace => {
             Fault::new("The watcher is not running: its login job is in place").run("immunity on")
         }
-        _ => {
+        Case::NotInstalled | Case::NoWatcher => {
             Fault::new("No watcher runs: changes are seen only at a check you run").run("immunity on")
         }
     };
@@ -819,7 +811,14 @@ pub(crate) fn answer(
     .filter(|_| !findings && !s.running);
     // An answer that is not fresh is said beside what was found, by the reason the message gives.
     if findings && !fresh {
-        let no_watcher = s.watching.is_none() && s.watcher_restarting_since_at.is_none();
+        let no_watcher = !matches!(
+            crate::watch::case(s),
+            crate::watch::Case::Live
+                | crate::watch::Case::LiveFailed
+                | crate::watch::Case::Failing
+                | crate::watch::Case::Starting
+                | crate::watch::Case::Restarting
+        );
         let reason = m.and_then(|m| m.stale_reason.as_deref());
         faults.insert(
             0,
@@ -934,7 +933,10 @@ pub(crate) fn answer(
         faults.push(Fault::new("Something was not read in full").run("immunity status --coverage"));
     }
     // A watcher watching live says so under a headline that says what was found.
-    let live = m.is_some_and(|m| m.live) && s.watching.is_some();
+    let live = matches!(
+        crate::watch::case(s),
+        crate::watch::Case::Live | crate::watch::Case::LiveFailed
+    );
     let calm = said.starts_with('✓');
     if state.is_none() && live && (findings || calm) {
         let projects = s.estate.as_ref().map_or(0, |e| e.checkouts);
@@ -3590,10 +3592,17 @@ mod tests {
     }
 
     #[test]
-    fn a_restart_of_the_watcher_is_said_whatever_else_the_message_says() {
-        // Live, with a watcher on the store, and restarting: read at other moments, all said.
+    fn the_terminal_says_the_watchers_one_case_and_a_restart_only_while_no_watcher_holds_the_store()
+    {
+        // Live, with a watcher on the store, and a restart's time, which one reading never gives
+        // together: the watcher on the store is the case (`watch::case`), as on the pages.
         let mut s = calm_status();
         s.watcher_restarting_since_at = Some(NOW - 30);
+        let text = super::status(&s, &Screen::pipe(), false);
+        assert!(fault_lines_of(&text).is_empty(), "{text}");
+        // With none on the store, the restart is the case.
+        s.this_mac.as_mut().unwrap().live = false;
+        s.watching = None;
         let text = super::status(&s, &Screen::pipe(), false);
         assert_eq!(
             fault_lines_of(&text),

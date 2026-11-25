@@ -3858,6 +3858,9 @@ fn left(tx: &Transaction) -> rusqlite::Result<Left> {
 pub struct Level {
     pub state: String,
     pub read_at: i64,
+    /// The state and the time of the latest reading as the store holds them, which `served`
+    /// leaves as they are when it says the level failed.
+    pub stored: (String, i64),
     pub written: Option<i64>,
     pub said_by: Option<String>,
     pub said: Option<crate::secrets::Text>,
@@ -3895,6 +3898,13 @@ pub struct Files {
 }
 
 impl Level {
+    /// Since when file events are not seen while the store says the level runs: the collector
+    /// installed records less than this build reads. Decided by the store's state, so a failed
+    /// reading by the watcher (`served`) never hides it.
+    pub fn files_not_collected(&self) -> Option<i64> {
+        (self.stored.0 == RUNNING && !self.files.collected).then_some(self.stored.1)
+    }
+
     /// The rules for file events watch: the level runs and its collector records file events.
     pub fn files_watched(&self) -> bool {
         self.state == RUNNING && self.files.collected
@@ -4014,6 +4024,7 @@ pub fn level(conn: &Connection, now: i64) -> rusqlite::Result<Option<Level>> {
         files,
         arrivals: arrivals(conn)?,
         cap: cap(conn)?,
+        stored: (state.clone(), read_at),
         state,
         read_at,
         written,
@@ -4050,25 +4061,32 @@ pub fn served(
     Ok(level)
 }
 
-/// The store's reading of program starts in `latest` as `served` says it, when the two differ:
-/// failed, while the level is served failed and the store's own reading of it stands. So the
-/// watcher's failed reading is named among the readings that failed (`covered::not_covered`)
-/// as the store's own would be.
-pub fn served_reading(
+/// The latest readings as `served` says them: while the level is served failed, by the watcher's
+/// reading or by the store's own, that failed reading stands for this Mac's reading of program
+/// starts, `this`, in place of the store's row when there is one and beside the rest when there
+/// is none. So `covered::not_covered` names it once, among the readings that failed.
+pub fn served_readings<'a>(
     level: Option<&Level>,
-    latest: &[crate::view::Latest],
-) -> Option<crate::view::Latest> {
-    let l = level.filter(|l| l.state == FAILED)?;
-    let r = latest
-        .iter()
-        .find(|r| r.reader == READER && r.kind == KIND)?;
-    (!crate::covered::failed(r)).then(|| crate::view::Latest {
+    latest: &'a [crate::view::Latest],
+    this: Option<&str>,
+) -> std::borrow::Cow<'a, [crate::view::Latest]> {
+    let Some(l) = level.filter(|l| l.state == FAILED) else {
+        return std::borrow::Cow::Borrowed(latest);
+    };
+    let scope = this.unwrap_or_default();
+    let mine = |r: &crate::view::Latest| r.reader == READER && r.kind == KIND && r.scope == scope;
+    let failed = crate::view::Latest {
+        reader: READER.into(),
+        scope: scope.into(),
+        kind: KIND.into(),
         completeness: "none".into(),
         reason: l.reason.clone(),
         cause: Some(Cause::Failed.literal().into()),
         at: l.read_at,
-        ..r.clone()
-    })
+        last_full: latest.iter().find(|r| mine(r)).and_then(|r| r.last_full),
+    };
+    let others = latest.iter().filter(|r| !mine(r)).cloned();
+    std::borrow::Cow::Owned(others.chain([failed]).collect())
 }
 
 /// The cap of the log, as the latest reading left it.
@@ -5851,6 +5869,7 @@ mod tests {
         let mut l = Level {
             state: RUNNING.to_string(),
             read_at: 0,
+            stored: (RUNNING.to_string(), 0),
             written: None,
             said_by: None,
             said: None,
@@ -5899,6 +5918,7 @@ mod tests {
         let l = Level {
             state: RUNNING.to_string(),
             read_at: 1_000,
+            stored: (RUNNING.to_string(), 1_000),
             written: None,
             said_by: None,
             said: None,
@@ -5952,6 +5972,7 @@ mod tests {
         let l = Level {
             state: RUNNING.to_string(),
             read_at: 0,
+            stored: (RUNNING.to_string(), 0),
             written: None,
             said_by: None,
             said: None,

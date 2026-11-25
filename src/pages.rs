@@ -255,7 +255,12 @@ fn state(
 /// How this Mac is watched (`state`, as `ThisMac.state` says it) and the watcher's case, in the
 /// page's words: the case as the terminal's picks it (`watch::case`), then what failed in the
 /// watcher, `failed` in words, when anything did.
-fn watcher_said(state: &str, case: crate::watch::Case, failed: &str, now: i64) -> String {
+pub(crate) fn watcher_said(
+    state: &str,
+    case: crate::watch::Case,
+    failed: &str,
+    now: i64,
+) -> String {
     use crate::watch::Case;
     let words = match case {
         Case::Live | Case::LiveFailed => "live".to_string(),
@@ -3192,6 +3197,20 @@ mod tests {
         let mut left = calm();
         left.watching = None;
         assert_eq!(crate::watch::case(&left), Case::NoWatcher);
+        // A watcher on the store, not live, beside a restart's time is starting: the terminal says
+        // that case alone, as the page does, and no restart.
+        let mut both = calm();
+        both.this_mac.as_mut().unwrap().live = false;
+        both.watcher_restarting_since_at = Some(now - 5);
+        both.store = Some(v1::StoreFile {
+            exists: true,
+            ..Default::default()
+        });
+        assert_eq!(crate::watch::case(&both), Case::Starting);
+        let text = crate::overview::status(&both, &crate::screen::Screen::pipe(), false);
+        // Its first letter aside, which a sentence makes a capital.
+        assert!(text.contains(&crate::watch::STARTING_WORDS[1..]), "{text}");
+        assert!(!text.contains("restarting"), "{text}");
         let mut said = BTreeSet::new();
         for (case, s, both) in &cases {
             assert_eq!(crate::watch::case(s), *case);
@@ -3386,6 +3405,7 @@ mod tests {
         let level_as = |state: &str, collected: bool, arrivals| Level {
             state: state.to_string(),
             read_at: 0,
+            stored: (state.to_string(), 0),
             written: None,
             said_by: None,
             said: None,

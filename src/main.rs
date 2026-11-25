@@ -1665,7 +1665,12 @@ fn current_view(
     ) else {
         return Ok(Current::No);
     };
-    let outlived = made["until"].as_i64().is_some_and(|until| until < now);
+    // None is what pages made on a stale check have; one that is not a time this build did not
+    // write, and the pages are not current.
+    let outlived = match &made["until"] {
+        serde_json::Value::Null => false,
+        until => until.as_i64().is_none_or(|until| until < now),
+    };
     if !(at..at + view::CURRENT_FOR).contains(&now) || outlived {
         return Ok(Current::No);
     }
@@ -6360,5 +6365,12 @@ mod tests {
         drop(conn);
         write_view(&path, false).unwrap();
         assert!(current(now_secs() + 60));
+        // An `until` that is not a time is not what this build wrote: the pages are not current.
+        let made = dir.join(view::MADE);
+        let mut written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&made).unwrap()).unwrap();
+        written["until"] = "later".into();
+        std::fs::write(&made, written.to_string()).unwrap();
+        assert!(!current(now_secs() + 60));
     }
 }
