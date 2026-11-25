@@ -176,28 +176,21 @@ pub enum Text {
 
 /// `texts` of the property list at `path`, `None` when nothing is there. Anything there but a
 /// regular file (a link, a folder, a pipe, a device) is the error without being opened. The file
-/// is read as a stranger's file is (`autorun::read_capped_resolved`): a regular file only,
-/// opened without waiting and without following a link in its last part, at most
-/// `watched::CAP` bytes. Why it was not read, or not taken as a property list, is the error.
+/// is read by `open::read` as a file of the core's own: a regular file only, opened without
+/// waiting and without following a link in its last part, at most `watched::CAP` bytes. Why it
+/// was not read, or not taken as a property list, is the error.
 #[allow(clippy::type_complexity)]
 pub fn texts_at<'k>(
     path: &std::path::Path,
     keys: &[&'k str],
 ) -> Result<Option<Vec<(&'k str, Text)>>, String> {
-    match std::fs::symlink_metadata(path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.to_string()),
-        Ok(m) if m.file_type().is_symlink() => {
-            return Err("a symbolic link, which is not followed".to_string());
-        }
-        Ok(m) if !m.is_file() => {
-            let what = crate::watched::kind_of(m.file_type());
-            return Err(format!("a {what}, not a regular file"));
-        }
-        Ok(_) => {}
+    use crate::open::Refused;
+    match crate::open::read(path, crate::open::Reach::Own, crate::watched::CAP) {
+        Err(Refused::Look(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(Refused::Kind("symbolic link")) => Err("a symbolic link, which is not followed".into()),
+        Err(refused) => Err(refused.to_string()),
+        Ok(bytes) => texts(&bytes, keys).map(Some).map_err(str::to_string),
     }
-    let bytes = crate::autorun::read_capped_resolved(path, crate::watched::CAP)?;
-    texts(&bytes, keys).map(Some).map_err(str::to_string)
 }
 
 /// For each of `keys` the file holds at its top, in the order given, the value there as text.

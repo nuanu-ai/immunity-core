@@ -14,6 +14,7 @@
 //! A visit that fails never destroys the reading an earlier one left: it leaves
 //! `<alias>.failed` with its time and reason instead, which `immunity run` reads.
 
+use crate::open::{Reach, UNCAPPED};
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -26,7 +27,8 @@ const SKIP_HEADER: &str =
 
 /// The aliases listed in `skip.txt` in the folder; none when there is no such file.
 pub fn skip_list(dir: &Path) -> BTreeSet<String> {
-    std::fs::read_to_string(dir.join(SKIP))
+    let bytes = crate::open::read(&dir.join(SKIP), Reach::Own, UNCAPPED).unwrap_or_default();
+    String::from_utf8(bytes)
         .unwrap_or_default()
         .lines()
         .map(str::trim)

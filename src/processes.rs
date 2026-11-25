@@ -34,6 +34,7 @@
 
 use crate::codesign;
 use crate::findings::Observed;
+use crate::open::{Reach, UNCAPPED};
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -776,7 +777,7 @@ fn listed_addresses(tx: &Transaction, folder: &Path) -> rusqlite::Result<Vec<IpA
     use crate::indicators;
     let raw = crate::store::last_raw(tx, indicators::READER, indicators::LIST)?;
     let list = raw
-        .and_then(|raw| std::fs::read(folder.join(raw)).ok())
+        .and_then(|raw| crate::open::read(&folder.join(raw), Reach::Own, UNCAPPED).ok())
         .and_then(|bytes| indicators::parse(&bytes).ok());
     Ok(list
         .iter()

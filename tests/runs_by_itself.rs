@@ -456,7 +456,7 @@ fn a_task_file_that_is_not_a_regular_file_or_is_too_large_is_a_failed_reading() 
     e.run();
     assert_eq!(
         e.coverage(TASKS_KIND),
-        "none|could not be read: dev/a/.vscode/tasks.json (not a regular file); dev/b/.vscode/tasks.json (over the size cap of 1024 KiB)"
+        "none|could not be read: dev/a/.vscode/tasks.json (a folder, not a regular file); dev/b/.vscode/tasks.json (over the size cap of 1024 KiB)"
     );
 }
 
@@ -832,6 +832,32 @@ fn a_walk_given_a_folder_closes_the_known_projects_gone_from_it_and_none_outside
     assert_eq!(
         e.coverage(CHECKOUTS_KIND),
         "partial|only the given folder was walked"
+    );
+}
+
+#[test]
+fn a_checkout_deleted_and_made_again_is_not_gone_and_a_run_that_does_not_read_it_says_so() {
+    // Made again at its path, it holds a retracted `located_on` and a live one. A run whose walk
+    // is pointed elsewhere reads nothing in it: its readings are counted as not repeated, in the
+    // run's line and on the page of changes, as those of a checkout that never went.
+    let e = Estate::new("made-again");
+    let make = || put(&e.checkout("dev/shop").join("package-lock.json"), LOCK);
+    make();
+    e.full();
+    std::fs::remove_dir_all(e.home().join("dev/shop")).unwrap();
+    e.full();
+    make();
+    e.full();
+    let line = e.run_in(&e.0.join("empty"));
+    assert!(
+        line.contains("2 earlier readings were not repeated."),
+        "{line}"
+    );
+    let latest = e.page("changes.html");
+    let latest = latest.split("<details").nth(1).unwrap();
+    assert!(
+        latest.contains("2 readings read before were not read in this run."),
+        "{latest}"
     );
 }
 

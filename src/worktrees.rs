@@ -86,7 +86,7 @@ fn at(path: &Path, homes: &[&Path]) -> Option<PathBuf> {
 /// link into a guarded folder and is opened without waiting.
 pub fn pointer(path: &Path, homes: &[&Path]) -> Option<String> {
     let path = guarded::followed(path, homes).ok()?;
-    let bytes = crate::autorun::read_capped(&path, POINTER_CAP).ok()?;
+    let bytes = crate::open::read(&path, crate::open::Reach::Place, POINTER_CAP).ok()?;
     Some(String::from_utf8(bytes).ok()?.trim().to_string())
 }
 

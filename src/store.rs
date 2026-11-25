@@ -352,6 +352,21 @@ latest AS (
 )
 ";
 
+/// The condition that the entity `x` names is gone: what `x IN (SELECT id FROM gone_entity)`
+/// says for an `x` that is never NULL, asked of that one id through `assertion_subject`. The
+/// view reads every retracted fact through `assertion_reading`, about 130 ms on an invented
+/// store a year old; the unary `+` keeps the planner off that index. `x` is qualified by a table
+/// of the statement, since an unqualified name such as `scope` would be read as a column of
+/// `assertion` here, and the aliases are unlike any a statement around it uses.
+pub fn gone_entity(x: &str) -> String {
+    format!(
+        "(EXISTS (SELECT 1 FROM assertion gone_r WHERE gone_r.subject = {x}
+                  AND gone_r.predicate = 'located_on' AND +gone_r.layer = 'retracted')
+          AND NOT EXISTS (SELECT 1 FROM assertion gone_l WHERE gone_l.subject = {x}
+                          AND gone_l.predicate = 'located_on' AND +gone_l.layer = 'live'))"
+    )
+}
+
 /// Why a reading is incomplete. The order is from worst: a reading incomplete for several
 /// reasons takes the worst of them, so that it never looks better than it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -946,14 +961,17 @@ pub fn lock_waiting(handle: File) -> std::io::Result<Option<File>> {
     }
 }
 
-/// Whether a process holds the lock taken by `lock_waiting` on the file or folder at `path`
-/// now. It opens it only to read, creates nothing, and holds the lock shared for a moment,
-/// which a process taking it meanwhile waits out. Nothing at the path is no lock held.
+/// Whether a process holds the lock taken by `lock_waiting` on the file at `path` now. It opens
+/// it only to read (`open::open`), creates nothing, and holds the lock shared for a moment,
+/// which a process taking it meanwhile waits out. Nothing at the path is no lock held; anything
+/// but a regular file there is an error.
 pub fn held(path: &Path) -> std::io::Result<bool> {
-    let handle = match File::open(path) {
-        Ok(handle) => handle,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e),
+    use crate::open::Refused;
+    let handle = match crate::open::open(path, crate::open::Reach::Own, crate::open::UNCAPPED) {
+        Ok((handle, _)) => handle,
+        Err(Refused::Look(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(Refused::Look(e) | Refused::Failed(e)) => return Err(e),
+        Err(refused) => return Err(std::io::Error::other(refused)),
     };
     match handle.try_lock_shared() {
         Ok(()) => Ok(false),
@@ -1349,7 +1367,8 @@ pub fn totals(tx: &Connection, run_id: &str) -> rusqlite::Result<Totals> {
             "{LATEST}
              SELECT COUNT(*) FROM reading
              WHERE scope NOT IN (SELECT scope FROM coverage WHERE run_id = ?1)
-               AND scope NOT IN (SELECT id FROM gone_entity)"
+               AND NOT {}",
+            gone_entity("reading.scope")
         ))?,
     })
 }
@@ -2771,6 +2790,48 @@ mod tests {
     }
 
     #[test]
+    fn a_place_read_before_and_not_in_a_run_is_not_repeated_unless_what_holds_it_is_gone() {
+        // `located_on` decides it: a checkout whose only one was retracted is gone; one with a
+        // live one again is not, nor is a machine, which has none.
+        let mut k = Kept::new("not-repeated");
+        let (gone, back) = ("checkout:machine:mac/gone", "checkout:machine:mac/back");
+        let read = |scope| {
+            (
+                crate::lockfiles::READER,
+                scope,
+                crate::lockfiles::KIND,
+                FULL,
+            )
+        };
+        let server = (
+            crate::servers::READER,
+            "machine:web-1",
+            crate::servers::PACKAGES,
+            FULL,
+        );
+        k.run(true, &[read(gone), read(back), server]);
+        for (layer, subject) in [("retracted", gone), ("retracted", back), ("live", back)] {
+            k.conn
+                .execute(
+                    "INSERT INTO assertion (layer, subject, predicate, object, reader, scope, kind,
+                                            source_ref, basis, observed_at, run_id, retracted_at)
+                     VALUES (?1, ?2, 'located_on', ?3, 'checkouts', ?2, ?4, '', ?5, 1, 'r1',
+                             CASE WHEN ?1 = 'retracted' THEN 2 END)",
+                    params![
+                        layer,
+                        subject,
+                        MAC,
+                        crate::lockfiles::KIND,
+                        crate::lockfiles::BASIS
+                    ],
+                )
+                .unwrap();
+        }
+        let run = k.run(true, &[("watched-places", MAC, PROFILES, FULL)]);
+        assert_eq!(totals(&k.conn, &run).unwrap().not_repeated, 2);
+    }
+
+    #[test]
     fn nothing_is_folded_before_any_run_journaled_nor_from_the_runs_kept_whole() {
         let mut k = Kept::new("young");
         for _ in 0..5 {
@@ -2916,5 +2977,15 @@ mod tests {
         let missing = dir.join("store.db");
         assert!(roll_back(&missing).is_err());
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn a_pipe_or_a_link_to_a_device_in_place_of_a_lock_file_is_an_error_and_never_holds_a_status() {
+        let dir = crate::common::Scratch::new("store-held-refused");
+        let [pipe, zero, ..] = crate::open::tests::refusals(&dir);
+        for path in [pipe, zero] {
+            let held = crate::open::tests::within(move || held(&path).is_err());
+            assert_eq!(held, Some(true));
+        }
     }
 }

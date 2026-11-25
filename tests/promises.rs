@@ -10758,12 +10758,15 @@ fn a_lockfile_of_a_kind_without_a_reader_is_named_as_such_by_status_and_the_repo
             && row("yarn.lock version 2"),
         "{printed}"
     );
-    // The pages list what is read: what this version has no reader for is the status's to say.
+    // What this version has no reader for is a limit: said once, at the end of the summary.
     let pages = view_pages(&store);
-    for name in ["view.html", "this-mac.html"] {
-        let page = page_named(&pages, name);
-        assert!(!page.contains("id=\"not-understood\""), "{page}");
-    }
+    let summary = page_named(&pages, "view.html");
+    assert!(
+        section(summary, "not-read-here").contains("<li id=\"not-understood\">"),
+        "{summary}"
+    );
+    let this_mac = page_named(&pages, "this-mac.html");
+    assert!(!this_mac.contains("id=\"not-understood\""), "{this_mac}");
 
     let second = immunity_home(&store, &brew, &absent);
     assert!(
@@ -13333,15 +13336,14 @@ fn the_summary_page_says_what_status_says_with_each_item_in_full_and_no_markup_f
         !body.contains("var(--now)") && !body.contains("fg open now"),
         "{body}"
     );
-    // It opens with whether this Mac is watched: its name as data, how it is watched and the last
-    // full check right there; then the findings, open and answered; then what is watched; then
-    // what happens as it happens; then what the owner can fix, with what could not be judged on
-    // this Mac closed under it.
+    // It opens with whether this Mac is watched: its name as data and the last full check right
+    // there, and no watcher as the fault the terminal says; then the findings, open and answered; then what is watched; then
+    // what happens as it happens; then what the owner can fix; last, collapsed, what this version
+    // does not read here.
     let this_mac = section(page, "this-mac");
     assert!(
-        this_mac.contains("<span class=\"name\">mac</span>")
-            && this_mac.contains(" · no watcher runs · ")
-            && this_mac.contains("last check <time datetime=\"2"),
+        this_mac.contains("<span class=\"name\">mac</span> · last check <time datetime=\"2")
+            && this_mac.contains("<p class=\"sub fault\">! No watcher runs: "),
         "{this_mac}"
     );
     assert!(
@@ -13357,9 +13359,11 @@ fn the_summary_page_says_what_status_says_with_each_item_in_full_and_no_markup_f
         "watched-here",
         "as-it-happens",
         "you-can-fix",
+        "not-read-here",
     ];
     assert!(order.windows(2).all(|w| at(w[0]) < at(w[1])), "{page}");
-    // The one thing the owner can do here is turn the event level on.
+    // The one thing the owner can do here, turn the event level on, is a limit: told with its
+    // advice among the limits, and no fault to fix.
     let yours: Vec<&str> = r["not_covered"]
         .as_array()
         .unwrap()
@@ -13368,28 +13372,33 @@ fn the_summary_page_says_what_status_says_with_each_item_in_full_and_no_markup_f
         .map(|u| u["id"].as_str().unwrap())
         .collect();
     assert_eq!(yours, ["program-starts-not-seen"]);
-    // Each cause is in full where it belongs: what the owner can fix on the summary, and a
-    // reading of this Mac that failed on the page the summary's one line links to. The pages
-    // list what is read, so anything else is left out of both: a limit of this version, true
-    // of every Mac, and what this version has no reader for on this one.
+    // Each cause is told once where it belongs, by the status's `fault`: a fault the owner can
+    // fix on the summary, any other fault on the page the summary's one line links to, and a
+    // limit in the summary's last section, its title in one line.
     let fix = section(page, "you-can-fix");
     let not_read = not_read(&pages);
-    let failed_here = |u: &serde_json::Value| {
-        u["who"] != "you" && u["holds_on"] != "every_mac" && u["class"] == "failed"
-    };
+    let limits = section(page, "not-read-here");
+    let failed_here = |u: &serde_json::Value| u["who"] != "you" && u["fault"] == true;
     for u in r["not_covered"].as_array().unwrap() {
         let id = u["id"].as_str().unwrap();
+        let told: usize = pages
+            .iter()
+            .map(|(_, html)| html.matches(&format!(" id=\"{id}\"")).count())
+            .sum();
+        assert_eq!(told, 1, "{id}");
+        if u["fault"] != true {
+            let title = u["title"].as_str().unwrap().replace('\'', "&#39;");
+            assert!(
+                limits.contains(&format!("<li id=\"{id}\">{title}")),
+                "{id}: {limits}"
+            );
+            continue;
+        }
         let (held, tag) = if u["who"] == "you" {
             (fix, format!("<article class=\"fixc\" id=\"{id}\">"))
         } else {
             (not_read, format!("<article class=\"item\" id=\"{id}\">"))
         };
-        if u["who"] != "you" && !failed_here(u) {
-            for (_, html) in &pages {
-                assert!(!html.contains(&format!(" id=\"{id}\"")), "{id}");
-            }
-            continue;
-        }
         let start = held.find(&tag).unwrap_or_else(|| panic!("{id}: {held}"));
         let article = &held[start..start + held[start..].find("</article>").unwrap()];
         for part in ["title", "meaning", "advice"] {
@@ -13441,9 +13450,10 @@ fn the_summary_page_says_what_status_says_with_each_item_in_full_and_no_markup_f
         assert!(!html.contains("<img") && !html.contains('\u{202e}'));
         assert!(!html.contains("http://") && !html.contains("https://"));
     }
-    // The limits of this version are not on the page, and nothing is answered yet.
+    // A limit of this version is said once, in the last section, and nothing is answered yet.
+    let compared = "Known vulnerabilities are not yet compared with your installed software";
     assert!(
-        !page.contains("Known vulnerabilities are not yet compared with your installed software"),
+        page.matches(compared).count() == 1 && limits.contains(compared),
         "{page}"
     );
     assert!(!page.contains("cannot be judged"), "{page}");
@@ -13642,11 +13652,16 @@ fn each_link_on_the_summary_shows_what_its_label_says_first_thing_on_arrival() {
     assert!(page.contains(" id=\"you-can-fix\""), "{page}");
     // What a person lands on first is in his words, not the program's. What a source said,
     // listed apart under its item, is data. The rules' own words are a person's words where
-    // they are written, and "an app you build yourself" is not about this program's build.
+    // they are written, and "an app you build yourself" is not about this program's build. A
+    // fault is the status's own line, with what its source said in it.
     let mut words = page[page.find("<main>").unwrap()..].to_string();
-    for list in ["<ul class=\"readings mono\">", "<ul class=\"rules\">"] {
+    for (list, end) in [
+        ("<ul class=\"readings mono\">", "</ul>"),
+        ("<ul class=\"rules\">", "</ul>"),
+        ("<p class=\"sub fault\">", "</p>"),
+    ] {
         while let Some(start) = words.find(list) {
-            let end = start + words[start..].find("</ul>").unwrap();
+            let end = start + words[start..].find(end).unwrap();
             words.replace_range(start..end, "");
         }
     }

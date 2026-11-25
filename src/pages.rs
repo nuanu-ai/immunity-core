@@ -1,9 +1,12 @@
 //! The pages a person lands on: the summary, which answers what the app answers; what is
 //! watched on this Mac, kind by kind; and what is beyond it. Every sentence is in plain
 //! words: what something means for the owner, and whether he can do something about it.
-//! What holds on every Mac, the limits of this version, is not on the pages: the documents
-//! and the commands' machine form say it. The other pages are reached from the links at the
-//! bottom of the summary.
+//! The summary says a state and its faults at the top, as the default status decides them
+//! (`overview::told`); what is read, in the table, a row drawn as a fault only by a fault of the
+//! status; and every limit of this version here once, collapsed, at its end (`not_read_here.rs`).
+//! Whether a thing not covered is a fault or a limit is the status's word (`Uncovered.fault`):
+//! the pages decide neither. The other pages are reached from the links at the bottom of the
+//! summary.
 //!
 //! Every link on the summary leads to a section that lists exactly what its label says,
 //! under a heading that says it, first thing on arrival.
@@ -31,7 +34,7 @@ pub const RULES: &str = "rules";
 /// The heading of that page and of the summary's section about it.
 const RULES_TITLE: &str = "Published rules";
 /// The heading of that page, which the tile leading to it is named by.
-const THREAT_DATA_TITLE: &str = "Threat data";
+pub(crate) const THREAT_DATA_TITLE: &str = "Threat data";
 pub const TECHNICAL: &str = "technical";
 pub const VULNERABILITIES: &str = "vulnerabilities";
 
@@ -103,8 +106,9 @@ fn about(what: &str) -> &'static str {
 /// on what it rests on; the findings as a table, open, answered and all, each row opening in
 /// place to its evidence as `immunity finding` gives it; what is watched, area by area, with its
 /// state and when it was last read; "As it happens", every program start checked against
-/// published rules (`happens.rs`); what the person can fix, and what on this Mac was not judged;
-/// and a line of links to the other pages. Built from the state and the result
+/// published rules (`happens.rs`); the faults the person can fix; once, collapsed, what this
+/// version does not read here (`not_read_here.rs`); and a line of links to the other pages.
+/// Built from the state and the result
 /// `immunity status --json` gives, so the two agree.
 pub fn summary(
     conn: &Connection,
@@ -116,18 +120,16 @@ pub fn summary(
     let latest = view::latest_coverage(conn)?;
     let map = crate::map::read(conn, st, &latest)?;
     let mac = findings::This::of(conn, covered::this_machine(conn)?)?;
-    let fixable: Vec<&Uncovered> = st
-        .not_covered
-        .iter()
-        .filter(|u| u.cause.who == YOU)
-        .collect();
+    let (faults, limits) = sorted(st, r);
+    let fixable = fixable(&faults);
     // The scope of the answer, said once as a link to where each thing is named.
     state(conn, &mut out, st, r, now)?;
     findings_table(conn, &mut out, st, mac.as_ref(), now)?;
-    let failed = failed_here(st).len();
-    watched_table(conn, &mut out, st, &map, &latest, &fixable, failed, now)?;
+    let failed = failed_here(&faults).len();
+    watched_table(conn, &mut out, st, &map, &latest, &faults, failed, now)?;
     crate::happens::draw(&mut out, st, &r.rules.clone().unwrap_or_default(), now)?;
     you_can_fix(&mut out, &fixable)?;
+    crate::not_read_here::section(&mut out, &limits)?;
     let name = crate::store::held_mac(conn)?.map(|(_, name)| name);
     links(&mut out, name.as_deref(), now)?;
     out.push_str(FOOT);
@@ -137,8 +139,8 @@ pub fn summary(
 /// The state's glyph, one shape for each state, as the panel draws it, so colour is never the
 /// only sign: a disc with an exclamation mark in `--now` when something needs the person now; a
 /// disc with an eye in `--look` when there are things to look at and none is urgent; a disc with
-/// a tick in `--calm` for nothing to look at on a Mac watched in full; a ring with a tick in
-/// `--look` for one watched in part; a ring with a clock in `--quiet` for an answer that is old; a
+/// a tick in `--calm` for nothing to look at; a ring with a tick in `--look` for nothing to look
+/// at while a fault stands (`in_part`); a ring with a clock in `--quiet` for an answer that is old; a
 /// dashed ring with a question mark in `--quiet` when it is not known. The glyph's class names its
 /// state, and the band takes a thin tint of the same colour from it. The colours are the
 /// stylesheet's, defined once.
@@ -168,9 +170,10 @@ fn needs_you(urgent: u64, total: u64) -> String {
 }
 
 /// The state band: the glyph and the headline in the panel's words, then one short line: this
-/// Mac's name as data, why the headline cannot say more when it cannot, how it is watched, the
-/// last full check and when the page was made. A state the page cannot work out is said as not
-/// known, never as calm.
+/// Mac's name as data, why the headline cannot say more when it cannot, the state the terminal
+/// says under its headline, the last full check and when the page was made; under it every
+/// fault the terminal lists (`band`). A state the page cannot work out is said as not known,
+/// never as calm.
 fn state(
     conn: &Connection,
     out: &mut String,
@@ -199,18 +202,14 @@ fn state(
         Ok(H::NotChecked) if m.state == "not_checked" => {
             (GLYPH_UNKNOWN, "Nothing has been checked yet.".to_string())
         }
-        Ok(H::NotChecked | H::Stale) => {
-            if let Some(reason) = r.this_mac.as_ref().and_then(|t| t.stale_reason.as_deref()) {
-                why.push(esc(reason));
-            }
-            (
-                GLYPH_STALE,
-                match m.checked_at {
-                    Some(t) => format!("Not checked since {}", view::when(t, now)),
-                    None => "No full check has finished".to_string(),
-                },
-            )
-        }
+        // Why it is not fresh is the state under it, as the terminal says it.
+        Ok(H::NotChecked | H::Stale) => (
+            GLYPH_STALE,
+            match m.checked_at {
+                Some(t) => format!("Not checked since {}", view::when(t, now)),
+                None => "No full check has finished".to_string(),
+            },
+        ),
         Ok(H::Calm) => (GLYPH_CALM, "Nothing needs you".to_string()),
         Ok(H::InPart) => (GLYPH_PART, "Nothing needs you".to_string()),
         _ => {
@@ -234,8 +233,8 @@ fn state(
         ));
     }
     parts.extend(why);
-    let failed = covered::watcher_failed(m);
-    parts.push(watcher_said(m.state, crate::watch::case(r), &failed, now));
+    let (said, faults) = band(r);
+    parts.extend(said);
     parts.push(match m.checked_at {
         Some(t) => format!("last check {}", view::when(t, now)),
         None => "no full check yet".to_string(),
@@ -246,53 +245,52 @@ fn state(
     }
     writeln!(
         out,
-        "<section id=\"this-mac\">\n{glyph}\n<div>\n<h1>{headline}</h1>\n<p class=\"sub\">{}</p>\n</div>\n</section>",
+        "<section id=\"this-mac\">\n{glyph}\n<div>\n<h1>{headline}</h1>\n<p class=\"sub\">{}</p>\n{faults}</div>\n</section>",
         parts.join(" · ")
     )?;
     Ok(())
 }
 
-/// How this Mac is watched (`state`, as `ThisMac.state` says it) and the watcher's case, in the
-/// page's words: the case as the terminal's picks it (`watch::case`), then what failed in the
-/// watcher, `failed` in words, when anything did.
-pub(crate) fn watcher_said(
-    state: &str,
-    case: crate::watch::Case,
-    failed: &str,
-    now: i64,
-) -> String {
-    use crate::watch::Case;
-    let words = match case {
-        Case::Live | Case::LiveFailed => "live".to_string(),
-        Case::Failing => "live watching is off".to_string(),
-        Case::Starting => crate::watch::STARTING_WORDS.to_string(),
-        Case::Restarting => crate::watch::RESTARTING_WORDS.to_string(),
-        Case::OffNotByCommand { on, job } => format!(
-            "Immunity Core is off, and immunity off did not turn it off: turned on {}{}",
-            view::when(on, now),
-            match job {
-                Some(true) => ", its job is in place and not running",
-                Some(false) => ", its job is gone",
-                None => "",
-            }
-        ),
-        Case::OffByCommand { off } => format!(
-            "Immunity Core is off: turned off {} with immunity off",
-            view::when(off, now)
-        ),
-        Case::JobInPlace => "no watcher runs: its login job is in place and not running".into(),
-        Case::NotInstalled => "no watcher runs: the login job is not installed".to_string(),
-        Case::NoWatcher => "no watcher runs".to_string(),
+/// The terminal's times for the band's words: a page says them as `immunity status` does.
+const TERMINAL: crate::screen::Screen = crate::screen::Screen {
+    terminal: true,
+    colour: false,
+    width: None,
+};
+
+/// What the band says under its headline, as the default status decides it for the message
+/// (`overview::told`), and nothing of its own: the state, for the line under the headline; and
+/// each fault, a block of its own: `!` and the core's words, what the source said as data, the
+/// words after it, its command after a middle dot, and what the person can do on a line under.
+pub(crate) fn band(r: &v1::Status) -> (Option<String>, String) {
+    let told = crate::overview::told(r, &TERMINAL);
+    let run = |c: Option<&str>| {
+        c.map_or(String::new(), |c| {
+            format!(
+                " · <span class=\"cmd\"><span class=\"mono\">{}</span>{COPY}</span>",
+                esc(c)
+            )
+        })
     };
-    let mut said = match state {
-        "watched_in_part" => format!("watched in part · {words}"),
-        "watched" if matches!(case, Case::Live | Case::LiveFailed) => format!("watched {words}"),
-        _ => words,
-    };
-    if !failed.is_empty() {
-        said.push_str(&format!(" · the watcher's latest {failed} failed"));
-    }
-    said
+    let state = (told.state.as_ref()).map(|(words, c)| format!("{}{}", esc(words), run(*c)));
+    let faults = (told.faults.iter())
+        .map(|f| {
+            let (words, said, tail, c, advice) = f.parts();
+            let said = said.map_or(String::new(), |s| {
+                format!(": <span class=\"said\">{}</span>", esc_said(s))
+            });
+            let advice = advice.map_or(String::new(), |a| {
+                format!("<span class=\"advice\">{}</span>", esc(a))
+            });
+            format!(
+                "<p class=\"sub fault\">! {}{said}{}{}{advice}</p>\n",
+                esc(words),
+                esc(tail),
+                run(c)
+            )
+        })
+        .collect();
+    (state, faults)
 }
 
 /// One row of the table of findings: one thing. Its finding, whether that is open, and the
@@ -1130,16 +1128,16 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
 }
 
 /// How a row of what is watched stands: its dot's classes and its words, which are safe HTML.
-/// Read in full is a filled dot of `--calm`; read in part, not read or failed a hollow one of
-/// `--look`; none here or a plain count a filled one of `--quiet`; never checked a hollow one of
-/// `--quiet`. Only coverage: findings are not repeated here.
+/// Read, in full or as far as this version reads here, is a filled dot of `--calm`; a fault a
+/// hollow one of `--look`; none here or a plain count a filled one of `--quiet`; never checked a
+/// hollow one of `--quiet`. Only coverage: findings are not repeated here.
 struct Standing {
     dot: &'static str,
     said: String,
 }
 
 impl Standing {
-    /// Read in full.
+    /// Read, in full or as far as this version reads here.
     fn read(said: &str) -> Standing {
         Standing {
             dot: " calm",
@@ -1152,7 +1150,7 @@ impl Standing {
         Standing { dot: "", said }
     }
 
-    /// Read in part, not read, or failed.
+    /// A fault.
     fn not(said: String) -> Standing {
         Standing {
             dot: " off look",
@@ -1221,10 +1219,13 @@ fn last_read(readings: &[&Latest]) -> Option<i64> {
 }
 
 /// What is watched, as a table by kind of place, grouped as on this Mac, in your projects and
-/// beyond this Mac: how often each is looked at, how many things, whether it was read and when,
-/// from the latest readings in the store, as the page of coverage shows them. "None here" and
-/// "read in full" are said only where every reading that fills the row is full and fresh. Then
-/// one line: how many things on this Mac were not judged, as a link to the page that names each.
+/// beyond this Mac: how often each is looked at, how many things, its state and when it was last
+/// read, from the latest readings in the store. A row's state is one of three: the faults of the
+/// message that name it, linked to where they are told, and only they are drawn as faults; else
+/// how it was read, "read in full" and "none here" only where every reading that fills the row is
+/// full, "read" where something left it short, and "not checked yet" with no reading of it; else
+/// a plain count. A limit is never a row's fault: it is told once, at the end. Then one line: how
+/// many faults on this Mac nothing the person does changes, as a link to the page that names each.
 #[allow(clippy::too_many_arguments)]
 fn watched_table(
     conn: &Connection,
@@ -1232,20 +1233,36 @@ fn watched_table(
     st: &crate::status::State,
     map: &crate::map::Map,
     latest: &[Latest],
-    fixable: &[&Uncovered],
+    faults: &[&Uncovered],
     failed: usize,
     now: i64,
 ) -> Out {
     let m = &st.this_mac;
     let this = covered::this_machine(conn)?;
     let mac = findings::This::of(conn, this.clone())?;
-    let latest_run = crate::status::latest_finished(conn)?.map(|r| r.started_at);
-    let fix_link = "<a href=\"#you-can-fix\">you can fix</a>";
-    // An example is the place's name alone (`covered::Example`), so it is matched whole.
-    let can_fix = |place: &str| {
-        fixable
-            .iter()
-            .any(|u| u.examples.iter().any(|e| e.name == place))
+    let place = |scope: &str| findings::place(scope, mac.as_ref());
+    // What the faults name, each a place's name alone (`covered::Example`), so it is matched
+    // whole; and those of them the person can fix.
+    let named = |list: &[&Uncovered]| -> BTreeSet<String> {
+        (list.iter())
+            .flat_map(|u| u.examples.iter().map(|e| e.name.clone()))
+            .collect()
+    };
+    let (at_fault, can_fix) = (named(faults), named(&fixable(faults)));
+    // Where a fault is told in full: "You can fix", or the page of what could not be read, its
+    // label naming that place before what the row says.
+    let told = |fixable: bool, said: String| {
+        let (href, at) = match fixable {
+            true => ("#you-can-fix".to_string(), "You can fix"),
+            false => (
+                format!("{DETAILS}/{THIS_MAC}.html#{NOT_READ}"),
+                NOT_READ_TITLE,
+            ),
+        };
+        let said = esc(&said);
+        Standing::not(format!(
+            "<a href=\"{href}\" aria-label=\"{at}: {said}\">{said}</a>"
+        ))
     };
     writeln!(
         out,
@@ -1261,56 +1278,77 @@ fn watched_table(
         };
         let readings = readings_of(count, latest);
         let n = m.watched.iter().find(|w| w.0 == what).map(|w| w.1);
-        let mut walk = walk_gap(count, latest, this.as_deref());
-        if let Count::Dependencies = count {
-            // Known vulnerabilities rest on the data too: a feed not current leaves the
-            // answer short, as on the page of known vulnerabilities (`vulnerability_gap`).
-            walk.extend(old_feeds(conn, now)?);
-        }
-        let gap = unread(&readings, latest_run, now, &walk);
-        let mut states: Vec<Standing> = Vec::new();
+        // Its things a fault names: a reading of it that failed, the walk that finds the
+        // projects it is kept in, or a watched file.
+        let walks = (latest.iter()).filter(|r| {
+            covered::in_projects(count)
+                && (crate::project::FOUND_BY.iter())
+                    .any(|(by, kind)| r.reader == *by && r.kind == *kind)
+        });
+        let mut cannot: BTreeSet<String> = (readings.iter().copied().chain(walks))
+            .filter(|r| covered::failed(r))
+            .map(|r| place(&r.scope))
+            .filter(|p| at_fault.contains(p))
+            .collect();
         if let Count::Files(as_) = count {
-            let failed: Vec<String> = conn
+            let files: Vec<String> = conn
                 .prepare(
                     "SELECT DISTINCT subject FROM assertion
                      WHERE layer = 'live' AND reader = ?1 AND predicate = 'watched_as'
                        AND object = ?2 ORDER BY subject",
                 )?
                 .query_map(params![watched::READER, as_], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<String>>>()?
-                .into_iter()
-                .filter(|f| {
-                    latest
-                        .iter()
-                        .any(|r| r.scope == *f && r.completeness != "full")
-                })
-                .map(|f| findings::place(&f, mac.as_ref()))
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            cannot.extend((files.iter().map(|f| place(f))).filter(|p| at_fault.contains(p)));
+        }
+        // Read in full only where every reading of it is full and not dated ahead of the clock,
+        // the walk that finds its projects was whole, and for the packages the vulnerability
+        // data is current. Whatever of that is short is a fault only by the message's word.
+        let mut walk = walk_gap(count, latest, this.as_deref());
+        if let Count::Dependencies = count {
+            walk.extend(old_feeds(conn, now)?);
+        }
+        let whole = walk.is_empty()
+            && (readings.iter())
+                .all(|r| r.completeness == "full" && crate::store::age(r.at, now).is_some());
+        let mut faulted: Vec<Standing> = Vec::new();
+        if !cannot.is_empty() {
+            let fixable = cannot.iter().all(|p| can_fix.contains(p));
+            let said = format!("{} can't be read now", grouped(cannot.len() as i64));
+            faulted.push(told(fixable, said));
+        }
+        // The faults of what the packages are compared with, by the message's items.
+        let by = |ids: &[&str], said: &str| {
+            let of: Vec<&&Uncovered> = (faults.iter())
+                .filter(|u| ids.contains(&u.cause.id))
                 .collect();
-            if !failed.is_empty() {
-                let mut said = format!("{} can't be read", grouped(failed.len() as i64));
-                if failed.iter().any(|f| can_fix(f)) {
-                    let _ = write!(said, " · {fix_link}");
-                }
-                states.push(Standing::not(said));
-            }
+            (!of.is_empty()).then(|| told(of.iter().all(|u| u.cause.who == YOU), said.into()))
+        };
+        if let Count::Dependencies = count {
+            let data = [
+                covered::VULNERABILITY_DATA_OLD.id,
+                covered::VULNERABILITY_DATA_FIXABLE.id,
+            ];
+            faulted.extend(by(&data, "vulnerability data not current"));
         }
         let mut things = n.map_or("—".to_string(), grouped);
+        // The packages' own state, and beside it what the comparison found.
+        let (mut read, mut beside) = (None, Vec::new());
         if let Count::Dependencies = count {
             if let Some(n) = n {
                 things = grouped(n);
             }
             let t = crate::vulnerabilities::totals(conn, now)?;
-            let open = map.projects_open();
-            if !t.matched {
-                states.push(Standing::never("not compared yet"));
-            } else if open > 0 {
-                states.push(Standing::not(esc(&format!(
-                    "{} not compared",
-                    counted(open as i64, "project", "projects")
-                ))));
-            } else if gap.is_none() {
-                states.push(Standing::read("compared at every check"));
-            }
+            // At every check only where every project was compared in full; why one was not is
+            // a fault above or a limit at the end.
+            // And compared at all only where a project was: with none, nothing is said read.
+            let all = whole && map.projects_open() == 0;
+            read = Some(match (t.matched, t.projects_compared, all) {
+                (false, ..) => Standing::never("not compared yet"),
+                (true, 0, _) => Standing::never("no project compared"),
+                (true, _, true) => Standing::read("compared at every check"),
+                (true, _, false) => Standing::read("compared"),
+            });
             if t.matched {
                 let known: usize = t
                     .records_by_label
@@ -1319,7 +1357,7 @@ fn watched_table(
                     .map(|(_, n)| n)
                     .sum();
                 if known > 0 {
-                    states.push(Standing::none(format!(
+                    beside.push(Standing::none(format!(
                         "<a href=\"{DETAILS}/{VULNERABILITIES}.html\">{}</a>",
                         esc(&counted(
                             known as i64,
@@ -1329,39 +1367,41 @@ fn watched_table(
                     )));
                     // "None used in attacks" rests on the list of them having been read; one
                     // that is used is a finding, in the table of findings.
+                    // Its fault is the list's download, by the message's items.
                     if !any_used(conn)? {
-                        states.push(match exploited_gap(conn, now)? {
-                            Some(gap) => Standing::not(format!(
-                                "<span title=\"{}\">whether any is used in attacks is not known</span>",
-                                esc_said(&gap)
-                            )),
-                            None => Standing::read("none is known to be used in attacks"),
+                        let list = [covered::THREATS_UNREAD.id, covered::THREATS_FIXABLE.id];
+                        let unknown = "whether any is used in attacks is not known";
+                        beside.push(match crate::threats::last_good(conn)?.is_none() {
+                            true => {
+                                by(&list, unknown).unwrap_or_else(|| Standing::none(esc(unknown)))
+                            }
+                            false => Standing::read("none is known to be used in attacks"),
                         });
                     }
                 }
             }
         }
-        if let Some(gap) = &gap {
-            if readings.is_empty() && walk.is_empty() && n.is_none() && states.is_empty() {
-                states.push(Standing::never("not checked yet"));
-            } else {
-                states.push(Standing::not(format!(
-                    "<span title=\"{}\">not read in full</span>",
-                    esc_said(gap)
-                )));
+        let read = read.unwrap_or_else(|| {
+            // With no reading of it, a count proves nothing read.
+            if readings.is_empty() {
+                return Standing::never("not checked yet");
             }
-        }
-        if states.is_empty() {
             // Of a kind kept in projects, while projects were not looked for everywhere:
             // what was read is the projects found.
             let found = covered::in_projects(count) && not_entered(latest, this.as_deref());
-            states.push(match (n.unwrap_or(0) == 0, found) {
-                (true, true) => Standing::none("none in the projects found".to_string()),
-                (true, false) => Standing::none("none here".to_string()),
-                (false, true) => Standing::read("read in the projects found"),
-                (false, false) => Standing::read("read in full"),
-            });
-        }
+            match (n.unwrap_or(0) == 0, found, whole) {
+                (true, true, true) => Standing::none("none in the projects found".to_string()),
+                (true, false, true) => Standing::none("none here".to_string()),
+                (_, true, _) => Standing::read("read in the projects found"),
+                (false, false, true) => Standing::read("read in full"),
+                (_, false, false) => Standing::read("read"),
+            }
+        });
+        let mut states = match faulted.is_empty() {
+            true => vec![read],
+            false => faulted,
+        };
+        states.extend(beside);
         let id = matches!(count, Count::Dependencies).then_some("vulnerabilities");
         let href = format!("{DETAILS}/{THIS_MAC}.html#{}", anchor(what));
         let group = if covered::in_projects(count) || matches!(count, Count::Dependencies) {
@@ -1385,31 +1425,32 @@ fn watched_table(
         }
     }
     // Servers, checked only when the person runs the server check. A person with no servers is
-    // not told about servers at all. "Checked" rests on every server's latest visit having read
-    // it in full, whatever findings rest on it; a server not read in full is one that could not
-    // be opened or one the check did not finish on (`servers-not-checked`), counted apart.
-    let not_checked = map.servers.len() - map.servers_checked;
-    let unopened: usize = fixable
-        .iter()
-        .filter(|u| u.cause.id == covered::SERVERS_NOT_OPENED.id)
-        .map(|u| u.count)
-        .sum();
+    // not told about servers at all. Its faults are the status's: servers that could not be
+    // opened, and those the last server check did not finish on. Else "checked" rests on every
+    // server's latest visit having read it in full, whatever findings rest on it.
     if !map.servers.is_empty() || map.on_servers > 0 {
         let mut states = Vec::new();
-        if unopened > 0 {
-            states.push(Standing::not(format!(
-                "{} could not be opened · {fix_link}",
-                grouped(unopened as i64)
-            )));
-        }
-        if not_checked > unopened {
-            states.push(Standing::not(esc(&format!(
-                "{} not checked",
-                grouped((not_checked - unopened) as i64)
-            ))));
+        for (cause, words) in [
+            (&covered::SERVERS_NOT_OPENED, "could not be opened"),
+            (&covered::SERVERS_NOT_CHECKED, "not checked last time"),
+        ] {
+            let n: usize = (faults.iter().filter(|u| u.cause.id == cause.id))
+                .map(|u| u.count)
+                .sum();
+            if n > 0 {
+                let said = format!("{} {words}", grouped(n as i64));
+                states.push(told(cause.who == YOU, said));
+            }
         }
         if states.is_empty() {
-            states.push(Standing::read("checked at the last server check"));
+            states.push(match map.servers_checked {
+                0 => Standing::never("not checked yet"),
+                n if n == map.servers.len() => Standing::read("checked at the last server check"),
+                n => Standing::none(esc(&format!(
+                    "{} checked at the last server check",
+                    grouped(n as i64)
+                ))),
+            });
         }
         let visits: Vec<&Latest> = latest
             .iter()
@@ -1444,22 +1485,52 @@ fn watched_table(
 
 /// The anchor of what could not be read on this Mac, on the page of what is watched.
 pub const NOT_READ: &str = "not-read";
+/// Its heading.
+const NOT_READ_TITLE: &str = "Could not be read on this Mac";
 
-/// What on this Mac was tried at the last check and could not be read, and nothing the person
-/// does changes: a reading or a download that failed. The pages list what is read, so what this
-/// version has no reader for and what its source does not give are not on them, on this Mac or
-/// on any; the documents and the commands' machine form say those.
-fn failed_here(st: &crate::status::State) -> Vec<&Uncovered> {
-    st.not_covered
+/// Every thing not covered, as the faults and the limits, each in the order of the status: whether
+/// one is a fault is the message's word (`Uncovered.fault`), item for item, since the message is
+/// made from the same list (`status::uncovered_message`). One the message does not hold as the
+/// same cause is a fault, so nothing is quieted by a message that differs.
+fn sorted<'a>(
+    st: &'a crate::status::State,
+    r: &v1::Status,
+) -> (Vec<&'a Uncovered>, Vec<&'a Uncovered>) {
+    let fault = |i: usize, u: &Uncovered| {
+        (r.not_covered.get(i))
+            .filter(|m| m.id == u.cause.id)
+            .is_none_or(|m| m.fault)
+    };
+    let (faults, limits): (Vec<_>, Vec<_>) = st
+        .not_covered
         .iter()
-        .filter(|u| {
-            u.cause.who != YOU && !u.every_mac && u.cause.class == crate::store::Cause::Failed
-        })
+        .enumerate()
+        .partition(|(i, u)| fault(*i, u));
+    let items = |list: Vec<(usize, &'a Uncovered)>| list.into_iter().map(|(_, u)| u).collect();
+    (items(faults), items(limits))
+}
+
+/// The faults the person can do something about, told under "You can fix".
+fn fixable<'a>(faults: &[&'a Uncovered]) -> Vec<&'a Uncovered> {
+    faults
+        .iter()
+        .copied()
+        .filter(|u| u.cause.who == YOU)
         .collect()
 }
 
-/// What the person can fix, one cause beside another: what it is, every example as data, and
-/// Immunity Core's advice.
+/// The faults nothing the person does changes, such as a reading or a download that failed, told
+/// under "Could not be read on this Mac". With `fixable`, every fault, each once.
+fn failed_here<'a>(faults: &[&'a Uncovered]) -> Vec<&'a Uncovered> {
+    faults
+        .iter()
+        .copied()
+        .filter(|u| u.cause.who != YOU)
+        .collect()
+}
+
+/// The faults the person can fix, one cause beside another: what it is, every example as data,
+/// and Immunity Core's advice. A limit with advice is told among the limits.
 fn you_can_fix(out: &mut String, fixable: &[&Uncovered]) -> Out {
     writeln!(
         out,
@@ -1713,7 +1784,7 @@ fn example(name: &str, reason: Option<&str>) -> String {
 /// What is told apart from a thing's words, as safe HTML: every example with what its source
 /// said, then the value, what sources said of it, such as why a download failed, cut where it
 /// was put together (`covered::Uncovered::value`).
-fn apart(u: &Uncovered) -> Vec<String> {
+pub(crate) fn apart(u: &Uncovered) -> Vec<String> {
     let mut out: Vec<String> = u
         .examples
         .iter()
@@ -1723,8 +1794,8 @@ fn apart(u: &Uncovered) -> Vec<String> {
     out
 }
 
-/// At most this many examples are listed under one thing that could not be read.
-const EXAMPLES_SHOWN: usize = 20;
+/// At most this many examples are listed under one thing not covered.
+pub(crate) const EXAMPLES_SHOWN: usize = 20;
 
 /// One thing not covered, in full: its title, where, what it means and what to do.
 fn uncovered(out: &mut String, u: &Uncovered) -> Out {
@@ -2243,11 +2314,12 @@ const NONE_IN_FOUND: &str = "None in the projects found.";
 fn readings_of(count: Count, coverage: &[Latest]) -> Vec<&Latest> {
     let kinds: Vec<String> = match count {
         Count::Files(as_) => {
+            // The kinds of place watched as it, the programs startup items run among them.
             let mut kinds = crate::autorun::kinds_of(as_);
             kinds.extend(
-                crate::autorun::places()
-                    .filter(|(_, k)| k.0 == as_)
-                    .map(|(_, k)| k.1.to_string()),
+                (watched::kinds().into_iter())
+                    .filter(|k| k.0 == as_)
+                    .map(|k| k.1.to_string()),
             );
             kinds
         }
@@ -2291,16 +2363,6 @@ fn old_feeds(conn: &Connection, now: i64) -> rusqlite::Result<Vec<String>> {
         .collect())
 }
 
-/// What "none used in attacks" lacks while the list of them was never downloaded; `None` once
-/// it was read.
-fn exploited_gap(conn: &Connection, now: i64) -> rusqlite::Result<Option<String>> {
-    if crate::threats::last_good(conn)?.is_some() {
-        return Ok(None);
-    }
-    let never = ["the list of vulnerabilities used in attacks (never downloaded)".to_string()];
-    Ok(unread(&[], Some(now), now, &never))
-}
-
 /// Writes what a list rests on when it is not whole, and, for an empty list, that nothing is
 /// there only when it is (`unread`).
 fn coverage_of_list(out: &mut String, unread: Option<&str>, empty: bool, absent: &str) {
@@ -2332,11 +2394,12 @@ fn top(title: &str, meta: &str) -> String {
     out
 }
 
-/// What is watched on this Mac, one section per kind with the things of that kind, and the
-/// projects.
+/// What is watched on this Mac, one section per kind with the things of that kind, the projects,
+/// and in full each fault nothing the person does changes, by the message (`sorted`).
 pub fn this_mac(
     conn: &Connection,
     st: &crate::status::State,
+    r: &v1::Status,
     now: i64,
 ) -> Result<String, Box<dyn Error>> {
     let mut out = top(
@@ -2462,11 +2525,11 @@ pub fn this_mac(
     }
     out.push_str("</section>\n");
     // What could not be read on this Mac, each thing in full, where the summary's line leads.
-    let failed = failed_here(st);
+    let failed = failed_here(&sorted(st, r).0);
     if !failed.is_empty() {
         writeln!(
             out,
-            "<section id=\"{NOT_READ}\">\n<h2>Could not be read on this Mac</h2>\n<p class=\"muted\">{} could not be read at the last check. Each is tried again at every check.</p>",
+            "<section id=\"{NOT_READ}\">\n<h2>{NOT_READ_TITLE}</h2>\n<p class=\"muted\">{} could not be read at the last check. Each is tried again at every check.</p>",
             capital(&counted(failed.len() as i64, "thing", "things"))
         )?;
         for u in failed {
@@ -3139,8 +3202,8 @@ mod tests {
     }
 
     /// The band's glyph is the status's headline: the calm disc only for `calm`, the ring for
-    /// `in_part`, the clock for `stale`, and the question mark for a headline not known. The line
-    /// under it says how this Mac is watched, whatever the headline, by the message's watcher.
+    /// `in_part`, the clock for `stale`, and the question mark for a headline not known. How this
+    /// Mac is watched is said by the message's watcher, and one not live is never said to be.
     #[test]
     fn a_page_draws_the_calm_disc_only_for_a_calm_headline() {
         let dir = crate::common::Scratch::new("report-live");
@@ -3172,7 +3235,7 @@ mod tests {
         st.this_mac.live = true;
         let drawn = draw(&st, &calm);
         assert!(
-            drawn.contains(GLYPH_CALM) && drawn.contains("watched live"),
+            drawn.contains(GLYPH_CALM) && drawn.contains("Watching live"),
             "{drawn}"
         );
         // Every other headline, set by hand to pick the glyph, never draws the calm disc.
@@ -3199,41 +3262,102 @@ mod tests {
         (stopped.this_mac.as_mut().unwrap().live, stopped.watching) = (false, None);
         let stopped = draw(&st, &stopped);
         assert!(
-            stopped.contains("no watcher runs") && !stopped.contains("live"),
+            stopped.contains("No watcher runs") && !stopped.contains("live"),
             "{stopped}"
         );
+        // A watcher's failure is a fault: said once, under the line, as the terminal says it, and
+        // the line says nothing of how much is read or of the failure.
+        st.this_mac.state = "watched_in_part";
         for (what, words) in [
             (crate::watch::FULL_CHECK, "full check"),
             (crate::watch::EVENTS, "reading of program starts"),
         ] {
-            st.this_mac.failed = vec![crate::watch::Failure {
-                what: what.to_string(),
-                at: now,
-                detail: "invented refusal".to_string(),
-            }];
-            let failed = band(&st, v1::Headline::InPart);
-            assert!(failed.contains("watched live"), "{failed}");
+            let mut r = calm.clone();
+            r.headline = v1::Headline::InPart as i32;
+            r.watching = Some(v1::Watcher {
+                failed: vec![v1::WatcherFailure {
+                    what: what.to_string(),
+                    at: now,
+                    detail_text: "invented refusal".to_string(),
+                }],
+                ..Default::default()
+            });
+            let failed = draw(&st, &r);
+            let sub = failed.split("<p class=\"sub fault\">").next().unwrap();
             assert!(
-                failed.contains(&format!("latest {words} failed")),
+                sub.contains("<p class=\"sub\">Watching live · "),
                 "{failed}"
             );
+            assert!(
+                !sub.contains(" failed") && !sub.contains("in part"),
+                "{failed}"
+            );
+            let line = format!("<p class=\"sub fault\">! The watcher&#39;s latest {words} failed");
+            assert_eq!(failed.matches(&line).count(), 1, "{failed}");
         }
     }
 
-    /// The page names the watcher's case: each case `watch::case` picks from a message gives the
-    /// page a sentence of its own, the terminal's words for the same message say the same case,
-    /// and a watcher that is starting is never said to be off. After `immunity on`, a job in
-    /// place with no watcher and none restarting is off and not by `immunity off` on both, and
-    /// never calm.
+    /// A fault as a page draws it: its text with a mark where what the source said (`§s`), its
+    /// command (`§c`) and its advice (`§a`) stand, and those three apart.
+    type Drawn = (String, Option<String>, Option<String>, Option<String>);
+
+    /// Takes the first `open`…`close` out of `text`, leaving `mark`, and gives what was inside.
+    fn take(text: &mut String, open: &str, close: &str, mark: &str) -> Option<String> {
+        let i = text.find(open)? + open.len();
+        let j = i + text[i..].find(close)?;
+        let inner = text[i..j].to_string();
+        text.replace_range(i - open.len()..j + close.len(), mark);
+        Some(inner)
+    }
+
+    /// The band of a page in parts: the line under the headline, its command taken out, and each
+    /// fault.
+    fn band_drawn(page: &str) -> ((String, Option<String>), Vec<Drawn>) {
+        let command = |t: &mut String| {
+            let close = format!("</span>{COPY}</span>");
+            take(
+                t,
+                " · <span class=\"cmd\"><span class=\"mono\">",
+                &close,
+                "§c",
+            )
+        };
+        let mut sub = page.split("<p class=\"sub\">").nth(1).unwrap().to_string();
+        sub.truncate(sub.find("</p>").unwrap());
+        let sub_command = command(&mut sub);
+        let faults = (page.split("<p class=\"sub fault\">").skip(1))
+            .map(|b| {
+                let mut b = b[..b.find("</p>").unwrap()].to_string();
+                let said = take(&mut b, "<span class=\"said\">", "</span>", "§s");
+                let c = command(&mut b);
+                let advice = take(&mut b, "<span class=\"advice\">", "</span>", "§a");
+                (b, said, c, advice)
+            })
+            .collect();
+        ((sub, sub_command), faults)
+    }
+
+    /// The pages and the text agree, as values: for every case of the watcher, a check not fresh
+    /// with and without findings, and a status of real size with faults and with only limits,
+    /// the band holds the state the default status decides (`overview::told`) on the line under
+    /// its headline, and every fault it lists, in order, each with its own words, what its source
+    /// said, its command and its advice, and nothing else; the state is never also a fault, the
+    /// ring is drawn only while a fault stands, and a watcher that is starting is never said to be
+    /// off. After `immunity on`, a job in place with no watcher and none restarting is off and not
+    /// by `immunity off`, and never calm.
     #[test]
-    fn the_page_names_the_watchers_case_as_the_terminal_does_and_a_starting_watcher_is_never_off() {
+    fn the_band_holds_the_state_faults_and_commands_the_status_decides_and_nothing_else() {
         use crate::watch::{Case, EVENTS, READ};
+        let dir = crate::common::Scratch::new("band-told");
+        let conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
         let now = 1_800_000_000;
+        let st = crate::status::state(&conn, &dir, now).unwrap();
         let on = now - 60;
         let failed = |what: &str| v1::Watcher {
             failed: vec![v1::WatcherFailure {
                 what: what.to_string(),
-                ..Default::default()
+                at: now - 5,
+                detail_text: "an invented <refusal>".to_string(),
             }],
             ..Default::default()
         };
@@ -3252,67 +3376,83 @@ mod tests {
         let after_off = (Some(on - 60), Some(on), Some(false));
         let mut live_failed = calm();
         live_failed.watching = Some(failed(EVENTS));
+        let mut full_failed = calm();
+        full_failed.watching = Some(failed(crate::watch::FULL_CHECK));
         let mut failing = off(None, (None, None, None));
         failing.watching = Some(failed(READ));
         let mut starting = off(None, (None, None, None));
         starting.watching = Some(v1::Watcher::default());
         let mut restarting = off(Some(false), after_on);
         restarting.watcher_restarting_since_at = Some(now - 5);
-        // Each case, the message that gives it, and words the page and the terminal both say.
         let cases = [
-            (Case::Live, calm(), "live"),
-            (Case::LiveFailed, live_failed, "reading of program starts"),
-            (Case::Failing, failing, "reading of the watched places"),
-            (Case::Starting, starting, crate::watch::STARTING_WORDS),
-            (Case::Restarting, restarting, crate::watch::RESTARTING_WORDS),
+            (Some(Case::Live), calm()),
+            (Some(Case::LiveFailed), live_failed),
+            (Some(Case::LiveFailed), full_failed),
+            (Some(Case::Failing), failing),
+            (Some(Case::Starting), starting),
+            (Some(Case::Restarting), restarting),
             (
-                Case::OffNotByCommand {
+                Some(Case::OffNotByCommand {
                     on,
                     job: Some(true),
-                },
+                }),
                 off(Some(true), after_on),
-                "its job is in place and not running",
             ),
             (
-                Case::OffNotByCommand {
+                Some(Case::OffNotByCommand {
                     on,
                     job: Some(false),
-                },
+                }),
                 off(Some(false), after_on),
-                "its job is gone",
             ),
             (
-                Case::OffNotByCommand { on, job: None },
+                Some(Case::OffNotByCommand { on, job: None }),
                 off(None, after_on),
-                "immunity off did not turn it off",
             ),
             (
-                Case::OffByCommand { off: on },
+                Some(Case::OffByCommand { off: on }),
                 off(Some(false), after_off),
-                "with immunity off",
             ),
+            (Some(Case::JobInPlace), off(Some(true), after_off)),
             (
-                Case::JobInPlace,
-                off(Some(true), after_off),
-                "login job is in place",
-            ),
-            (
-                Case::NotInstalled,
+                Some(Case::NotInstalled),
                 off(Some(false), (None, None, None)),
-                "not installed",
             ),
-            (
-                Case::NoWatcher,
-                off(None, (None, None, None)),
-                "no watcher runs",
-            ),
+            (Some(Case::NoWatcher), off(None, (None, None, None))),
         ];
-        // Live as `this_mac` says, with no watcher on the store, is no watcher.
+        // Not fresh with no watcher: the terminal takes the watcher for the state; with a finding,
+        // it says the answer is not fresh as a fault.
+        let mut stale = off(None, (None, None, None));
+        stale.headline = v1::Headline::Stale as i32;
+        let t = stale.this_mac.as_mut().unwrap();
+        (t.fresh, t.stale_reason) = (false, Some("an invented reason".to_string()));
+        let mut stale_found = stale.clone();
+        stale_found.headline = v1::Headline::NeedsALook as i32;
+        stale_found.needs_a_look = Some(v1::NeedsALook {
+            total: 1,
+            ..Default::default()
+        });
+        // A status of real size, with its faults, and with only limits.
+        let sample = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/contract/samples/status-real-size.json"
+        ));
+        let mut real: v1::Status = serde_json::from_str(sample).unwrap();
+        (real.answered_at, real.headline) = (now, v1::Headline::InPart as i32);
+        real.needs_a_look = Some(v1::NeedsALook::default());
+        let mut limits = real.clone();
+        for u in &mut limits.not_covered {
+            u.fault = false;
+        }
+        // No download failed either: the text says a failed one by the feeds themselves.
+        (limits.watching, limits.threats, limits.vulnerability_data) =
+            (Some(v1::Watcher::default()), None, None);
+        limits.headline = v1::Headline::Calm as i32;
+        // Live as `this_mac` says, with no watcher on the store, is no watcher; a watcher on the
+        // store, not live, beside a restart's time is starting, and no restart is said.
         let mut left = calm();
         left.watching = None;
         assert_eq!(crate::watch::case(&left), Case::NoWatcher);
-        // A watcher on the store, not live, beside a restart's time is starting: the terminal says
-        // that case alone, as the page does, and no restart.
         let mut both = calm();
         both.this_mac.as_mut().unwrap().live = false;
         both.watcher_restarting_since_at = Some(now - 5);
@@ -3321,37 +3461,77 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(crate::watch::case(&both), Case::Starting);
-        let text = crate::overview::status(&both, &crate::screen::Screen::pipe(), false);
-        // Its first letter aside, which a sentence makes a capital.
-        assert!(text.contains(&crate::watch::STARTING_WORDS[1..]), "{text}");
-        assert!(!text.contains("restarting"), "{text}");
-        let mut said = BTreeSet::new();
-        for (case, s, both) in &cases {
-            assert_eq!(crate::watch::case(s), *case);
-            let words: Vec<&str> = (s.watching.iter().flat_map(|w| &w.failed))
-                .map(|f| crate::watch::failed_words(&f.what))
-                .collect();
-            let page = watcher_said("watched", *case, &words.join(" and "), now);
-            let terminal = crate::overview::watching(s, &crate::screen::Screen::pipe()).0;
-            assert!(
-                page.contains(both) && terminal.contains(both),
-                "{page} | {terminal}"
-            );
-            assert!(
-                said.insert(page.clone()),
-                "{case:?} says what another says: {page}"
-            );
-            // Only a watcher that watches live is said to watch.
-            let live = matches!(case, Case::Live | Case::LiveFailed);
-            assert_eq!(page.starts_with("watched "), live, "{page}");
-            if let Case::OffNotByCommand { .. } = case {
-                assert!(page.contains("did not turn it off"), "{page}");
-                assert!(terminal.contains("did not turn it off"), "{terminal}");
-                let headline = crate::headline::headline(s).0;
-                assert_ne!(headline, v1::Headline::Calm, "{case:?}");
+        let mut drawn_both = String::new();
+        state(&conn, &mut drawn_both, &st, &both, now).unwrap();
+        assert!(!drawn_both.contains("restarting"), "{drawn_both}");
+        // Faults with commands of their own: a check that died, then no watcher.
+        let mut died = off(None, (None, None, None));
+        died.last_run = Some(v1::CheckMark {
+            started_at: now - 600,
+            ..Default::default()
+        });
+        let others = [
+            (None, died),
+            (None, left),
+            (None, both),
+            (None, stale),
+            (None, stale_found),
+            (None, real),
+            (None, limits),
+        ];
+        for (case, s) in cases.into_iter().chain(others) {
+            if let Some(case) = case {
+                assert_eq!(crate::watch::case(&s), case);
             }
-            if *case == Case::Starting {
-                assert!(!page.contains("off") && !terminal.contains("off"), "{page}");
+            let mut page = String::new();
+            state(&conn, &mut page, &st, &s, now).unwrap();
+            let ((sub, sub_command), faults) = band_drawn(&page);
+            let told = crate::overview::told(&s, &TERMINAL);
+            // The state, in the line under the headline, its command after it.
+            match &told.state {
+                Some((words, c)) => {
+                    let mark = if c.is_some() { "§c" } else { "" };
+                    assert!(sub.contains(&format!("{}{mark}", esc(words))), "{page}");
+                    assert_eq!(sub_command, c.map(esc), "{page}");
+                }
+                None => assert_eq!(sub_command, None, "{page}"),
+            }
+            let wanted: Vec<Drawn> = (told.faults.iter())
+                .map(|f| {
+                    let (words, from, tail, c, advice) = f.parts();
+                    let text = format!(
+                        "! {}{}{}{}{}",
+                        esc(words),
+                        if from.is_some() { ": §s" } else { "" },
+                        esc(tail),
+                        if c.is_some() { "§c" } else { "" },
+                        if advice.is_some() { "§a" } else { "" },
+                    );
+                    (text, from.map(esc_said), c.map(esc), advice.map(esc))
+                })
+                .collect();
+            assert_eq!(faults, wanted, "{page}");
+            // The state is said once: no fault is the state's words.
+            if let Some((words, _)) = &told.state {
+                assert!(faults.iter().all(|f| !f.0.contains(&esc(words))), "{page}");
+            }
+            // Of the status of real size: the ring only while a fault stands, by the headline
+            // that says so.
+            if !s.not_covered.is_empty() {
+                let calm = s.headline == v1::Headline::Calm as i32;
+                assert_eq!(page.contains(GLYPH_PART), !calm, "{page}");
+                assert_eq!(faults.is_empty(), calm, "{page}");
+            }
+            if let Some(case) = case {
+                let band = format!("{sub} {faults:?}");
+                if case == Case::Starting {
+                    assert!(!band.contains("off"), "{band}");
+                }
+                if let Case::OffNotByCommand { .. } = case {
+                    assert!(band.contains("did not turn it off"), "{band}");
+                    let headline = crate::headline::headline(&s).0;
+                    assert_ne!(headline, v1::Headline::Calm, "{case:?}");
+                }
             }
         }
     }
@@ -3724,7 +3904,7 @@ mod tests {
         let dir = crate::common::Scratch::new("told");
         let conn = crate::store::open_or_make(&dir.0.join("store.db")).unwrap();
         let st = crate::status::state(&conn, &dir.0.join("no-home"), 1_791_000_000).unwrap();
-        this_mac(&conn, &st, 1_791_000_000).unwrap()
+        this_mac(&conn, &st, &v1::Status::default(), 1_791_000_000).unwrap()
     }
 
     /// Each section of a kind of watched thing on the page, by its anchor, up to its end.
@@ -3828,6 +4008,189 @@ mod tests {
                 "For your agent <span class=\"cmd\"><span class=\"mono\">immunity finding &lt;b&gt;&quot;x --json</span>{COPY}</span></span>"
             )) && !line.contains("<b>"),
             "{line}"
+        );
+    }
+
+    /// The part of a page from the section with `id` to its end, or nothing.
+    fn section_of<'a>(html: &'a str, id: &str) -> &'a str {
+        let rest = html
+            .find(&format!("<section id=\"{id}\">"))
+            .map_or("", |i| &html[i..]);
+        &rest[..rest.find("</section>").unwrap_or(rest.len())]
+    }
+
+    /// Nothing is hidden and nothing is told twice: every thing not covered, for every cause of
+    /// the catalogue, is on the pages once, a fault in its own section and a limit in the
+    /// collapsed section at the end, by the message's `fault` alone; a limit's names are there
+    /// only, and stay text.
+    #[test]
+    fn every_thing_not_covered_is_on_the_pages_once_a_fault_in_its_section_a_limit_at_the_end() {
+        let dir = crate::common::Scratch::new("pages-once");
+        let conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
+        let now = 1_800_000_000;
+        let mut st = crate::status::state(&conn, &dir, now).unwrap();
+        st.not_covered = (covered::CAUSES.iter())
+            .map(|c| Uncovered {
+                examples: vec![covered::Example::named(format!("<b>{}</b>", c.id))],
+                ..Uncovered::new(c, 1)
+            })
+            .collect();
+        let mut r = v1::Status {
+            answered_at: now,
+            not_covered: (st.not_covered.iter())
+                .map(crate::status::uncovered_message)
+                .collect(),
+            ..Default::default()
+        };
+        // Both sorts of every cause: the message's word, then its opposite.
+        for flip in [false, true] {
+            for u in &mut r.not_covered {
+                u.fault = (u.class == v1::Cause::Failed as i32) != flip;
+            }
+            let pages = view::pages(&conn, &st, &r, "store.db", now).unwrap();
+            let page = |name: &str| &pages.iter().find(|(n, _)| n == name).unwrap().1;
+            let summary = page(view::SUMMARY);
+            let limits = section_of(summary, crate::not_read_here::ANCHOR);
+            let all = |what: &str| -> usize {
+                pages
+                    .iter()
+                    .map(|(_, html)| html.matches(what).count())
+                    .sum()
+            };
+            for u in &r.not_covered {
+                let (id, name) = (
+                    format!("id=\"{}\"", u.id),
+                    format!("&lt;b&gt;{}&lt;/b&gt;", u.id),
+                );
+                assert_eq!(all(&id), 1, "{} flip {flip}", u.id);
+                assert_eq!(all(&format!("<b>{}", u.id)), 0, "{}", u.id);
+                let home = match (u.fault, u.who == YOU) {
+                    (false, _) => limits,
+                    (true, true) => section_of(summary, "you-can-fix"),
+                    (true, false) => {
+                        section_of(page(&format!("{DETAILS}/{THIS_MAC}.html")), NOT_READ)
+                    }
+                };
+                assert!(
+                    home.contains(&id) && home.contains(&name),
+                    "{} flip {flip}",
+                    u.id
+                );
+                if !u.fault {
+                    assert_eq!(all(&name), 1, "{} flip {flip}", u.id);
+                }
+            }
+            let n = r.not_covered.iter().filter(|u| !u.fault).count();
+            assert!(
+                limits.contains(&format!("<span class=\"n\">{n} things</span>")),
+                "{limits}"
+            );
+        }
+        // A message that does not hold an item as the same cause makes it a fault, never a limit.
+        let (faults, limits) = sorted(&st, &v1::Status::default());
+        assert_eq!((faults.len(), limits.len()), (covered::CAUSES.len(), 0));
+    }
+
+    /// A row of what is watched is drawn as a fault only where a fault of the message names it,
+    /// linked to where it is told, and says "read in full" only over readings all full, with the
+    /// time of its own reading: one short by a limit, or read only at a check before the latest,
+    /// is never drawn as a failure; a row with no reading is "not checked yet" whatever it counts,
+    /// and the programs startup items run are read by their own reading.
+    #[test]
+    fn a_row_shows_a_fault_only_by_a_fault_and_read_in_full_only_over_readings_all_full() {
+        let dir = crate::common::Scratch::new("rows-by-faults");
+        let conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
+        let now = 1_800_000_000;
+        crate::store::journal_note(&conn, now - 60, "run-1", "run_started", "").unwrap();
+        crate::store::journal_note(&conn, now - 30, "run-1", "run_finished", "").unwrap();
+        let mut st = crate::status::state(&conn, &dir, now).unwrap();
+        st.this_mac.watched = vec![
+            ("Homebrew packages", 1_234_567, "hourly"),
+            ("programs startup items run", 3, "at checks"),
+        ];
+        let scope = "machine:example-mac";
+        let reading = |completeness: &str, cause: Option<crate::store::Cause>| Latest {
+            reader: integrity::READER.to_string(),
+            scope: scope.to_string(),
+            kind: integrity::KEGS.to_string(),
+            completeness: completeness.to_string(),
+            reason: cause.map(|_| "an invented reason".to_string()),
+            cause: cause.map(|c| c.literal().to_string()),
+            at: now - 40,
+            last_full: Some(now - 40),
+        };
+        let failed = Uncovered {
+            examples: vec![covered::Example::named(findings::place(scope, None))],
+            ..Uncovered::new(&covered::READING_FAILED, 1)
+        };
+        // The state and the last read of a row.
+        let row = |latest: &[Latest], faults: &[&Uncovered], what: &str| -> (String, String) {
+            let (mut out, map) = (String::new(), crate::map::Map::default());
+            watched_table(&conn, &mut out, &st, &map, latest, faults, 0, now).unwrap();
+            let row = out.lines().find(|l| l.contains(what)).unwrap();
+            let cell = &row[row.find("<span class=\"wc\">").unwrap() + 17..];
+            let (state, last) = cell.split_once("</span><span class=\"wl\">").unwrap();
+            (
+                state.to_string(),
+                last.trim_end_matches("</span></div>").to_string(),
+            )
+        };
+        let state = |latest: &[Latest], faults: &[&Uncovered]| row(latest, faults, "Homebrew").0;
+        let calm = "<span class=\"dot calm\"></span>";
+        assert_eq!(
+            state(&[reading("full", None)], &[]),
+            format!("{calm}read in full")
+        );
+        let limit = [reading("partial", Some(crate::store::Cause::NotGiven))];
+        assert_eq!(state(&limit, &[]), format!("{calm}read"));
+        let broken = [reading("none", Some(crate::store::Cause::Failed))];
+        assert_eq!(
+            state(&broken, &[&failed]),
+            format!(
+                "<span class=\"dot off look\"></span><a href=\"{DETAILS}/{THIS_MAC}.html#{NOT_READ}\" aria-label=\"{NOT_READ_TITLE}: 1 can&#39;t be read now\">1 can&#39;t be read now</a>"
+            )
+        );
+        // A failure the message does not call a fault is no row's fault either.
+        assert_eq!(state(&broken, &[]), format!("{calm}read"));
+        // Read in full at a check before the latest: no fault of the message, and its own time.
+        let earlier = Latest {
+            at: now - 7200,
+            last_full: Some(now - 7200),
+            ..reading("full", None)
+        };
+        assert_eq!(
+            row(std::slice::from_ref(&earlier), &[], "Homebrew"),
+            (format!("{calm}read in full"), view::when(now - 7200, now))
+        );
+        // A count with no reading of it.
+        assert_eq!(
+            row(&[], &[], "Homebrew"),
+            (
+                "<span class=\"dot off\"></span>not checked yet".to_string(),
+                "<span class=\"none\">—</span>".to_string()
+            )
+        );
+        // The packages, orange only by a fault of the data they are compared with.
+        let packages = |faults: &[&Uncovered]| row(&[], faults, "Packages your projects").0;
+        assert_eq!(
+            packages(&[]),
+            "<span class=\"dot off\"></span>not compared yet"
+        );
+        let old = Uncovered::new(&covered::VULNERABILITY_DATA_OLD, 1);
+        assert!(
+            packages(&[&old]).starts_with("<span class=\"dot off look\"></span><a href="),
+            "{}",
+            packages(&[&old])
+        );
+        // The programs startup items run, by the reading that reads them.
+        let targets = Latest {
+            reader: watched::READER.to_string(),
+            kind: crate::targets::KIND.to_string(),
+            ..reading("full", None)
+        };
+        assert_eq!(
+            row(&[targets], &[], "Programs startup items run"),
+            (format!("{calm}read in full"), view::when(now - 40, now))
         );
     }
 }

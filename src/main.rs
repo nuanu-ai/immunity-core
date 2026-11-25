@@ -48,6 +48,8 @@ mod machine;
 mod managers;
 mod map;
 mod matches;
+mod not_read_here;
+mod open;
 mod osv;
 mod outcome;
 mod overview;
@@ -322,7 +324,8 @@ fn parse_args(
                 osv_npm_input,
                 osv_pypi_input,
                 curl,
-                system_root: system_root.unwrap_or_else(|| PathBuf::from("/")),
+                // Made real, since every place is opened by a path with no link in it.
+                system_root: watched::real(system_root.unwrap_or_else(|| PathBuf::from("/"))),
                 indicators,
                 form: options.form(),
             })))
@@ -961,7 +964,10 @@ pub fn sample_held(
     let mut conn = store::open(path)?;
     let took = std::time::Instant::now();
     let reading = match input {
-        Some(file) => processes::Reading::from_json(&std::fs::read_to_string(file)?)?,
+        Some(file) => {
+            let bytes = open::read(file, open::Reach::Given, open::UNCAPPED)?;
+            processes::Reading::from_json(&String::from_utf8(bytes)?)?
+        }
         None => processes::read_system(now.as_secs() as i64),
     };
     let tx = conn.transaction()?;
@@ -1612,8 +1618,8 @@ fn write_view(store: &Path, if_stale: bool) -> Result<Vec<PathBuf>, Box<dyn Erro
         Current::Yes(all) => return Ok(all),
         // Only the pages that show the event level were written: the rest stand as they are.
         Current::Events(all) => {
-            let mut made: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(folder.join(view::MADE))?)?;
+            let made = open::read(&folder.join(view::MADE), open::Reach::Own, open::UNCAPPED)?;
+            let mut made: serde_json::Value = serde_json::from_slice(&made)?;
             made["events"] = events_basis.into();
             std::fs::write(folder.join(view::MADE), made.to_string())?;
             return Ok(all);
@@ -1655,10 +1661,10 @@ fn current_view(
     now: i64,
 ) -> Result<Current, Box<dyn Error>> {
     let folder = home(store);
-    let Ok(text) = std::fs::read_to_string(folder.join(view::MADE)) else {
+    let Ok(text) = open::read(&folder.join(view::MADE), open::Reach::Own, open::UNCAPPED) else {
         return Ok(Current::No);
     };
-    let made: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
+    let made: serde_json::Value = serde_json::from_slice(&text).unwrap_or_default();
     let (Some(basis), Some(at), Some(pages)) = (
         made["basis"].as_str(),
         made["made_at"].as_i64(),
@@ -2387,7 +2393,7 @@ fn last_reading(dir: &Path, names: &[&str]) -> (String, bool) {
     let mut seen = None;
     for name in names {
         let path = dir.join(format!("{name}.txt"));
-        let Ok(bytes) = std::fs::read(&path) else {
+        let Ok(bytes) = open::read(&path, open::Reach::Own, open::UNCAPPED) else {
             continue;
         };
         let text = String::from_utf8_lossy(&bytes);
@@ -2768,7 +2774,8 @@ impl Run<'_> {
     /// the path that assertions point at, relative to the store's folder.
     fn keep_raw(&self, reader: &str, input: &str, bytes: &[u8]) -> Result<String, Box<dyn Error>> {
         if let Some(path) = store::last_raw(self.tx, reader, input)?
-            && std::fs::read(self.home.join(&path)).is_ok_and(|saved| saved == bytes)
+            && open::read(&self.home.join(&path), open::Reach::Own, open::UNCAPPED)
+                .is_ok_and(|saved| saved == bytes)
         {
             return Ok(path);
         }
@@ -4718,7 +4725,7 @@ fn keep_lists<'a>(run: &Run, things: impl Iterator<Item = &'a integrity::Thing>)
         let before = kept
             .as_deref()
             .and_then(|path| integrity::kept_file(run.home, path, &input))
-            .and_then(|file| autorun::read_capped_resolved(&file, integrity::LIST_CAP).ok());
+            .and_then(|file| open::read(&file, open::Reach::Own, integrity::LIST_CAP).ok());
         // Most lists do not move between checks: this spares `keep_raw` reading each again.
         if before.as_ref() == Some(list) {
             continue;
@@ -4986,7 +4993,8 @@ fn read_indicators(
         at,
         observed_at: at,
     };
-    let given = autorun::read_capped(&path, indicators::CAP)
+    let given = open::read(&path, open::Reach::Given, indicators::CAP)
+        .map_err(|e| e.to_string())
         .and_then(|bytes| Ok((indicators::parse(&bytes)?, bytes)));
     let (list, raw) = match given {
         Ok((list, bytes)) => {
@@ -5005,7 +5013,8 @@ fn read_indicators(
         Err(why) => {
             let before = store::last_raw(run.tx, indicators::READER, indicators::LIST)?;
             let previous = before.and_then(|raw| {
-                let bytes = std::fs::read(run.home.join(&raw)).ok()?;
+                let bytes =
+                    open::read(&run.home.join(&raw), open::Reach::Own, open::UNCAPPED).ok()?;
                 Some((indicators::parse(&bytes).ok()?, raw))
             });
             let then = if previous.is_some() {
@@ -5067,7 +5076,7 @@ fn read_indicators(
         }
         for (rel, path) in opened {
             let shown = in_project(&rel);
-            match autorun::read_capped(&path, indicators::CAP) {
+            match open::read(&path, open::Reach::Place, indicators::CAP) {
                 Ok(bytes) => {
                     let text = String::from_utf8_lossy(&bytes);
                     let file = format!("file:{machine}/{shown}");

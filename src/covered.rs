@@ -280,17 +280,6 @@ pub fn this_mac(conn: &Connection, latest: &[Latest], live: bool) -> rusqlite::R
     })
 }
 
-/// What has failed in the watcher, in words: "reading of the watched places and sample of
-/// running programs". The reasons are text from the failures and are not in it.
-pub fn watcher_failed(m: &ThisMac) -> String {
-    let words: Vec<&str> = m
-        .failed
-        .iter()
-        .map(|f| crate::watch::failed_words(&f.what))
-        .collect();
-    words.join(" and ")
-}
-
 /// Who can do something about a thing that is not covered: the owner, or nobody, because it
 /// is a limit of this version or passes by itself. Its words say which.
 pub const YOU: &str = "you";
@@ -1710,9 +1699,9 @@ fn lacks(conn: &Connection) -> rusqlite::Result<Vec<(String, String, Option<Stri
     conn.prepare(&format!(
         "{}
          SELECT DISTINCT c.scope, l.what, l.name
-         FROM latest c CROSS JOIN coverage_lack l ON l.coverage = c.id
-         WHERE c.scope NOT IN (SELECT id FROM gone_entity)",
-        crate::store::LATEST
+         FROM latest c CROSS JOIN coverage_lack l ON l.coverage = c.id WHERE NOT {}",
+        crate::store::LATEST,
+        crate::store::gone_entity("c.scope")
     ))?
     .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
     .collect()

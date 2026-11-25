@@ -28,9 +28,12 @@ pub fn read(home: &Path) -> Found {
         Ok(path) => path,
         Err(found) => return *found,
     };
-    match std::fs::read(path) {
+    use crate::open::{Reach, Refused, UNCAPPED};
+    match crate::open::read(&path, Reach::Place, UNCAPPED) {
         Ok(bytes) => Found::Read(parse(&String::from_utf8_lossy(&bytes))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Found::Absent(NOT_PRESENT),
+        Err(Refused::Look(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            Found::Absent(NOT_PRESENT)
+        }
         Err(e) => Found::Failed(format!("cannot read ~/.ssh/known_hosts: {e}")),
     }
 }
