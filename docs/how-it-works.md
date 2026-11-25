@@ -266,7 +266,7 @@ The page `immunity view` writes is a report read from the top. Its headline uses
 
 Files on the Mac, feeds and indicator lists may be written by an attacker, sometimes for an agent to read. Immunity Core takes facts out of them and nothing else:
 
-- every file is opened one way (`src/open.rs`). It is looked at first, and anything but a regular file is refused without being opened. A place on the Mac is opened by its path made real, with no link left in it, so a link that appears later is not followed. The open never waits, and a file over its size cap is refused before a byte is read. A refusal is never read as the file's content or as nothing there. A folder replaced by a link while its path is being made real is a limit of this version;
+- every file is opened one way (`src/open.rs`), except what the event level's collector writes, whose reading in `src/events.rs` is not moved yet. It is looked at first, and anything but a regular file is refused without being opened. A place on the Mac is opened by its path made real, with no link left in it, so a link that appears later is not followed. The open never waits, and a file over its size cap is refused before a byte is read. A refusal is never read as the file's content or as nothing there. A folder replaced by a link while its path is being made real is a limit of this version;
 - no path, command or URL is ever taken from a feed or an indicator list and used;
 - nothing from an indicator list is visited, downloaded or run;
 - text from a source is returned only in fields ending in `_text`;

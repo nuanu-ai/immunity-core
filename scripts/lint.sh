@@ -33,8 +33,9 @@ absent "a library target, whose tests neither half of ./check runs" -nF '[lib]' 
 
 # Every file the core reads is opened one way, by src/open.rs. Left out: the store (SQLite and
 # its locks), the install (service.rs), tests (a test module, or a `#[cfg(test)]` module, which
-# rustfmt closes at the first column), and src/events.rs, whose readers of the collector's log,
-# written by root and read by offset, are not yet moved and are their own change.
+# rustfmt closes at the first column), and src/events.rs, whose readers of what the collector
+# and its installer write (the log read by offset, the record of what is collected, the notes
+# of what was removed) are not yet moved and are their own change.
 sources=$(git -c core.quotePath=false ls-files 'src/*.rs') ||
   fail "could not list the sources, whose reads of files are checked"
 if reads=$(printf '%s\n' "$sources" | /usr/bin/grep -vxE \
