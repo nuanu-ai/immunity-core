@@ -485,6 +485,8 @@ fn an_indicator_match_of_a_file_names_the_indicators_it_matched_and_no_process_a
         whole["evidence"]["indicator_matched"]["indicators_text"],
         format!("[file:hashes.'SHA-256' = '{hash}']")
     );
+    // A watched file: the reading of its place read it.
+    assert_eq!(whole["thing_now"]["presence"], "held");
     assert_eq!(
         whole["evidence"]["indicator_matched"]["indicators_text"],
         item["value_text"]
@@ -618,9 +620,9 @@ fn a_finding_the_person_answered_says_so_with_who_why_and_until_when_and_reopene
     );
 }
 
-/// A reason a person or an agent may type: a line break, then lines shaped like a label of the
-/// finding and like one of its commands.
-const FORGED: &str = "the installer of a tool\nWhere        ~/.ssh/authorized_keys\n→ immunity finding f0000000000 seen";
+/// A reason a person or an agent may type: markup, a line break, then lines shaped like a label
+/// of the finding and like one of its commands.
+const FORGED: &str = "the installer of a <i>tool</i>\nWhere        ~/.ssh/authorized_keys\n→ immunity finding f0000000000 seen";
 
 /// A shell profile read in full, then changed: the store holds it, and the change is a finding.
 fn a_profile_changed(tag: &str) -> (Estate, PathBuf, String) {
@@ -662,6 +664,28 @@ fn a_finding_found_again_after_seen_names_the_earlier_one_its_answer_and_reason_
     let whole = e.finding(&first);
     assert!(whole["earlier"].is_null(), "{whole:#}");
     assert!(!e.text(&first).contains("Earlier"));
+    // An occurrence before it that the core closed, which nobody answered, as of a package
+    // cleared by an upgrade: named in every form, with no answer.
+    rusqlite::Connection::open(e.store())
+        .unwrap()
+        .execute(
+            "INSERT INTO finding (id, rule, about, occurrence, state, first_seen_at,
+                                  first_seen_run, last_seen_at, last_seen_run)
+             SELECT 'f00000000aa', rule, about, 0, 'cleared', 1, 'r', 1, 'r' FROM finding
+             WHERE id = ?1",
+            [&first],
+        )
+        .unwrap();
+    let closed = &e.finding(&first)["earlier"];
+    assert_eq!(
+        (&closed["finding"]["id"], &closed["answer"]),
+        (&json!("f00000000aa"), &Value::Null)
+    );
+    assert!(
+        e.text(&first)
+            .contains("  Earlier       f00000000aa, cleared\n")
+    );
+    assert!(e.pages().contains("<dt>Earlier</dt><dd>f00000000aa</dd>"));
     let read = whole["journal_seq"].to_string();
     let answer = [
         "finding",
@@ -707,7 +731,7 @@ fn a_finding_found_again_after_seen_names_the_earlier_one_its_answer_and_reason_
         "{text}"
     );
     assert!(
-        text.contains("  Said then     the installer of a tool"),
+        text.contains("  Said then     the installer of a <i>tool</i>"),
         "{text}"
     );
     for line in text.lines() {
@@ -722,7 +746,7 @@ fn a_finding_found_again_after_seen_names_the_earlier_one_its_answer_and_reason_
     }
     let page = e.pages();
     assert!(page.contains(&format!("Your agent before, to {first}")));
-    assert!(page.contains("the installer of a tool"));
+    assert!(page.contains("the installer of a &lt;i&gt;tool&lt;/i&gt;"));
     assert!(!page.contains(FORGED) && !page.contains("\n→ immunity finding f0"));
     // Found a third time, after a seen from the command line with no reason: only the latest
     // earlier one is named, and it came from the command line.
@@ -739,133 +763,177 @@ fn a_finding_found_again_after_seen_names_the_earlier_one_its_answer_and_reason_
 }
 
 #[test]
-fn a_watched_file_s_finding_says_it_is_still_there_gone_since_when_or_not_known_never_gone_unread()
-{
-    // A shell profile and an SSH file, each changed after a first check. The profile is then
-    // removed and the SSH folder shut, in one check: the one that looked found the profile gone,
-    // and the SSH file's place was not read, so whether it is there is not known.
+fn a_watched_entry_is_there_only_as_the_latest_reading_of_its_place_read_it_and_never_gone_by_a_retraction()
+ {
+    // A shell profile and a Git hook in the folder the checkout's configuration names, each
+    // changed after a first check. Then the profile is removed and the configuration names
+    // another folder, and then the checkout goes. No reading records that it looked for either and found nothing, so neither
+    // is ever said to be gone: not known, last found by the check that read them.
     let e = Estate::new("now");
-    let (profile, ssh) = (e.home().join(".zshrc"), e.home().join(".ssh/config"));
-    for path in [&profile, &ssh] {
+    let (profile, hook) = (
+        e.home().join(".zshrc"),
+        e.home().join("dev/tree/first/pre-commit"),
+    );
+    e.put(
+        &e.home().join("dev/tree/.git/HEAD"),
+        "ref: refs/heads/main\n",
+    );
+    let config = e.home().join("dev/tree/.git/config");
+    e.put(&config, "[core]\n hooksPath = first\n");
+    // A hook in the checkout's own folder, still watched while the configuration names another.
+    let kept = e.home().join("dev/tree/.git/hooks/post-merge");
+    e.put(&kept, "# 1\n");
+    e.put(&e.home().join("dev/tree/second/pre-push"), "# other\n");
+    for path in [&profile, &hook] {
         e.put(path, "# 1\n");
     }
     e.run();
     common::next_second();
-    for path in [&profile, &ssh] {
+    for path in [&profile, &hook, &kept] {
         e.put(path, "# 2\n");
     }
     e.run();
-    let (shell, access) = (
-        id_of(&e, "watched.shell-profile"),
-        id_of(&e, "watched.ssh-access"),
-    );
+    let shell = id_of(&e, "watched.shell-profile");
+    let hooks = e.json(&["findings"])["findings"].clone();
+    let hook_of = |name: &str| {
+        let f = (hooks.as_array().unwrap().iter())
+            .find(|f| f["finding"]["about_text"].as_str().unwrap().ends_with(name))
+            .unwrap();
+        f["finding"]["id"].as_str().unwrap().to_string()
+    };
+    let (git, kept) = (hook_of("first/pre-commit"), hook_of("hooks/post-merge"));
     let now = |id: &str| e.finding(id)["thing_now"].clone();
     let found = now(&shell);
     assert_eq!(found["presence"], "held", "{found}");
     let at = found["at"].as_i64().unwrap();
-    assert_eq!(now(&access)["at"], at);
+    assert_eq!(
+        (&now(&git)["presence"], &now(&git)["at"]),
+        (&json!("held"), &json!(at))
+    );
     assert!(
         e.text(&shell)
-            .contains("    Now          still there when last read, ")
+            .contains("    Now          there when last read, ")
     );
-    assert!(
-        e.pages()
-            .contains("<dt>Now</dt><dd><span class=\"w\">still there when last read, <time ")
-    );
+    let page = e.pages();
+    assert!(page.contains("<dt>Now</dt><dd><span class=\"w\">found there by a reading, <time "));
+    assert!(!page.contains("still"), "{page}");
     common::next_second();
     std::fs::remove_file(&profile).unwrap();
-    let folder = e.home().join(".ssh");
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
+    e.put(&config, "[core]\n hooksPath = second\n");
     e.run();
-    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let whole = e.finding(&shell);
-    assert_eq!(whole["evidence"]["place_changed"]["change"], "gone");
-    let gone = &whole["thing_now"];
-    assert_eq!(
-        (&gone["presence"], &gone["at"]),
-        (&json!("gone"), &whole["last_seen_at"])
-    );
-    assert!(
-        e.text(&shell)
-            .contains("    Now          no longer there: a reading that looked did not find it, ")
-    );
-    // Not read: not known, last found by the check before, and never said to be gone.
-    let unread = now(&access);
-    assert_eq!(
-        (&unread["presence"], &unread["at"]),
-        (&json!("unknown"), &json!(at))
-    );
-    let text = e.text(&access);
-    assert!(text.contains("    Now          not known whether it is still there; last found "));
-    assert!(!text.contains("no longer there"), "{text}");
+    let unknown = (json!("unknown"), json!(at));
+    for id in [&shell, &git] {
+        let n = now(id);
+        assert_eq!((n["presence"].clone(), n["at"].clone()), unknown, "{id}");
+        let text = e.text(id);
+        assert!(text.contains("    Now          not known whether it is there; last found "));
+        assert!(!text.contains("no longer there"), "{text}");
+    }
+    common::next_second();
+    common::remove(&e.home().join("dev/tree/.git"));
+    e.run();
+    let n = now(&git);
+    assert_eq!((n["presence"].clone(), n["at"].clone()), unknown);
+    // The hook its own folder held was read until the checkout went, and no reading since.
+    let n = now(&kept);
+    assert_eq!(n["presence"], "unknown", "{n}");
+    assert!(n["at"].as_i64() > Some(at));
     // The line decides nothing: each finding stays open until the person answers it.
-    for id in [&shell, &access] {
+    for id in [&shell, &git] {
         assert_eq!(e.finding(id)["finding"]["state"], "open");
     }
 }
 
 #[test]
-fn an_indicator_match_says_whether_what_it_matched_is_still_on_the_list_or_that_it_is_not_known() {
-    let e = Estate::new("on-list");
-    let profile = e.home().join(".zshrc");
-    let sha = || {
-        let out = Command::new("/usr/bin/shasum")
-            .args(["-a", "256"])
-            .arg(&profile)
-            .output()
-            .unwrap();
-        String::from_utf8(out.stdout).unwrap()[..64].to_string()
+fn a_startup_program_looked_for_and_not_found_is_no_longer_there_and_not_known_once_not_looked_at()
+{
+    // The one record of a thing found absent is a program a startup item names, looked for at
+    // its path at each check. A program recorded as not there is never said to be there.
+    let e = Estate::new("target");
+    let folder = e.system().join("usr/local/bin");
+    let runner = folder.join("runner");
+    e.put(&runner, "#!/bin/sh\nexit 0\n");
+    e.put(
+        &e.home().join("Library/LaunchAgents/org.example.item.plist"),
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+         <key>Label</key><string>org.example.item</string><key>ProgramArguments</key>\
+         <array><string>/usr/local/bin/runner</string></array></dict></plist>\n",
+    );
+    e.run();
+    common::next_second();
+    e.put(&runner, "#!/bin/sh\nexit 1\n");
+    e.run();
+    let id = id_of(&e, "watched.startup-target");
+    let now = || e.finding(&id)["thing_now"].clone();
+    let there = now();
+    assert_eq!(there["presence"], "held", "{there}");
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |path: &Path, mode| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
     };
-    e.put(&profile, "export PATH=/opt/x:$PATH\n");
-    let hash = sha();
-    let list = |hash: &str| {
-        e.put(
-            &e.store().with_file_name("indicators.json"),
-            &format!(r#"[{{"kind": "file:hashes.'SHA-256'", "value": "{hash}"}}]"#),
-        )
-    };
-    list(&hash);
+    common::next_second();
+    mode(&runner, 0o000);
+    e.run();
+    mode(&runner, 0o644);
+    let unread = now();
+    assert_eq!(
+        (&unread["presence"], &unread["at"]),
+        (&json!("unknown"), &there["at"])
+    );
+    common::next_second();
+    std::fs::remove_file(&runner).unwrap();
+    e.run();
+    let gone = now();
+    assert_eq!(gone["presence"], "gone", "{gone}");
+    assert!(gone["at"].as_i64() > there["at"].as_i64());
+    assert!(e.text(&id).contains(
+        "    Now          no longer there: a reading that looked found nothing at its path, "
+    ));
+    assert!(
+        e.pages()
+            .contains("<span class=\"w\">a reading that looked found nothing at its path, <time ")
+    );
+    // Its folder shut: the latest check did not look, so whether it is there is not known, last
+    // found by the check that read it.
+    common::next_second();
+    mode(&folder, 0o000);
+    e.run();
+    mode(&folder, 0o755);
+    let unknown = now();
+    assert_eq!(
+        (&unknown["presence"], &unknown["at"]),
+        (&json!("unknown"), &there["at"])
+    );
+}
+
+#[test]
+fn an_indicator_match_of_a_file_no_reading_records_by_itself_says_nothing_of_what_is_there_now() {
+    // Nothing records a lockfile by itself, so nothing is said of whether it is there, also once
+    // the indicator it matched leaves the list.
+    let e = Estate::new("lockfile");
+    e.put(
+        &e.home().join("dev/shop/.git/HEAD"),
+        "ref: refs/heads/main\n",
+    );
+    e.put(
+        &e.home().join("dev/shop/package-lock.json"),
+        r#"{"name": "shop", "lockfileVersion": 3, "packages": {"": {"name": "shop"},
+            "node_modules/a": {"version": "1.0.0", "resolved": "https://relay.example/a.tgz"}}}"#,
+    );
+    let list = |entries: &str| e.put(&e.store().with_file_name("indicators.json"), entries);
+    list(r#"[{"kind": "domain-name:value", "value": "relay.example"}]"#);
     e.run();
     let id = id_of(&e, "indicator.match");
-    let now = e.finding(&id)["thing_now"].clone();
-    assert_eq!(
-        (&now["on_list"], &now["presence"]),
-        (&json!(true), &json!("held"))
-    );
-    assert!(
-        e.text(&id)
-            .contains("    List         what it matched is still on the indicator list\n")
-    );
-    // Taken off the list: the file is still there, and what it matched is not on the list.
+    assert!(e.finding(&id)["thing_now"].is_null());
     common::next_second();
-    list(&"0".repeat(64));
+    list("[]");
     e.run();
-    let now = e.finding(&id)["thing_now"].clone();
-    assert_eq!(
-        (&now["on_list"], &now["presence"]),
-        (&json!(false), &json!("held"))
-    );
+    assert!(e.finding(&id)["thing_now"].is_null());
     let text = e.text(&id);
     assert!(
-        text.contains("    List         what it matched is no longer all on the indicator list\n")
+        !text.contains("    Now ") && !text.contains("no longer there"),
+        "{text}"
     );
-    assert_eq!(e.finding(&id)["finding"]["state"], "open");
-    // Seen, then the file changed to what a new list names: the new finding names only what it
-    // matched, which is on the list, and not what the one before it matched.
-    assert!(e.immunity(&["finding", &id, "seen"]).status.success());
-    common::next_second();
-    e.put(&profile, "export PATH=/opt/y:$PATH\n");
-    list(&sha());
-    e.run();
-    let id = id_of(&e, "indicator.match");
-    assert_eq!(e.finding(&id)["thing_now"]["on_list"], true);
-    // The kept copy of the list gone: not known.
-    common::remove(&e.0.join("raw"));
-    assert!(e.finding(&id)["thing_now"]["on_list"].is_null());
-    assert!(e.text(&id).contains(
-        "    List         not known whether what it matched is still on the indicator list\n"
-    ));
 }
 
 #[test]

@@ -242,52 +242,6 @@ fn found(hay: &str, needle: &str, part: fn(u8) -> bool, check_left: bool) -> boo
     })
 }
 
-/// The list as the last run read it, from its kept copy in the store's folder: `None` when there
-/// is none, or it cannot be read or parsed now. Only a copy of the shape a run keeps is read, and
-/// no more of it than a list may hold.
-pub fn last_list(conn: &Connection, folder: &std::path::Path) -> rusqlite::Result<Option<List>> {
-    let raw = crate::store::last_raw(conn, READER, LIST)?;
-    Ok(raw
-        .and_then(|raw| crate::integrity::kept_file(folder, &raw, LIST))
-        .and_then(|file| crate::autorun::read_capped(&file, CAP).ok())
-        .and_then(|bytes| parse(&bytes).ok()))
-}
-
-/// Whether every indicator the finding `id` about the file `about` names is on the list as last
-/// read: `address`, the one its connection was sampled for, and each the file came to match in a
-/// reading the finding rests on, one fact each. `None` when the kept copy of the list cannot be
-/// read, or the store holds none of them.
-pub fn on_list(
-    conn: &Connection,
-    id: &str,
-    about: &str,
-    address: Option<&str>,
-) -> rusqlite::Result<Option<bool>> {
-    let mut named: Vec<String> = conn
-        .prepare(
-            "SELECT DISTINCT object FROM assertion
-             WHERE subject = ?2 AND reader = ?3 AND predicate = 'matches_indicator'
-               AND layer != 'draft'
-               AND run_id IN (SELECT j.run_id FROM finding_basis b JOIN journal j ON j.seq = b.journal
-                              WHERE b.finding = ?1)",
-        )?
-        .query_map(rusqlite::params![id, about, READER], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    named.extend(address.map(str::to_string));
-    let folder = conn
-        .path()
-        .map(std::path::Path::new)
-        .and_then(|p| p.parent());
-    let list = match folder {
-        Some(folder) if !named.is_empty() => last_list(conn, folder)?,
-        _ => None,
-    };
-    Ok(list.map(|l| {
-        let listed: BTreeSet<String> = l.matched.iter().map(Indicator::literal).collect();
-        named.iter().all(|n| listed.contains(n))
-    }))
-}
-
 /// What the kinds in a list are not matched against, by name.
 pub fn lacks(list: &List) -> Vec<Lack> {
     let mut out: Vec<Lack> = list

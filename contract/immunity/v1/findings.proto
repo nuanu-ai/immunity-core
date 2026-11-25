@@ -179,7 +179,8 @@ message Finding {
   // What the store holds now of the thing the finding is about, which may have gone since. It
   // describes and decides nothing: the finding stays as it is until the person answers it.
   // Absent for a finding that rests on events only, of a published rule, of `verdict.suspicious`
-  // and of `watched.first-read`, and for a package, whose evidence says it. Since 1.34.0.
+  // and of `watched.first-read`, for a package, whose evidence says it, and when the store holds
+  // none of it. Since 1.34.0.
   ThingNow thing_now = 26;
   // The latest earlier occurrence of this finding: of the same rule about the same thing, which
   // the person had answered `seen` or the core had cleared. Absent for a finding found for the
@@ -189,27 +190,23 @@ message Finding {
 
 // What the store holds now of what a finding is about. Since 1.34.0.
 message ThingNow {
-  // Whether the thing is there, as `Known.presence` decides it: for a file, an entry of one, an
-  // app or a package installed (`watched.*`, `autorun.*`, `integrity.*`, the file of
-  // `indicator.match`). `HELD` only when every reading that holds a fact of it in force was full
-  // at its latest, so it was read there. `GONE` when every fact of it was retracted by a reading
-  // that looked, and the latest reading of each was full. `UNKNOWN` otherwise: a reading did not
-  // read it at its latest, or set its facts aside without looking. Absent when the store never
-  // held a fact of it, as of a program only a sample saw.
+  // Whether the thing is there, from the one record the store keeps of a watched entry itself at
+  // each reading, the reading of its content, never from a retraction: for a file or an entry of
+  // one (`watched.*`, `autorun.*`, the file of `indicator.match` when it is watched). `HELD` when
+  // the latest reading of a place that holds it read it in full. `GONE` only for a program a
+  // startup item names, when that reading looked at its path and found nothing. `UNKNOWN`
+  // otherwise. Absent when nothing records the thing by itself: an app or a package
+  // (`integrity.*`), a lockfile, and the program of a process.
   optional Presence presence = 1;
-  // For `GONE`, when the reading that looked found it gone. For `HELD` and `UNKNOWN`, the latest
-  // reading that found it there.
+  // For `HELD` and `GONE`, when that reading was. For `UNKNOWN`, the latest reading that found it
+  // there; absent when none did.
   optional int64 at = 2;
   // For a process a sample saw (`processes.detached-inline-code`, a connection of
-  // `indicator.match`): when a sample last saw it, and whether that was the latest sample taken.
-  // Absent when the store no longer keeps it, a day after a sample last saw it. A sample that
-  // did not see it says nothing of whether it ended.
+  // `indicator.match`): when a sample last saw it, and whether the latest sample saw the process
+  // running. Absent when the store no longer keeps it, a day after a sample last saw it. A
+  // sample that did not see it says nothing of whether it ended.
   optional int64 sampled_at = 3;
   optional bool latest_sample = 4;
-  // For `indicator.match`: whether every indicator it names is on the indicator list as last
-  // read, the address of its connection and what its file matched. Absent when the kept copy of
-  // the list cannot be read, or the store holds none of the indicators it names.
-  optional bool on_list = 5;
 }
 
 // An earlier occurrence of a finding, as it stands now. Since 1.34.0.

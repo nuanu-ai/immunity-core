@@ -140,29 +140,24 @@ pub fn of(
 }
 
 /// What the store holds now of what a finding is about (`ThingNow`), by its rule's family: whether
-/// it is there as the store decides it (`known::now_of`), the latest sample that saw its process,
-/// and whether the indicators it names are on the list. `None` when the store holds none of
-/// these: for a finding that rests on events only, a published rule's, the response layer's and
-/// one of places read for the first time, which is about a check; and for a package, whose
-/// evidence says whether it is still found.
+/// a watched entry is there (`watched::now_of`), and the latest sample that saw its process. A
+/// process's program gets no presence: nothing records it by itself. `None` when the store holds
+/// none of these: for a finding that rests on events only, a published rule's, the response
+/// layer's and one of places read for the first time, which is about a check; for a package,
+/// whose evidence says whether it is still found; and for a file no reading records by itself,
+/// as a lockfile an indicator matched.
 fn thing_now(conn: &Connection, f: &Found) -> rusqlite::Result<Option<v1::ThingNow>> {
-    let Some(family @ ("watched" | "autorun" | "integrity" | "indicator" | "processes")) =
-        f.rule.split_once('.').map(|(family, _)| family)
-    else {
-        return Ok(None);
-    };
+    let family = f.rule.split_once('.').map(|(family, _)| family);
     let mut now = v1::ThingNow::default();
-    if let Some((presence, at)) = known::now_of(conn, &f.about)? {
+    if matches!(family, Some("watched" | "autorun" | "indicator"))
+        && let Some((presence, at)) = crate::watched::now_of(conn, &f.about)?
+    {
         (now.presence, now.at) = (Some(presence as i32), at);
     }
     if let Some(note) = &f.sampled
         && let Some((at, latest)) = crate::processes::last_seen(conn, note)?
     {
         (now.sampled_at, now.latest_sample) = (Some(at), Some(latest));
-    }
-    if family == "indicator" {
-        let address = f.sampled.as_ref().and_then(|n| n["value"].as_str());
-        now.on_list = crate::indicators::on_list(conn, &f.id, &f.about, address)?;
     }
     Ok(Some(now).filter(|n| *n != v1::ThingNow::default()))
 }

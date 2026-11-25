@@ -839,44 +839,56 @@ fn evidence_lines(s: &Screen, f: &v1::Finding) -> Vec<String> {
     };
     let mut out = vec![head(s, "Evidence")];
     out.extend(lines);
-    for (label, said) in now_said(f, &|at| s.time(at, f.answered_at)) {
+    for (label, said) in now_said(f, &|at| s.time(at, f.answered_at), false) {
         out.extend(e(label, &[(&said, PLAIN)]));
     }
     out
 }
 
 /// What the store holds now of what a finding is about (`ThingNow`), as labelled sentences of the
-/// core's own, the same in the finding and on the pages, each time given by `time`. Gone is said
-/// only where the message says `GONE`, and a process is never said to have ended. Of a process
-/// and of an indicator, by the evidence, what the message does not hold is not known.
-pub fn now_said(f: &v1::Finding, time: &dyn Fn(i64) -> String) -> Vec<(&'static str, String)> {
+/// core's own, each time given by `time`. Gone is said only where the message says `GONE`, and a
+/// process is never said to have ended. Of a process, by the evidence, what the message does not
+/// hold is not known. A `page` stands for an hour while a later sample moves nothing it rests on
+/// (`view::basis`), so it says only what a reading or a sample found and when, never that it was
+/// the latest.
+pub fn now_said(
+    f: &v1::Finding,
+    time: &dyn Fn(i64) -> String,
+    page: bool,
+) -> Vec<(&'static str, String)> {
+    use v1::Presence::{Gone, Held};
     let t = f.thing_now.unwrap_or_default();
     let body = f.evidence.as_ref().and_then(|e| e.body.as_ref());
-    let at = |at: Option<i64>| at.map_or(String::new(), |a| format!(", {}", time(a)));
-    let mut out = Vec::new();
+    let at = |a: Option<i64>| a.map_or(String::new(), |a| format!(", {}", time(a)));
     let presence = t
         .presence
         .map(|p| v1::Presence::try_from(p).unwrap_or_default());
-    out.extend(presence.map(|p| match p {
-        v1::Presence::Held => ("Now", format!("still there when last read{}", at(t.at))),
-        v1::Presence::Gone => (
-            "Now",
-            format!(
-                "no longer there: a reading that looked did not find it{}",
+    let mut out: Vec<(&str, String)> = presence
+        .map(|p| match (p, page) {
+            (Held, false) => format!("there when last read{}", at(t.at)),
+            (Held, true) => format!("found there by a reading{}", at(t.at)),
+            (Gone, false) => format!(
+                "no longer there: a reading that looked found nothing at its path{}",
                 at(t.at)
             ),
-        ),
-        _ => match t.at {
-            Some(a) => (
-                "Now",
-                format!(
-                    "not known whether it is still there; last found {}",
-                    time(a)
-                ),
+            (Gone, true) => format!(
+                "a reading that looked found nothing at its path{}",
+                at(t.at)
             ),
-            None => ("Now", "not known whether it is still there".to_string()),
-        },
-    }));
+            _ => match t.at {
+                Some(a) if page => {
+                    format!(
+                        "not known whether it is there; a reading found it {}",
+                        time(a)
+                    )
+                }
+                Some(a) => format!("not known whether it is there; last found {}", time(a)),
+                None => "not known whether it is there".to_string(),
+            },
+        })
+        .map(|said| ("Now", said))
+        .into_iter()
+        .collect();
     use v1::evidence::Body;
     let process = matches!(
         body,
@@ -886,36 +898,19 @@ pub fn now_said(f: &v1::Finding, time: &dyn Fn(i64) -> String) -> Vec<(&'static 
                 ..
             }))
     );
-    out.extend(match (t.sampled_at, t.latest_sample) {
-        (Some(a), Some(true)) => {
-            Some(("Process", format!("seen by the latest sample, {}", time(a))))
-        }
-        (Some(a), _) => Some((
-            "Process",
-            format!(
+    out.extend(
+        match (t.sampled_at, t.latest_sample, page) {
+            (Some(a), Some(true), false) => Some(format!("seen by the latest sample, {}", time(a))),
+            (Some(a), _, false) => Some(format!(
                 "not known whether it still runs; a sample last saw it {}",
                 time(a)
-            ),
-        )),
-        (None, _) if process => Some(("Process", "not known whether it still runs".to_string())),
-        (None, _) => None,
-    });
-    if let Some(Body::IndicatorMatched(_)) = body {
-        out.push(match t.on_list {
-            Some(true) => (
-                "List",
-                "what it matched is still on the indicator list".to_string(),
-            ),
-            Some(false) => (
-                "List",
-                "what it matched is no longer all on the indicator list".to_string(),
-            ),
-            None => (
-                "List",
-                "not known whether what it matched is still on the indicator list".to_string(),
-            ),
-        });
-    }
+            )),
+            (Some(a), _, true) => Some(format!("a sample last saw it {}", time(a))),
+            (None, ..) if process => Some("not known whether it runs".to_string()),
+            (None, ..) => None,
+        }
+        .map(|said| ("Process", said)),
+    );
     out
 }
 
@@ -1659,7 +1654,6 @@ mod tests {
                 at: Some(NOW - 3600),
                 sampled_at: Some(NOW - 600),
                 latest_sample: Some(false),
-                on_list: Some(false),
             }),
             // Found before and seen through an agent, `odd` in the reason given then.
             earlier: Some(v1::EarlierOccurrence {

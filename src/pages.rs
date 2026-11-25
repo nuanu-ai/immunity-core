@@ -1017,12 +1017,15 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
             });
         }
     }
-    for (label, said) in crate::finding_text::now_said(f, &|at| view::when(at, now)) {
+    for (label, said) in crate::finding_text::now_said(f, &|at| view::when(at, now), true) {
         facts.push((label, format!("<span class=\"w\">{said}</span>")));
     }
-    // The person's answer, then the answer to the earlier occurrence, named by its id.
-    let earlier = f.earlier.as_ref();
-    let then = earlier.and_then(|e| Some((e.answer.as_ref()?, e.finding.as_ref()?)));
+    // The earlier occurrence by its id, answered or not; the person's answer, then its answer.
+    let earlier = (f.earlier.as_ref()).and_then(|e| Some((e.answer.as_ref(), e.finding.as_ref()?)));
+    if let Some((_, r)) = earlier {
+        facts.push(("Earlier", esc(&r.id)));
+    }
+    let then = earlier.and_then(|(a, r)| Some((a?, r)));
     let answers = f.answer.as_ref().map(|a| (a, None));
     for (a, before) in answers.into_iter().chain(then.map(|(a, r)| (a, Some(r)))) {
         let said = match a.until_at {
