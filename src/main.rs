@@ -19,6 +19,7 @@ mod baseline;
 mod beyond;
 mod brew;
 mod checkouts;
+mod closed;
 mod codesign;
 mod contract;
 mod covered;
@@ -3964,7 +3965,7 @@ fn read_watched(
             .filter(|p| targets::runs_of(p.watched_as).is_some())
             .map(|p| &p.look)
             .collect();
-        let (look, read) = targets::read(run.tx, &run_id, &machine, &roots, &items, &all)?;
+        let (look, read) = targets::read(run.tx, &machine, &roots, &items, &all)?;
         // What each startup item runs, told or not, is a unit of its own (`fault.rs`).
         let (tx, kind) = (run.tx, targets::KIND);
         baseline::record(tx, watched::READER, kind, &run_id, run.at, &read.told, &[])?;
@@ -4106,6 +4107,9 @@ fn read_watched(
         });
     }
 
+    // A file that could not be read is weighed by everything this pass read, before any row.
+    let mut looks: Vec<&mut look::Look> = placed.iter_mut().map(|p| &mut p.look).collect();
+    closed::settle(run.tx, &machine, &roots, &mut looks, &[])?;
     // The raw copy: kind, path, checksum and link target, one line per entry; never content.
     let mut raw = String::new();
     let mut lines: Vec<Vec<usize>> = Vec::new();
@@ -4435,7 +4439,7 @@ fn read_watched(
             let read_before =
                 store::read_before(tx, watched::READER, &id, watched::CONTENT, &run_id)?;
             let (completeness, reason, gap) =
-                watched::content_coverage(&e.content, e.link.is_some(), read_before);
+                watched::content_coverage(&e.content, e.link.is_some());
             let reading = Reading {
                 scope: &id,
                 kind: watched::CONTENT,
@@ -5338,6 +5342,7 @@ fn match_dependencies(run: &Run) -> Result<usize, Box<dyn Error>> {
             .collect::<rusqlite::Result<_>>()?
     };
     let mut held: BTreeMap<&str, Vec<(String, Vec<i64>)>> = BTreeMap::new();
+    let mut rules: Vec<(&String, &str)> = Vec::new();
     for (component, records) in &matched.affected {
         let malicious: Vec<&(String, String, Vec<String>)> =
             records.iter().filter(|r| r.1 == "malicious").collect();
@@ -5357,19 +5362,44 @@ fn match_dependencies(run: &Run) -> Result<usize, Box<dyn Error>> {
         } else {
             continue;
         };
-        // What it rests on: the journal entries of the component's releases, and the latest
-        // reading of the data.
-        let basis: Vec<i64> = run
-            .tx
-            .prepare(
-                "SELECT MAX(seq) FROM journal
-                 WHERE subject = ?1 AND entry IN ('added', 'changed') AND predicate = 'has_version'
-                 UNION
-                 SELECT MAX(seq) FROM journal WHERE entry = 'advisories_read'",
-            )?
-            .query_map([component], |r| r.get::<_, Option<i64>>(0))?
-            .filter_map(|r| r.transpose())
-            .collect::<rusqlite::Result<_>>()?;
+        rules.push((component, rule));
+    }
+    // What each rests on: the latest journal entry of the component's releases, and the latest
+    // reading of the data, in that order of the journal. One pass over the journal for every
+    // component held, not one per component; the components are looked up here and not given
+    // to the statement, which takes no value larger than SQLite's limit.
+    let mut latest: BTreeMap<&str, i64> = BTreeMap::new();
+    if !rules.is_empty() {
+        let held: BTreeSet<&str> = rules.iter().map(|(c, _)| c.as_str()).collect();
+        let mut stmt = run.tx.prepare(
+            "SELECT subject, seq FROM journal
+             WHERE entry IN ('added', 'changed') AND predicate = 'has_version'",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let subject = row.get_ref(0)?.as_str_or_null()?;
+            if let Some(component) = subject.and_then(|s| held.get(s)) {
+                let seq: i64 = row.get(1)?;
+                latest
+                    .entry(component)
+                    .and_modify(|at| *at = seq.max(*at))
+                    .or_insert(seq);
+            }
+        }
+    }
+    let read: Option<i64> = run.tx.query_row(
+        "SELECT MAX(seq) FROM journal WHERE entry = 'advisories_read'",
+        [],
+        |r| r.get(0),
+    )?;
+    for (component, rule) in rules {
+        let mut basis: Vec<i64> = latest
+            .get(component.as_str())
+            .into_iter()
+            .copied()
+            .collect();
+        basis.extend(read);
+        basis.sort_unstable();
         held.entry(rule)
             .or_default()
             .push((component.clone(), basis));

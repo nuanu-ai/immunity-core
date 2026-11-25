@@ -8,7 +8,7 @@
 //! The invariant: for every store, the faults of this build are a superset of what main calls
 //! failed, plus the units of rule 1. Every reading that failed is a fault (`covered::failed`),
 //! as it is a failure on main; a file of another account closed to this one and never read here
-//! is not given by its source, as on main (`watched::unread_cause`), and so is no failure.
+//! is not given by its source, as on main (`closed::cause`), and so is no failure.
 //!
 //! 1. A unit of the watched places, the startup programs or the checkout walk is a fault when
 //!    the baseline marks it not read now (`unit_unread`, `part_unread`) and it was read here

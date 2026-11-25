@@ -31,7 +31,7 @@ use crate::contract::{self, v1, value_of};
 use crate::{checkouts, findings, guarded, status, store};
 use prost::Message;
 use rusqlite::{Connection, OptionalExtension};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, btree_map};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 
@@ -358,7 +358,7 @@ pub fn known_of(
     // Each way can only add: the store's links are its own word, and the names add what no
     // reading tied. A finding about a part that is gone stays the thing's, as it stays open until
     // it is answered.
-    let links = links(conn)?;
+    let mut links = links(conn)?;
     let at_place = |at: &str, machine: &str, rel: &str| {
         place_of(at).is_some_and(|(m, path)| m == machine && same_place(path, rel))
     };
@@ -373,7 +373,7 @@ pub fn known_of(
             || q.machine
                 .is_some_and(|machine| q.places.iter().any(|rel| at_place(at, machine, rel)))
     };
-    known.findings = finding_refs(conn, now, |about| held_by(about, &links, &theirs))?;
+    known.findings = finding_refs(conn, now, |about| held_by(about, &mut links, &theirs))?;
     Ok(known)
 }
 
@@ -451,39 +451,51 @@ fn presence<'a>(
     Ok((presence, owners))
 }
 
-/// What each entity was ever `part_of` or `located_on`, in force or retracted, by its id.
-type Links = BTreeMap<String, Vec<String>>;
+/// What each entity was ever `part_of` or `located_on`, in force or retracted, looked up by its id
+/// on `assertion_subject` as a walk reaches it, each id once for the whole answer.
+struct Links<'c> {
+    of: rusqlite::Statement<'c>,
+    known: BTreeMap<String, Vec<String>>,
+}
 
-/// Every link of a part to what holds it that the store ever held: one pass over the assertions,
-/// since the store has no index by object.
-fn links(conn: &Connection) -> rusqlite::Result<Links> {
-    let mut out = Links::new();
-    let mut q = conn.prepare(
-        "SELECT DISTINCT subject, object FROM assertion
-         WHERE layer IN ('live', 'retracted') AND predicate IN ('part_of', 'located_on')",
+fn links(conn: &Connection) -> rusqlite::Result<Links<'_>> {
+    let of = conn.prepare(
+        "SELECT DISTINCT object FROM assertion
+         WHERE subject = ?1 AND predicate IN ('part_of', 'located_on')
+           AND +layer IN ('live', 'retracted')",
     )?;
-    for row in q.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get(1)?)))? {
-        let (subject, object) = row?;
-        out.entry(subject).or_default().push(object);
-    }
-    Ok(out)
+    Ok(Links {
+        of,
+        known: BTreeMap::new(),
+    })
 }
 
 /// Whether `about`, or anything it is tied to through `links` at any depth, is one `theirs`
 /// takes. Each id is looked at once, so links that run in a circle end.
-fn held_by(about: &str, links: &Links, theirs: &impl Fn(&str) -> bool) -> bool {
-    let mut seen: BTreeSet<&str> = BTreeSet::new();
-    let mut next = vec![about];
+fn held_by(
+    about: &str,
+    links: &mut Links,
+    theirs: &impl Fn(&str) -> bool,
+) -> rusqlite::Result<bool> {
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut next = vec![about.to_string()];
     while let Some(at) = next.pop() {
-        if !seen.insert(at) {
+        if !seen.insert(at.clone()) {
             continue;
         }
-        if theirs(at) {
-            return true;
+        if theirs(&at) {
+            return Ok(true);
         }
-        next.extend(links.get(at).into_iter().flatten().map(String::as_str));
+        let tied = match links.known.entry(at) {
+            btree_map::Entry::Occupied(e) => e.into_mut(),
+            btree_map::Entry::Vacant(e) => {
+                let tied = links.of.query_map([e.key()], |r| r.get(0))?;
+                e.insert(tied.collect::<rusqlite::Result<_>>()?)
+            }
+        };
+        next.extend(tied.iter().cloned());
     }
-    false
+    Ok(false)
 }
 
 /// Whether the id `at` names a thing inside the thing whose id is `own`, by how ids are made: a
@@ -615,11 +627,12 @@ fn parts(
         .collect::<rusqlite::Result<_>>()?;
     let in_folder: Parts = match folder {
         // Every file id that begins with the folder's: from `file:<machine>/<path>/` up to,
-        // not including, the same with `0`, the character after `/`.
+        // not including, the same with `0`, the character after `/`. The `+` keeps SQLite on
+        // that range of `assertion_subject`, off the index by layer.
         Some((machine, rel)) => conn
             .prepare(
                 "SELECT DISTINCT a.subject, e.type FROM assertion a JOIN entity e ON e.id = a.subject
-                 WHERE a.layer = 'live' AND a.subject > ?1 AND a.subject < ?2",
+                 WHERE +a.layer = 'live' AND a.subject > ?1 AND a.subject < ?2",
             )?
             .query_map(
                 [format!("file:{machine}/{rel}/"), format!("file:{machine}/{rel}0")],
@@ -793,14 +806,14 @@ fn coverage(conn: &Connection, r: Reading) -> rusqlite::Result<v1::Coverage> {
 fn finding_refs(
     conn: &Connection,
     now: i64,
-    about: impl Fn(&str) -> bool,
+    mut about: impl FnMut(&str) -> rusqlite::Result<bool>,
 ) -> rusqlite::Result<Vec<v1::FindingRef>> {
-    let found = findings::all(conn, now)?;
-    let mut items: Vec<findings::Item> = found
-        .iter()
-        .filter(|f| about(&f.about))
-        .map(findings::item)
-        .collect();
+    let mut items: Vec<findings::Item> = Vec::new();
+    for f in findings::all(conn, now)? {
+        if about(&f.about)? {
+            items.push(findings::item(&f));
+        }
+    }
     findings::order(&mut items);
     Ok(items.iter().map(finding_ref).collect())
 }

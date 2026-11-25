@@ -397,7 +397,7 @@ pub const READING_FAILED: Cause = Cause {
 };
 
 /// Files of another account whose permissions do not let this account open them, never read on
-/// this Mac. One read here before is a reading that failed (`watched::unread_cause`), among
+/// this Mac. One read here before is a reading that failed (`closed::cause`), among
 /// `READING_FAILED`.
 pub const OTHER_ACCOUNTS: Cause = Cause {
     id: "other-accounts-files",
@@ -1064,7 +1064,7 @@ pub fn not_covered(
         .partition(|r| not_permitted(r.reason.as_deref()));
     // Files of another account closed to this one and never read here: their source does not
     // give them, so the cause stored is `not_given`. One read here before failed, and is among
-    // `other`, said with what could not be read (`watched::unread_cause`).
+    // `other`, said with what could not be read (`closed::cause`).
     let theirs: Vec<&Latest> = latest
         .iter()
         .filter(|r| r.cause.as_deref() == Some(store::Cause::NotGiven.literal()))
