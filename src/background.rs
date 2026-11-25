@@ -183,16 +183,17 @@ impl Checks {
     }
 
     /// The failure the latest check's tick said, in the check's own words once what it printed
-    /// has come: the same failure, its text now with the reason. Asked after every tick, it
-    /// never waits, and stops expecting a reason when the check's time is up.
-    pub fn late_reason(&mut self, awake: Instant) -> Option<String> {
+    /// has come: the same failure, its text now with the reason, or none when the check said it
+    /// committed (`reason`). Asked after every tick, it never waits, and stops expecting a
+    /// reason when the check's time is up.
+    pub fn late_reason(&mut self, awake: Instant) -> Option<Result<(), String>> {
         let (status, since) = self.late?;
         let said = match self.said.as_ref()?.try_recv() {
             Err(TryRecvError::Empty) if !Self::expired(since, awake) => return None,
             said => said.ok().and_then(|said| reason(&said)),
         };
         (self.said, self.late) = (None, None);
-        Some(format!("the full check failed ({status}): {}", said?))
+        Some(said?.map_err(|why| format!("the full check failed ({status}): {why}")))
     }
 
     fn expired(since: Instant, awake: Instant) -> bool {
@@ -210,17 +211,26 @@ fn kept(mut out: impl Read) -> Vec<u8> {
 }
 
 /// Why a check failed in its own words: the code of the `Failure` it printed and what that
-/// quoted, at most `TEXT_CAP` characters of it. It is data: nothing is decided by it.
-fn reason(said: &[u8]) -> Option<String> {
+/// quoted, cut for secrets and then at most `TEXT_CAP` characters of it, so a cap never leaves
+/// part of a secret the cut would not know. It is data: only the code is read, and a check that
+/// committed and could not read its answer back (`answer_unreadable`, `unread` in `main.rs`)
+/// finished, which is no failure.
+fn reason(said: &[u8]) -> Option<Result<(), String>> {
     let failure: crate::contract::v1::Failure = serde_json::from_slice(said).ok()?;
     let error = failure.errors.first()?;
-    Some(match error.detail_text.as_deref() {
+    if error.code == "answer_unreadable" {
+        return Some(Ok(()));
+    }
+    Some(Err(match error.detail_text.as_deref() {
         Some(detail) => {
-            let detail = crate::status::capped(crate::contract::unescape(detail));
-            format!("{}: {detail}", error.code)
+            let cut = crate::secrets::said_within(
+                &crate::contract::unescape(detail),
+                crate::status::TEXT_CAP,
+            );
+            format!("{}: {}", error.code, crate::contract::unescape(&cut))
         }
         None => error.code.clone(),
-    })
+    }))
 }
 
 impl Running {
@@ -287,8 +297,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         };
         while checks.late.is_some() {
-            if let Some(why) = checks.late_reason(Instant::now()) {
-                return Err(why);
+            if let Some(late) = checks.late_reason(Instant::now()) {
+                return late;
             }
             assert!(
                 Instant::now() < end,
@@ -397,6 +407,16 @@ mod tests {
     }
 
     #[test]
+    fn a_secret_the_cap_of_a_reason_would_end_inside_is_cut_whole_before_the_cap() {
+        // A check's detail with a token across the cap, as no check of the core prints it.
+        let token = ["gh", "p_", "Q7mZ2xK9pL4vR8nT3wY6bH1cJ5dF0gS2aE7u"].concat();
+        let mut failure: serde_json::Value = serde_json::from_str(&failure_json("x")).unwrap();
+        failure["errors"][0]["detail_text"] = format!("{} ?t={token}", "y".repeat(240)).into();
+        let why = reason(failure.to_string().as_bytes()).unwrap().unwrap_err();
+        assert_eq!(why, format!("run_failed: {} ?t=…", "y".repeat(240)));
+    }
+
+    #[test]
     fn a_failed_check_whose_tool_keeps_its_output_open_is_recorded_on_the_tick_it_ended() {
         let dir = crate::common::Scratch::new("check-output-held");
         let pid_file = dir.join("tool");
@@ -458,7 +478,7 @@ mod tests {
         let ended = Err("the full check ended with exit status: 1".to_string());
         assert_eq!(result, ended);
         let failed = "the full check failed (exit status: 1): run_failed: held";
-        assert_eq!(reason.as_deref(), Some(failed));
+        assert_eq!(reason, Some(Err(failed.to_string())));
         assert_eq!(endless_result, ended);
         assert_eq!((early, given_up, late), (None, None, None));
     }
