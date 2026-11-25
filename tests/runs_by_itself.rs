@@ -6173,7 +6173,10 @@ fn a_place_that_could_not_be_read_is_never_told_as_a_change_that_was_seen() {
         );
         let (rule_severity, rule_title) = level(rule);
         assert_ne!(title, rule_title);
-        assert!(meaning.contains("cannot read it now"), "{meaning}");
+        assert!(
+            meaning.contains("could not read it at this one"),
+            "{meaning}"
+        );
         assert_eq!(severity, rule_severity, "{rule}");
     }
     // A suspicious verdict about such a finding names it in the same words.

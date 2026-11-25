@@ -1936,6 +1936,19 @@ pub struct PlaceChanged {
     /// such observation. Neither value gives the coverage or freshness of a later reading.
     #[prost(bool, optional, tag = "2")]
     pub presence_only: ::core::option::Option<bool>,
+    /// The journal's time of a reading, which for a check is when the check began, that read the
+    /// file's content with the checksum it had before the first change of content this finding
+    /// rests on. Decided from the `has_content` entries of `rests_on` alone, when they are of one
+    /// file and form one chain, each entry's value before being the value after the entry before
+    /// it, every link a SHA-256 of the whole content (`sha256:`): the value before the first equals
+    /// the value after the latest, and this is the time of the latest. It is said of that reading
+    /// and says nothing of the file since: a later reading that could not read it, or read it
+    /// unchanged, writes no entry and leaves this time as it is; and nothing of what the file held
+    /// between the finding's entries, where a change the finding does not rest on may lie. Absent
+    /// otherwise, as when its entries do not follow one another, or a value is the checksum of one
+    /// selected value (`value sha256:`). It changes nothing else of the finding. Since 1.35.0.
+    #[prost(int64, optional, tag = "3")]
+    pub read_as_before_at: ::core::option::Option<i64>,
 }
 /// Installed software changed in place. The digests and verdicts before and after are in
 /// `rests_on`, as `has_digest`, `has_seal` and `signed_by`.
