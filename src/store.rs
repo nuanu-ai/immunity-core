@@ -2895,7 +2895,7 @@ mod tests {
         drop(open_or_make(&path).unwrap());
         let holder = Connection::open(&path).unwrap();
         let refused = read(&path, |c| {
-            holder.execute_batch("BEGIN EXCLUSIVE")?;
+            holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
             Ok(id(c)?)
         })
         .unwrap_err();

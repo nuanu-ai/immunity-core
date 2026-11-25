@@ -2409,7 +2409,8 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        let failed = watcher(&args.store).unwrap().failed.into_iter();
+        let told = store::read(&args.store, |c| Ok(watcher(&args.store, Some(c))?.unwrap()));
+        let failed = told.unwrap().failed.into_iter();
         failed.map(|f| (f.what, f.detail_text)).collect()
     }
 

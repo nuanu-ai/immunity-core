@@ -1580,18 +1580,17 @@ fn write_view(store: &Path, if_stale: bool) -> Result<Vec<PathBuf>, Box<dyn Erro
         if let Current::Yes(_) = current {
             return Ok((current, Vec::new(), String::new(), String::new()));
         }
+        // Taken before the pages are read: a basis also names what is not in the store, the
+        // watcher's lock, so the pages hold at least what it names and a watcher that stops
+        // meanwhile moves the basis of the next look.
+        let (basis, events_basis) = (view::basis(tx, &folder)?, events::basis(tx)?);
         // The summary is built from what `immunity status --json` answers, read the same way.
         let (state, result) = status_read(tx, store, now)?;
         let pages = match current {
             Current::Events(_) => view::event_pages(tx, &state, &result, now)?,
             _ => view::pages(tx, &state, &result, &store.display().to_string(), now)?,
         };
-        Ok((
-            current,
-            pages,
-            view::basis(tx, &folder)?,
-            events::basis(tx)?,
-        ))
+        Ok((current, pages, basis, events_basis))
     })?;
     std::fs::create_dir_all(folder.join(view::DETAILS))?;
     let mut written = Vec::new();
