@@ -117,9 +117,10 @@ message Status {
   optional int64 turned_on_at = 30;
   optional int64 turned_off_at = 31;
   // Whether the latest of the two in the journal's order, not by their times, is `turned_on`;
-  // absent when there is neither. With no watcher on the store and `login_job_installed` false, it
-  // says how Immunity Core went off: false, by `immunity off`; true, by something else, since the job
-  // `immunity on` loaded is gone. Since 1.20.0.
+  // absent when there is neither. With no watcher on the store and none restarting, true says
+  // Immunity Core is off and not by `immunity off`, whatever `login_job_installed` says: something
+  // else stopped the job `immunity on` loaded or removed its property list. False, with
+  // `login_job_installed` false, says it was turned off by `immunity off`. Since 1.20.0.
   optional bool turned_on_latest = 32;
   // The stage the full check that runs now is in, as the check noted it, and when that stage
   // began. Present only while `running` is true and the stage could be read; absent otherwise,

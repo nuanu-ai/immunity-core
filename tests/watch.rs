@@ -582,7 +582,7 @@ fn the_view_says_whether_a_watcher_watches_live() {
     let before = summary(&mac.view());
     let fast = "<span class=\"wh2 t2\">within seconds</span>";
     assert!(
-        before.contains(" · live watching is off · ")
+        before.contains(" · no watcher runs · ")
             && before.contains(">at full checks<")
             && !before.contains(fast),
         "{before}"
@@ -600,7 +600,7 @@ fn the_view_says_whether_a_watcher_watches_live() {
     drop(w);
     let after = summary(&mac.view_if_stale());
     assert!(
-        after.contains(" · live watching is off · ")
+        after.contains(" · no watcher runs · ")
             && after.contains(">at full checks<")
             && !after.contains(" · watched live")
             && !after.contains(fast),

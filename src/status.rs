@@ -709,8 +709,10 @@ pub struct State {
     pub this_mac: crate::covered::ThisMac,
     /// What the program does not cover, aggregated for a person.
     pub not_covered: Vec<crate::covered::Uncovered>,
-    /// The event level as its latest reading left it; `None` before any reading of it.
+    /// The event level as it is served (`events::served`); `None` before any reading of it.
     pub event_level: Option<crate::events::Level>,
+    /// The one reading of the watcher's lock file that the answer rests on.
+    pub watcher: crate::watch::Lock,
 }
 
 pub fn state(conn: &Connection, home: &Path, now: i64) -> Res<State> {
@@ -729,22 +731,14 @@ pub fn state(conn: &Connection, home: &Path, now: i64) -> Res<State> {
     }
     let (coverage, problems, needs) = looked(conn, now)?;
     // Watched live while a watcher runs and its latest reading, sample and look at what to
-    // watch did not fail. A failed reading of the event level stands for program starts
-    // alone, which are then not claimed as seen.
-    let failed = crate::watch::failures(conn, home)?;
-    let live = crate::watch::watching_live(home) && crate::watch::live_with(&failed);
-    let events_failed = failed.iter().find(|f| f.what == crate::watch::EVENTS);
+    // watch did not fail, by one reading of its lock file. A failed reading of the event level
+    // stands for program starts alone, which are then not claimed as seen.
+    let watcher = crate::watch::Lock::read(home);
+    let failed = crate::watch::failures(conn, &watcher)?;
+    let events_failed = failed.iter().any(|f| f.what == crate::watch::EVENTS);
     let full_check_failed = failed.iter().any(|f| f.what == crate::watch::FULL_CHECK);
-    let mut this_mac = crate::covered::this_mac(conn, &coverage, live)?;
-    let mut event_level = crate::events::level(conn, now)?;
-    if let Some(failure) = events_failed
-        && let Some(level) = &mut event_level
-        && level.state == crate::events::RUNNING
-    {
-        level.state = crate::events::FAILED.into();
-        level.read_at = failure.at;
-        level.reason = Some(failure.detail.clone());
-    }
+    let mut this_mac = crate::covered::this_mac(conn, &coverage, watcher.live(&failed))?;
+    let event_level = crate::events::served(conn, &failed, now)?;
     // A collector that is installed and records nothing (refused, failing or silent), or that
     // runs and lost part of what it was to record (a gap in its numbering, a restart it cannot
     // account for, lines it could not read, log files the cap or the tidy job deleted before
@@ -756,7 +750,7 @@ pub fn state(conn: &Connection, home: &Path, now: i64) -> Res<State> {
     // here. A log file the cap deleted after it was read is no loss. Not installed is a limit
     // the person can lift, and `not_covered` says it.
     if this_mac.state == "watched"
-        && (events_failed.is_some()
+        && (events_failed
             || full_check_failed
             || event_level.as_ref().is_some_and(|l| {
                 [
@@ -780,9 +774,15 @@ pub fn state(conn: &Connection, home: &Path, now: i64) -> Res<State> {
             .push((crate::covered::EVENTS, l.last_day.starts, "events"));
     }
     this_mac.failed = failed;
-    let not_covered =
-        crate::covered::not_covered(conn, &coverage, &problems, catalogue(conn)?.as_ref())?;
+    let not_covered = crate::covered::not_covered(
+        conn,
+        &coverage,
+        &problems,
+        catalogue(conn)?.as_ref(),
+        event_level.as_ref(),
+    )?;
     Ok(State {
+        watcher,
         last: latest_run(conn)?,
         summary,
         problems,
@@ -909,6 +909,11 @@ pub fn message(
 ) -> Res<crate::contract::v1::Status> {
     use crate::contract::{v1, value_of};
     use crate::known::whole;
+    // The state's one reading of the watcher's lock file; without a store, a reading of its own.
+    let watcher = match state {
+        Some(st) => &st.watcher,
+        None => &crate::watch::Lock::read(&crate::home(path)),
+    };
     let mut out = v1::Status {
         format: CONTRACT_FORMAT,
         answered_at: now,
@@ -922,10 +927,10 @@ pub fn message(
             ))
             .collect(),
         rules: Some(rules_now(state.and_then(|s| s.event_level.as_ref()))),
-        watching: crate::watch::watcher(path, conn)?,
+        watching: crate::watch::watcher(watcher, conn)?,
         answers_note: findings::ANSWERS_NOTE.to_string(),
         login_job_installed: login_job_installed(path),
-        watcher_restarting_since_at: crate::watch::restarting_since(&crate::home(path), now),
+        watcher_restarting_since_at: watcher.restarting_since(now),
         ..Default::default()
     };
     out.store = Some(v1::StoreFile {
@@ -971,23 +976,17 @@ pub fn message(
     out.journal_seq = Some(findings::journal_seq(conn)?);
     let latest = |entry: &str| {
         conn.query_row(
-            "SELECT at FROM journal WHERE run_id = ?1 AND entry = ?2 ORDER BY seq DESC LIMIT 1",
+            "SELECT seq, at FROM journal WHERE run_id = ?1 AND entry = ?2
+             ORDER BY seq DESC LIMIT 1",
             [crate::service::JOURNAL_RUN, entry],
-            |r| r.get(0),
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
         )
         .optional()
     };
-    out.turned_on_at = latest("turned_on")?;
-    out.turned_off_at = latest("turned_off")?;
+    let (on, off) = (latest("turned_on")?, latest("turned_off")?);
+    (out.turned_on_at, out.turned_off_at) = (on.map(|e| e.1), off.map(|e| e.1));
     // Which came last by the journal's order: a clock set back between the two changes nothing.
-    out.turned_on_latest = conn
-        .query_row(
-            "SELECT entry = 'turned_on' FROM journal WHERE run_id = ?1
-             AND entry IN ('turned_on', 'turned_off') ORDER BY seq DESC LIMIT 1",
-            [crate::service::JOURNAL_RUN],
-            |r| r.get(0),
-        )
-        .optional()?;
+    out.turned_on_latest = on.or(off).map(|_| on > off);
     out.this_mac = Some(this_mac_message(&st.this_mac, now));
     match &st.event_level {
         Some(l) => out.event_level = Some(crate::events::message(l)),
@@ -1863,6 +1862,7 @@ mod tests {
         Level {
             state: RUNNING.to_string(),
             read_at: 0,
+            stored: (RUNNING.to_string(), 0),
             written: None,
             said_by: None,
             said: None,

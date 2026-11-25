@@ -1574,13 +1574,13 @@ fn write_view(store: &Path, if_stale: bool) -> Result<Vec<PathBuf>, Box<dyn Erro
     }
     let now = now_secs();
     let folder = home(store);
-    let (current, pages, basis, events_basis) = store::read(store, |tx| {
+    let (current, pages, basis, events_basis, until) = store::read(store, |tx| {
         let current = match if_stale {
             true => current_view(tx, store, now)?,
             false => Current::No,
         };
         if let Current::Yes(_) = current {
-            return Ok((current, Vec::new(), String::new(), String::new()));
+            return Ok((current, Vec::new(), String::new(), String::new(), None));
         }
         // Taken before the pages are read: a basis also names what is not in the store, the
         // watcher's lock, so the pages hold at least what it names and a watcher that stops
@@ -1592,7 +1592,12 @@ fn write_view(store: &Path, if_stale: bool) -> Result<Vec<PathBuf>, Box<dyn Erro
             Current::Events(_) => view::event_pages(tx, &state, &result, now)?,
             _ => view::pages(tx, &state, &result, &store.display().to_string(), now)?,
         };
-        Ok((current, pages, basis, events_basis))
+        // The time until which the headline drawn can stand: the status is fresh until its
+        // check is older than `FRESH_FOR`. One already stale stays so.
+        let until = (result.this_mac.as_ref())
+            .filter(|m| m.fresh)
+            .and_then(|m| Some(m.checked_at? + status::FRESH_FOR));
+        Ok((current, pages, basis, events_basis, until))
     })?;
     std::fs::create_dir_all(folder.join(view::DETAILS))?;
     let mut written = Vec::new();
@@ -1622,6 +1627,7 @@ fn write_view(store: &Path, if_stale: bool) -> Result<Vec<PathBuf>, Box<dyn Erro
         "events": events_basis,
         "made_at": now,
         "pages": names,
+        "until": until,
     });
     std::fs::write(folder.join(view::MADE), made.to_string())?;
     Ok(written)
@@ -1639,7 +1645,8 @@ enum Current {
 }
 
 /// Whether the pages are current at `now`: every one is there, they are younger than
-/// `view::CURRENT_FOR`, and their basis has not moved since they were made. When only the
+/// `view::CURRENT_FOR` and than the time their headline could stand until (`until` in
+/// `view::MADE`), and their basis has not moved since they were made. When only the
 /// event level's basis moved, the pages that show it are written again, not every page. `tx` is
 /// a read of `store`.
 fn current_view(
@@ -1659,7 +1666,13 @@ fn current_view(
     ) else {
         return Ok(Current::No);
     };
-    if !(at..at + view::CURRENT_FOR).contains(&now) {
+    // None is what pages made on a stale check have; one that is not a time this build did not
+    // write, and the pages are not current.
+    let outlived = match &made["until"] {
+        serde_json::Value::Null => false,
+        until => until.as_i64().is_none_or(|until| until < now),
+    };
+    if !(at..at + view::CURRENT_FOR).contains(&now) || outlived {
         return Ok(Current::No);
     }
     let mut paths = Vec::new();
@@ -2532,8 +2545,12 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     let latest = view::latest_coverage(&tx)?;
     let problems = status::problems(&tx, &latest)?;
     let needs = findings::needs(&tx, at)?;
-    // What is not covered is one clause, never a count of things to look at.
-    let not_covered = covered::not_covered(&tx, &latest, &problems, summary.catalogue.as_ref())?;
+    // What is not covered is one clause, never a count of things to look at, with the event level
+    // as `immunity status` serves it.
+    let failed = watch::failures(&tx, &watch::Lock::read(&home))?;
+    let level = events::served(&tx, &failed, at)?;
+    let catalogue = summary.catalogue.as_ref();
+    let not_covered = covered::not_covered(&tx, &latest, &problems, catalogue, level.as_ref())?;
     let mut said = needs_sentence(needs.items.len(), opened);
     if let Some(clause) = covered::clause(&not_covered) {
         said.push(' ');
@@ -6347,5 +6364,43 @@ mod tests {
         assert_eq!(made(true), (all.clone(), 1));
         let (now, still) = times(&all);
         assert_eq!((now != summary, still), (true, other));
+    }
+
+    /// Pages made while their check is fresh, as the calm disc needs, stand only until that check
+    /// is older than the status's own limit (`status::FRESH_FOR`), with their basis unmoved and
+    /// within `view::CURRENT_FOR` of their making: then they are made again.
+    #[test]
+    fn pages_made_on_a_fresh_check_are_made_again_once_it_is_older_than_the_freshness_limit() {
+        let dir = crate::common::Scratch::new("view-until");
+        let path = dir.join("store.db");
+        let conn = store::open_or_make(&path).unwrap();
+        // Fresh now, and stale within `view::CURRENT_FOR` of now.
+        let checked = now_secs() - status::FRESH_FOR + view::CURRENT_FOR / 2;
+        store::journal_note(&conn, checked - 60, "run-1", "run_started", "").unwrap();
+        store::journal_note(&conn, checked, "run-1", "run_finished", "").unwrap();
+        drop(conn);
+        write_view(&path, false).unwrap();
+        let current = |at: i64| {
+            let current = store::read(&path, |tx| current_view(tx, &path, at));
+            matches!(current.unwrap(), Current::Yes(_))
+        };
+        let until = checked + status::FRESH_FOR;
+        assert!(current(until));
+        assert!(!current(until + 1));
+        // Pages made on a check already stale stand as before: time does not make them calmer.
+        let conn = store::open(&path).unwrap();
+        let stale = now_secs() - status::FRESH_FOR - 60;
+        store::journal_note(&conn, stale - 60, "run-2", "run_started", "").unwrap();
+        store::journal_note(&conn, stale, "run-2", "run_finished", "").unwrap();
+        drop(conn);
+        write_view(&path, false).unwrap();
+        assert!(current(now_secs() + 60));
+        // An `until` that is not a time is not what this build wrote: the pages are not current.
+        let made = dir.join(view::MADE);
+        let mut written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&made).unwrap()).unwrap();
+        written["until"] = "later".into();
+        std::fs::write(&made, written.to_string()).unwrap();
+        assert!(!current(now_secs() + 60));
     }
 }

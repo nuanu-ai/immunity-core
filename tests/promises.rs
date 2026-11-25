@@ -13108,7 +13108,7 @@ fn the_summary_page_says_what_status_says_with_each_item_in_full_and_no_markup_f
     let this_mac = section(page, "this-mac");
     assert!(
         this_mac.contains("<span class=\"name\">mac</span>")
-            && this_mac.contains(" · live watching is off · ")
+            && this_mac.contains(" · no watcher runs · ")
             && this_mac.contains("last check <time datetime=\"2"),
         "{this_mac}"
     );

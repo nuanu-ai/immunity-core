@@ -129,7 +129,8 @@ pub fn matches_cmd(args: &MatchesArgs) -> ExitCode {
 struct Held {
     /// Where the core's own reading has read each log file up to.
     read_to: BTreeMap<String, (u64, u64)>,
-    /// The collector's state as the latest reading left it, and when.
+    /// The collector's state as `immunity status` serves it (`events::served`), and when it
+    /// was read.
     state: Option<(String, i64)>,
     /// The findings by id, as a match names them.
     findings: BTreeMap<String, v1::FindingRef>,
@@ -192,7 +193,12 @@ fn answered(
     }
     let held = Held {
         read_to: events::read_up_to(tx)?,
-        state: events::state_read(tx)?,
+        // As `immunity status` serves it, by a reading of the watcher's lock file of its own.
+        state: {
+            let failed =
+                crate::watch::failures(tx, &crate::watch::Lock::read(&crate::home(&args.store)))?;
+            events::served(tx, &failed, now)?.map(|l| (l.state, l.read_at))
+        },
         findings: finding_refs(tx, now)?,
         arrivals: events::arrivals(tx)?,
     };
@@ -1236,6 +1242,129 @@ mod tests {
             system_root: root,
         };
         (dir, args)
+    }
+
+    /// A reading of program starts the watcher failed is named among the readings that failed in
+    /// `not_covered`, and `immunity matches` gives the state of the event level `immunity status`
+    /// gives for the same store and lock file: failed then, running before.
+    #[test]
+    fn a_failed_reading_of_program_starts_by_the_watcher_is_named_and_matches_gives_the_status_state()
+     {
+        let (dir, args) = one_line("watcher-failed");
+        let now = 1_791_090_010;
+        let lock = store::lock_watch(&dir).unwrap().unwrap();
+        std::fs::write(dir.join(store::WATCH_LOCK), "1791000000\nheartbeat\nready").unwrap();
+        let said = || {
+            let state = read_through(Rules::shipped(), &args, now, |awake| {
+                events::queue(&args.system_root, None, LIMIT, now, awake)
+            });
+            let state = state.ok().unwrap().collector.unwrap().status_state;
+            let status = store::read(&args.store, |tx| {
+                let st = crate::status::state(tx, &dir, now)?;
+                crate::status::message(Some(tx), Some(&st), false, &args.store, now)
+            });
+            let status = status.unwrap();
+            let failed = status.not_covered.iter().find(|u| {
+                u.id == crate::covered::READING_FAILED.id
+                    && u.examples
+                        .iter()
+                        .any(|e| e.reason_text.as_deref() == Some("invented"))
+            });
+            (
+                state,
+                Some(status.event_level.unwrap().state),
+                failed.is_some(),
+            )
+        };
+        let running = Some(v1::CollectorState::Running as i32);
+        assert_eq!(said(), (running, running, false));
+        store::open(&args.store)
+            .unwrap()
+            .execute(
+                "INSERT INTO watcher_failed (what, at, detail) VALUES ('events', ?1, 'invented')",
+                [now - 5],
+            )
+            .unwrap();
+        let failed = Some(v1::CollectorState::Failed as i32);
+        assert_eq!(said(), (failed, failed, true));
+        drop(lock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The watcher's failed reading makes failed only a level the store says runs: a level that
+    /// records nothing keeps its own state and words. A failed reading, the watcher's or the
+    /// store's own, is named once among the readings that failed, in place of this Mac's row of
+    /// program starts or with none there. File events not collected stay named, by what the
+    /// store says of the level and since its reading, beside the failure.
+    #[test]
+    fn a_level_is_served_failed_only_over_running_and_its_failure_is_named_once_with_or_without_a_row()
+     {
+        let dir = crate::common::Scratch::new("matches-served");
+        let conn = store::open_or_make(&dir.join("store.db")).unwrap();
+        let watcher = [crate::watch::Failure {
+            what: crate::watch::EVENTS.to_string(),
+            at: 5,
+            detail: "invented".to_string(),
+        }];
+        let put = |state: &str| {
+            let sql = "INSERT OR REPLACE INTO event_level (id, read_at, state) VALUES (1, 1, ?1)";
+            conn.execute(sql, [state]).unwrap();
+            events::served(&conn, &watcher, 10).unwrap().unwrap()
+        };
+        assert_eq!(put(events::SILENT).state, events::SILENT);
+        let own = put(events::FAILED);
+        let failed = put(events::RUNNING);
+        assert_eq!((failed.state.as_str(), failed.read_at), (events::FAILED, 5));
+        let row = |scope: &str, completeness: &str| crate::view::Latest {
+            reader: events::READER.to_string(),
+            scope: scope.to_string(),
+            kind: events::KIND.to_string(),
+            completeness: completeness.to_string(),
+            reason: None,
+            cause: None,
+            at: 1,
+            last_full: Some(1),
+        };
+        let this = Some("machine:mac");
+        // Each row as (scope, completeness, at).
+        let served = |level: &events::Level, rows: &[crate::view::Latest]| {
+            let rows = events::served_readings(Some(level), rows, this);
+            let told = rows
+                .iter()
+                .map(|r| (r.scope.clone(), r.completeness.clone(), r.at));
+            told.collect::<Vec<_>>()
+        };
+        let other = || row("machine:other", "full");
+        let failure = ("machine:mac".to_string(), "none".to_string(), 5);
+        let kept = ("machine:other".to_string(), "full".to_string(), 1);
+        let mine = [other(), row("machine:mac", "full")];
+        assert_eq!(served(&failed, &mine), [kept.clone(), failure.clone()]);
+        assert_eq!(served(&failed, &[other()]), [kept.clone(), failure]);
+        // A level whose own reading failed is named once too, with its row or without.
+        let failed_row = [row("machine:mac", "none")];
+        let own_failure = ("machine:mac".to_string(), "none".to_string(), 1);
+        assert_eq!(
+            served(&own, &failed_row),
+            std::slice::from_ref(&own_failure)
+        );
+        assert_eq!(served(&own, &[]), std::slice::from_ref(&own_failure));
+        // A row that failed already says it with its own reason and is kept, the watcher's
+        // failure not put in its place.
+        let mut said = row("machine:mac", "none");
+        said.cause = Some(crate::store::Cause::Failed.literal().to_string());
+        assert_eq!(served(&failed, &[said]), std::slice::from_ref(&own_failure));
+        // With no row at all in a store that does not know its Mac yet, there is no scope to
+        // name the failure under, so it is not filed under another machine: the level and the
+        // headline say it. File events not collected are listed.
+        let p = crate::status::problems(&conn, &[]).unwrap();
+        let items = crate::covered::not_covered(&conn, &[], &p, None, Some(&failed)).unwrap();
+        let ids: Vec<&str> = items.iter().map(|u| u.cause.id).collect();
+        assert!(!ids.contains(&crate::covered::READING_FAILED.id), "{ids:?}");
+        let files = items
+            .iter()
+            .find(|u| u.cause.id == crate::covered::FILES_NOT_COLLECTED.id);
+        // Since the store's reading, not the watcher's failure.
+        assert_eq!(files.map(|u| u.since), Some(Some(1)), "{ids:?}");
     }
 
     #[test]
