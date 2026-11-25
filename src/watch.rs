@@ -50,11 +50,12 @@
 //! `problem` line, `sample_failed`, and the next is taken at its time.
 //!
 //! Program starts. Every `EVENTS_EVERY` (`--events-every`) the watcher reads the event level's
-//! log (`events.rs`), under the run lock in its own transaction. A reading that took program
-//! starts or changed the level's state prints a `program_starts` line, so that the app shows
-//! it without asking for the status; a reading that failed is a `problem` line,
-//! `events_failed`; one that took nothing prints nothing. After every reading it writes the
-//! numbers of "As it happens" to `view/live.js` for a summary page that is open
+//! log (`events.rs`) one log file a step, each step under the run lock in its own transaction.
+//! While log is left after a step, the next is read at the next turn of the loop, at once. A
+//! step that took program starts or changed the level's state prints a `program_starts` line,
+//! so that the app shows it without asking for the status; a reading that failed is a
+//! `problem` line, `events_failed`; one that took nothing prints nothing. After every step it
+//! writes the numbers of "As it happens" to `view/live.js` for a summary page that is open
 //! (`happens::live`).
 //!
 //! Failures. A reading, a sample or a look at what to watch that failed is a `problem` line,
@@ -875,6 +876,7 @@ impl Watcher<'_> {
         // reading of program starts after it.
         let mut sample = Instant::now();
         let mut starts = Instant::now();
+        let mut pass = crate::events::Pass::default();
         loop {
             if !self.progress() {
                 return;
@@ -955,7 +957,14 @@ impl Watcher<'_> {
             }
             if starts <= Instant::now() {
                 starts = Instant::now() + self.args.events_every;
-                match self.events() {
+                let read = self.events(&mut pass);
+                // Log left unread is read on at the next turn, at once: a full check waiting for
+                // the run lock takes it between steps, and the turn says the watcher is alive. A
+                // step that did not commit is tried again at the next reading.
+                if matches!(read, Ok(Some(_))) && pass.more() {
+                    starts = Instant::now();
+                }
+                match read {
                     // A reading that took program starts or changed the level's state is said,
                     // so that the app shows it without asking for the status.
                     Ok(Some(read)) => {
@@ -1217,14 +1226,17 @@ impl Watcher<'_> {
         Ok(Some((report.findings_opened, needs)))
     }
 
-    /// One reading of the event level under the run lock, and then the numbers of
-    /// "As it happens" written beside the pages for a page that is open (`happens::live`).
-    /// `None` when the watcher was stopped while it waited for the lock.
-    fn events(&mut self) -> Result<Option<crate::EventsRead>, Box<dyn Error>> {
+    /// One step of the reading of the event level under the run lock (`events::Pass`), and then
+    /// the numbers of "As it happens" written beside the pages for a page that is open
+    /// (`happens::live`). `None` when the watcher was stopped while it waited for the lock.
+    fn events(
+        &mut self,
+        pass: &mut crate::events::Pass,
+    ) -> Result<Option<crate::EventsRead>, Box<dyn Error>> {
         let Some(_lock) = self.lock_for(EVENTS)? else {
             return Ok(None);
         };
-        let read = crate::read_events_held(&self.args.store, &self.args.system_root);
+        let read = crate::read_events_held(&self.args.store, &self.args.system_root, pass);
         self.mark_reading(EVENTS, to_mark(&read, |r| r.failed.clone()));
         let read = read?;
         // A page that is open shows these numbers; one that could not be written is a page

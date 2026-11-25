@@ -630,7 +630,7 @@ mod tests {
         let mut conn = crate::store::open_or_make(store).unwrap();
         let tx = conn.transaction().unwrap();
         crate::store::put_entity(&tx, "machine:mac").unwrap();
-        events::read(&tx, "events-1", "machine:mac", root, 1_791_090_000).unwrap();
+        events::read(&tx, "events-1", "machine:mac", root, 1_791_090_000, None).unwrap();
         tx.commit().unwrap();
     }
 

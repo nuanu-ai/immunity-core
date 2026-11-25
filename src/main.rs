@@ -1013,7 +1013,8 @@ fn sample_cmd(args: &SampleArgs) -> ExitCode {
 /// the published rules, see `events.rs`. A reading that failed is coverage with its reason,
 /// never a failed run. Returns how many findings the rules opened.
 fn read_events(run: &mut Run, args: &Args) -> Result<usize, Box<dyn Error>> {
-    let outcome = events::read(run.tx, run.run_id, run.machine, &args.system_root, run.at)?;
+    let root = &args.system_root;
+    let outcome = events::read(run.tx, run.run_id, run.machine, root, run.at, None)?;
     if outcome.state != events::NOT_INSTALLED {
         run.readers += 1;
     }
@@ -1030,10 +1031,15 @@ pub struct EventsRead {
     pub at: i64,
 }
 
-/// One reading of the event level, with the run lock held by the caller: what the watcher
-/// does at every `--events-every`. It commits what it read, the state and the coverage, and
-/// returns the reason when the reading failed, so that the watcher records the failure.
-pub fn read_events_held(path: &Path, system_root: &Path) -> Result<EventsRead, Box<dyn Error>> {
+/// One step of the watcher's reading of the event level (`events::Pass`), with the run lock
+/// held by the caller. It commits what it read, the state and the coverage, and returns the
+/// reason when the reading failed, so that the watcher records the failure. The pass moves on
+/// only once the step committed.
+pub fn read_events_held(
+    path: &Path,
+    system_root: &Path,
+    pass: &mut events::Pass,
+) -> Result<EventsRead, Box<dyn Error>> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
     let at = now.as_secs() as i64;
     let run_id = format!(
@@ -1047,11 +1053,12 @@ pub fn read_events_held(path: &Path, system_root: &Path) -> Result<EventsRead, B
     let machine = this_machine_or_named(&tx)?;
     store::put_entity(&tx, &machine)?;
     let before = events::state(&tx)?;
-    let outcome = events::read(&tx, &run_id, &machine, system_root, at)?;
+    let outcome = events::read(&tx, &run_id, &machine, system_root, at, Some(pass))?;
     tx.commit()?;
+    *pass = outcome.pass;
     Ok(EventsRead {
         starts: outcome.starts,
-        changed: before.as_deref() != Some(outcome.state),
+        changed: before != events::state(&conn)?,
         level: events::level(&conn, at)?,
         failed: outcome.failed,
         at,
