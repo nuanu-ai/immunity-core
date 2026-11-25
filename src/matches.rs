@@ -1347,12 +1347,19 @@ mod tests {
             served(&own, &failed_row),
             std::slice::from_ref(&own_failure)
         );
-        assert_eq!(served(&own, &[]), [own_failure]);
-        // With no row at all, both the failure and file events not collected are listed.
+        assert_eq!(served(&own, &[]), std::slice::from_ref(&own_failure));
+        // A row that failed already says it with its own reason and is kept, the watcher's
+        // failure not put in its place.
+        let mut said = row("machine:mac", "none");
+        said.cause = Some(crate::store::Cause::Failed.literal().to_string());
+        assert_eq!(served(&failed, &[said]), std::slice::from_ref(&own_failure));
+        // With no row at all in a store that does not know its Mac yet, there is no scope to
+        // name the failure under, so it is not filed under another machine: the level and the
+        // headline say it. File events not collected are listed.
         let p = crate::status::problems(&conn, &[]).unwrap();
         let items = crate::covered::not_covered(&conn, &[], &p, None, Some(&failed)).unwrap();
         let ids: Vec<&str> = items.iter().map(|u| u.cause.id).collect();
-        assert!(ids.contains(&crate::covered::READING_FAILED.id), "{ids:?}");
+        assert!(!ids.contains(&crate::covered::READING_FAILED.id), "{ids:?}");
         let files = items
             .iter()
             .find(|u| u.cause.id == crate::covered::FILES_NOT_COLLECTED.id);

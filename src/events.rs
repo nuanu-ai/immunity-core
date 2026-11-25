@@ -4061,32 +4061,45 @@ pub fn served(
     Ok(level)
 }
 
-/// The latest readings as `served` says them: while the level is served failed, by the watcher's
-/// reading or by the store's own, that failed reading stands for this Mac's reading of program
-/// starts, `this`, in place of the store's row when there is one and beside the rest when there
-/// is none. So `covered::not_covered` names it once, among the readings that failed.
+/// The latest readings as `served` says them: while the level is served failed, that failed
+/// reading stands for this Mac's reading of program starts, in place of the store's row, or
+/// beside the rest when the store has none. So `covered::not_covered` names it once, among the
+/// readings that failed. A stored row that failed already says it with its own reason and is
+/// kept as it is. `this` is this Mac; before the store knows it, the row of program starts is
+/// taken as its own, and with no row there is no scope to name the failure under, so the level
+/// and the headline alone say it.
 pub fn served_readings<'a>(
     level: Option<&Level>,
     latest: &'a [crate::view::Latest],
     this: Option<&str>,
 ) -> std::borrow::Cow<'a, [crate::view::Latest]> {
+    let kept = std::borrow::Cow::Borrowed(latest);
     let Some(l) = level.filter(|l| l.state == FAILED) else {
-        return std::borrow::Cow::Borrowed(latest);
+        return kept;
     };
-    let scope = this.unwrap_or_default();
-    let mine = |r: &crate::view::Latest| r.reader == READER && r.kind == KIND && r.scope == scope;
-    let failed = crate::view::Latest {
+    let mine = |r: &&crate::view::Latest| {
+        r.reader == READER && r.kind == KIND && this.is_none_or(|t| r.scope == t)
+    };
+    let stored = latest.iter().find(mine);
+    let failed = Cause::Failed.literal();
+    let Some(scope) = this.or(stored.map(|r| r.scope.as_str())) else {
+        return kept;
+    };
+    if stored.is_some_and(|r| r.cause.as_deref() == Some(failed)) {
+        return kept;
+    }
+    let said = crate::view::Latest {
         reader: READER.into(),
         scope: scope.into(),
         kind: KIND.into(),
         completeness: "none".into(),
         reason: l.reason.clone(),
-        cause: Some(Cause::Failed.literal().into()),
+        cause: Some(failed.into()),
         at: l.read_at,
-        last_full: latest.iter().find(|r| mine(r)).and_then(|r| r.last_full),
+        last_full: stored.and_then(|r| r.last_full),
     };
     let others = latest.iter().filter(|r| !mine(r)).cloned();
-    std::borrow::Cow::Owned(others.chain([failed]).collect())
+    std::borrow::Cow::Owned(others.chain([said]).collect())
 }
 
 /// The cap of the log, as the latest reading left it.
