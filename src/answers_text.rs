@@ -14,7 +14,8 @@
 //!
 //! Text from a source is in a message's `_text` fields, already escaped one to one
 //! (`known::whole`), and is escaped again as it reaches the screen, before it is measured, cut or
-//! styled (`screen.rs`). No line begins with text from a source: each begins with Immunity Core's own
+//! styled (`screen.rs`). Alone beside a label or in a cell it goes without quotes (`Name::bare`);
+//! after the core's words or in a list it is quoted, each name by itself (`Name::quoted`). No line begins with text from a source: each begins with Immunity Core's own
 //! words, an indent or a mark of Immunity Core's, so a name made to look like `✓ Nothing needs a look`
 //! can never stand where Immunity Core's own answer stands.
 //!
@@ -25,6 +26,8 @@ use crate::contract::v1;
 use crate::covered::Found;
 use crate::overview::{level, rank, short_title, urgent_cell};
 use crate::screen::{self, BOLD, Cell, Column, Cut, DIM, GREEN, PLAIN, RED, Screen, Style, YELLOW};
+use crate::secrets::{self, Name};
+use crate::text::names;
 use crate::view;
 use std::collections::BTreeMap;
 
@@ -118,7 +121,7 @@ fn pieces(screen: &Screen, indent: usize, parts: &[(String, Style)]) -> Vec<Stri
 /// thing as asked, bold, cut in the middle on a terminal, and the time at the right, dim; where
 /// both do not fit, the time goes on a line of its own below. In a pipe the time follows.
 fn first_line(screen: &Screen, label: &str, what: &str, right: &str) -> Vec<String> {
-    let what = view::shown(what);
+    let what = Name::given(what).quoted();
     let right = view::shown(right);
     let fixed = screen::columns(label) + 2;
     let start = |what: &str| {
@@ -363,7 +366,7 @@ fn values<'a>(k: &'a v1::Known, subject: &str, predicate: &str) -> Vec<&'a str> 
         .collect()
 }
 
-/// A list of names: how many, the first few, and how many more.
+/// A list of names, each already printed: how many, the first few, and how many more.
 fn named(items: &[String]) -> String {
     let shown = &items[..items.len().min(NAMED)];
     let more = items.len() - shown.len();
@@ -372,6 +375,14 @@ fn named(items: &[String]) -> String {
         said.push_str(&format!(" +{}", grouped(more as u64)));
     }
     said
+}
+
+/// Names from `_text` fields beside a label: one alone, bare; several, each quoted.
+fn beside(values: &[String]) -> String {
+    match values {
+        [one] => Name::given(one).bare(),
+        all => names(all, ", "),
+    }
 }
 
 /// What the store holds of the thing, one labelled line a kind: where it is, its own facts, the
@@ -390,7 +401,7 @@ fn known_lines(screen: &Screen, k: &v1::Known, what: &str) -> Vec<(String, Strin
             Some(_) => "Where",
             None => "Name",
         };
-        lines.push((label.to_string(), name));
+        lines.push((label.to_string(), Name::given(&name).bare()));
     }
     // The thing's own facts, one line a label, in the order the message gives them: a machine
     // it is part of and one it is located on are both where it is.
@@ -414,11 +425,11 @@ fn known_lines(screen: &Screen, k: &v1::Known, what: &str) -> Vec<(String, Strin
         }
     }
     for (label, values) in said {
-        lines.push((label, values.join(", ")));
+        lines.push((label, beside(&values)));
     }
     if !k.same_as.is_empty() {
         let names: Vec<String> = k.same_as.iter().map(|e| name_of(&e.id_text)).collect();
-        lines.push(("Also known as".to_string(), names.join(", ")));
+        lines.push(("Also known as".to_string(), beside(&names)));
     }
     // The things inside it, by kind.
     let mut by_type: BTreeMap<u8, (String, Vec<String>)> = BTreeMap::new();
@@ -445,12 +456,14 @@ fn known_lines(screen: &Screen, k: &v1::Known, what: &str) -> Vec<(String, Strin
             }
             _ => name_of(&p.id_text),
         };
-        // A long name is cut in the middle on a terminal; what is said of it stays whole.
+        item = Name::given(&item).quoted();
+        // A long name is cut in the middle on a terminal, its quotes kept; what is said of it
+        // stays whole.
         if screen.fits().is_some() {
-            item = screen::cut_middle(&view::shown(&item), ITEM_WIDTH);
+            item = screen::cut_middle(&item, ITEM_WIDTH);
         }
         if let Some(v) = values(k, &p.id_text, "has_version").first() {
-            item = format!("{item} {v}");
+            item = format!("{item} {}", Name::given(v).quoted());
         }
         if let Some(w) = values(k, &p.id_text, "watched_as").first() {
             item = format!("{item} ({w})");
@@ -490,7 +503,7 @@ fn known_lines(screen: &Screen, k: &v1::Known, what: &str) -> Vec<(String, Strin
             }
         }
         if !files.is_empty() {
-            lines.push(("Declared in".to_string(), files.join(", ")));
+            lines.push(("Declared in".to_string(), beside(&files)));
         }
     }
     lines
@@ -509,7 +522,7 @@ fn completeness_said(c: &v1::Coverage) -> &'static str {
 /// reader for.
 fn why_said(c: &v1::Coverage) -> String {
     let mut said = match &c.reason_text {
-        Some(r) => r.clone(),
+        Some(r) => secrets::Said::given(r).quoted(),
         None => match c.cause.map(v1::Cause::try_from) {
             Some(Ok(v1::Cause::NoReader)) => "this version has no reader for it".to_string(),
             Some(Ok(v1::Cause::NotGiven)) => "it was not given to the reader".to_string(),
@@ -521,7 +534,7 @@ fn why_said(c: &v1::Coverage) -> String {
         .lacks
         .iter()
         .map(|l| match &l.name_text {
-            Some(name) => format!("{} {name}", l.what),
+            Some(name) => format!("{} {}", l.what, Name::given(name).quoted()),
             None => l.what.clone(),
         })
         .collect();
@@ -647,7 +660,7 @@ pub fn known(k: &v1::Known, screen: &Screen) -> String {
             0,
             &format!(
                 "Answered for {}: {}",
-                name_of(&thing.id_text),
+                Name::given(&name_of(&thing.id_text)).quoted(),
                 asked_why.join("; ")
             ),
             YELLOW,
@@ -740,35 +753,29 @@ fn not_full_lines(screen: &Screen, k: &v1::Known, not_full: &[&v1::Coverage]) ->
         let on = if own.contains(&c.scope_text.as_str()) {
             String::new()
         } else {
-            format!(" on {}", name_of(&c.scope_text))
+            format!(" on {}", Name::given(&name_of(&c.scope_text)).quoted())
         };
         let why = view::shown(&why_said(c));
         // A reason that already says how much was read is not preceded by the same words.
         let words = completeness_said(c);
-        let words = if why.starts_with(words) {
-            String::new()
-        } else {
-            format!("{words}, ")
+        let words = match &c.reason_text {
+            Some(r) if r.starts_with(words) => String::new(),
+            _ => format!("{words}, "),
         };
         let said = view::shown(&format!("{}{on}: {words}", c.kind));
-        // On a terminal a reading takes two lines at most: the first clause of its reason, the
-        // rest cut with the mark, escaped before it is cut. The pipe form keeps it whole.
+        // On a terminal a reading takes two lines at most, the rest cut with the mark, escaped
+        // before it is cut. The pipe form keeps it whole.
+        let whole = format!("{said}{why}");
         let said = match screen.fits() {
             Some(screen_width) => {
                 let room = screen_width.saturating_sub(4 + width + 3);
-                let first = first_clause(&why);
-                let clause = if first.len() < why.len() {
-                    format!("{first}…")
-                } else {
-                    why.clone()
-                };
                 // Room for two lines, less what breaking at spaces may leave unused.
                 let room = (2 * room).saturating_sub(room / 4).max(1);
-                screen::cut_end(&format!("{said}{clause}"), room)
+                screen::cut_end(&whole, room)
             }
-            None => format!("{said}{why}"),
+            None => whole.clone(),
         };
-        cut |= said.ends_with('…');
+        cut |= said != whole;
         let style = if failed(c) { RED } else { YELLOW };
         out.extend(screen.labelled(4, width, &c.reader, &said, style, None, 0));
     }
@@ -790,16 +797,6 @@ fn not_full_lines(screen: &Screen, k: &v1::Known, not_full: &[&v1::Coverage]) ->
         ));
     }
     out
-}
-
-/// The first clause of a reason: up to its first `;`, `:` or full stop followed by a space.
-fn first_clause(why: &str) -> &str {
-    // A colon introduces what the clause is about, such as the file not read, so it does not end it.
-    ["; ", ". "]
-        .iter()
-        .filter_map(|p| why.find(p))
-        .min()
-        .map_or(why, |at| &why[..at])
 }
 
 /// A record's label as a person reads it, and its style: malicious and critical red, high
@@ -844,8 +841,20 @@ fn unread_said(p: &v1::UnreadPlace) -> String {
         other => return other.replace('_', " "),
     };
     match &p.why_text {
-        Some(why) => format!("{word}: {why}"),
+        Some(why) => format!("{word}: {}", secrets::Said::given(why).quoted()),
         None => word.to_string(),
+    }
+}
+
+/// A package and its releases in a cell, each quoted.
+fn package_said(package: &str, versions: &[&str]) -> String {
+    match versions {
+        [] => Name::given(package).quoted(),
+        _ => format!(
+            "{} {}",
+            Name::given(package).quoted(),
+            names(versions, ", ")
+        ),
     }
 }
 
@@ -855,10 +864,14 @@ fn fix_cell(screen: &Screen, fixed: &[String]) -> Cell {
     match fixed {
         [] => Cell::plain("no fix named"),
         [first, rest @ ..] if screen.fits().is_some() && !rest.is_empty() => Cell::new(
-            format!("fixed in {first} +{}", grouped(rest.len() as u64)),
+            format!(
+                "fixed in {} +{}",
+                Name::given(first).quoted(),
+                grouped(rest.len() as u64)
+            ),
             GREEN,
         ),
-        all => Cell::new(format!("fixed in {}", all.join(", ")), GREEN),
+        all => Cell::new(format!("fixed in {}", names(all, ", ")), GREEN),
     }
 }
 
@@ -1039,9 +1052,9 @@ pub fn vulnerabilities(m: &v1::Vulnerabilities, screen: &Screen) -> String {
             let versions: Vec<&str> = a.releases.iter().map(|x| x.version_text.as_str()).collect();
             vec![
                 Cell::new(r.label.clone(), label_style(&r.label)),
-                Cell::plain(r.id_text.clone()),
-                Cell::plain(format!("{} {}", a.package_text, versions.join(", "))),
-                Cell::plain(a.project_text.clone()),
+                Cell::plain(Name::given(&r.id_text).bare()),
+                Cell::plain(package_said(&a.package_text, &versions)),
+                Cell::plain(Name::given(&a.project_text).bare()),
                 fix_cell(screen, &r.fixed_text),
             ]
         })
@@ -1137,8 +1150,8 @@ pub fn vulnerabilities(m: &v1::Vulnerabilities, screen: &Screen) -> String {
             .take(ROWS_SHOWN)
             .map(|p| {
                 vec![
-                    Cell::plain(p.project_text.clone()),
-                    Cell::plain(p.package_text.clone()),
+                    Cell::plain(Name::given(&p.project_text).bare()),
+                    Cell::plain(Name::given(&p.package_text).bare()),
                     Cell::new(p.ecosystem.clone(), DIM),
                     Cell::new(reason_said(&p.reason), YELLOW),
                 ]
@@ -1193,7 +1206,7 @@ pub fn vulnerabilities(m: &v1::Vulnerabilities, screen: &Screen) -> String {
                     p.ecosystem.clone()
                 };
                 vec![
-                    Cell::plain(p.project_text.clone()),
+                    Cell::plain(Name::given(&p.project_text).bare()),
                     Cell::new(ecosystem, DIM),
                     Cell::new(unread_said(p), YELLOW),
                 ]
@@ -1301,7 +1314,7 @@ fn rows_of(answers: &[v1::PlaceAnswer]) -> Vec<Row> {
             let said = said_of(a.answer);
             out.push(Row {
                 said,
-                project: a.project_text.clone(),
+                project: Name::given(&a.project_text).bare(),
                 what: a.ecosystem.clone(),
                 answer: answer_said(
                     said,
@@ -1322,10 +1335,8 @@ fn rows_of(answers: &[v1::PlaceAnswer]) -> Vec<Row> {
                 .collect();
             out.push(Row {
                 said,
-                project: a.project_text.clone(),
-                what: format!("{} {}", p.package_text, versions.join(", "))
-                    .trim_end()
-                    .to_string(),
+                project: Name::given(&a.project_text).bare(),
+                what: package_said(&p.package_text, &versions),
                 answer: answer_said(
                     said,
                     p.openvex.as_deref(),
@@ -1401,7 +1412,7 @@ pub fn vulnerability(m: &v1::Vulnerability, screen: &Screen) -> String {
             YELLOW,
         ),
     };
-    let id = view::shown(&m.id_text);
+    let id = Name::given(&m.id_text).quoted();
     match screen.fits() {
         Some(width) => {
             let line = format!("Vulnerability {id}   {attacks}");
@@ -1524,8 +1535,14 @@ pub fn vulnerability(m: &v1::Vulnerability, screen: &Screen) -> String {
     }
     for (r, rows) in &records {
         out.push(String::new());
-        let summary = r.summary_text.as_deref().unwrap_or_default();
-        let head = format!("{}  {}", view::shown(&r.record_text), view::shown(summary));
+        let head = match r.summary_text.as_deref() {
+            Some(summary) => format!(
+                "{}  {}",
+                Name::given(&r.record_text).quoted(),
+                secrets::Said::given(summary).quoted()
+            ),
+            None => Name::given(&r.record_text).bare(),
+        };
         let head = match screen.fits() {
             Some(width) => screen::cut_end(&head, width.saturating_sub(2)),
             None => head,
@@ -1536,7 +1553,9 @@ pub fn vulnerability(m: &v1::Vulnerability, screen: &Screen) -> String {
             2,
             &format!(
                 "{}, {} data, modified {}",
-                r.record_source, r.ecosystem, r.modified_text
+                r.record_source,
+                r.ecosystem,
+                Name::given(&r.modified_text).quoted()
             ),
             DIM,
         ));
@@ -1698,8 +1717,10 @@ mod tests {
                 let text = known(k, &screen);
                 assert_eq!(calm_in(&text), Vec::<&str>::new(), "{text}");
                 assert!(!text.contains('✓'), "{text}");
-                // The lines that say it are never dim.
-                for line in text.lines().skip(1).take(4) {
+                // The lines that say it are never dim; the time of the first line, on a line of
+                // its own where the first does not hold it, is.
+                let time = |l: &&str| l.trim_start().starts_with("\u{1b}[2mchecked");
+                for line in text.lines().skip(1).filter(|l| !time(l)).take(4) {
                     assert!(!line.contains("\u{1b}[2m"), "{line:?}");
                 }
             }
@@ -1727,7 +1748,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{text}"));
         // The first clause, cut with the mark, and the next line is no longer the reason.
         assert!(
-            lines[at].contains("in part, x\\u{1b}[31mthe file could"),
+            lines[at].contains("in part, \"x\\u{1b}[31mthe file could"),
             "{text}"
         );
         assert!(lines[at..at + 2].concat().contains('…'), "{text}");
@@ -1749,20 +1770,8 @@ mod tests {
             Some("not supported yet"),
         ));
         let text = known(&short, &Screen::terminal(80, false));
-        assert!(text.contains("in part, not supported yet\n"), "{text}");
+        assert!(text.contains("in part, \"not supported yet\"\n"), "{text}");
         assert!(!text.contains("whole with --json"), "{text}");
-        // The first clause keeps what its colon names; what follows the clause is cut.
-        let mut named = project("~/dev/shop", v1::Presence::Held, true);
-        named.coverage.push(reading(
-            "lockfile dependencies",
-            v1::Completeness::Partial,
-            Some("not supported yet: yarn.lock; no reader for lockfile kind yarn.lock"),
-        ));
-        let text = known(&named, &Screen::terminal(80, false));
-        assert!(
-            text.contains("in part, not supported yet: yarn.lock…\n"),
-            "{text}"
-        );
     }
 
     #[test]
@@ -1778,9 +1787,9 @@ mod tests {
             k.coverage
                 .push(reading("two", completeness, Some("the file is gone")));
             let text = known(&k, &Screen::pipe());
-            assert!(text.contains(&format!("one: {own}\n")), "{text}");
+            assert!(text.contains(&format!("one: \"{own}\"\n")), "{text}");
             assert!(
-                text.contains(&format!("two: {words}, the file is gone\n")),
+                text.contains(&format!("two: {words}, \"the file is gone\"\n")),
                 "{text}"
             );
         }
@@ -1797,7 +1806,7 @@ mod tests {
         let text = known(&k, &Screen::pipe());
         assert!(text.contains("Readings   2, 1 not full"), "{text}");
         assert!(
-            text.contains("lockfile dependencies: in part, not supported yet: yarn.lock"),
+            text.contains(r#"lockfile dependencies: in part, "not supported yet: yarn.lock""#),
             "{text}"
         );
         // A partial reading keeps the answer from calm.
@@ -1832,7 +1841,7 @@ mod tests {
         assert!(text.contains("2, 1 not full"), "{text}");
         assert!(
             text.contains(
-                "Not judged   sweep visit: the server check has never visited this machine"
+                r#"Not judged   sweep visit: "the server check has never visited this machine""#
             ),
             "{text}"
         );
@@ -2002,8 +2011,8 @@ mod tests {
             "Where            ~/dev/shop\n",
             "On               example-host\n",
             "Runs by itself   .vscode/tasks.json\n",
-            "Packages         1: @scope/left-pad 1.3.0\n",
-            "Files            1: .vscode/tasks.json (task run when the project folder is opened)\n",
+            "Packages         1: \"@scope/left-pad\" \"1.3.0\"\n",
+            "Files            1: \".vscode/tasks.json\" (task run when the project folder is opened)\n",
             "Declared in      package-lock.json\n",
         ] {
             assert!(text.contains(said), "{said}{text}");
@@ -2017,7 +2026,10 @@ mod tests {
             })
             .collect();
         let text = known(&k, &Screen::pipe());
-        assert!(text.contains("8: p0, p1, p2, p3, p4, p5 +2\n"), "{text}");
+        assert!(
+            text.contains(r#"8: "p0", "p1", "p2", "p3", "p4", "p5" +2"#),
+            "{text}"
+        );
         // This Mac, asked with no name, is named by the store's name for it, and a program
         // asked by its id by its name.
         let mut mac = project("", v1::Presence::Held, true);
@@ -2032,7 +2044,7 @@ mod tests {
         }];
         let text = known(&mac, &Screen::pipe());
         assert!(
-            text.starts_with("This Mac  example-host   checked "),
+            text.starts_with("This Mac  \"example-host\"   checked "),
             "{text}"
         );
         assert!(text.contains("Also known as   web-1\n"), "{text}");
@@ -2048,7 +2060,7 @@ mod tests {
             r#type: "component".to_string(),
         });
         let text = known(&app, &Screen::pipe());
-        assert!(text.starts_with("Program  component:"), "{text}");
+        assert!(text.starts_with("Program  \"component:"), "{text}");
         assert!(text.contains("Name       org.example.editor\n"), "{text}");
     }
 
@@ -2323,7 +2335,7 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[0],
-            "Vulnerability GHSA-0000-0000-0000   not on the list of those used in attacks"
+            "Vulnerability \"GHSA-0000-0000-0000\"   not on the list of those used in attacks"
         );
         // ~/dev/odd cannot be told in npm: it is counted as cannot be told, though it is not
         // affected in crates.io.
@@ -2342,16 +2354,16 @@ mod tests {
             .unwrap_or_else(|| panic!("{text}"));
         assert!(affected < untold && untold < calm, "{text}");
         assert!(
-            text.contains("~/dev/odd   dset 3.1.1, 3.1.2  its version cannot be compared"),
+            text.contains(r#"~/dev/odd   "dset" "3.1.1", "3.1.2"  its version cannot be compared"#),
             "{text}"
         );
         // An affected row names the releases the record affects and the fix.
         assert!(
-            text.contains("~/dev/shop  dset 3.1.1         fixed in 3.1.2"),
+            text.contains(r#"~/dev/shop  "dset" "3.1.1"           fixed in "3.1.2""#),
             "{text}"
         );
         assert!(
-            text.contains("dset 3.1.1, 3.1.2  at or above a fix"),
+            text.contains(r#""dset" "3.1.1", "3.1.2"  at or above a fix"#),
             "{text}"
         );
         // Without the affected project, the opening says what cannot be told first.
@@ -2407,7 +2419,7 @@ mod tests {
         m.in_catalogue = Some(true);
         let text = vulnerability(&m, &Screen::pipe());
         assert!(
-            text.starts_with("Vulnerability GHSA-0000-0000-0000   used in attacks\n"),
+            text.starts_with("Vulnerability \"GHSA-0000-0000-0000\"   used in attacks\n"),
             "{text}"
         );
         assert!(
@@ -2418,7 +2430,7 @@ mod tests {
         );
         // On a narrow terminal the word goes on a line of its own, whole.
         let text = vulnerability(&m, &Screen::terminal(40, false));
-        assert!(text.starts_with("Vulnerability GHSA-0000-0000-0000\n  used in attacks\n"));
+        assert!(text.starts_with("Vulnerability \"GHSA-0000-0000-0000\"\n  used in attacks\n"));
         // An id no record names: the core's sentence, and each place's answer with how sure.
         let place = |p: &str, answer: v1::PackageAnswer| v1::PlaceAnswer {
             project_text: p.to_string(),
@@ -2743,19 +2755,19 @@ mod tests {
         assert!(
             first
                 .trim_end()
-                .ends_with("GHSA-fv66-9v8q-g76r  react-server-dom-webpack 19.0.0"),
+                .ends_with(r#"GHSA-fv66-9v8q-g76r  "react-server-dom-webpack" "19.0.0""#),
             "{text}"
         );
         // The project and the fix on the second, under the package.
         let second = lines[at + 1];
-        let under = first.find("react-server").unwrap();
+        let under = first.find("\"react-server").unwrap();
         assert_eq!(&second[..under], " ".repeat(under), "{text}");
         // The project gives way, in its middle, only to what is left of the second line.
         assert!(
-            second.contains("~/dev/a-project-") && second.contains("ong-name"),
+            second.contains("~/dev/a-project") && second.contains("ng-name"),
             "{text}"
         );
-        assert!(second.contains("fixed in 19.0.1"), "{text}");
+        assert!(second.contains(r#"fixed in "19.0.1""#), "{text}");
         assert!(lines.iter().all(|l| screen::columns(l) <= 80), "{text}");
         // Where the row fits whole, one line.
         let wide = vulnerabilities(&m, &Screen::terminal(140, false));
@@ -2811,12 +2823,12 @@ mod tests {
         // Each group's head, its row's first line, then its second line.
         assert_eq!(at("GHSA-aaaa"), at("Used in attacks") + 1, "{text}");
         assert!(
-            lines[at("GHSA-aaaa") + 1].contains("fixed in 19.0.1"),
+            lines[at("GHSA-aaaa") + 1].contains(r#"fixed in "19.0.1""#),
             "{text}"
         );
         assert_eq!(at("GHSA-bbbb"), at("Other") + 1, "{text}");
         assert!(
-            lines[at("GHSA-bbbb") + 1].contains("fixed in 19.0.1"),
+            lines[at("GHSA-bbbb") + 1].contains(r#"fixed in "19.0.1""#),
             "{text}"
         );
     }
@@ -2887,12 +2899,12 @@ mod tests {
         let other = text.find("\n  Other\n").unwrap_or_else(|| panic!("{text}"));
         let first = text.find("GHSA-0001").unwrap();
         assert!(attacks < first && first < other, "{text}");
-        assert!(text.contains("fixed in 19.0.1, 19.1.2"), "{text}");
+        assert!(text.contains(r#"fixed in "19.0.1", "19.1.2""#), "{text}");
         assert!(text.contains("no fix named"), "{text}");
         assert!(text.contains("    … 1 more not listed here\n"), "{text}");
         // On a terminal the first fix and how many more.
         let wide = vulnerabilities(&m, &Screen::terminal(120, false));
-        assert!(wide.contains("fixed in 19.0.1 +1"), "{wide}");
+        assert!(wide.contains(r#"fixed in "19.0.1" +1"#), "{wide}");
         // The first ten that cannot be told are named, the rest counted with every reason, in
         // words.
         assert!(text.contains("Cannot be told  12 packages\n"), "{text}");
@@ -2973,7 +2985,7 @@ mod tests {
         for said in [
             "  Not read  13 places\n",
             "    ~/dev/notes       no lockfile this version reads\n",
-            "    ~/dev/yarn   npm  some lockfiles not read: not supported yet: yarn.lock\n",
+            "    ~/dev/yarn   npm  some lockfiles not read: \"not supported yet: yarn.lock\"\n",
             "    ~/dev/go     go   lockfiles of a kind this version does not read\n",
             "    ~/dev/shut        lockfiles not read\n",
             "    ~/dev/new    npm  some new word\n",
@@ -3012,11 +3024,11 @@ mod tests {
         k.coverage = vec![failed, limit];
         let text = known(&k, &screen);
         assert!(
-            text.contains("\u{1b}[31mfailed reading: in part, x"),
+            text.contains("\u{1b}[31mfailed reading: in part, \"x\""),
             "{text}"
         );
         assert!(
-            text.contains("\u{1b}[33mlimited reading: in part, y"),
+            text.contains("\u{1b}[33mlimited reading: in part, \"y\""),
             "{text}"
         );
         let item = |label: &str| v1::AffectedPackage {
@@ -3063,7 +3075,7 @@ mod tests {
             .map(|i| reading(&format!("kind {i}"), v1::Completeness::Partial, Some("z")))
             .collect();
         let text = known(&k, &Screen::pipe());
-        assert!(text.contains("kind 7: in part, z"), "{text}");
+        assert!(text.contains("kind 7: in part, \"z\""), "{text}");
         assert!(!text.contains("kind 8:"), "{text}");
         assert!(text.contains("    … 2 more not full\n"), "{text}");
     }
@@ -3083,15 +3095,18 @@ mod tests {
         let text = known(&k, &screen);
         let first = text.lines().next().unwrap();
         assert!(
-            first.starts_with("Project  ~/dev/a-long") && first.contains('…'),
+            first.starts_with("Project  \"~/dev/a-long") && first.contains('…'),
             "{text}"
         );
-        assert!(first.contains("end ") && first.ends_with(" ago"), "{text}");
+        assert!(
+            first.contains("end\" ") && first.ends_with(" ago"),
+            "{text}"
+        );
         let files = text
             .lines()
-            .find(|l| l.contains("1: ~/elsewhere/n/n/"))
+            .find(|l| l.contains("1: \"~/elsewhere/n/n/"))
             .unwrap_or_else(|| panic!("{text}"));
-        assert!(files.contains('…') && files.ends_with("x.json"), "{text}");
+        assert!(files.contains('…') && files.ends_with("x.json\""), "{text}");
         // In a pipe, whole.
         let text = known(&k, &Screen::pipe());
         assert!(
@@ -3142,7 +3157,7 @@ mod tests {
         let text = known(&k, &Screen::pipe());
         assert!(
             text.contains(
-                "in part, one was skipped; no reader for lockfile kind bun.lockb, ecosystem"
+                r#"in part, "one was skipped"; no reader for lockfile kind "bun.lockb", ecosystem"#
             ),
             "{text}"
         );
@@ -3155,7 +3170,7 @@ mod tests {
         k.coverage
             .push(asked(v1::Question::Machine, "asked by another name"));
         let text = known(&k, &Screen::pipe());
-        assert!(text.starts_with("Machine  web-1"), "{text}");
+        assert!(text.starts_with("Machine  \"web-1\""), "{text}");
         assert!(text.contains("Answered for "), "{text}");
         assert_eq!(text.matches("asked by another name").count(), 1, "{text}");
         // A reading that was observed is never the one made by rule, whatever its reader.

@@ -631,7 +631,7 @@ fn a_reading_that_was_not_read_is_said_once_with_its_reason() {
     let line = text.lines().find(|l| l.contains(OTHERS_KIND)).unwrap();
     assert!(
         line.contains(&format!(
-            "{OTHERS_KIND} on mac: not read: .npmrc in 1 checkout;"
+            "{OTHERS_KIND} on \"mac\": \"not read: .npmrc in 1 checkout\";"
         )),
         "{line}"
     );
@@ -6647,7 +6647,7 @@ fn each_check_with_first_readings_raises_its_own_item_whatever_was_answered_abou
         text.contains("\n    First read   ~/.tools/helper, 1 thing runs by itself\n"),
         "{text}"
     );
-    assert!(text.contains("\n  1 project on mac   "), "{text}");
+    assert!(text.contains("\n  1 project on \"mac\"   "), "{text}");
     // The list's row says it too, beside the short title; what needs a look counts the rule.
     let said = |args: &[&str]| {
         let out = Command::new(env!("CARGO_BIN_EXE_immunity"))
@@ -8787,7 +8787,7 @@ fn a_unit_read_before_and_unreadable_now_keeps_the_headline_from_calm_whoever_ow
             .filter(|l| l.starts_with("  ! ") && l.contains("~/.zshrc"))
             .collect();
         assert!(
-            lines.len() == 1 && lines[0].starts_with("  ! Could not read: ~/.zshrc: "),
+            lines.len() == 1 && lines[0].starts_with("  ! Could not read: \"~/.zshrc\": "),
             "{text}"
         );
         // Another check that cannot read it changes nothing.
@@ -8836,7 +8836,7 @@ fn a_file_read_before_that_the_guard_of_protected_folders_now_turns_away_is_a_fa
     );
     assert_eq!(about(&s, "~/.zshrc"), [(lost, true)], "{s:#}");
     assert!(
-        text.contains("\n  ! Can no longer be read: ~/.zshrc\n"),
+        text.contains("\n  ! Can no longer be read: \"~/.zshrc\"\n"),
         "{text}"
     );
 }
@@ -8866,7 +8866,7 @@ fn a_narrower_check_that_does_not_look_at_a_unit_read_before_leaves_its_fault_st
     assert!(about(&s, "~/dev/shop/.mcp.json").contains(&lost), "{s:#}");
     assert_eq!(s["this_mac"]["state"], "watched_in_part");
     assert!(
-        text.contains("! Can no longer be read: ~/dev/shop/.mcp.json"),
+        text.contains("! Can no longer be read: \"~/dev/shop/.mcp.json\""),
         "{text}"
     );
 }

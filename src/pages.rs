@@ -3069,11 +3069,11 @@ mod tests {
         let text = crate::finding_text::finding(&f, &crate::screen::Screen::pipe());
         for line in [
             format!(
-                "    Signer       until the reading of {}: second before\n",
+                "    Signer       until the reading of {}: \"second before\"\n",
                 view::utc(latest)
             ),
             format!(
-                "                 from the reading of {}: second after\n",
+                "                 from the reading of {}: \"second after\"\n",
                 view::utc(latest)
             ),
         ] {

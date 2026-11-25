@@ -1049,7 +1049,7 @@ fn the_page_of_code_changed_outside_an_app_names_each_file_escaped() {
     let files = &e.finding(&id)["evidence"]["changed_in_place"]["files"];
     assert_eq!((&files["added"], &files["changed"]), (&json!(3), &json!(1)));
     let text = e.text(&id);
-    assert!(text.contains("app/main.js") && text.contains("app/vendor/ (2 files)"));
+    assert!(text.contains("app/main.js") && text.contains("\"app/vendor/\" (2 files)"));
     let page = e.pages();
     // Each kind's label once, on its first entry, as the text gives it.
     let mono = |path: &str| format!("<span class=\"mono\">{path}</span>");
@@ -1427,7 +1427,7 @@ fn a_launch_agent_added_names_the_program_the_store_ties_to_it_in_force_with_its
     let text = e.text(&id);
     for line in [
         format!(
-            "    Runs         held since the reading of {}: /usr/local/bin/runner\n",
+            "    Runs         held since the reading of {}: \"/usr/local/bin/runner\"\n",
             utc(added[0].1)
         ),
         format!("    Signer       {TRUE_SIGNER}\n"),
@@ -1493,7 +1493,7 @@ fn a_login_hook_removed_names_the_script_the_store_last_tied_to_it_as_retracted_
     );
     let text = e.text(&id);
     let line = format!(
-        "    Runs         held until the reading of {}: /usr/local/bin/hook.sh\n",
+        "    Runs         held until the reading of {}: \"/usr/local/bin/hook.sh\"\n",
         utc(removed)
     );
     assert!(text.contains(&line), "{line}\n{text}");
@@ -1585,19 +1585,19 @@ fn a_startup_program_changed_names_every_item_that_runs_it_and_its_signer_before
     let text = e.text(&id);
     for line in [
         format!(
-            "    Run by       held since the reading of {}: {a_place}\n",
+            "    Run by       held since the reading of {}: \"{a_place}\"\n",
             utc(added)
         ),
         format!(
-            "    Run by       held since the reading of {}: {b_place}\n",
+            "    Run by       held since the reading of {}: \"{b_place}\"\n",
             utc(added)
         ),
         format!(
-            "    Signer       until the reading of {}: {TRUE_SIGNER}\n",
+            "    Signer       until the reading of {}: \"{TRUE_SIGNER}\"\n",
             utc(signed)
         ),
         format!(
-            "                 from the reading of {}: unsigned\n",
+            "                 from the reading of {}: \"unsigned\"\n",
             utc(signed)
         ),
     ] {

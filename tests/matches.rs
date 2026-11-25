@@ -2231,7 +2231,7 @@ fn every_listing_of_rules_tells_two_rules_of_the_same_title_apart_by_their_set()
     dir.run();
     let labels: Vec<String> = XCSSET_SETS
         .iter()
-        .map(|(_, set)| format!("{XCSSET} ({set})"))
+        .map(|(_, set)| format!("\"{XCSSET}\" ({set})"))
         .collect();
     // A machine form: the entries of this title carry each set once, by name and in words.
     let sets_of = |entries: Vec<&Value>, title: &str| -> Vec<(String, String)> {
@@ -2334,8 +2334,8 @@ fn every_listing_of_rules_tells_two_rules_of_the_same_title_apart_by_their_set()
         .1;
     let summary = &pages[0].1;
     for page in [summary, rules_page] {
-        for label in &labels {
-            let label = label.replace('\'', "&#39;");
+        for (_, set) in XCSSET_SETS {
+            let label = format!("{XCSSET} ({set})").replace('\'', "&#39;");
             assert_eq!(page.matches(&label).count(), 1, "{label}");
         }
     }
@@ -2569,7 +2569,7 @@ fn immunity_rules_lists_both_sets_and_names_every_rule_not_taken_with_its_reason
         "{plain}"
     );
     assert!(
-        plain.contains("an alternative needs process.parent.code_signature.trusted, which a program start does not give"),
+        plain.contains("an alternative needs \"process.parent.code_signature.trusted\", which a program start does not give"),
         "{plain}"
     );
     // A replay is not a list of the shipped rules: --all does not go with --over-log.

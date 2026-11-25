@@ -293,6 +293,8 @@ fn units(s: &str) -> Vec<&str> {
 }
 
 /// A text cut to `width` columns, keeping its start and ending with `…`: how a sentence is cut.
+/// A quotation of text from outside (`secrets::Name::quoted`) that the cut leaves open is closed
+/// after the mark, so the core's words never read as inside it.
 pub fn cut_end(s: &str, width: usize) -> String {
     if columns(s) <= width {
         return s.to_string();
@@ -300,17 +302,28 @@ pub fn cut_end(s: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }
-    let mut out = String::new();
-    let mut taken = 0;
+    // Each unit kept, with whether a quotation is open after it: a quote opens or closes one
+    // unless a backslash, which the core's words never hold, is just before it.
+    let mut kept: Vec<(&str, bool)> = Vec::new();
+    let (mut taken, mut open, mut escaped) = (0, false, false);
     for u in units(s) {
         let w = columns(u);
         if taken + w > width - 1 {
             break;
         }
-        out.push_str(u);
+        open ^= u == "\"" && !escaped;
+        escaped = u == "\\";
+        kept.push((u, open));
         taken += w;
     }
+    while kept.last().is_some_and(|(_, open)| *open) && taken + 2 > width {
+        taken -= kept.pop().map_or(0, |(u, _)| columns(u));
+    }
+    let mut out: String = kept.iter().map(|(u, _)| *u).collect();
     out.push('…');
+    if kept.last().is_some_and(|(_, open)| *open) {
+        out.push('"');
+    }
     out
 }
 

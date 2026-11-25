@@ -10,7 +10,8 @@
 //! Text from a source is in a message's `_text` fields, already escaped one to one
 //! (`known::whole`), and every piece of text is escaped again as it reaches the screen, before
 //! it is measured, cut or styled (`screen.rs`). In a column or beside a label it is data by its
-//! place and goes without quotes; inside a sentence it keeps them (`text::quoted`).
+//! place and goes without quotes (`Name::bare`); inside a sentence or a list it keeps them, each
+//! name by itself (`Name::quoted`).
 //!
 //! Nothing a status says is calmer than the message: a fault the message holds (a check that
 //! died, a watcher that does not watch live, an event level that records nothing or lost part of
@@ -22,7 +23,8 @@ use crate::findings::SHORT_MAX;
 use crate::screen::{
     self, BOLD, CYAN, Cell, Column, Cut, DIM, GREEN, PLAIN, RED, Screen, Style, YELLOW,
 };
-use crate::text::{quoted, word};
+use crate::secrets::{Name, Said};
+use crate::text::word;
 use crate::view;
 
 /// At most this many findings are listed in the text of `immunity findings`; the total is always
@@ -91,8 +93,8 @@ pub(crate) fn short_title(
     title: &str,
 ) -> String {
     match rule_title {
-        Some(t) if screen.terminal => screen::cut_end(&view::shown(t), SHORT_MAX),
-        Some(t) => t.to_string(),
+        Some(t) if screen.terminal => screen::cut_end(&Name::given(t).bare(), SHORT_MAX),
+        Some(t) => Name::given(t).bare(),
         None if short.is_empty() => unstopped(title).to_string(),
         None => short.to_string(),
     }
@@ -144,21 +146,17 @@ fn examples(u: &v1::Uncovered) -> String {
         .enumerate()
         .map(
             |(i, name)| match u.examples.get(i).and_then(|e| e.reason_text.as_deref()) {
-                Some(r) => format!("{}: {}", quoted(name), quoted(r)),
-                None => quoted(name),
+                Some(r) => format!(
+                    "{}: {}",
+                    Name::given(name).quoted(),
+                    Said::given(r).quoted()
+                ),
+                None => Name::given(name).quoted(),
             },
         )
-        .chain(u.value_text.as_deref().map(quoted))
+        .chain(u.value_text.as_deref().map(|v| Said::given(v).quoted()))
         .collect::<Vec<_>>()
         .join("; ")
-}
-
-/// A name from a source, escaped as everywhere, with the one character that separates it from
-/// what follows written as an escape too: a comma in a list of names, a colon before a reason.
-/// So a name holding ", " or ": " never passes for two names or for a name and a reason, and a
-/// line feed in it is already an escape, `\u{a}`, so it never starts a line of its own.
-fn name_in(name: &str, separator: char) -> String {
-    view::shown(name).replace(separator, &format!("\\u{{{:x}}}", u32::from(separator)))
 }
 
 /// A section of causes for `--coverage`: its label bold on a line when it has one, then each
@@ -346,8 +344,8 @@ const DATA_CAUSES: [&str; 2] = [
 /// command that ends it, with what the person can do on a line of its own under it.
 pub(crate) struct Fault {
     words: String,
-    /// What a source said, cut on a terminal to a line: a sentence keeps its start, names their
-    /// start and end. Whole in a pipe.
+    /// What a source said, as printed (`Said::quoted`), cut on a terminal to a line: a sentence
+    /// keeps its start, names their start and end. Whole in a pipe.
     said: Option<(String, Cut)>,
     tail: String,
     command: Option<&'static str>,
@@ -451,7 +449,7 @@ fn watcher_faults(s: &v1::Status, screen: &Screen) -> Vec<Fault> {
                 crate::watch::failed_words(&f.what),
                 screen.time(f.at, now)
             ))
-            .said(Some(&f.detail_text), Cut::End);
+            .said(Some(&Said::given(&f.detail_text).quoted()), Cut::End);
             match f.what == crate::watch::FULL_CHECK {
                 true => fault.run("immunity run"),
                 false => fault,
@@ -515,10 +513,11 @@ fn event_faults(l: &v1::EventLevel, said_by_cause: bool) -> Vec<Fault> {
             } else {
                 state
             };
-            let said = l.said_text.as_deref().or(l.reason_text.as_deref());
+            let said = (l.said_text.as_deref().or(l.reason_text.as_deref()))
+                .map(|t| Said::given(t).quoted());
             return vec![
                 Fault::new(format!("Program starts are not seen; event level: {state}"))
-                    .said(said, Cut::End),
+                    .said(said.as_deref(), Cut::End),
             ];
         }
     }
@@ -599,16 +598,16 @@ fn cause_fault(u: &v1::Uncovered) -> Fault {
     let with_reasons = (0..u.examples_text.len()).any(|i| reason(i).is_some());
     let place = ["this_mac", "projects"].contains(&u.scope.as_str());
     let mut fault = if u.examples_text.is_empty() {
-        Fault::new(unstopped(&u.title)).said(u.value_text.as_deref(), Cut::End)
+        let value = u.value_text.as_deref().map(|v| Said::given(v).quoted());
+        Fault::new(unstopped(&u.title)).said(value.as_deref(), Cut::End)
     } else {
         let names: Vec<String> = u
             .examples_text
             .iter()
             .enumerate()
-            .map(|(i, n)| match (with_reasons, reason(i)) {
-                (true, Some(r)) => format!("{}: {r}", name_in(n, ':')),
-                (true, None) => name_in(n, ':'),
-                (false, _) => name_in(n, ','),
+            .map(|(i, n)| match reason(i) {
+                Some(r) => format!("{}: {}", Name::given(n).quoted(), Said::given(r).quoted()),
+                None => Name::given(n).quoted(),
             })
             .collect();
         // A place by its names alone; anything else by its title, and its names with what the
@@ -752,7 +751,8 @@ pub fn status(s: &v1::Status, screen: &Screen, coverage: bool) -> String {
     if !store.exists {
         out.extend(crate::text::no_store(screen));
         out.push(String::new());
-        out.extend(screen.labelled(2, 5, "Store", &store.path_text, PLAIN, None, 0));
+        let path = Name::given(&store.path_text).bare();
+        out.extend(screen.labelled(2, 5, "Store", &path, PLAIN, None, 0));
         out.push(String::new());
         out.push(screen.next("immunity run", "makes it"));
         return joined(&out);
@@ -1002,6 +1002,11 @@ fn needing_lines(screen: &Screen, n: &v1::NeedsALook) -> Vec<String> {
                 if about.text.is_empty() {
                     (Cell::plain(title), command)
                 } else {
+                    // A published rule's own title is a name in this sentence.
+                    let title = match g.rule_title_text.as_deref() {
+                        Some(t) => Name::given(t).quoted(),
+                        None => title,
+                    };
                     let keep = screen::columns(&view::shown(&title)) + 2 + about.keep;
                     let cell = Cell::plain(format!("{title}: {}", about.text)).keeping(keep);
                     (cell, command)
@@ -1187,7 +1192,7 @@ fn counted(screen: &Screen, s: &v1::Status, f: &v1::FinishedCheck) -> Vec<(&'sta
             let seen: Vec<String> = e
                 .machines_seen_after_owner_word_text
                 .iter()
-                .map(|m| quoted(m))
+                .map(|m| Name::given(m).quoted())
                 .collect();
             line.push_str(&format!(
                 " Seen alive after the owner's word: {}.",
@@ -1381,13 +1386,13 @@ fn counted(screen: &Screen, s: &v1::Status, f: &v1::FinishedCheck) -> Vec<(&'sta
                 ),
                 (Ok(v1::FeedOutcome::Failed), Some(n)) => format!(
                     "not read: {}; what is new is unknown, and the {} it held at its last reading, {}, are {judged}",
-                    quoted(t.reason_text.as_deref().unwrap_or_default()),
+                    Said::given(t.reason_text.as_deref().unwrap_or_default()).quoted(),
                     held(n),
                     when(t.read_at, "an unknown time")
                 ),
                 (Ok(v1::FeedOutcome::Failed), None) => format!(
                     "not read: {}; the program knows no exploited vulnerability yet, so whether any affects this estate is unknown",
-                    quoted(t.reason_text.as_deref().unwrap_or_default())
+                    Said::given(t.reason_text.as_deref().unwrap_or_default()).quoted()
                 ),
                 _ => "never read; the program knows no exploited vulnerability yet, so whether any affects this estate is unknown".to_string(),
             },
@@ -1438,7 +1443,8 @@ fn counted(screen: &Screen, s: &v1::Status, f: &v1::FinishedCheck) -> Vec<(&'sta
                         format!("{}: {held}, unchanged {since}", f.ecosystem)
                     }
                     _ => {
-                        let reason = quoted(f.reason_text.as_deref().unwrap_or_default());
+                        let reason =
+                            Said::given(f.reason_text.as_deref().unwrap_or_default()).quoted();
                         match f.read_at {
                             Some(at) => format!(
                                 "{} not read: {reason}; the {held}, read {}, stay in force",
@@ -1521,7 +1527,7 @@ fn coverage_text(s: &v1::Status, screen: &Screen, out: &mut Vec<String>) {
     out.push(String::new());
     let mut lines: Vec<(&str, String, Style)> = Vec::new();
     let store = s.store.clone().unwrap_or_default();
-    lines.push(("Store", store.path_text.clone(), PLAIN));
+    lines.push(("Store", Name::given(&store.path_text).bare(), PLAIN));
     match &s.last_run {
         None => lines.push(("Last run", "none has started".to_string(), YELLOW)),
         Some(l) => match l.finished_at {
@@ -1697,9 +1703,11 @@ fn coverage_text(s: &v1::Status, screen: &Screen, out: &mut Vec<String>) {
                 .iter()
                 .map(|u| {
                     vec![
-                        Cell::new(machine_name(&u.scope_text), RED),
+                        Cell::new(Name::given(machine_name(&u.scope_text)).bare(), RED),
                         Cell::plain(screen.time(u.since_at, now)),
-                        Cell::plain(u.reason_text.clone().unwrap_or_default()),
+                        Cell::plain(
+                            Said::given(u.reason_text.as_deref().unwrap_or_default()).quoted(),
+                        ),
                     ]
                 })
                 .collect();
@@ -1746,10 +1754,12 @@ fn coverage_text(s: &v1::Status, screen: &Screen, out: &mut Vec<String>) {
                         Cell::plain(
                             g.examples_text
                                 .first()
-                                .map(|e| machine_name(e).to_string())
+                                .map(|e| Name::given(machine_name(e)).bare())
                                 .unwrap_or_default(),
                         ),
-                        Cell::plain(g.reason_text.clone().unwrap_or_default()),
+                        Cell::plain(
+                            Said::given(g.reason_text.as_deref().unwrap_or_default()).quoted(),
+                        ),
                     ]
                 })
                 .collect();
@@ -1784,7 +1794,7 @@ fn coverage_text(s: &v1::Status, screen: &Screen, out: &mut Vec<String>) {
             .map(|r| {
                 vec![
                     Cell::plain(r.what.clone()),
-                    Cell::plain(r.what_text.clone().unwrap_or_default()),
+                    Cell::plain(Name::given(r.what_text.as_deref().unwrap_or_default()).bare()),
                     Cell::new(grouped(r.where_count), BOLD),
                 ]
             })
@@ -1811,7 +1821,7 @@ fn coverage_text(s: &v1::Status, screen: &Screen, out: &mut Vec<String>) {
                     Cell::new(screen.time(c.at, now), DIM),
                     Cell::plain(words::<v1::Change>(c.change)),
                     Cell::plain(c.kind.clone()),
-                    Cell::plain(c.path_text.clone()),
+                    Cell::plain(Name::given(&c.path_text).bare()),
                 ]
             })
             .collect();
@@ -1848,18 +1858,21 @@ fn telling(l: &v1::ListedFinding) -> Cell {
             .split_once('#')
             .map_or(l.where_text.as_str(), |(f, _)| f);
         let folder = file.rsplit_once('/').map_or(file, |(d, _)| d);
-        let releases = l.releases_text.join(", ");
+        let releases = crate::text::names(&l.releases_text, ", ");
+        let p = Name::given(p).quoted();
         let package = if releases.is_empty() {
             format!("{p} in ")
         } else {
             format!("{p} {releases} in ")
         };
         let keep = screen::columns(&view::shown(&package));
-        return Cell::plain(format!("{package}{folder}")).keeping(keep);
+        return Cell::plain(format!("{package}{}", Name::given(folder).quoted())).keeping(keep);
     }
     Cell::plain(match &l.thing {
-        Some(t) => format!("{t} on {}", l.where_text),
-        None => l.where_text.clone(),
+        Some(t) => format!("{t} on {}", Name::given(&l.where_text).quoted()),
+        None if l.where_text.is_empty() => String::new(),
+        // Quoted also alone: the same words follow a title in the status's sentence.
+        None => Name::given(&l.where_text).quoted(),
     })
 }
 
@@ -2041,7 +2054,7 @@ pub fn findings(f: &v1::Findings, all: bool, screen: &Screen) -> String {
                     row.push(Cell::plain(said));
                 }
                 row.push(match &l.folder_text {
-                    Some(folder) if n > 1 => Cell::plain(folder.clone()),
+                    Some(folder) if n > 1 => Cell::plain(Name::given(folder).bare()),
                     _ => telling(l),
                 });
                 row.push(Cell::new(if r.urgent { "urgent" } else { "" }, RED));
@@ -2912,14 +2925,14 @@ mod tests {
         let text = findings(&findings_of("x"), false, &Screen::pipe());
         assert!(
             text.contains(
-                "@ctrl/tinycolor-x 4.1.1, 4.1.2 in ~/Developer/clients/northwind-traders/customer-portal-frontend-monorepo-with-a-very-long-name"
+                r#""@ctrl/tinycolor-x" "4.1.1", "4.1.2" in "~/Developer/clients/northwind-traders/customer-portal-frontend-monorepo-with-a-very-long-name""#
             ),
             "{text}"
         );
         // On a terminal the package and its releases stay whole while the folder is cut.
         let cut = findings(&findings_of("x"), false, &Screen::terminal(120, false));
         assert!(
-            cut.contains("@ctrl/tinycolor-x 4.1.1, 4.1.2 in ~/Dev"),
+            cut.contains(r#""@ctrl/tinycolor-x" "4.1.1", "4.1.2" in "~/Dev"#),
             "{cut}"
         );
     }
@@ -3040,7 +3053,7 @@ mod tests {
             let rows: Vec<&str> = text.lines().filter(|l| l.starts_with("    f")).collect();
             assert_eq!(rows.len(), 6, "{text}");
             assert!(
-                rows[0].starts_with("    f0000000004  ~/dev/p4/x") && rows[0].ends_with("urgent"),
+                rows[0].starts_with("    f0000000004  \"~/dev/p4/x") && rows[0].ends_with("urgent"),
                 "{text}"
             );
             assert!(rows[1].contains("f0000000001") && rows[3].contains("f0000000005"));
@@ -3141,7 +3154,7 @@ mod tests {
             // The group of one: its own id first on its row, with its own place.
             assert!(
                 holding(&text, "f0000000014")[0]
-                    .starts_with("    f0000000014  added  ~/dev/shop/.git/hooks/h20"),
+                    .starts_with("    f0000000014  added  \"~/dev/shop/.git/hooks/h20"),
                 "{text}"
             );
             // Nothing on it answers.
@@ -3503,11 +3516,11 @@ mod tests {
             faults_in(&s),
             [
                 format!(
-                    "! The watcher's latest full check failed {}: the store was busy   immunity run",
+                    "! The watcher's latest full check failed {}: \"the store was busy\"   immunity run",
                     view::utc(NOW - 3600)
                 ),
                 format!(
-                    "! The watcher's latest reading of the watched places failed {}: could not be read: {LONG}",
+                    "! The watcher's latest reading of the watched places failed {}: \"could not be read: {LONG}\"",
                     view::utc(NOW - 120)
                 ),
             ]
@@ -3518,11 +3531,11 @@ mod tests {
         let lines = fault_lines_of(&text);
         assert!(
             lines[0].starts_with(
-                "! The watcher's latest full check failed 1 h ago: the store was busy"
+                "! The watcher's latest full check failed 1 h ago: \"the store was busy\""
             ) && lines[0].ends_with("immunity run"),
             "{text}"
         );
-        assert!(lines[1].ends_with('…') && !text.contains(LONG), "{text}");
+        assert!(lines[1].ends_with("…\"") && !text.contains(LONG), "{text}");
     }
 
     #[test]
@@ -3759,7 +3772,7 @@ mod tests {
         });
         assert_eq!(
             fault_lines_of(&super::status(&s, &Screen::pipe(), false)),
-            ["! Could not read: ~/a"]
+            [r#"! Could not read: "~/a""#]
         );
     }
 
@@ -3844,7 +3857,7 @@ mod tests {
             assert_eq!(
                 faults_in(&s),
                 [format!(
-                    "! Program starts are not seen; event level: {words}: eslogger: Not permitted"
+                    "! Program starts are not seen; event level: {words}: \"eslogger: Not permitted\""
                 )]
             );
         }
@@ -3866,7 +3879,7 @@ mod tests {
         assert_eq!(
             faults_in(&s),
             [
-                "! Program starts are not seen: macOS refuses eslogger Full Disk Access: eslogger: Not permitted Open System Settings and turn on eslogger."
+                r#"! Program starts are not seen: macOS refuses eslogger Full Disk Access: "eslogger: Not permitted" Open System Settings and turn on eslogger."#
             ]
         );
         // Not installed is a limit and says nothing.
@@ -4026,16 +4039,16 @@ mod tests {
         assert_eq!(
             faults_in(&s),
             [
-                "! Could not read: ~/Library/LaunchAgents/com.example.sync.plist: Permission denied If they are yours, make them readable again.",
+                r#"! Could not read: "~/Library/LaunchAgents/com.example.sync.plist": "Permission denied" If they are yours, make them readable again."#,
                 // A name holding ", " never passes for two; only the person's own advice is said.
-                "! Could not read: ~/a\\u{2c} b, ~/.zshrc, and 1,234,565 more",
+                r#"! Could not read: "~/a, b", "~/.zshrc", and 1,234,565 more"#,
             ]
         );
         // Where a source said why of one, each name has what its source said after it.
         s.not_covered[1].examples[1].reason_text = Some("Is a directory".to_string());
         assert_eq!(
             faults_in(&s)[1],
-            "! Could not read: ~/a, b; ~/.zshrc: Is a directory, and 1,234,565 more"
+            r#"! Could not read: "~/a, b"; "~/.zshrc": "Is a directory", and 1,234,565 more"#
         );
         // On a terminal a long path is cut in its middle, and the count of the rest is whole.
         s.not_covered[1].examples_text = vec![format!("{LONG}/poetry.lock")];
@@ -4043,7 +4056,7 @@ mod tests {
         let text = status(&s, &Screen::terminal(60, false), false);
         let line = &fault_lines_of(&text)[1];
         assert!(
-            line.contains('…') && line.ends_with("poetry.lock, and 1,234,566 more"),
+            line.contains('…') && line.ends_with(".lock\", and 1,234,566 more"),
             "{text}"
         );
     }
@@ -4198,7 +4211,7 @@ mod tests {
         );
         assert_eq!(
             lines[1],
-            "  critical  Malicious package in a project: left-pad 1.0.7 in ~/dev/site"
+            r#"  critical  Malicious package in a project: "left-pad" "1.0.7" in "~/dev/site""#
         );
         assert_eq!(
             lines[2],

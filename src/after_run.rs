@@ -16,6 +16,7 @@
 use crate::contract::v1;
 use crate::overview;
 use crate::screen::{self, BOLD, DIM, GREEN, PLAIN, RED, Screen, Style, YELLOW};
+use crate::secrets::Name;
 use crate::view;
 use std::io::{IsTerminal, Write};
 
@@ -142,11 +143,13 @@ impl Drop for Running {
     }
 }
 
-/// A home folder's path written `~` where a path starts with it.
+/// A home folder's path written `~` where a path starts with it, alone beside its label.
 fn tilde(path: &str, home: Option<&str>) -> String {
     match home.and_then(|h| path.strip_prefix(h)) {
-        Some(rest) if rest.is_empty() || rest.starts_with('/') => format!("~{rest}"),
-        _ => path.to_string(),
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => {
+            Name::given(&format!("~{rest}")).bare()
+        }
+        _ => Name::given(path).bare(),
     }
 }
 

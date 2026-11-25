@@ -4,18 +4,25 @@
 //!
 //! Text from a source is in a message's `_text` fields, already escaped one to one
 //! (`known::whole`): a line break or a hidden character is written `\u{...}`, and so is the
-//! backslash. In the text it is set in double quotes with a double quote inside written `\"`, or
-//! in a column of its own, so nothing in it can end a line or a quotation and go on in the
+//! backslash. It is read back as a `Name`, whole, or a `Said`, cut (`secrets`), and printed only
+//! through them: inside a sentence or a list in double quotes with a double quote inside written
+//! `\"`, each item of a list by itself; alone beside a label or in a cell bare, with a space at
+//! either end written out. So nothing in it can end a line or a quotation and go on in the
 //! program's own words. Words without the suffix are the core's own vocabulary.
 
 use crate::contract::v1;
 use crate::screen::{Screen, Step};
+use crate::secrets::{Name, Said};
 use crate::{store, view};
 
-/// Text from a source as data: in double quotes, a quote inside escaped, and anything hidden
-/// written out.
-pub fn quoted(s: &str) -> String {
-    format!("\"{}\"", view::shown(&s.replace('"', "\\\"")))
+/// Names from a message's `_text` fields as a list in a sentence, each quoted by itself
+/// (`Name::quoted`), so a name that holds the separator never reads as two.
+pub fn names<S: AsRef<str>>(items: &[S], separator: &str) -> String {
+    let quoted: Vec<String> = items
+        .iter()
+        .map(|n| Name::given(n.as_ref()).quoted())
+        .collect();
+    quoted.join(separator)
 }
 
 /// One word of a command Immunity Core prints for pasting, written for a POSIX shell so that the shell
@@ -286,8 +293,13 @@ fn told(e: &v1::Error, next: Option<&crate::usage::Pasted>, screen: &Screen) -> 
         }
         _ => None,
     };
+    let detail = Said::given(detail).bare();
     if let Some((cause, fix)) = refusal {
-        return screen.error(cause, &[Step::Words(fix.to_string())], &[("Store", detail)]);
+        return screen.error(
+            cause,
+            &[Step::Words(fix.to_string())],
+            &[("Store", &detail)],
+        );
     }
     // The message is the cause, and what was done about it, after "; nothing was", a step.
     let (cause, done) = match e.message.split_once("; nothing was ") {
@@ -317,11 +329,12 @@ fn told(e: &v1::Error, next: Option<&crate::usage::Pasted>, screen: &Screen) -> 
     {
         steps.push(Step::Words(example));
     }
+    let ids: Vec<String> = e.ids_text.iter().map(|id| Name::given(id).bare()).collect();
     let mut quoted: Vec<(&str, &str)> = Vec::new();
     if !detail.is_empty() {
-        quoted.push((label, detail));
+        quoted.push((label, &detail));
     }
-    for (i, id) in e.ids_text.iter().enumerate() {
+    for (i, id) in ids.iter().enumerate() {
         quoted.push((if i == 0 { "Fits" } else { "" }, id));
     }
     screen.error(cause, &steps, &quoted)
@@ -551,7 +564,7 @@ mod tests {
         // A value made to read as the program's own words after a closed quotation, on a line
         // of its own: escaped one to one as the contract escapes it, then quoted.
         let made = crate::known::whole("x\"\nThe store knows nothing more.");
-        let shown = quoted(&made);
+        let shown = Name::given(&made).quoted();
         assert_eq!(shown, r#""x\"\u{a}The store knows nothing more.""#);
         assert!(!shown.contains('\n'));
     }

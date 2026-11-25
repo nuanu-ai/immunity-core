@@ -13,11 +13,13 @@
 //! (`known::whole`), and every piece is escaped again as it reaches the screen, before it is
 //! measured, cut, broken into lines or styled (`screen.rs`). It is never placed at the start of
 //! a line: every line that holds it is indented, so it cannot pass for a line of Immunity Core's own
-//! (`✓`, `→ immunity …`, `error:`). Beside a label it goes without quotes.
+//! (`✓`, `→ immunity …`, `error:`). Alone beside a label it goes without quotes (`Name::bare`);
+//! after the core's words or in a list it is quoted, each name by itself (`Name::quoted`).
 
 use crate::contract::v1;
 use crate::overview::{count, joined, level, unstopped, words};
 use crate::screen::{self, BOLD, CYAN, DIM, GREEN, PLAIN, RED, Screen, Style};
+use crate::secrets::{Name, Said};
 use crate::{findings, view};
 
 /// The labels beside the core's words and the person's answer: "Your answer" is the widest.
@@ -203,9 +205,10 @@ fn state_said(s: &Screen, f: &v1::Finding) -> String {
 /// terminal to keep its state in sight, and its state at the right. Where that would leave the
 /// thing less than half the line, the state is on a line of its own, at the right.
 fn second_line(s: &Screen, f: &v1::Finding) -> Vec<String> {
+    let place = Name::given(&f.where_text).quoted();
     let thing = view::shown(&match &f.thing {
-        Some(t) => format!("{t} on {}", f.where_text),
-        None => f.where_text.clone(),
+        Some(t) => format!("{t} on {place}"),
+        None => place,
     });
     let state = view::shown(&state_said(s, f));
     let Some(width) = s.fits() else {
@@ -267,7 +270,7 @@ fn command_line(args: &[String]) -> String {
             let inside = |i: usize| marks.iter().any(|(start, end, ..)| *start <= i && i < *end);
             let spaced = a.char_indices().any(|(i, c)| c == ' ' && !inside(i));
             if a.is_empty() || spaced || a.contains('"') {
-                format!("\"{}\"", a.replace('"', "\\\""))
+                Said::given(a).quoted()
             } else {
                 a.clone()
             }
@@ -280,10 +283,10 @@ fn command_line(args: &[String]) -> String {
 fn signer(p: &v1::Process) -> Option<String> {
     let mut said: Vec<String> = Vec::new();
     if let Some(id) = &p.signing_id_text {
-        said.push(id.clone());
+        said.push(Name::given(id).quoted());
     }
     if let Some(team) = &p.team_id_text {
-        said.push(format!("team {team}"));
+        said.push(format!("team {}", Name::given(team).quoted()));
     }
     if p.platform_binary == Some(true) {
         said.push("part of macOS".to_string());
@@ -422,6 +425,8 @@ fn event_lines(s: &Screen, group: &[&v1::Event], now: i64, mark: &str) -> Vec<St
         parts_line(s, 4, &[(&what, BOLD), (" · ", PLAIN), (&said_when, DIM)])
     };
     let f = |label: &str, value: &str| field(s, 6, EVENT_LABEL, label, &[(value, PLAIN)]);
+    // A value from a source alone beside its label.
+    let from = |label: &str, value: &str| f(label, &Name::given(value).bare());
     let mut out = Vec::new();
     let Some(e) = group.first() else {
         return out;
@@ -432,19 +437,21 @@ fn event_lines(s: &Screen, group: &[&v1::Event], now: i64, mark: &str) -> Vec<St
             let process = p.process.as_ref();
             out.extend(f(
                 "Program",
-                process.map_or("not known", |p| p.executable_text.as_str()),
+                &process.map_or("not known".to_string(), |p| {
+                    Name::given(&p.executable_text).bare()
+                }),
             ));
             if !p.args_text.is_empty() {
                 out.extend(f("Command", &command_line(&p.args_text)));
             }
             if let Some(script) = &p.script_text {
-                out.extend(f("Script", script));
+                out.extend(from("Script", script));
             }
             if let Some(folder) = &p.working_directory_text {
-                out.extend(f("Folder", folder));
+                out.extend(from("Folder", folder));
             }
             if let Some(by) = &p.instigator {
-                out.extend(f("Started by", &by.executable_text));
+                out.extend(from("Started by", &by.executable_text));
             }
             if let Some(signed) = process.and_then(signer) {
                 out.extend(f("Signer", &signed));
@@ -462,17 +469,20 @@ fn event_lines(s: &Screen, group: &[&v1::Event], now: i64, mark: &str) -> Vec<St
         }
         Some(Body::FileEvent(e)) => {
             out.extend(headed("File event"));
-            out.extend(f("File", &e.path_text));
+            out.extend(from("File", &e.path_text));
             match v1::FileAction::try_from(e.action) {
                 Ok(v1::FileAction::Create) => out.extend(f("Action", "created")),
                 Ok(v1::FileAction::Rename) => {
                     out.extend(f("Action", "renamed"));
-                    out.extend(f("From", e.source_text.as_deref().unwrap_or("not known")));
+                    match e.source_text.as_deref() {
+                        Some(source) => out.extend(from("From", source)),
+                        None => out.extend(f("From", "not known")),
+                    }
                 }
                 _ => out.extend(f("Action", "an action this build does not know")),
             }
             if let Some(by) = &e.instigator {
-                out.extend(f("Program", &by.executable_text));
+                out.extend(from("Program", &by.executable_text));
                 if let Some(signed) = signer(by) {
                     out.extend(f("Signer", &signed));
                 }
@@ -564,7 +574,7 @@ fn place_lines(s: &Screen, f: &v1::Finding, p: &v1::PlaceChanged) -> Vec<String>
     let mut out = e("Change", &[(said, style), (&at, PLAIN)]);
     if change == v1::Change::NotRead {
         match unread(f) {
-            Some(why) => out.extend(e("Why", &[(why, PLAIN)])),
+            Some(why) => out.extend(e("Why", &[(&Said::given(why).bare(), PLAIN)])),
             None => out.extend(e("Why", &[("the store gives no reason", PLAIN)])),
         }
     }
@@ -596,9 +606,10 @@ fn place_lines(s: &Screen, f: &v1::Finding, p: &v1::PlaceChanged) -> Vec<String>
             tie_said(t.state),
             s.time(t.recorded_at, f.answered_at)
         );
-        out.extend(e(label, &[(&said, PLAIN), (&t.path_text, PLAIN)]));
+        let path = Name::given(&t.path_text).quoted();
+        out.extend(e(label, &[(&said, PLAIN), (&path, PLAIN)]));
         if let Some(signer) = &t.signed_by_text {
-            out.extend(e("Signer", &[(signer, PLAIN)]));
+            out.extend(e("Signer", &[(&Said::given(signer).bare(), PLAIN)]));
         }
     }
     if let Some(b) = signer_entry(f) {
@@ -610,7 +621,8 @@ fn place_lines(s: &Screen, f: &v1::Finding, p: &v1::PlaceChanged) -> Vec<String>
         ] {
             if let Some(value) = value {
                 let said = format!("{said} {at}: ");
-                out.extend(e(label, &[(&said, PLAIN), (value, PLAIN)]));
+                let value = Said::given(value).quoted();
+                out.extend(e(label, &[(&said, PLAIN), (&value, PLAIN)]));
                 label = "";
             }
         }
@@ -681,10 +693,10 @@ fn package_lines(s: &Screen, f: &v1::Finding, p: &v1::VulnerablePackage) -> Vec<
         ));
     }
     if let Some(name) = &p.package_text {
-        let mut said = name.clone();
+        let mut said = Name::given(name).quoted();
         let versions: Vec<&str> = p.releases.iter().map(|r| r.version_text.as_str()).collect();
         if !versions.is_empty() {
-            said = format!("{said} {}", versions.join(", "));
+            said = format!("{said} {}", crate::text::names(&versions, ", "));
         }
         if let Some(eco) = &p.ecosystem {
             said = format!("{said} ({eco})");
@@ -695,30 +707,35 @@ fn package_lines(s: &Screen, f: &v1::Finding, p: &v1::VulnerablePackage) -> Vec<
     // line already.
     for r in p.releases.iter().filter(|r| r.at_text != f.where_text) {
         let at = if p.releases.len() > 1 {
-            format!("{} at {}", r.version_text, r.at_text)
+            format!(
+                "{} at {}",
+                Name::given(&r.version_text).quoted(),
+                Name::given(&r.at_text).quoted()
+            )
         } else {
-            r.at_text.clone()
+            Name::given(&r.at_text).bare()
         };
         out.extend(e("Declared", &[(&at, PLAIN)]));
     }
     for r in &p.records {
-        let mut said = r.id_text.clone();
+        let mut said = Name::given(&r.id_text).quoted();
         if !r.label.is_empty() {
             said = format!("{said}, {}", r.label);
         }
         said = format!("{said}, from {}", r.source);
         if !r.aliases_text.is_empty() {
-            said = format!("{said}; also {}", r.aliases_text.join(", "));
+            said = format!("{said}; also {}", crate::text::names(&r.aliases_text, ", "));
         }
         out.extend(e("Record", &[(&said, PLAIN)]));
         if r.exploited == Some(true) {
             out.extend(e("", &[("CISA lists it as used in attacks", RED.bold())]));
         }
         if let Some(summary) = &r.summary_text {
-            out.extend(e("", &[(summary, PLAIN)]));
+            out.extend(e("", &[(&Said::given(summary).bare(), PLAIN)]));
         }
         if !r.fixed_text.is_empty() {
-            out.extend(e("Fixed in", &[(&r.fixed_text.join(", "), GREEN)]));
+            let fixed = crate::text::names(&r.fixed_text, ", ");
+            out.extend(e("Fixed in", &[(&fixed, GREEN)]));
         }
     }
     out
@@ -733,10 +750,14 @@ fn published_lines(s: &Screen, f: &v1::Finding, p: &v1::PublishedRuleMatched) ->
     let rule = p.rule.clone().unwrap_or_default();
     let mut out = e(
         "Rule",
-        &[(&rule.title_text, PLAIN), ("  ", PLAIN), (&rule.name, DIM)],
+        &[
+            (&Name::given(&rule.title_text).quoted(), PLAIN),
+            ("  ", PLAIN),
+            (&rule.name, DIM),
+        ],
     );
     if let Some(author) = &rule.author_text {
-        out.extend(e("Author", &[(author, PLAIN)]));
+        out.extend(e("Author", &[(&Name::given(author).bare(), PLAIN)]));
     }
     let licence = crate::sigma::SOURCES
         .iter()
@@ -798,7 +819,7 @@ fn process_lines(s: &Screen, f: &v1::Finding, p: &v1::DetachedProcess) -> Vec<St
         out.extend(e("Command", &[(&command_line(&p.args_text), PLAIN)]));
     }
     if let Some(folder) = &p.working_directory_text {
-        out.extend(e("Folder", &[(folder, PLAIN)]));
+        out.extend(e("Folder", &[(&Name::given(folder).bare(), PLAIN)]));
     }
     for (label, l, led) in [
         ("Parent", &p.parent, ""),
@@ -809,9 +830,14 @@ fn process_lines(s: &Screen, f: &v1::Finding, p: &v1::DetachedProcess) -> Vec<St
             let signed = l
                 .signed_by_text
                 .as_ref()
-                .map_or("signer not known".to_string(), |s| format!("signed by {s}"));
-            // The path last, so no program's name reads as the core's words.
-            let said = format!("{led}pid {}, {signed}: {}", l.pid, l.executable_text);
+                .map_or("signer not known".to_string(), |s| {
+                    format!("signed by {}", Said::given(s).quoted())
+                });
+            let said = format!(
+                "{led}pid {}, {signed}: {}",
+                l.pid,
+                Name::given(&l.executable_text).quoted()
+            );
             out.extend(e(label, &[(&said, PLAIN)]));
         }
     }
@@ -829,8 +855,12 @@ fn files_lines(s: &Screen, p: &v1::FilesChanged) -> Vec<String> {
     let mut out = e("Files", &[(&counts, PLAIN)]);
     for (label, x) in entries {
         let shown = match x.folder {
-            true => format!("{}/ ({})", x.path_text, count(x.files, "file", "files")),
-            false => x.path_text.clone(),
+            true => format!(
+                "{} ({})",
+                Name::given(&format!("{}/", x.path_text)).quoted(),
+                count(x.files, "file", "files")
+            ),
+            false => Name::given(&x.path_text).bare(),
         };
         out.extend(e(label, &[(&shown, PLAIN)]));
     }
@@ -883,7 +913,7 @@ fn evidence_lines(s: &Screen, f: &v1::Finding) -> Vec<String> {
     let lines = match body {
         Body::PlaceChanged(p) => place_lines(s, f, p),
         Body::ChangedInPlace(p) => match (&p.became_text, &p.files) {
-            (Some(became), _) => e("Became", &[(became, PLAIN)]),
+            (Some(became), _) => e("Became", &[(&Said::given(became).bare(), PLAIN)]),
             (None, Some(files)) => files_lines(s, files),
             (None, None) => e(
                 "Files",
@@ -896,7 +926,8 @@ fn evidence_lines(s: &Screen, f: &v1::Finding) -> Vec<String> {
         Body::IndicatorMatched(p) => {
             let matched = p.indicators_text.as_deref();
             let gone = "not known: the entry that held it is gone";
-            let mut out = e("Matched", &[(matched.unwrap_or(gone), PLAIN)]);
+            let matched = matched.map_or(gone.to_string(), |m| Said::given(m).bare());
+            let mut out = e("Matched", &[(&matched, PLAIN)]);
             let port = p.port.map(|n| format!("port {n}"));
             let said: Vec<String> = port.into_iter().chain(p.transport.clone()).collect();
             if !said.is_empty() {
@@ -934,7 +965,8 @@ fn earlier_lines(s: &Screen, f: &v1::Finding) -> Vec<String> {
     };
     let mut out = field(s, 2, LABEL, "Earlier", &[(&said, PLAIN)]);
     if let Some(reason) = e.answer.as_ref().and_then(|a| a.reason_text.as_deref()) {
-        out.extend(field(s, 2, LABEL, "Said then", &[(reason, PLAIN)]));
+        let reason = Said::given(reason).bare();
+        out.extend(field(s, 2, LABEL, "Said then", &[(&reason, PLAIN)]));
     }
     out
 }
@@ -1033,14 +1065,14 @@ fn verdict_lines(s: &Screen, f: &v1::Finding) -> Vec<String> {
             6,
             EVENT_LABEL,
             "Reason",
-            &[(&verdict.reason_text, PLAIN)],
+            &[(&Said::given(&verdict.reason_text).bare(), PLAIN)],
         ));
         out.extend(field(
             s,
             6,
             EVENT_LABEL,
             "Case",
-            &[(&verdict.case_text, PLAIN)],
+            &[(&Said::given(&verdict.case_text).bare(), PLAIN)],
         ));
     }
     if harmless && state_of(f) == v1::FindingState::Open {
@@ -1116,7 +1148,8 @@ fn answer_lines(s: &Screen, f: &v1::Finding) -> Vec<String> {
         &[(&given(s, a, f.answered_at), PLAIN)],
     );
     if let Some(reason) = &a.reason_text {
-        out.extend(field(s, 2, LABEL, "Reason", &[(reason, PLAIN)]));
+        let reason = Said::given(reason).bare();
+        out.extend(field(s, 2, LABEL, "Reason", &[(&reason, PLAIN)]));
     }
     if !a.in_force {
         out.extend(field(
@@ -1146,7 +1179,7 @@ fn rule_line(s: &Screen, f: &v1::Finding) -> Vec<String> {
         parts.push(format!("confidence {}", words::<v1::Level>(c)));
     }
     if let Some(t) = &f.technique_text {
-        parts.push(format!("ATT&CK {t}"));
+        parts.push(format!("ATT&CK {}", Name::given(t).quoted()));
     }
     if parts.is_empty() {
         return Vec::new();
@@ -1359,7 +1392,13 @@ pub fn answered(f: &v1::Finding, s: &Screen) -> String {
         top.extend(para(s, 2, b, PLAIN));
     }
     if let Some(reason) = f.answer.as_ref().and_then(|a| a.reason_text.as_deref()) {
-        top.extend(field(s, 2, 6, "Reason", &[(reason, PLAIN)]));
+        top.extend(field(
+            s,
+            2,
+            6,
+            "Reason",
+            &[(&Said::given(reason).bare(), PLAIN)],
+        ));
     }
     // The id in a command as the shell reads it back.
     let word = crate::text::shell_word_or(id, "<id>");
@@ -1872,8 +1911,8 @@ mod tests {
             text,
             [
                 "    Files        changed while the version stayed the same, since the reading before: 250 added, 3 removed, 4,000 changed (3,997 not listed)",
-                "    Added        app/2.0/ (250 files)",
-                "    Removed      ./ (3 files)",
+                "    Added        \"app/2.0/\" (250 files)",
+                "    Removed      \"./\" (3 files)",
                 "    Changed      d0/a.js",
                 "                 d1/a.js",
                 "                 d2/a.js",
@@ -1960,7 +1999,7 @@ mod tests {
             let text = finding(&finding_of(body, "odd"), &s);
             let mut wanted = vec![
                 "● high · urgent",
-                "~/dev/design-tokens",
+                "\"~/dev/design-tokens",
                 "What it is",
                 "Meaning",
                 "What to do",
@@ -2105,8 +2144,8 @@ mod tests {
             assert!(line.contains("since 1 h ago;"), "{text}");
             assert!(text.contains("the finding was about then"), "{text}");
             // The kept package, release and record are still shown under it.
-            assert!(text.contains("left-pad 1.0.7 (npm)"), "{text}");
-            assert!(text.contains("MAL-2099-0001, malicious"), "{text}");
+            assert!(text.contains(r#""left-pad" "1.0.7" (npm)"#), "{text}");
+            assert!(text.contains(r#""MAL-2099-0001", malicious"#), "{text}");
         }
     }
 
@@ -2347,7 +2386,7 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(
             lines[1],
-            "  ~/dev/design-tokens/odd/.mcp.json#/mcpServers/helper"
+            "  \"~/dev/design-tokens/odd/.mcp.json#/mcpServers/helper\""
         );
         assert!(lines[2].ends_with(", last seen 1 min ago"), "{text}");
         assert_eq!(screen::columns(lines[2]), 80, "{text}");
@@ -2397,7 +2436,7 @@ mod tests {
         // A program start: who signed it, its process and its parent.
         let published = with(bodies("odd").remove(5).1);
         for said in [
-            "      Signer       com.example.odd, team TEAModd\n",
+            "      Signer       \"com.example.odd\", team \"TEAModd\"\n",
             "      Process      pid 4242, user 501, parent pid 1\n",
             "      Script       /Users/example/odd.sh\n",
         ] {
@@ -2427,7 +2466,7 @@ mod tests {
         }));
         assert!(
             unsigned.contains(
-                "    Session      led by pid 812, signer not known: /opt/tools/Tool, signed by apple\n"
+                "    Session      led by pid 812, signer not known: \"/opt/tools/Tool, signed by apple\"\n"
             ),
             "{unsigned}"
         );
@@ -2441,7 +2480,7 @@ mod tests {
         }
         let package = with(package);
         assert!(
-            package.contains("    Declared     2.0.0 at ~/dev/b/package-lock.json\n"),
+            package.contains(r#"    Declared     "2.0.0" at "~/dev/b/package-lock.json""#),
             "{package}"
         );
         // Verdicts: how many are listed when not all are; a verdict that raised the response
