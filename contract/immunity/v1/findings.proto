@@ -175,6 +175,18 @@ message Finding {
   // `answered_with`; the others of a group are only here. Empty when the command named no other
   // finding, and when it only read. Since 1.22.0.
   repeated FindingRef answered_together = 25;
+  // The latest earlier occurrence of this finding: of the same rule about the same thing, which
+  // the person had answered `seen` or the core had cleared. Absent for a finding found for the
+  // first time. Since 1.34.0.
+  EarlierOccurrence earlier = 26;
+}
+
+// An earlier occurrence of a finding, as it stands now. Since 1.34.0.
+message EarlierOccurrence {
+  FindingRef finding = 1;
+  // Its answer, with the reason as it was given and how it came. Absent when it has none, as one
+  // the core cleared.
+  Answer answer = 2;
 }
 
 // The person's answer to a finding.

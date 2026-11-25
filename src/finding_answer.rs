@@ -134,6 +134,32 @@ pub fn of(
         thing: i.thing.clone(),
         kind_title: findings::kind_title(i.kind).to_string(),
         short_title: i.words.short.to_string(),
+        earlier: earlier(conn, found, f)?,
+    }))
+}
+
+/// The latest earlier occurrence of a finding, of its rule about its thing, as it stands now with
+/// its answer; `None` for a finding found for the first time.
+fn earlier(
+    conn: &Connection,
+    found: &[Found],
+    f: &Found,
+) -> rusqlite::Result<Option<v1::EarlierOccurrence>> {
+    let id: Option<String> = conn
+        .query_row(
+            "SELECT g.id FROM finding f JOIN finding g
+                 ON g.rule = f.rule AND g.about = f.about AND g.occurrence < f.occurrence
+             WHERE f.id = ?1 ORDER BY g.occurrence DESC LIMIT 1",
+            [&f.id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(found.iter().find(|g| Some(&g.id) == id.as_ref()).map(|g| {
+        let i = findings::item(g);
+        v1::EarlierOccurrence {
+            finding: Some(known::finding_ref(&i)),
+            answer: i.answer.as_ref().map(answer),
+        }
     }))
 }
 

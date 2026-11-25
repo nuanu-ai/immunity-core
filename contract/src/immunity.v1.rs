@@ -1819,6 +1819,23 @@ pub struct Finding {
     /// finding, and when it only read. Since 1.22.0.
     #[prost(message, repeated, tag = "25")]
     pub answered_together: ::prost::alloc::vec::Vec<FindingRef>,
+    /// The latest earlier occurrence of this finding: of the same rule about the same thing, which
+    /// the person had answered `seen` or the core had cleared. Absent for a finding found for the
+    /// first time. Since 1.34.0.
+    #[prost(message, optional, tag = "26")]
+    pub earlier: ::core::option::Option<EarlierOccurrence>,
+}
+/// An earlier occurrence of a finding, as it stands now. Since 1.34.0.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EarlierOccurrence {
+    #[prost(message, optional, tag = "1")]
+    pub finding: ::core::option::Option<FindingRef>,
+    /// Its answer, with the reason as it was given and how it came. Absent when it has none, as one
+    /// the core cleared.
+    #[prost(message, optional, tag = "2")]
+    pub answer: ::core::option::Option<Answer>,
 }
 /// The person's answer to a finding.
 #[derive(serde::Serialize, serde::Deserialize)]

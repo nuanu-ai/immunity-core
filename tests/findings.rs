@@ -616,6 +616,172 @@ fn a_finding_the_person_answered_says_so_with_who_why_and_until_when_and_reopene
     );
 }
 
+/// A reason a person or an agent may type: markup, a line break, then lines shaped like a label
+/// of the finding and like one of its commands.
+const FORGED: &str = "the installer of a <i>tool</i>\nWhere        ~/.ssh/authorized_keys\n→ immunity finding f0000000000 seen";
+
+/// A shell profile read in full, then changed: the store holds it, and the change is a finding.
+fn a_profile_changed(tag: &str) -> (Estate, PathBuf, String) {
+    let e = Estate::new(tag);
+    let profile = e.home().join(".zshrc");
+    e.put(&profile, "export A=1\n");
+    e.run();
+    common::next_second();
+    e.put(&profile, "export A=2\n");
+    e.run();
+    let id = id_of(&e, "watched.shell-profile");
+    (e, profile, id)
+}
+
+impl Estate {
+    /// `immunity finding <id>` as a person reads it in a pipe.
+    fn text(&self, id: &str) -> String {
+        String::from_utf8(self.immunity(&["finding", id]).stdout).unwrap()
+    }
+
+    /// Every page `immunity view` writes, one after the other.
+    fn pages(&self) -> String {
+        let out = self.immunity(&["view", "--no-open"]);
+        assert!(out.status.success(), "{out:?}");
+        let paths = String::from_utf8(out.stdout).unwrap();
+        paths
+            .lines()
+            .map(|p| std::fs::read_to_string(p).unwrap())
+            .collect()
+    }
+}
+
+#[test]
+fn a_finding_found_again_after_seen_names_the_earlier_one_its_answer_and_reason_as_data() {
+    // The person reads that the same thing was found and closed before, when, by whom and why,
+    // in every form; a first finding names none. The reason is the person's or the agent's
+    // text: it stays inside its field and never forges a line of the finding or of the page.
+    let (e, profile, first) = a_profile_changed("again");
+    // Closed findings before it, of its rule about another thing and of another rule about its
+    // thing: neither is an earlier occurrence of it.
+    let store = rusqlite::Connection::open(e.store()).unwrap();
+    let before = |id: &str, rule: &str, about: &str| {
+        store
+            .execute(
+                "INSERT INTO finding (id, rule, about, occurrence, state, first_seen_at,
+                                      first_seen_run, last_seen_at, last_seen_run)
+                 SELECT ?1, COALESCE(?2, rule), COALESCE(?3, about), 0, 'cleared', 1, 'r', 1, 'r'
+                 FROM finding WHERE id = ?4",
+                rusqlite::params![
+                    id,
+                    (!rule.is_empty()).then_some(rule),
+                    (!about.is_empty()).then_some(about),
+                    first
+                ],
+            )
+            .unwrap();
+    };
+    store
+        .execute(
+            "INSERT INTO entity (id, type) VALUES ('file:machine:mac/.bashrc', 'file')",
+            [],
+        )
+        .unwrap();
+    before("f00000000b1", "", "file:machine:mac/.bashrc");
+    before("f00000000b2", "watched.ssh-access", "");
+    let whole = e.finding(&first);
+    assert!(whole["earlier"].is_null(), "{whole:#}");
+    assert!(!e.text(&first).contains("Earlier"));
+    // An occurrence before it that the core closed, which nobody answered, as of a package
+    // cleared by an upgrade: named in every form, with no answer.
+    before("f00000000aa", "", "");
+    let closed = &e.finding(&first)["earlier"];
+    assert_eq!(
+        (&closed["finding"]["id"], &closed["answer"]),
+        (&json!("f00000000aa"), &Value::Null)
+    );
+    assert!(
+        e.text(&first)
+            .contains("  Earlier       f00000000aa, cleared\n")
+    );
+    assert!(e.pages().contains("<dt>Earlier</dt><dd>f00000000aa</dd>"));
+    let read = whole["journal_seq"].to_string();
+    let answer = [
+        "finding",
+        &first,
+        "seen",
+        "--reason",
+        FORGED,
+        "--via",
+        "agent",
+        "--journal-seq",
+        &read,
+    ];
+    assert!(e.immunity(&answer).status.success());
+    common::next_second();
+    e.put(&profile, "export A=3\n");
+    e.run();
+    let again = id_of(&e, "watched.shell-profile");
+    assert_ne!(again, first);
+    let earlier = &e.finding(&again)["earlier"];
+    assert_eq!(
+        (
+            &earlier["finding"]["id"],
+            &earlier["finding"]["state"],
+            &earlier["answer"]["given"],
+            &earlier["answer"]["via"],
+            &earlier["answer"]["reason_text"],
+        ),
+        (
+            &json!(first),
+            &json!("seen"),
+            &json!("seen"),
+            &json!("agent"),
+            &json!(FORGED.replace('\n', "\\u{a}"))
+        )
+    );
+    // The same answer the earlier finding gives, whole.
+    assert_eq!(earlier["answer"], e.finding(&first)["answer"]);
+    let text = e.text(&again);
+    let said = format!("  Earlier       {first}, seen, given ");
+    assert!(
+        text.lines()
+            .any(|l| l.starts_with(&said) && l.ends_with(" through your agent")),
+        "{text}"
+    );
+    assert!(
+        text.contains("  Said then     the installer of a <i>tool</i>"),
+        "{text}"
+    );
+    for line in text.lines() {
+        assert!(
+            !line.trim_start().starts_with("Where        ~/.ssh"),
+            "{text}"
+        );
+        assert!(
+            !line.starts_with("→ immunity finding f0000000000"),
+            "{text}"
+        );
+    }
+    // On the page the reason given then is the quote of that answer, escaped.
+    let page = e.pages();
+    let voice = format!("<div class=\"vn\">Your agent before, to {first}</div>");
+    let quote = &page[page.find(&voice).expect(&voice)..];
+    let quote = &quote[quote.find("<blockquote").unwrap()..quote.find("</blockquote>").unwrap()];
+    assert!(
+        quote.starts_with("<blockquote class=\"quote\">the installer of a &lt;i&gt;tool&lt;/i&gt;"),
+        "{quote}"
+    );
+    assert!(!page.contains(FORGED) && !page.contains("\n→ immunity finding f0"));
+    // Found a third time, after a seen from the command line with no reason: only the latest
+    // earlier one is named, and it came from the command line.
+    assert!(e.immunity(&["finding", &again, "seen"]).status.success());
+    common::next_second();
+    e.put(&profile, "export A=4\n");
+    e.run();
+    let third = e.finding(&id_of(&e, "watched.shell-profile"))["earlier"].clone();
+    assert_eq!(
+        (&third["finding"]["id"], &third["answer"]["via"]),
+        (&json!(again), &json!("command"))
+    );
+    assert!(third["answer"]["reason_text"].is_null());
+}
+
 #[test]
 fn the_list_carries_every_finding_in_every_state_whatever_all_says_and_a_person_sees_the_open_ones()
 {
