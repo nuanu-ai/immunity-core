@@ -352,6 +352,21 @@ latest AS (
 )
 ";
 
+/// The condition that the entity `x` names is gone: what `x IN (SELECT id FROM gone_entity)`
+/// says for an `x` that is never NULL, asked of that one id through `assertion_subject`. The
+/// view reads every retracted fact through `assertion_reading`, about 130 ms on an invented
+/// store a year old; the unary `+` keeps the planner off that index. `x` is qualified by a table
+/// of the statement, since an unqualified name such as `scope` would be read as a column of
+/// `assertion` here, and the aliases are unlike any a statement around it uses.
+pub fn gone_entity(x: &str) -> String {
+    format!(
+        "(EXISTS (SELECT 1 FROM assertion gone_r WHERE gone_r.subject = {x}
+                  AND gone_r.predicate = 'located_on' AND +gone_r.layer = 'retracted')
+          AND NOT EXISTS (SELECT 1 FROM assertion gone_l WHERE gone_l.subject = {x}
+                          AND gone_l.predicate = 'located_on' AND +gone_l.layer = 'live'))"
+    )
+}
+
 /// Why a reading is incomplete. The order is from worst: a reading incomplete for several
 /// reasons takes the worst of them, so that it never looks better than it is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -1352,7 +1367,8 @@ pub fn totals(tx: &Connection, run_id: &str) -> rusqlite::Result<Totals> {
             "{LATEST}
              SELECT COUNT(*) FROM reading
              WHERE scope NOT IN (SELECT scope FROM coverage WHERE run_id = ?1)
-               AND scope NOT IN (SELECT id FROM gone_entity)"
+               AND NOT {}",
+            gone_entity("reading.scope")
         ))?,
     })
 }
@@ -2771,6 +2787,48 @@ mod tests {
         let after: Vec<_> = kept.iter().map(|r| per_run(&k, r)).collect();
         assert_eq!(after, before);
         assert!(before.iter().all(|t| t.1 == 1), "{before:?}");
+    }
+
+    #[test]
+    fn a_place_read_before_and_not_in_a_run_is_not_repeated_unless_what_holds_it_is_gone() {
+        // `located_on` decides it: a checkout whose only one was retracted is gone; one with a
+        // live one again is not, nor is a machine, which has none.
+        let mut k = Kept::new("not-repeated");
+        let (gone, back) = ("checkout:machine:mac/gone", "checkout:machine:mac/back");
+        let read = |scope| {
+            (
+                crate::lockfiles::READER,
+                scope,
+                crate::lockfiles::KIND,
+                FULL,
+            )
+        };
+        let server = (
+            crate::servers::READER,
+            "machine:web-1",
+            crate::servers::PACKAGES,
+            FULL,
+        );
+        k.run(true, &[read(gone), read(back), server]);
+        for (layer, subject) in [("retracted", gone), ("retracted", back), ("live", back)] {
+            k.conn
+                .execute(
+                    "INSERT INTO assertion (layer, subject, predicate, object, reader, scope, kind,
+                                            source_ref, basis, observed_at, run_id, retracted_at)
+                     VALUES (?1, ?2, 'located_on', ?3, 'checkouts', ?2, ?4, '', ?5, 1, 'r1',
+                             CASE WHEN ?1 = 'retracted' THEN 2 END)",
+                    params![
+                        layer,
+                        subject,
+                        MAC,
+                        crate::lockfiles::KIND,
+                        crate::lockfiles::BASIS
+                    ],
+                )
+                .unwrap();
+        }
+        let run = k.run(true, &[("watched-places", MAC, PROFILES, FULL)]);
+        assert_eq!(totals(&k.conn, &run).unwrap().not_repeated, 2);
     }
 
     #[test]
