@@ -610,7 +610,7 @@ mod tests {
         };
         let latest = [latest];
         let p = crate::status::problems(&h.conn, &latest).unwrap();
-        let items = crate::covered::not_covered(&h.conn, &latest, &p, None).unwrap();
+        let items = crate::covered::not_covered(&h.conn, &latest, &p, None, None).unwrap();
         let ids: Vec<(&str, usize)> = items.iter().map(|u| (u.cause.id, u.count)).collect();
         assert!(
             ids.contains(&(crate::covered::OTHER_ACCOUNTS.id, 1)),
