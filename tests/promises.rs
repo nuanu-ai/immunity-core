@@ -10687,9 +10687,9 @@ fn a_machine_that_could_not_be_reached_is_named_once_and_what_it_leaves_unread_i
 }
 
 #[test]
-fn an_incomplete_reading_without_a_cause_is_never_called_milder_than_failed() {
+fn an_incomplete_reading_without_a_cause_is_read_as_failed_everywhere_the_status_sorts_it() {
     // An incomplete reading whose cause the store does not hold is, not knowing why, never
-    // called anything milder than failed.
+    // called anything milder than failed, as the schema says of a class it does not know.
     let w = Watch::new("before-causes");
     std::fs::create_dir_all(w.home()).unwrap();
     let shop = checkout(w.home(), "dev/shop");
@@ -10707,16 +10707,15 @@ fn an_incomplete_reading_without_a_cause_is_never_called_milder_than_failed() {
         .unwrap();
     let r = status_json(&w.store());
     assert_eq!(classes(&r), [2, 0, 0]);
-    // For a person they are not a failure of his Mac: the next run reads them again and says
-    // why, so a status read before it, or while it runs, is not alarmed by numbers that run is
-    // about to change.
-    assert_eq!(r["this_mac"]["state"], "watched", "{r:#}");
+    // The same where the status sorts them: failed readings of whole sources, faults, which
+    // hold this Mac in part until the next run reads them again and says why.
+    assert_eq!(r["this_mac"]["state"], "watched_in_part", "{r:#}");
     assert!(
         r["not_covered"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|u| u["id"] != "could-not-read"),
+            .any(|u| u["id"] == "could-not-read" && u["fault"] == true),
         "{r:#}"
     );
 }

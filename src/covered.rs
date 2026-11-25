@@ -184,12 +184,10 @@ fn on_this_mac(scope: &str, this: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Whether a reading is a failure the owner can act on. A reading written before causes
-/// were kept has none, and is not taken for a failure here: the next run reads it again and
-/// says why (`coverage` still counts it as failed, for agents).
-fn failed(r: &Latest) -> bool {
-    r.cause.is_some()
-        && status::class(&r.completeness, r.reason.as_deref(), r.cause.as_deref()) == Some("failed")
+/// Whether a reading failed: one not full whose cause is `failed`, or that kept none, as the
+/// schema says of a class it does not know (`status::class`). Every one is a fault.
+pub(crate) fn failed(r: &Latest) -> bool {
+    status::class(&r.completeness, r.reason.as_deref(), r.cause.as_deref()) == Some("failed")
 }
 
 /// A reading of a server file an earlier probe printed, which only the person can make again.
@@ -199,7 +197,7 @@ fn earlier_probe(r: &Latest) -> bool {
 
 /// Is this Mac watched, and how: from the latest readings, `live` and when a watcher last
 /// read. `not_checked` before any reading of this Mac; `watched_in_part` when a reading of its
-/// own places failed, that is, they are there and could not be read; else `watched`.
+/// own places failed or one read here before is not read now (`fault::lost`); else `watched`.
 pub fn this_mac(conn: &Connection, latest: &[Latest], live: bool) -> rusqlite::Result<ThisMac> {
     let this = this_machine(conn)?;
     let checked_at = status::latest_finished(conn)?.and_then(|r| r.finished_at);
@@ -215,7 +213,8 @@ pub fn this_mac(conn: &Connection, latest: &[Latest], live: bool) -> rusqlite::R
         .iter()
         .filter(|r| on_this_mac(&r.scope, &this))
         .collect();
-    let state = if mine.iter().any(|r| failed(r)) {
+    let lost = crate::fault::lost(conn, latest)?;
+    let state = if mine.iter().any(|r| failed(r)) || lost.iter().any(|l| !l.project) {
         "watched_in_part"
     } else {
         "watched"
@@ -769,9 +768,10 @@ pub const NOT_CHECKED_ON_MACOS: Cause = Cause {
 };
 
 /// Every cause, in the order items are listed: what the owner can fix first.
-pub const CAUSES: [&Cause; 28] = [
+pub const CAUSES: [&Cause; 29] = [
     &SERVERS_NOT_CHECKED,
     &SERVERS_NOT_OPENED,
+    &crate::fault::NO_LONGER_READ,
     &NOT_PERMITTED,
     &READING_FAILED,
     &OTHER_ACCOUNTS,
@@ -844,6 +844,10 @@ pub struct Uncovered {
     /// every Mac. Set at the one place that adds those, `LIMITS`, and where a reading found
     /// nothing of its kind here; everything else is of this Mac.
     pub every_mac: bool,
+    /// Something Immunity Core has reason to expect met on this Mac now (`fault.rs`): set where
+    /// readings are sorted; a failure of the core's own work, a cause of class `failed` that no
+    /// reading holds, otherwise.
+    pub fault: bool,
 }
 
 /// One thing a cause is about: its name as the Mac names it, and apart from it what its source
@@ -856,7 +860,7 @@ pub struct Example {
 }
 
 impl Example {
-    fn named(name: impl Into<String>) -> Example {
+    pub(crate) fn named(name: impl Into<String>) -> Example {
         Example {
             name: name.into(),
             reason: None,
@@ -865,7 +869,7 @@ impl Example {
 }
 
 impl Uncovered {
-    fn new(cause: &'static Cause, count: usize) -> Uncovered {
+    pub(crate) fn new(cause: &'static Cause, count: usize) -> Uncovered {
         Uncovered {
             scope: cause.scope,
             cause,
@@ -878,6 +882,7 @@ impl Uncovered {
             read_whole: true,
             projects: Found::All.projects(),
             every_mac: false,
+            fault: cause.class == store::Cause::Failed,
         }
     }
 
@@ -1045,6 +1050,8 @@ pub fn not_covered(
         });
     }
 
+    out.extend(crate::fault::item(conn, latest, place)?);
+
     // Readings that failed: those kept closed by permissions, which the owner can open, and
     // the rest. On a server that could not be opened they are implied by it and told there.
     let away: BTreeSet<&str> = p.unreached.iter().map(|u| u.scope.as_str()).collect();
@@ -1112,10 +1119,12 @@ pub fn not_covered(
                 ..Uncovered::new(cause, 1)
             });
         }
-        // Recording program starts, not files: the rules for files do not watch.
+        // Recording program starts, not files: the rules for files do not watch. The collector
+        // installed records less than this build reads, a fault while it stays so.
         if l.state == crate::events::RUNNING && !l.files.collected {
             out.push(Uncovered {
                 since: Some(l.read_at),
+                fault: true,
                 ..Uncovered::new(&FILES_NOT_COLLECTED, 1)
             });
         }
@@ -1724,7 +1733,12 @@ pub const EXAMPLES: usize = 3;
 /// a person needs by name to know what is left out, and the ways and places not read, which
 /// are counted by way and named by each of a way's names, so a first three would leave a way
 /// out unsaid.
-const EVERY_EXAMPLE: [&str; 3] = [OTHER_MANAGERS.id, PROJECT_AUTORUN.id, HOME_AUTORUN.id];
+const EVERY_EXAMPLE: [&str; 4] = [
+    crate::fault::NO_LONGER_READ.id,
+    OTHER_MANAGERS.id,
+    PROJECT_AUTORUN.id,
+    HOME_AUTORUN.id,
+];
 
 /// The examples of the ways or places not read: each name of each way, a name of its own, never
 /// a way's names joined into one.
@@ -1775,13 +1789,13 @@ mod tests {
 
     #[test]
     fn a_reading_or_a_download_that_failed_is_a_failure_whoever_can_fix_it() {
-        // The causes raised when a reading or a download was tried and did not succeed; the
-        // status is calm only without them.
+        // The causes raised when a reading or a download was tried and did not succeed (`fault.rs`).
         let failed = [
             "servers-not-checked",
             "servers-not-opened",
             "not-permitted",
             "could-not-read",
+            "read-before-not-read-now",
             "eslogger-refused",
             "event-level-failing",
             "event-level-silent",

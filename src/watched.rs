@@ -421,7 +421,9 @@ pub fn look_checkout(
     let mut told = untold.is_none();
     let before = look.not_read().count();
     for (path, names) in folder.configured() {
-        let unit = Unit::whole(crate::checkouts::rel(at.homes[0], path));
+        // Named as its hooks are, by the home folder it is under, as given or made real.
+        let home = (at.homes.into_iter()).find(|h| path.starts_with(h));
+        let unit = Unit::whole(crate::checkouts::rel(home.unwrap_or(at.homes[0]), path));
         configured_hooks(&mut look, path, unit.clone(), names, &at);
         // A folder that could not be looked at is not told yet.
         told &= !look.not_read().any(|u| u.unit == unit);
@@ -434,7 +436,7 @@ pub fn look_checkout(
     }
     match untold {
         Some((cause, why)) => {
-            look.short(cause, why);
+            look.short_named([hooks_told(&checkout.rel)], cause, why);
             look.unplaced();
         }
         None if told => look.read(hooks_told(&checkout.rel)),
@@ -454,8 +456,11 @@ fn configured_hooks(look: &mut Look, path: &Path, unit: Unit, names: &[&str], at
     let folder = match guarded::real_in(path, &at.homes, at.given) {
         Real::At(folder) => folder,
         Real::Guarded(g) => return look.not_into(unit, g, at.home),
-        Real::Failed(e) if Absent::on_the_way(&e).is_some() => return,
-        Real::Failed(e) => return look.not_looked_at(unit, reason(&e)),
+        Real::Failed(e) => match Absent::on_the_way(&e) {
+            // Not there: read in full, it holds no hook (`baseline.rs`).
+            Some(absent) => return look.absent(unit, absent),
+            None => return look.not_looked_at(unit, reason(&e)),
+        },
     };
     match std::fs::metadata(&folder) {
         Ok(meta) if meta.is_dir() => {}
