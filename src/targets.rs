@@ -7,8 +7,9 @@
 
 use crate::autorun::{self, Runs};
 use crate::baseline::Unit;
+use crate::closed::By;
 use crate::codesign;
-use crate::guarded::{self, Real};
+use crate::guarded::{self, Real, Stopped};
 use crate::look::{Absent, Look};
 use crate::plist::{self, Text};
 use crate::store::{Cause, Gap, Lack, Statement};
@@ -384,7 +385,7 @@ pub fn read(
             (Content::Unread(Cause::NoReader, why.into()), None)
         } else {
             let before = previous(tx, &id)?;
-            let mut resolve = || guarded::real(&on_disk(roots, &unit.path), &homes);
+            let mut resolve = || guarded::real_to(&on_disk(roots, &unit.path), &homes);
             let (content, after, why) =
                 read_target(&mut resolve, roots, &unit.path, &before, &mut look);
             why.into_iter().for_each(|why| t.count(why));
@@ -458,17 +459,21 @@ pub fn from_root(system: &Path, real: &Path) -> String {
 /// bucket it counts in. The name is made real again and the identity taken again after the
 /// read: if either moved it is read once more, then not read. Out of reach: a file swapped
 /// during the read with its identity put back, since the signature is asked of a name. A file
-/// that could not be opened counts once its cause is decided (`closed::settle`).
+/// that could not be opened counts once its cause is decided (`closed::settle`), told by the
+/// walk `resolve` made; once its bytes were read here, a refusal at the second look is not
+/// weighed, since it was read.
 fn read_target(
-    resolve: &mut dyn FnMut() -> Real,
+    resolve: &mut dyn FnMut() -> (Real, Stopped),
     roots: &Roots,
     path: &str,
     before: &Signature,
     look: &mut Look,
 ) -> (Content, Signature, Option<&'static str>) {
     let not = |content, why| (content, Signature::default(), why);
+    let mut read_here = false;
     for _ in 0..2 {
-        let real = match resolve() {
+        let (real, stopped) = resolve();
+        let real = match real {
             Real::At(real) => real,
             Real::Guarded(g) => {
                 let into = guarded::leads_into(&g, roots.home);
@@ -483,8 +488,15 @@ fn read_target(
                     _ => not(Content::Missing, Some(ABSENT)),
                 };
             }
+            // Counted once its cause is decided, as a file that could not be opened.
             Real::Failed(e) => {
-                return not(Content::Unread(Cause::Failed, e.to_string()), Some(FAILED));
+                let met = on_disk(roots, path);
+                let by = match read_here {
+                    true => By::Untold,
+                    false => By::stopped(&stopped),
+                };
+                let failed = crate::closed::Failure::of(&e, by, &met, e.to_string());
+                return not(Content::Failed(failed), None);
             }
         };
         let shown = from_root(roots.system, &real);
@@ -498,9 +510,15 @@ fn read_target(
             Err(content @ Content::Unread(Cause::NoReader, _)) => {
                 return not(content, Some(watched::OVER_CAP));
             }
-            Err(content @ Content::Failed(_)) => return not(content, None),
+            Err(Content::Failed(mut f)) => {
+                if read_here {
+                    f.by = By::Untold;
+                }
+                return not(Content::Failed(f), None);
+            }
             Err(content) => return not(content, Some(FAILED)),
         };
+        read_here = true;
         let content = format!("sha256:{}", crate::sha256::hex(&bytes));
         drop(bytes);
         // Carried only for the same content reached the same way; else asked of the code.
@@ -510,7 +528,7 @@ fn read_target(
         } else {
             signed(&real)
         };
-        if matches!(resolve(), Real::At(again) if again == real) && !moved(&meta, &real) {
+        if matches!(resolve().0, Real::At(again) if again == real) && !moved(&meta, &real) {
             let s = Signature {
                 content: Some(content.clone()),
                 link,
@@ -809,13 +827,15 @@ mod tests {
         };
         let mut t = Targets::default();
         let mut look = Look::default();
+        let (uid, dev, ino) = (0, 1, 2);
+        let theirs = crate::closed::Object { uid, dev, ino };
         look.read(Unit::whole("/Library/Example/helper"));
         look.entries.push(Entry {
             unit: Unit::whole("/Library/Example/helper"),
             watched_as: TARGET,
             content: Content::Failed(crate::closed::Failure {
                 errno: Some(libc::EACCES),
-                owner: 0,
+                by: crate::closed::By::File(theirs, Some(theirs)),
                 us: 501,
                 real: dir.join("Library/Example/helper"),
                 why: "Permission denied (os error 13)".to_string(),
@@ -834,23 +854,127 @@ mod tests {
         let program = dir.join("runner");
         std::fs::write(&program, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // And a program behind a folder closed to this account, counted once, as the file.
+        let shut = std::fs::canonicalize(&dir).unwrap().join("shut");
+        std::fs::create_dir_all(&shut).unwrap();
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
         let mut items = Look::default();
-        let agent = AGENT.replace("/Users/example/bin/agent", "/runner");
-        items.entries.push(Entry {
-            unit: Unit::whole("Library/LaunchAgents/org.example.agent.plist"),
-            watched_as: watched::AUTOSTART,
-            content: Content::Hash("sha256:00".to_string()),
-            link: None,
-            bytes: Some(std::sync::Arc::from(agent.into_bytes())),
-        });
+        for (name, runs) in [("agent", "/runner"), ("shut", "/shut/runner")] {
+            let agent = AGENT.replace("/Users/example/bin/agent", runs);
+            items.entries.push(Entry {
+                unit: Unit::whole(format!("Library/LaunchAgents/org.example.{name}.plist")),
+                watched_as: watched::AUTOSTART,
+                content: Content::Hash("sha256:00".to_string()),
+                link: None,
+                bytes: Some(std::sync::Arc::from(agent.into_bytes())),
+            });
+        }
         let (mut look, t) = read(&tx, "example-mac", &roots, &[&items], &[&items]).unwrap();
         let why = "Permission denied (os error 13)".to_string();
-        assert_eq!(look.entries[0].content, Content::Unread(Cause::Failed, why));
-        let failed = format!("not read in full: {FAILED}: 1; {AT_CHECKS}");
+        // Neither keeps a link, so its row is `none` whatever its cause (`closed::Read::of`).
+        for e in &look.entries {
+            assert_eq!(e.content, Content::Unread(Cause::Failed, why.clone()));
+            assert_eq!(e.link, None);
+        }
+        let failed = format!("not read in full: {FAILED}: 2; {AT_CHECKS}");
         assert_eq!(
             said(&t, &mut look),
             ("partial", failed, Some(Cause::Failed))
         );
+        // The program behind the folder is said with that folder.
+        let mut resolve = || guarded::real_to(&dir.join("shut/runner"), &[]);
+        let (content, ..) = refused_at(&mut resolve, &roots, "/shut/runner");
+        assert!(
+            matches!(&content, Content::Failed(f) if matches!(&f.by,
+                crate::closed::By::Folder(folder) if folder.path == shut && !folder.search)),
+            "{content:?}"
+        );
+    }
+
+    /// What reading the program `path` under `roots` gives, its name made real by `resolve`.
+    fn refused_at(
+        resolve: &mut dyn FnMut() -> (Real, Stopped),
+        roots: &Roots,
+        path: &str,
+    ) -> (Content, Signature, Option<&'static str>) {
+        read_target(
+            resolve,
+            roots,
+            path,
+            &Default::default(),
+            &mut Look::default(),
+        )
+    }
+
+    #[test]
+    fn rule_1_a_refused_program_is_told_by_the_walk_its_reader_made_and_by_no_other() {
+        // The walk that refused names the folder; the name read again now leads to a file
+        // every part of which is seen, which a second walk would take for nothing refused.
+        use std::os::unix::fs::PermissionsExt;
+        let (_removed, dir) = scratch("one-walk");
+        let real = std::fs::canonicalize(&dir).unwrap();
+        std::fs::write(real.join("runner"), "#!/bin/sh\n").unwrap();
+        let shut = real.join("shut");
+        std::fs::create_dir(&shut).unwrap();
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let roots = Roots {
+            home: &real.join("home"),
+            system: &real,
+        };
+        let mut resolve = || {
+            let refused = std::io::Error::from_raw_os_error(libc::EACCES);
+            let part = Some(shut.join("runner"));
+            (
+                Real::Failed(refused),
+                Stopped {
+                    part,
+                    own_on_the_way: false,
+                },
+            )
+        };
+        let (content, ..) = refused_at(&mut resolve, &roots, "/runner");
+        let Content::Failed(f) = content else {
+            panic!("{content:?}");
+        };
+        assert!(matches!(&f.by, crate::closed::By::Folder(folder) if folder.path == shut));
+    }
+
+    #[test]
+    fn rule_5_a_program_read_in_this_reading_and_refused_at_its_second_look_is_failed() {
+        // Read, then closed before the look that checks it, by its folder or by itself: it
+        // was read here, so what refused is not weighed.
+        use std::os::unix::fs::PermissionsExt;
+        for closes in ["folder", "file"] {
+            let (_removed, dir) = scratch(&format!("read-then-closed-{closes}"));
+            let real = std::fs::canonicalize(&dir).unwrap();
+            let folder = real.join("bin");
+            std::fs::create_dir(&folder).unwrap();
+            let program = folder.join("runner");
+            std::fs::write(&program, "#!/bin/sh\n").unwrap();
+            let roots = Roots {
+                home: &real,
+                system: &real,
+            };
+            let mut looks = 0;
+            let mut resolve = || {
+                looks += 1;
+                if looks == 2 {
+                    let shut = if closes == "folder" {
+                        &folder
+                    } else {
+                        &program
+                    };
+                    let mode = std::fs::Permissions::from_mode(0o000);
+                    std::fs::set_permissions(shut, mode).unwrap();
+                }
+                guarded::real_to(&program, &[])
+            };
+            let (content, ..) = refused_at(&mut resolve, &roots, "/bin/runner");
+            let Content::Failed(f) = content else {
+                panic!("{closes}: {content:?}");
+            };
+            assert_eq!(f.by, crate::closed::By::Untold, "{closes}");
+        }
     }
 
     #[test]
@@ -881,6 +1005,99 @@ mod tests {
         }
     }
 
+    /// What reading the programs startup items name gives, on a store that holds a full content
+    /// reading of `stored` if any: each program as decided, with the reading's reason. The
+    /// Mac's root is read under, and the home is a scratch folder.
+    fn read_named(tag: &str, programs: &[&Path], stored: Option<&Path>) -> (Vec<Content>, String) {
+        let (_removed, dir) = scratch(tag);
+        let conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        let kinds = "INSERT OR IGNORE INTO coverage_kind (name) VALUES (?1)";
+        tx.execute(kinds, [watched::CONTENT]).unwrap();
+        if let Some(stored) = stored {
+            let scope = format!("file:example-mac/{}", stored.display());
+            crate::store::put_entity(&tx, &scope).unwrap();
+            let r = crate::store::Reading {
+                reader: watched::READER,
+                scope: &scope,
+                kind: watched::CONTENT,
+                run_id: "run-1",
+                at: 1,
+                observed_at: 1,
+            };
+            crate::store::put_coverage(&tx, &r, "full", None, &Gap::default()).unwrap();
+        }
+        let roots = Roots {
+            home: &dir,
+            system: Path::new("/"),
+        };
+        let mut items = Look::default();
+        for (n, program) in programs.iter().enumerate() {
+            // No argument names a file: only the program is looked at.
+            let agent = (AGENT.replace("/Users/example/bin/agent", &program.to_string_lossy()))
+                .replace("/Users/example/agent.conf", "agent.conf");
+            items.entries.push(Entry {
+                unit: Unit::whole(format!("Library/LaunchAgents/org.example.{n}.plist")),
+                watched_as: watched::AUTOSTART,
+                content: Content::Hash("sha256:00".to_string()),
+                link: None,
+                bytes: Some(std::sync::Arc::from(agent.into_bytes())),
+            });
+        }
+        let (mut look, t) = read(&tx, "example-mac", &roots, &[&items], &[&items]).unwrap();
+        t.short_of(&mut look);
+        let reason = t.coverage(&look).1.unwrap_or_default();
+        (
+            look.entries.into_iter().map(|e| e.content).collect(),
+            reason,
+        )
+    }
+
+    #[test]
+    fn a_program_in_roots_home_with_nothing_inside_read_here_is_a_limit_through_the_reader() {
+        let Some(home) = crate::closed::real_folder::root_home() else {
+            return;
+        };
+        let program = home.join(crate::closed::real_folder::NOT_THERE);
+        let (read, reason) = read_named("in-roots-home", &[&program], None);
+        let limit = Content::Unread(Cause::NotGiven, watched::CLOSED_ON_THE_WAY.into());
+        assert_eq!(read, vec![limit]);
+        assert_eq!(
+            reason,
+            format!("not read in full: {CLOSED}: 1; {AT_CHECKS}")
+        );
+    }
+
+    #[test]
+    fn a_program_in_roots_home_is_failed_once_the_store_holds_a_reading_of_a_name_inside_it() {
+        let Some(home) = crate::closed::real_folder::root_home() else {
+            return;
+        };
+        let program = home.join(crate::closed::real_folder::NOT_THERE);
+        let (read, reason) = read_named("in-roots-home-read", &[&program], Some(&home.join("x")));
+        let failed = Content::Unread(Cause::Failed, watched::CLOSED_ON_THE_WAY.into());
+        assert_eq!(read, vec![failed]);
+        assert_eq!(
+            reason,
+            format!("not read in full: {FAILED}: 1; {AT_CHECKS}")
+        );
+    }
+
+    #[test]
+    fn a_program_in_roots_home_reached_through_a_link_of_this_accounts_is_failed() {
+        // The link can be pointed anywhere by anything running as the person.
+        let Some(home) = crate::closed::real_folder::root_home() else {
+            return;
+        };
+        let (_removed, dir) = scratch("through-own-link");
+        let link = std::fs::canonicalize(&dir).unwrap().join("runner");
+        std::os::unix::fs::symlink(home.join(crate::closed::real_folder::NOT_THERE), &link)
+            .unwrap();
+        let (read, _) = read_named("through-own-link-store", &[&link], None);
+        let failed = Content::Unread(Cause::Failed, "Permission denied (os error 13)".into());
+        assert_eq!(read, vec![failed]);
+    }
+
     /// A folder of its own in the temporary folder, removed with it.
     fn scratch(name: &str) -> (crate::common::Scratch, PathBuf) {
         let dir = crate::common::Scratch::new(name);
@@ -897,7 +1114,9 @@ mod tests {
             home: dir,
             system: dir,
         };
-        let (content, s, _) = read_target(resolve, &roots, "/runner", before, &mut Look::default());
+        let mut resolve = || (resolve(), Stopped::default());
+        let mut look = Look::default();
+        let (content, s, _) = read_target(&mut resolve, &roots, "/runner", before, &mut look);
         (content, s)
     }
 
