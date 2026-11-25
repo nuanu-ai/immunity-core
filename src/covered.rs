@@ -1219,10 +1219,9 @@ pub fn not_covered(
         .into_iter()
         .partition(|(_, what, _)| what == autorun::OTHER_HOME);
     // Package managers on this Mac are told in their own item, below.
-    let lacks: Vec<_> = lacks
+    let (managers, lacks): (Vec<_>, Vec<_>) = lacks
         .into_iter()
-        .filter(|(_, what, _)| what != crate::managers::NO_READER)
-        .collect();
+        .partition(|(_, what, _)| what == crate::managers::NO_READER);
     let looked = latest.iter().any(|r| {
         r.reader == watched::READER
             && r.kind == autorun::OTHERS_KIND
@@ -1263,14 +1262,9 @@ pub fn not_covered(
             ..Uncovered::new(&NOT_UNDERSTOOD, kinds.len())
         });
     }
-    // Package managers on this Mac that no reader reads, each named, in the order the latest
-    // reading found them.
-    if let Some(names) = latest
-        .iter()
-        .filter(|r| r.reader == integrity::READER && r.kind == crate::managers::KIND)
-        .find_map(|r| r.reason.as_deref()?.strip_prefix(crate::managers::NOT_READ))
-    {
-        let names: Vec<String> = names.split(", ").map(str::to_string).collect();
+    // Package managers on this Mac that no reader reads, each named by its row.
+    let names: Vec<String> = managers.into_iter().filter_map(|(_, _, n)| n).collect();
+    if !names.is_empty() {
         out.push(Uncovered {
             count: names.len(),
             examples: names.into_iter().map(Example::named).collect(),

@@ -3328,7 +3328,7 @@ mod tests {
                     l
                 .starts_with("  Drill ")
                 && l.ends_with(
-                    " Atomic Red Team T1027.001: 4 of 4 program starts raise Binary Padding - MacOS"
+                    " Atomic Red Team T1027.001: 4 of 4 program starts raise \"Binary Padding - MacOS\""
                 )
                 })
         );
@@ -4356,7 +4356,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("selection_meshagent needs OriginalFileName"))
+                .any(|l| l.contains(r#""selection_meshagent" needs "OriginalFileName""#))
         );
         // A person reads that a rule states no level, in the level's column; the rules of such a
         // set come after the rest of their part.

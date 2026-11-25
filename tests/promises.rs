@@ -3511,8 +3511,10 @@ fn an_uncovered_meaning_is_the_same_whatever_the_mac_holds_and_the_places_are_it
 }
 
 /// What every name and path from the Mac holds in the canary's store: a quote, "; " and ", "
-/// beside a word no sentence of the core holds, by which it is found.
-const CANARY: &str = "canary-7f3 \"q\"; s, c";
+/// beside a word no sentence of the core holds, by which it is found; then what a file's name
+/// can also hold: a line break, the words of a system's error, a right-to-left override and a
+/// backslash.
+const CANARY: &str = "canary-7f3 \"q\"; s, c\n(os error 13)\u{202e}\\";
 const CANARY_WORD: &str = "canary-7f3";
 
 /// Where in `v` a string holds the canary's word outside a field named for text from a source.
@@ -3533,15 +3535,13 @@ fn outside_text_fields(v: &serde_json::Value, key: &str, at: &str, out: &mut Vec
     }
 }
 
-#[test]
-fn text_from_the_mac_reaches_the_contracts_json_only_in_fields_named_for_it() {
-    // A Mac whose home folder, project, sessions and the places tools were looked for all hold
-    // the marker: a tool read before and lost sight of, a project found by a walk and by a
-    // session whose lockfile declares a package named as malicious, and sessions of an agent
-    // this version does not read. The answers that carry what is not covered, the vulnerability
-    // data and the projects found hold the marker only in fields whose names say they hold
-    // text from a source.
-    let dir = Dir::new("canary");
+/// The canary's store: a Mac whose home folder, project, sessions, startup items and the places
+/// tools were looked for all hold the marker. A tool read before and lost sight of, a project
+/// found by a walk and by a session whose lockfile declares a package named as malicious,
+/// sessions of an agent this version does not read, a startup item changed and one its
+/// permissions keep closed. The folder, named by `tag`, the home folder and the store.
+fn canary_mac(tag: &str) -> (Dir, PathBuf, PathBuf) {
+    let dir = Dir::new(tag);
     let mac = dir.0.join(CANARY);
     let home = mac.join("home");
     let project = checkout(&home, &format!("dev/{CANARY}"));
@@ -3550,6 +3550,9 @@ fn text_from_the_mac_reaches_the_contracts_json_only_in_fields_named_for_it() {
     put(&project, "package-lock.json", lock);
     osv_npm(&home, &["MAL-2021-1"]);
     std::fs::create_dir_all(home.join(".gemini/tmp")).unwrap();
+    let agents = format!("Library/LaunchAgents/{CANARY}");
+    let changed = put(&home, &format!("{agents}.plist"), "not a property list\n");
+    let closed = put(&home, &format!("{agents} closed.plist"), "invented\n");
     let sessions = mac.join("sessions");
     session(&sessions, "s1", &[&project]);
     let (absent, store) = (dir.0.join("absent"), dir.store());
@@ -3569,7 +3572,18 @@ fn text_from_the_mac_reaches_the_contracts_json_only_in_fields_named_for_it() {
         Some(&dir.input("brew.txt", SAMPLE)),
         &fake(&dir.0.join("bin/tailscale"), TAILNET),
     );
+    std::fs::write(&changed, "not a property list either\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
     run(None, &mac.join("lost/tailscale"));
+    (dir, home, store)
+}
+
+#[test]
+fn text_from_the_mac_reaches_the_contracts_json_only_in_fields_named_for_it() {
+    // The answers that carry what is not covered, the vulnerability data and the projects found
+    // hold the marker only in fields whose names say they hold text from a source.
+    let (_dir, home, store) = canary_mac("canary-json");
     let contract = |args: &[&str]| -> serde_json::Value {
         let out = ok(immunity_cmd(&home)
             .args(args)
@@ -3593,6 +3607,100 @@ fn text_from_the_mac_reaches_the_contracts_json_only_in_fields_named_for_it() {
     for (command, v) in &answers {
         outside_text_fields(v, "", command, &mut found);
     }
+    assert!(found.is_empty(), "{found:#?}");
+}
+
+/// Where in a command's text the canary's word stands other than inside a quotation or at the
+/// start of a value alone beside a label or in a column, or is not followed by the rest of the
+/// marker escaped as it is in the one form or the other.
+fn outside_quotes_or_labels(text: &str) -> Vec<String> {
+    let escaped = r#" "q"; s, c\u{a}(os error 13)\u{202e}\u{5c}"#;
+    let in_quotes = escaped.replace('"', "\\\"");
+    let mut out = Vec::new();
+    for line in text.lines() {
+        // Whether a quotation is open at each byte: a quote inside one is written `\"`.
+        let (mut open, mut escape) = (false, false);
+        let mut quoted_at = vec![false; line.len() + 1];
+        for (i, c) in line.char_indices() {
+            quoted_at[i] = open;
+            if open && c == '"' && !escape {
+                open = false;
+            } else if !open && c == '"' {
+                open = true;
+            }
+            escape = open && c == '\\' && !escape;
+        }
+        for (at, _) in line.match_indices(CANARY_WORD) {
+            let rest = &line[at + CANARY_WORD.len()..];
+            let fine = if quoted_at[at] {
+                rest.starts_with(&in_quotes)
+            } else {
+                // Bare, a value starts after two spaces at least, and the word is in its first
+                // piece: nothing of the core's stands between them.
+                let value = line[..at].rsplit("  ").next().unwrap_or_default();
+                !value.contains(' ') && rest.starts_with(escaped)
+            };
+            if !fine {
+                out.push(line.to_string());
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn text_from_the_mac_in_the_text_of_every_command_is_quoted_or_a_value_of_its_own_and_escaped() {
+    // The same store as above, every command of the contract that answers about it as text
+    // for a person: the marker is inside a quotation, or the value beside a label or in a
+    // column; it never stands in the core's own sentence, never ends a line, and its quote,
+    // backslash, line break and right-to-left override are each written as an escape.
+    let (_dir, home, store) = canary_mac("canary-text");
+    let no_system = home.join("no-system");
+    let text = |args: &[&str]| -> String {
+        let out = immunity_cmd(&home)
+            .args(args)
+            .arg("--store")
+            .arg(&store)
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let findings = status_json(&store)["needs_a_look"]["items"]
+        .as_array()
+        .map_or(Vec::new(), |items| {
+            (items.iter())
+                .filter_map(|i| i["finding"]["finding"]["id"].as_str().map(str::to_string))
+                .collect()
+        });
+    let project = home.join(format!("dev/{CANARY}"));
+    let mut commands: Vec<Vec<&str>> = vec![
+        vec!["status"],
+        vec!["status", "--coverage"],
+        vec!["findings", "--all"],
+        vec!["matches", "--system-root", no_system.to_str().unwrap()],
+        vec!["rules"],
+        vec!["machine"],
+        vec!["program", CANARY],
+        vec!["project", project.to_str().unwrap()],
+        vec!["vulnerabilities"],
+        vec!["vulnerability", "MAL-2021-1"],
+    ];
+    commands.extend(findings.iter().map(|id| vec!["finding", id.as_str()]));
+    let mut found = Vec::new();
+    let mut marked = 0;
+    for args in &commands {
+        let said = text(args);
+        assert!(!said.contains('\u{202e}'), "{args:?}: {said}");
+        assert!(!said.contains("\n(os error 13)"), "{args:?}: {said}");
+        marked += said.matches(CANARY_WORD).count();
+        found.extend(
+            outside_quotes_or_labels(&said)
+                .into_iter()
+                .map(|l| format!("{args:?}: {l}")),
+        );
+    }
+    // The marker is there to be found: in the findings, the projects and what was not read.
+    assert!(findings.len() >= 2 && marked >= 10, "{findings:?} {marked}");
     assert!(found.is_empty(), "{found:#?}");
 }
 
@@ -5797,7 +5905,7 @@ fn a_new_trace_after_the_statement_contradicts_it_and_a_later_statement_clears_i
         .unwrap();
     let listing = h.owner(&[]);
     assert!(
-        listing.contains("Moved to a new host  10.0.0.5, web-new\n")
+        listing.contains(r#"Moved to a new host  "10.0.0.5", "web-new""#)
             && !listing.contains("Contradicted"),
         "{listing}"
     );
@@ -5882,7 +5990,7 @@ fn a_link_the_resolver_makes_after_the_statement_is_not_a_sign_of_life() {
     assert_eq!(rows(&h.store(), SAME_AS), ["machine:a|machine:web-1"]);
     let listing = h.owner(&[]);
     assert!(
-        listing.contains("a, web-host.example.org") && !listing.contains("contradicted"),
+        listing.contains(r#""a", "web-host.example.org""#) && !listing.contains("contradicted"),
         "{listing}"
     );
 }
@@ -10799,7 +10907,7 @@ fn a_machine_that_could_not_be_reached_is_named_once_and_what_it_leaves_unread_i
         .collect();
     assert_eq!(rows.len(), 1, "{printed}");
     assert!(
-        rows[0].ends_with("2026-01-03 04:00 UTC  Permission denied (publickey)."),
+        rows[0].ends_with("2026-01-03 04:00 UTC  \"Permission denied (publickey).\""),
         "{printed}"
     );
     // The status names it once too, on the fault line of the servers that could not be opened,
@@ -10808,7 +10916,7 @@ fn a_machine_that_could_not_be_reached_is_named_once_and_what_it_leaves_unread_i
     assert_eq!(printed.matches("db-1").count(), 1, "{printed}");
     assert!(
         printed.contains(
-            "\n  ! 2 servers could not be opened at the last server check: db-1: Permission denied (publickey).; "
+            "\n  ! 2 servers could not be opened at the last server check: \"db-1\": \"Permission denied (publickey).\"; "
         ) && !printed.contains("not reached"),
         "{printed}"
     );
@@ -12054,7 +12162,7 @@ fn a_change_in_a_watched_place_stays_open_through_quiet_runs_and_is_the_number_t
     for said in [
         "● medium  ",
         rule["title"].as_str().unwrap(),
-        "\n  rule watched.autostart · confidence low · ATT&CK T1543\n",
+        "\n  rule watched.autostart · confidence low · ATT&CK \"T1543\"\n",
         "   open, first seen ",
     ] {
         assert!(text.contains(said), "{said}\n{text}");
@@ -12474,11 +12582,11 @@ fn a_server_that_cannot_be_opened_is_one_thing_the_owner_can_fix_with_its_reason
         "{r:#}"
     );
     // A server that could not be opened is a fault, though the owner can fix it: a fault line
-    // with the name and its reason, without quotes, and in the full account among the faults,
+    // with the name and its reason, each quoted, and in the full account among the faults,
     // the reason on the line under the cause.
     let (_, printed, _) = status_out(&h.store(), &[]);
     assert!(
-        printed.contains("\n  ! 1 server could not be opened at the last server check: db-1: Permission denied (publickey).\n"),
+        printed.contains("\n  ! 1 server could not be opened at the last server check: \"db-1\": \"Permission denied (publickey).\"\n"),
         "{printed}"
     );
     let (_, printed, _) = status_out(&h.store(), &["--coverage"]);
@@ -12602,13 +12710,12 @@ fn a_name_and_what_its_source_said_stay_apart_as_data_and_a_secret_in_what_it_sa
         ]),
         "{item:#}"
     );
-    // As text, a fault line with each name and its reason, a colon in a name written out, so the
-    // name never passes for a name and a reason; in the full account, each quoted.
+    // As text, a fault line with each name and its reason, each quoted, so the name never
+    // passes for a name and a reason; in the full account the same.
     let (_, printed, _) = status_out(&h.store(), &[]);
-    let name = shown_name.replace(':', "\\u{3a}");
     assert!(
         printed.contains(&format!(
-            "\n  ! 2 servers could not be opened at the last server check: db-1: Connection refused; {name}: {shown_reason}\n"
+            "\n  ! 2 servers could not be opened at the last server check: \"db-1\": \"Connection refused\"; \"{shown_name}\": \"{shown_reason}\"\n"
         )),
         "{printed}"
     );

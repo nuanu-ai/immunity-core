@@ -11,8 +11,9 @@
 //! (`known::whole`), and is escaped again as it reaches the screen, before it is measured, cut,
 //! wrapped or styled (`screen.rs`). No line begins with it: a line that holds it begins with
 //! Immunity Core's own words or with spaces, so it can never pass for a line of Immunity Core's own (`✓`,
-//! `→ immunity …`). In a column or beside a label it is data by its place and goes without quotes;
-//! inside a sentence it keeps them (`text::quoted`).
+//! `→ immunity …`). In a column or beside a label it is data by its place and goes without quotes
+//! (`Name::bare`); inside a sentence or a list it keeps them, each name by itself
+//! (`Name::quoted`).
 //!
 //! Nothing here is calmer than the message: what was lost and what is not evaluated is in the
 //! default text whenever the message holds it, in words, and never dim.
@@ -22,7 +23,8 @@ use crate::findings::SHORT_MAX;
 use crate::screen::{
     self, BOLD, CYAN, Cell, Column, Cut, DIM, GREEN, PLAIN, RED, Screen, Style, YELLOW,
 };
-use crate::text::{quoted, word};
+use crate::secrets::{Name, Said};
+use crate::text::{names, word};
 use crate::view;
 use std::collections::BTreeMap;
 
@@ -103,11 +105,23 @@ fn rule_level(level: i32) -> (u8, String, Style) {
 /// share a title: where another rule of the same listing (`among`) has this one's title, its set
 /// follows in words, so the two are told apart.
 fn title(screen: &Screen, rule: &v1::Rule, among: &[&v1::Rule]) -> String {
-    let own = if screen.terminal {
-        screen::cut_end(&view::shown(&rule.title_text), SHORT_MAX)
+    let own = Name::given(&rule.title_text).bare();
+    if among
+        .iter()
+        .any(|o| o.title_text == rule.title_text && o.set != rule.set)
+    {
+        title_said(rule, among)
+    } else if screen.terminal {
+        screen::cut_end(&own, SHORT_MAX)
     } else {
-        rule.title_text.clone()
-    };
+        own
+    }
+}
+
+/// A published rule's title in a sentence or a list: quoted and whole, with its set as `title`
+/// gives it.
+fn title_said(rule: &v1::Rule, among: &[&v1::Rule]) -> String {
+    let own = Name::given(&rule.title_text).quoted();
     if among
         .iter()
         .any(|o| o.title_text == rule.title_text && o.set != rule.set)
@@ -245,7 +259,10 @@ fn program(m: &v1::RuleMatch) -> String {
         Some(Body::FileEvent(f)) => f.instigator.as_ref(),
         None => None,
     };
-    p.map_or_else(|| "not known".to_string(), |p| p.executable_text.clone())
+    p.map_or_else(
+        || "not known".to_string(),
+        |p| Name::given(&p.executable_text).bare(),
+    )
 }
 
 /// What was lost of what the stretch should hold, in a person's words; empty when nothing was.
@@ -343,7 +360,7 @@ fn collector_said(screen: &Screen, c: &v1::Collector, now: i64) -> Vec<(String, 
             format!(
                 "; {} said {}",
                 c.said_by.as_deref().unwrap_or("it"),
-                quoted(said)
+                Said::given(said).quoted()
             ),
             RED,
         ));
@@ -666,7 +683,7 @@ fn judged_said(r: &v1::RulesNow) -> Option<(&'static str, String)> {
 /// the most first, by title and count, a rule this build does not ship by its id and said so, and
 /// how many more rules matched than the message lists; or why it is not known. Every number is the
 /// message's own, never a sum over a part of it.
-fn matched_said(screen: &Screen, m: &v1::Rules) -> (String, Style) {
+fn matched_said(m: &v1::Rules) -> (String, Style) {
     let now = m.now.clone().unwrap_or_default();
     let Some(matches) = now.matches_last_day else {
         let why = m
@@ -688,8 +705,12 @@ fn matched_said(screen: &Screen, m: &v1::Rules) -> (String, Style) {
         .matched_last_day
         .iter()
         .map(|r| match &r.rule {
-            Some(rule) => format!("{} {}", title(screen, rule, &among), grouped(r.matches)),
-            None => format!("{} {}, not in this build", r.id_text, grouped(r.matches)),
+            Some(rule) => format!("{} {}", title_said(rule, &among), grouped(r.matches)),
+            None => format!(
+                "{} {}, not in this build",
+                Name::given(&r.id_text).quoted(),
+                grouped(r.matches)
+            ),
         })
         .collect();
     let rules = now
@@ -714,7 +735,10 @@ fn drill_said(m: &v1::Rules) -> Option<String> {
         .chain(&m.in_part)
         .filter_map(|r| r.rule.as_ref())
         .find(|r| r.id_text == first.must_raise)
-        .map_or(first.must_raise.clone(), |r| r.title_text.clone());
+        .map_or_else(
+            || Name::given(&first.must_raise).quoted(),
+            |r| title_said(r, &[]),
+        );
     Some(format!(
         "Atomic Red Team T1027.001: {raised} of {} program starts raise {title}",
         m.drill.len()
@@ -736,12 +760,13 @@ fn state_said(r: &v1::ShippedRule, part: Part) -> (&'static str, Style, String) 
                 .iter()
                 .map(|b| match (&b.selection_text, b.fields_text.is_empty()) {
                     (Some(sel), _) => format!(
-                        "{sel} needs {}, which {given_by} does not give",
-                        b.fields_text.join(", ")
+                        "{} needs {}, which {given_by} does not give",
+                        Name::given(sel).quoted(),
+                        names(&b.fields_text, ", ")
                     ),
                     (None, false) => format!(
                         "an alternative needs {}, which {given_by} does not give",
-                        b.fields_text.join(", ")
+                        names(&b.fields_text, ", ")
                     ),
                     (None, true) => format!(
                         "an alternative was left out in translation: {}",
@@ -759,11 +784,12 @@ fn state_said(r: &v1::ShippedRule, part: Part) -> (&'static str, Style, String) 
                 .as_deref()
                 .filter(|_| r.fields_text.is_empty())
                 .map(translated);
-            let detail: Vec<&str> = [r.events_text.as_deref(), r.said_text.as_deref()]
+            let detail: Vec<String> = [r.events_text.as_deref(), r.said_text.as_deref()]
                 .into_iter()
                 .flatten()
                 .chain(r.fields_text.iter().map(String::as_str))
-                .chain(translation.as_deref())
+                .map(|t| Said::given(t).quoted())
+                .chain(translation)
                 .collect();
             if !detail.is_empty() {
                 said.push_str(&format!(" ({})", detail.join(", ")));
@@ -847,7 +873,7 @@ pub fn rules(m: &v1::Rules, all: bool, screen: &Screen) -> String {
     if let Some((what, said)) = judged_said(&now) {
         out.extend(screen.labelled(2, label, what, &said, YELLOW, None, 0));
     }
-    let (matched, style) = matched_said(screen, m);
+    let (matched, style) = matched_said(m);
     out.extend(screen.labelled(
         2,
         label,
@@ -1076,12 +1102,12 @@ pub fn statements(m: &v1::Statements, screen: &Screen) -> String {
             .map(|s| {
                 let (via, via_style) = via_said(s.via);
                 vec![
-                    Cell::plain(s.machine_text.clone()),
+                    Cell::plain(Name::given(&s.machine_text).bare()),
                     Cell::plain(s.said.clone()),
                     Cell::new(via, via_style),
                     Cell::new(screen.time(s.at, m.answered_at), DIM),
-                    Cell::plain(s.reason_text.clone()),
-                    Cell::plain(s.names_text.join(", ")),
+                    Cell::plain(Said::given(&s.reason_text).bare()),
+                    Cell::plain(names(&s.names_text, ", ")),
                 ]
             })
             .collect();
@@ -1116,9 +1142,9 @@ pub fn statements(m: &v1::Statements, screen: &Screen) -> String {
                 let e = s.seen_after.clone().unwrap_or_default();
                 let value = format!(
                     "{} was seen alive after it, {}: {}",
-                    s.machine_text,
+                    Name::given(&s.machine_text).quoted(),
                     screen.time(e.at, m.answered_at),
-                    e.what_text
+                    Said::given(&e.what_text).quoted()
                 );
                 out.extend(screen.labelled(2, 12, "Contradicted", &value, RED, None, 0));
             }
@@ -1146,12 +1172,16 @@ pub fn statement_made(m: &v1::StatementMade, screen: &Screen) -> String {
         Some(v1::statement_made::Done::Said(s)) => {
             out.extend(opening(
                 screen,
-                &format!("✓ Said: {} is {}", quoted(&m.machine_text), s.said),
+                &format!(
+                    "✓ Said: {} is {}",
+                    Name::given(&m.machine_text).quoted(),
+                    s.said
+                ),
                 GREEN.bold(),
             ));
             out.extend(under(
                 screen,
-                &format!("Its reason: {}", quoted(&s.reason_text)),
+                &format!("Its reason: {}", Said::given(&s.reason_text).quoted()),
                 PLAIN,
             ));
             if !s.reason_cuts.is_empty() {
@@ -1176,7 +1206,7 @@ pub fn statement_made(m: &v1::StatementMade, screen: &Screen) -> String {
                     screen,
                     &format!(
                         "✓ Withdrawn: the statement that {} is {} no longer stands, and is kept.",
-                        quoted(&s.machine_text),
+                        Name::given(&s.machine_text).quoted(),
                         s.said
                     ),
                     GREEN.bold(),
@@ -1189,12 +1219,11 @@ pub fn statement_made(m: &v1::StatementMade, screen: &Screen) -> String {
         }
         None => {}
     }
-    let names: Vec<String> = m.names_text.iter().map(|n| quoted(n)).collect();
     out.extend(under(
         screen,
         &format!(
             "It covers the machine under every name: {}.",
-            names.join(", ")
+            names(&m.names_text, ", ")
         ),
         PLAIN,
     ));
@@ -1215,7 +1244,7 @@ pub fn statement_made(m: &v1::StatementMade, screen: &Screen) -> String {
             screen,
             &format!(
                 "✗ The sweep script could not be written again: {}.",
-                quoted(problem.unwrap_or_default())
+                Said::given(problem.unwrap_or_default()).quoted()
             ),
             RED,
         )),
@@ -1916,7 +1945,7 @@ mod tests {
         assert!(
             all.contains(&format!(
                 "not evaluated  correlates a sequence of events ({})",
-                view::shown(&src(ODD))
+                Said::given(&src(ODD)).quoted()
             )),
             "{all}"
         );
@@ -2150,7 +2179,7 @@ mod tests {
         assert!(text.contains("2  correlate a sequence of events"), "{text}");
         // What matched lately, the most first, and what the event level does now.
         assert!(
-            text.contains("Binary Padding - MacOS 4, odd 2, odd 1"),
+            text.contains(r#""Binary Padding - MacOS" 4, "odd" 2, "odd" 1"#),
             "{text}"
         );
         assert!(
@@ -2293,11 +2322,11 @@ mod tests {
             .find(|l| l.starts_with("  Matched in the last day"))
             .unwrap_or_else(|| panic!("{text}"));
         assert!(
-            line.contains("19 matches: Binary Padding - MacOS 4"),
+            line.contains(r#"19 matches: "Binary Padding - MacOS" 4"#),
             "{line}"
         );
         assert!(
-            line.contains("sigma:0000-gone 12, not in this build, and 2 more rules"),
+            line.contains(r#""sigma:0000-gone" 12, not in this build, and 2 more rules"#),
             "{line}"
         );
         // One more rule, in the singular.
@@ -2320,7 +2349,7 @@ mod tests {
         let text = rules(&gone, false, &Screen::pipe());
         assert!(
             text.contains(
-                "Matched in the last day   7 matches: sigma:0000-gone 7, not in this build"
+                r#"Matched in the last day   7 matches: "sigma:0000-gone" 7, not in this build"#
             ),
             "{text}"
         );
@@ -2342,7 +2371,9 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("in part        odd needs odd, which a program start does not give"),
+            text.contains(
+                r#"in part        "odd" needs "odd", which a program start does not give"#
+            ),
             "{text}"
         );
         assert!(
@@ -2451,7 +2482,7 @@ mod tests {
         let coloured = statements(&statements_of("odd"), &Screen::terminal(120, true));
         assert!(coloured.contains("\u{1b}[33myour agent"), "{coloured}");
         assert!(
-            text.contains("Contradicted   old-boxodd was seen alive after it"),
+            text.contains(r#"Contradicted   "old-boxodd" was seen alive after it"#),
             "{text}"
         );
         let none = statements(&v1::Statements::default(), &Screen::pipe());

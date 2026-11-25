@@ -560,7 +560,7 @@ fn the_finding_of_a_process_that_has_ended_still_says_what_the_sample_that_raise
     for line in [
         "    Command      zsh -c \"sleep 600\"\n",
         "    Folder       /Users/example/dev/site\n",
-        "    Group        led by pid 812, signed by apple: /bin/zsh\n",
+        "    Group        led by pid 812, signed by \"apple\": \"/bin/zsh\"\n",
     ] {
         assert!(text.contains(line), "{line}\n{text}");
     }
@@ -937,7 +937,7 @@ fn a_connection_match_keeps_its_port_transport_parent_and_cut_command_line_after
         "    Process      pid 4242, started 1970-01-01 00:00 UTC\n",
         &format!("    Command      node server.js --password {cut}\n"),
         "    Folder       /Users/example/dev/shop\n",
-        &format!("    Parent       pid 500, signed by {signer}: /bin/zsh\n"),
+        &format!("    Parent       pid 500, signed by \"{signer}\": \"/bin/zsh\"\n"),
     ] {
         assert!(shown.contains(line), "{line}\n{shown}");
     }

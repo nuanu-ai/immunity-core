@@ -3350,8 +3350,9 @@ fn a_watched_file_its_permissions_keep_closed_leaves_this_mac_watched_in_part_an
     let state = &page[page.find("<section id=\"this-mac\">").unwrap()..];
     let state = &state[..state.find("</section>").unwrap()];
     assert!(
-        state.contains("<p class=\"sub fault\">! Could not read: <span class=\"said\">~/.zprofile")
-            && !state.contains("--green"),
+        state.contains(
+            "<p class=\"sub fault\">! Could not read: <span class=\"said\">&quot;~/.zprofile&quot;"
+        ) && !state.contains("--green"),
         "{state}"
     );
     let fix = &page[page.find("<section id=\"you-can-fix\"").unwrap()..];

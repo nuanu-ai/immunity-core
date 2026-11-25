@@ -1371,8 +1371,8 @@ fn a_new_version_beside_an_old_one_is_a_folder_added_and_a_folder_removed_and_th
         );
         let lines = [
             "    Files        changed while the version stayed the same, since the reading before: 3 added, 3 removed, 1 changed",
-            "    Added        2.0/ (3 files)",
-            "    Removed      1.0/ (3 files)",
+            "    Added        \"2.0/\" (3 files)",
+            "    Removed      \"1.0/\" (3 files)",
             "    Changed      shared/main.js",
         ];
         let at: Vec<usize> = lines

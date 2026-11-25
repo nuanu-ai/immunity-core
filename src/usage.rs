@@ -582,7 +582,7 @@ pub fn unknown(asked: Option<&str>, screen: &Screen) -> String {
         None => "immunity needs a command".to_string(),
         Some(word) => format!(
             "{} is not a command of immunity",
-            crate::text::quoted(&crate::secrets::said(word))
+            crate::secrets::Said::of(word).quoted()
         ),
     };
     let mut out = screen.error(&cause, &[], &[]);
@@ -978,7 +978,7 @@ const HINTS: &[&str] = &[
 /// knows, the command's own form.
 fn right_form(op: &str, args: &[String], said: &str) -> (String, Pasted) {
     let mut typed = Typed(args.iter().cloned().map(Word::Typed).collect());
-    let quoted = |s: &str| crate::text::quoted(&crate::secrets::said(s));
+    let quoted = |s: &str| crate::secrets::Said::of(s).quoted();
     // What the parser said may repeat what was typed: cut and escaped as any such text.
     let mut cause = crate::secrets::said(
         HINTS

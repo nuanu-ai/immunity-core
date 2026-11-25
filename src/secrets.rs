@@ -246,6 +246,81 @@ impl Text {
     }
 }
 
+/// A reference that came from outside the core: a path, a package, a lockfile's key, an entity's
+/// id, a disk's name, a rule's title. Whole: never cut, as the contract gives a reference. It has
+/// no `Display` and gives up no `&str`, so it reaches the text for a person only through the
+/// printer, `quoted` in a sentence or a list and `bare` alone beside a label or in a cell.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Name(String);
+
+/// Prose a source wrote: a system error's message, a tool's line, a person's or an agent's
+/// reason. Cut, and printed as a name is.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Said(Text);
+
+impl Name {
+    /// A name as a contract's `_text` field holds it, escaped one to one (`known::whole`).
+    pub fn given(text: &str) -> Name {
+        Name(crate::contract::unescape(text))
+    }
+
+    fn shown(&self) -> String {
+        crate::contract::escape(&self.0, crate::icu::hidden)
+    }
+
+    /// In a sentence or a list: in double quotes (`quoted`).
+    pub fn quoted(&self) -> String {
+        quoted(&self.shown())
+    }
+
+    /// Alone beside a label or in a cell (`bare`).
+    pub fn bare(&self) -> String {
+        bare(self.shown())
+    }
+}
+
+impl Said {
+    /// What a source said, cut.
+    pub fn of(raw: &str) -> Said {
+        Said(Text::source(raw))
+    }
+
+    /// What a source said as a contract's `_text` field holds it, already cut (`said`): its
+    /// marks are read back as marks and nothing is cut again.
+    pub fn given(text: &str) -> Said {
+        Said(Text(parse(text)))
+    }
+
+    pub fn quoted(&self) -> String {
+        quoted(&self.0.said())
+    }
+
+    pub fn bare(&self) -> String {
+        bare(self.0.said())
+    }
+}
+
+/// Text from outside in a sentence of the core's or in a list, already escaped one to one: in
+/// double quotes, a quote inside written `\"`. A backslash is `\u{5c}` and a line break `\u{a}`
+/// already, so nothing inside can close the quotation or end the line, and the core's own
+/// words never hold a double quote.
+fn quoted(shown: &str) -> String {
+    format!("\"{}\"", shown.replace('"', "\\\""))
+}
+
+/// Text from outside alone in its place, already escaped one to one, with a space at either end
+/// written `\u{20}`, so what is there is seen whole.
+fn bare(mut shown: String) -> String {
+    if shown.ends_with(' ') {
+        shown.pop();
+        shown.push_str("\\u{20}");
+    }
+    if shown.starts_with(' ') {
+        shown.replace_range(..1, "\\u{20}");
+    }
+    shown
+}
+
 /// One text cut by `set`, or withheld whole without one.
 fn cut_one(set: Option<&Set>, text: Vec<Piece>) -> Vec<Piece> {
     cut_with(set, vec![text]).pop().unwrap_or_default()
@@ -3189,6 +3264,24 @@ mod tests {
                 (27, 37, "x".to_string(), 12)
             ]
         );
+    }
+
+    #[test]
+    fn a_name_or_what_a_source_said_never_closes_its_quotation_or_ends_its_line() {
+        // A name is whole, what a source said is cut; either one's quote, backslash and line
+        // break are written out, and a space at an end of a bare value too.
+        let token = github_token();
+        let raw = format!(" a\"b\\c\nd ?t={token} ");
+        let name = Name::given(&crate::known::whole(&raw));
+        let shown = format!(" a\\\"b\\u{{5c}}c\\u{{a}}d ?t={token} ");
+        assert_eq!(name.quoted(), format!("\"{shown}\""));
+        let bare = format!("\\u{{20}}a\"b\\u{{5c}}c\\u{{a}}d ?t={token}\\u{{20}}");
+        assert_eq!(name.bare(), bare);
+        let cut = " a\\\"b\\u{5c}c\\u{a}d ?t=\\cut{gitleaks:github-pat 40} ";
+        assert_eq!(Said::of(&raw).quoted(), format!("\"{cut}\""));
+        assert_eq!(Said::given(&said(&raw)).quoted(), format!("\"{cut}\""));
+        // Each name of a list by itself, so a name that holds the separator is still one.
+        assert_eq!(crate::text::names(&["a, b", "c"], ", "), "\"a, b\", \"c\"");
     }
 
     #[test]

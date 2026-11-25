@@ -277,7 +277,8 @@ fn every_command_of_the_contract_gives_one_message_in_its_three_forms() {
                     first.contains(json["short_title"].as_str().unwrap()) && first.ends_with(&id),
                     "{first}"
                 );
-                said.push(format!("\n  {}   ", json["where_text"].as_str().unwrap()));
+                let place = json["where_text"].as_str().unwrap().replace('"', "\\\"");
+                said.push(format!("\n  \"{place}\"   "));
                 said.push(format!(
                     "   {}, first seen ",
                     json["finding"]["state"].as_str().unwrap()
@@ -424,7 +425,7 @@ fn text_from_a_source_in_the_text_of_an_answer_cannot_pose_as_the_program_s_word
     let text = String::from_utf8(out.stdout).unwrap();
     assert!(!text.lines().any(|l| l.starts_with('✓')), "{text}");
     assert!(
-        text.starts_with(&format!(r"Project  ~/dev/x\u{{a}}{posing}   checked ")),
+        text.starts_with(&format!(r#"Project  "~/dev/x\u{{a}}{posing}"   checked "#)),
         "{text}"
     );
 }
@@ -998,6 +999,14 @@ fn words_taken_from_the_mac_never_enter_a_field_that_is_not_text_nor_a_sentence(
             [MARKER],
         )
         .unwrap();
+    // The manager named as the reader names one: its own row beside the reason.
+    db.execute(
+        "INSERT INTO coverage_lack (coverage, what, name)
+         SELECT id, 'package manager on this Mac', ?1 FROM coverage
+         WHERE kind = 'software of package managers this version does not read'",
+        [MARKER],
+    )
+    .unwrap();
     let any: i64 = db
         .query_row("SELECT MAX(id) FROM coverage", [], |r| r.get(0))
         .unwrap();

@@ -25,6 +25,7 @@ use crate::contract::{v1, value_of};
 use crate::events::{
     self, Arrival, Arrivals, Evidence, Hit, Lacked, LineAt, Place, Queue, Stretch,
 };
+use crate::known::whole;
 use crate::outcome::{Code, Outcome};
 use crate::secrets::Args;
 use crate::sigma::{Kind, Meta, Placement, Reason, Rules};
@@ -336,12 +337,6 @@ fn happened(e: &Evidence) -> Option<(i64, u32)> {
         Evidence::Start(s) => &s.timestamp,
         Evidence::File(f) => &f.timestamp,
     })
-}
-
-/// Text from the Mac or from a rule, whole, with hidden characters escaped. Every `_text` value
-/// of the answer passes through here.
-fn whole(s: &str) -> String {
-    known::whole(s)
 }
 
 /// A rule's level as the contract gives it: `not_stated` for a rule whose set states none.

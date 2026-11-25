@@ -2667,7 +2667,7 @@ fn a_binary_padding_start_raises_one_finding_with_its_authors_and_arguments_and_
     for (label, value) in [
         (
             "Rule",
-            "Binary Padding - MacOS  sigma:95361ce5-c891-4b0a-87ca-e24607884a96",
+            "\"Binary Padding - MacOS\"  sigma:95361ce5-c891-4b0a-87ca-e24607884a96",
         ),
         ("Author", "Igor Fits, Mikhail Larin, oscd.community"),
         (
@@ -2796,7 +2796,7 @@ fn a_medium_rule_s_match_is_counted_raises_nothing_and_keeps_no_argument() {
         .find(|l| l.starts_with("  Matched in the last day "))
         .unwrap_or_else(|| panic!("no line of what matched: {plain}"));
     assert!(
-        matched.ends_with("   1 match: System Information Discovery Using sw_vers 1"),
+        matched.ends_with("   1 match: \"System Information Discovery Using sw_vers\" 1"),
         "{plain}"
     );
     let all = dir.immunity(&["rules", "--all"]);
