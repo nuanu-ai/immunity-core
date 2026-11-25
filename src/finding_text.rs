@@ -525,6 +525,29 @@ pub const READ_AS_BEFORE: (&str, &str) = (
     "read the content with the checksum it had before the first change of content this finding rests on",
 );
 
+/// How the store holds a tie between a startup item and its program, in the text and on the
+/// page, before the time of its journal entry: never whether the program is there now. A value
+/// this build does not know is `retracted`, as the schema says.
+pub fn tie_said(state: i32) -> &'static str {
+    match v1::TieState::try_from(state) {
+        Ok(v1::TieState::InForce) => "held since the reading of",
+        Ok(v1::TieState::SetAside) => "set aside, not read again, by the reading of",
+        _ => "held until the reading of",
+    }
+}
+
+/// The finding's latest `signed_by` entry in `rests_on`: the one statement of who signed a
+/// startup program that the text and the page make, its value before and its value after, each
+/// with that entry's time and nothing of an earlier entry.
+pub fn signer_entry(f: &v1::Finding) -> Option<&v1::JournalEntry> {
+    (f.rests_on.iter())
+        .rev()
+        .find(|b| b.predicate.as_deref() == Some("signed_by"))
+}
+
+/// What the signer's entry says of its value before and of its value after, before its time.
+pub const SIGNER_SAID: (&str, &str) = ("until the reading of", "from the reading of");
+
 /// The evidence of a watched place: what happened to it in words, and when; how it is watched;
 /// that its content is not kept; why it could not be read; the places read for the first time.
 fn place_lines(s: &Screen, f: &v1::Finding, p: &v1::PlaceChanged) -> Vec<String> {
@@ -563,6 +586,34 @@ fn place_lines(s: &Screen, f: &v1::Finding, p: &v1::PlaceChanged) -> Vec<String>
                 PLAIN,
             )],
         ));
+    }
+    // The other side of each tie last, so no path reads as the core's words.
+    for (label, t) in
+        (p.runs.iter().map(|t| ("Runs", t))).chain(p.started_by.iter().map(|t| ("Run by", t)))
+    {
+        let said = format!(
+            "{} {}: ",
+            tie_said(t.state),
+            s.time(t.recorded_at, f.answered_at)
+        );
+        out.extend(e(label, &[(&said, PLAIN), (&t.path_text, PLAIN)]));
+        if let Some(signer) = &t.signed_by_text {
+            out.extend(e("Signer", &[(signer, PLAIN)]));
+        }
+    }
+    if let Some(b) = signer_entry(f) {
+        let at = s.time(b.recorded_at, f.answered_at);
+        let mut label = "Signer";
+        for (said, value) in [
+            (SIGNER_SAID.0, &b.old_value_text),
+            (SIGNER_SAID.1, &b.new_value_text),
+        ] {
+            if let Some(value) = value {
+                let said = format!("{said} {at}: ");
+                out.extend(e(label, &[(&said, PLAIN), (value, PLAIN)]));
+                label = "";
+            }
+        }
     }
     for b in f.rests_on.iter().filter(|b| b.entry == "place_first_read") {
         let place = b
@@ -1415,6 +1466,18 @@ mod tests {
                     change: v1::Change::NotRead as i32,
                     presence_only: Some(true),
                     read_as_before_at: None,
+                    runs: vec![v1::StartupTie {
+                        path_text: format!("/opt/example/{odd}"),
+                        state: v1::TieState::InForce as i32,
+                        recorded_at: NOW - 7200,
+                        signed_by_text: Some(format!("developer id, team {odd}")),
+                    }],
+                    started_by: vec![v1::StartupTie {
+                        path_text: format!("~/Library/LaunchAgents/{odd}.plist"),
+                        state: v1::TieState::Retracted as i32,
+                        recorded_at: NOW - 7200,
+                        signed_by_text: None,
+                    }],
                 }),
             ),
             (
@@ -1589,6 +1652,15 @@ mod tests {
                     entry: "place_first_read".to_string(),
                     subject_text: Some(format!("checkout:machine:example-host/dev/{odd}")),
                     new_value_text: Some("3".to_string()),
+                    ..Default::default()
+                },
+                v1::JournalEntry {
+                    seq: 321,
+                    run_id: "run-1".to_string(),
+                    entry: "changed".to_string(),
+                    predicate: Some("signed_by".to_string()),
+                    old_value_text: Some(format!("apple, identifier {odd}")),
+                    new_value_text: Some(format!("unsigned {odd}")),
                     ..Default::default()
                 },
             ],
@@ -1827,7 +1899,18 @@ mod tests {
      {
         let s = Screen::terminal(80, false);
         let evidence: &[(&str, &[&str])] = &[
-            ("place", &["Change", "Why", "Watched", "First read"]),
+            (
+                "place",
+                &[
+                    "Change",
+                    "Why",
+                    "Watched",
+                    "Runs",
+                    "Signer",
+                    "Run by",
+                    "First read",
+                ],
+            ),
             ("changed in place", &["Became"]),
             (
                 "indicator",
@@ -2292,7 +2375,7 @@ mod tests {
             with(Body::PlaceChanged(v1::PlaceChanged {
                 change: change as i32,
                 presence_only,
-                read_as_before_at: None,
+                ..Default::default()
             }))
         };
         let added = place(v1::Change::New, Some(false));
