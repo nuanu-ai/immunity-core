@@ -518,10 +518,12 @@ fn freshness_of(
 }
 
 /// A record's time as OSV writes it (`osv::parse`), in UTC seconds; `None` when it is no date,
-/// such as one of a thirteenth month. The C library reads it (`events::instant`); the fraction
-/// of a second is never said.
+/// such as one of a thirteenth month. The C library reads it (`events::instant`), and it is
+/// taken only when the time it gives is said with the same date, hour and minute, since
+/// `timegm` carries a 31 February into March. The fraction of a second is never said.
 fn record_time(t: &str) -> Option<i64> {
-    crate::events::instant(&format!("{}Z", t.get(..19)?)).map(|(secs, _)| secs)
+    let (secs, _) = crate::events::instant(&format!("{}Z", t.get(..19)?))?;
+    (crate::view::utc(secs).get(..16)? == t.get(..16)?.replace('T', " ")).then_some(secs)
 }
 
 /// A checkout's lockfiles reading: its scope, completeness, reason, run, the names of what it
