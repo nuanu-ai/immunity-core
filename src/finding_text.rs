@@ -710,6 +710,48 @@ fn published_lines(s: &Screen, f: &v1::Finding, p: &v1::PublishedRuleMatched) ->
     out
 }
 
+/// A process a sample saw, as `DetachedProcess` gives it: its identity, its command line, its
+/// folder, and the processes tied to it, each line only where the finding has it.
+fn process_lines(s: &Screen, f: &v1::Finding, p: &v1::DetachedProcess) -> Vec<String> {
+    let e = |label: &str, parts: &[(&str, Style)]| field(s, 4, EVIDENCE_LABEL, label, parts);
+    let mut said: Vec<String> = Vec::new();
+    if let Some(pid) = p.pid {
+        said.push(format!("pid {pid}"));
+    }
+    if let Some(start) = p.start_micros {
+        said.push(format!(
+            "started {}",
+            s.time(start.div_euclid(1_000_000), f.answered_at)
+        ));
+    }
+    if said.is_empty() {
+        said.push("not known".to_string());
+    }
+    let mut out = e("Process", &[(&said.join(", "), PLAIN)]);
+    if !p.args_text.is_empty() {
+        out.extend(e("Command", &[(&command_line(&p.args_text), PLAIN)]));
+    }
+    if let Some(folder) = &p.working_directory_text {
+        out.extend(e("Folder", &[(folder, PLAIN)]));
+    }
+    for (label, l, led) in [
+        ("Parent", &p.parent, ""),
+        ("Session", &p.session_leader, "led by "),
+        ("Group", &p.process_group_leader, "led by "),
+    ] {
+        if let Some(l) = l {
+            let signed = l
+                .signed_by_text
+                .as_ref()
+                .map_or("signer not known".to_string(), |s| format!("signed by {s}"));
+            // The path last, so no program's name reads as the core's words.
+            let said = format!("{led}pid {}, {signed}: {}", l.pid, l.executable_text);
+            out.extend(e(label, &[(&said, PLAIN)]));
+        }
+    }
+    out
+}
+
 /// Which files of a package or of an app's code outside its bundle changed: the counts on one
 /// line, with how many of each the entries leave out when they do, then the entries, each kind
 /// under its word, a folder with a trailing `/` and its number of files, a file by its path. No
@@ -772,52 +814,21 @@ fn evidence_lines(s: &Screen, f: &v1::Finding) -> Vec<String> {
                 )],
             ),
         },
-        Body::IndicatorMatched(p) => e(
-            "Matched",
-            &[(
-                p.indicators_text
-                    .as_deref()
-                    .unwrap_or("not known: the entry that held it is gone"),
-                PLAIN,
-            )],
-        ),
-        Body::DetachedProcess(p) => {
-            let mut said: Vec<String> = Vec::new();
-            if let Some(pid) = p.pid {
-                said.push(format!("pid {pid}"));
+        Body::IndicatorMatched(p) => {
+            let matched = p.indicators_text.as_deref();
+            let gone = "not known: the entry that held it is gone";
+            let mut out = e("Matched", &[(matched.unwrap_or(gone), PLAIN)]);
+            let port = p.port.map(|n| format!("port {n}"));
+            let said: Vec<String> = port.into_iter().chain(p.transport.clone()).collect();
+            if !said.is_empty() {
+                out.extend(e("Connection", &[(&said.join(", "), PLAIN)]));
             }
-            if let Some(start) = p.start_micros {
-                said.push(format!(
-                    "started {}",
-                    s.time(start.div_euclid(1_000_000), f.answered_at)
-                ));
-            }
-            if said.is_empty() {
-                said.push("not known".to_string());
-            }
-            let mut out = e("Process", &[(&said.join(", "), PLAIN)]);
-            if !p.args_text.is_empty() {
-                out.extend(e("Command", &[(&command_line(&p.args_text), PLAIN)]));
-            }
-            if let Some(folder) = &p.working_directory_text {
-                out.extend(e("Folder", &[(folder, PLAIN)]));
-            }
-            for (label, l) in [
-                ("Session", &p.session_leader),
-                ("Group", &p.process_group_leader),
-            ] {
-                if let Some(l) = l {
-                    let signed = l
-                        .signed_by_text
-                        .as_ref()
-                        .map_or("signer not known".to_string(), |s| format!("signed by {s}"));
-                    // The path last, so no program's name reads as the core's words.
-                    let said = format!("led by pid {}, {signed}: {}", l.pid, l.executable_text);
-                    out.extend(e(label, &[(&said, PLAIN)]));
-                }
+            if let Some(p) = &p.process {
+                out.extend(process_lines(s, f, p));
             }
             out
         }
+        Body::DetachedProcess(p) => process_lines(s, f, p),
         Body::VulnerablePackage(p) => package_lines(s, f, p),
         Body::PublishedRuleMatched(p) => published_lines(s, f, p),
         Body::VerdictGiven(v) => {
@@ -1358,6 +1369,19 @@ mod tests {
                 "indicator",
                 Body::IndicatorMatched(v1::IndicatorMatched {
                     indicators_text: Some(format!("[url:value = '{odd}']")),
+                    process: Some(v1::DetachedProcess {
+                        pid: Some(4242),
+                        args_text: vec!["node".to_string(), format!("--name={odd}")],
+                        working_directory_text: Some(format!("/Users/example/{odd}")),
+                        parent: Some(v1::ProcessLeader {
+                            pid: 811,
+                            executable_text: format!("/opt/{odd}/bin/tool"),
+                            signed_by_text: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    port: Some(443),
+                    transport: Some("tcp".to_string()),
                 }),
             ),
             (
@@ -1731,7 +1755,17 @@ mod tests {
         let evidence: &[(&str, &[&str])] = &[
             ("place", &["Change", "Why", "Watched", "First read"]),
             ("changed in place", &["Became"]),
-            ("indicator", &["Matched"]),
+            (
+                "indicator",
+                &[
+                    "Matched",
+                    "Connection",
+                    "Process",
+                    "Command",
+                    "Folder",
+                    "Parent",
+                ],
+            ),
             ("detached", &["Process", "Command", "Folder", "Group"]),
             (
                 "package",

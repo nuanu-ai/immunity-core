@@ -605,6 +605,12 @@ fn indicator_match() -> Rule {
     }
 }
 
+/// The advice of `indicator.match` for a finding that holds a connection a sample saw: what is
+/// named is a program that reached a listed address. It claims no part of the process is shown,
+/// since what is shown depends on the program and on the build that raised the finding, and it
+/// holds when the finding also holds a match of the file.
+const CONNECTION_ADVICE: &str = "The program named here reached an address on the list you gave. Look at what is shown here of the process that did. Until you know why it reached that address, treat this Mac as affected; if nobody knows, ask your agent to look into it.";
+
 // ---- End of what runs by itself and indicators. ----
 
 // ---- Processes: what samples of this user's processes saw, see `processes::take`. ----
@@ -1131,6 +1137,9 @@ pub struct Found {
     /// For a published rule's finding, the rule, its count and its evidence, as
     /// `events::finding_detail` gives them.
     pub detail: Option<Value>,
+    /// For a finding of a sample, a match of indicators by a connection or a detached script,
+    /// what the latest entry `sampled` it rests on keeps of the process (`processes::sampled`).
+    pub sampled: Option<Value>,
     /// What it carries of the response layer's verdicts (`verdict::attach`).
     pub verdicts: Option<crate::verdict::Summary>,
     /// Its latest occurrence is a place that could not be read, and nothing it rests on is a
@@ -1173,7 +1182,7 @@ pub fn all(conn: &Connection, now: i64) -> rusqlite::Result<Vec<Found>> {
                    AND a.predicate = 'installed_at' ORDER BY a.id DESC LIMIT 1),
                 (SELECT j.new_value FROM finding_basis b JOIN journal j ON j.seq = b.journal
                  WHERE b.finding = f.id
-                   AND ((j.entry IN ('added', 'changed', 'sampled')
+                   AND ((j.entry IN ('added', 'changed')
                          AND j.predicate = CASE f.rule WHEN 'integrity.app-seal' THEN 'has_seal'
                                                        WHEN 'integrity.app-signer' THEN 'signed_by'
                                                        WHEN 'indicator.match' THEN 'matches_indicator'
@@ -1222,6 +1231,7 @@ pub fn all(conn: &Connection, now: i64) -> rusqlite::Result<Vec<Found>> {
             superseded: r.get(15)?,
             in_force: false,
             detail: None,
+            sampled: None,
             verdicts: None,
             unread_only: r.get::<_, Option<bool>>(16)?.unwrap_or(false),
         })
@@ -1255,6 +1265,23 @@ pub fn all(conn: &Connection, now: i64) -> rusqlite::Result<Vec<Found>> {
                     f.place = place;
                     f.became = Some(value);
                 }
+            }
+            // A finding a sample raised carries what the sample read of the process.
+            if let Some(r) = rule(&f.rule)
+                && [indicators::MATCHED, crate::processes::DETACHED_INLINE].contains(&r.kind)
+            {
+                f.sampled = crate::processes::sampled_note(conn, &f.id, r.kind)?;
+            }
+            // A connection's process is shown with the address it was sampled for, beside the
+            // indicator a file match of the same program found, if the finding holds one.
+            if let Some(r) = rule(&f.rule)
+                && r.kind == indicators::MATCHED
+                && let Some(address) = f.sampled.as_ref().and_then(|n| n["value"].as_str())
+            {
+                f.became = Some(match f.became.take() {
+                    Some(file) if file != address => format!("{file} OR {address}"),
+                    _ => address.to_string(),
+                });
             }
             // A published rule's finding carries the rule and the events it matched.
             if let Some(l) = published(&f.rule)
@@ -2196,6 +2223,11 @@ pub fn item(f: &Found) -> Item {
         last_seen: Some(f.last_seen.0),
         words: if f.unread_only {
             not_read_words(r.kind)
+        } else if r.kind == indicators::MATCHED && f.sampled.is_some() {
+            Words {
+                advice: CONNECTION_ADVICE,
+                ..r.words
+            }
         } else {
             r.words
         },
@@ -2402,6 +2434,7 @@ mod tests {
             became: None,
             thing: None,
             detail: None,
+            sampled: None,
             verdicts: None,
             unread_only: false,
         };
@@ -2448,6 +2481,7 @@ mod tests {
             became: None,
             thing: None,
             detail: None,
+            sampled: None,
             verdicts: None,
             unread_only: false,
         };
@@ -2488,6 +2522,7 @@ mod tests {
             became: None,
             thing: None,
             detail: None,
+            sampled: None,
             verdicts: Some(crate::verdict::Summary {
                 levels: Some((3, 2)),
                 ..Default::default()
@@ -2542,6 +2577,7 @@ mod tests {
             became: None,
             thing: None,
             detail: None,
+            sampled: None,
             verdicts: None,
             unread_only,
         };
