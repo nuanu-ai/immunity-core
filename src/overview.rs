@@ -19,7 +19,6 @@
 
 use crate::contract::v1;
 use crate::findings::SHORT_MAX;
-use crate::headline::is_failure;
 use crate::screen::{
     self, BOLD, CYAN, Cell, Column, Cut, DIM, GREEN, PLAIN, RED, Screen, Style, YELLOW,
 };
@@ -163,14 +162,14 @@ fn name_in(name: &str, separator: char) -> String {
 }
 
 /// A section of causes for `--coverage`: its label bold on a line when it has one, then each
-/// cause's title and the things it is about, whole, both broken into lines. A failed reading or
-/// download is red wherever it is listed.
+/// cause's title and the things it is about, whole, both broken into lines. A fault is red
+/// wherever it is listed.
 fn cause_section(screen: &Screen, out: &mut Vec<String>, label: &str, list: &[&v1::Uncovered]) {
     if list.is_empty() {
         return;
     }
     let style = |u: &v1::Uncovered| {
-        if is_failure(u) { RED } else { PLAIN }
+        if u.fault { RED } else { PLAIN }
     };
     if !label.is_empty() {
         out.push(format!("  {}", screen.paint(BOLD, label)));
@@ -425,9 +424,8 @@ fn times(n: u64) -> String {
 }
 
 /// Every fault the message holds, in the order a person acts on them: a check that died, the
-/// watcher, the event level, every cause of class `failed` (only `with_causes`, as `--coverage`
-/// lists them whole on their own), the downloads that failed. A limit of this version is none of
-/// them.
+/// watcher, the event level, every cause with `fault` (only `with_causes`, as `--coverage` lists
+/// them whole on their own), the downloads that failed. A limit of this version is none of them.
 fn faults(s: &v1::Status, screen: &Screen, with_causes: bool) -> Vec<Fault> {
     let now = s.answered_at;
     let mut out = Vec::new();
@@ -446,7 +444,7 @@ fn faults(s: &v1::Status, screen: &Screen, with_causes: bool) -> Vec<Fault> {
         );
     }
     out.extend(watcher_faults(s, screen));
-    let failed: Vec<&v1::Uncovered> = s.not_covered.iter().filter(|u| is_failure(u)).collect();
+    let failed: Vec<&v1::Uncovered> = s.not_covered.iter().filter(|u| u.fault).collect();
     let any = |ids: &[&str]| failed.iter().any(|u| ids.contains(&u.id.as_str()));
     if let Some(l) = &s.event_level {
         out.extend(event_faults(l, any(&EVENT_CAUSES)));
@@ -611,7 +609,7 @@ fn event_faults(l: &v1::EventLevel, said_by_cause: bool) -> Vec<Fault> {
         .collect()
 }
 
-/// A cause of class `failed` as a fault: what could not be read, by name, for one of this Mac or
+/// A cause that is a fault, as a line: what could not be read, by name, for one of this Mac or
 /// the projects that names its things; any other by its title and what its source said. What the
 /// person can do follows when the person can change it.
 fn cause_fault(u: &v1::Uncovered) -> Fault {
@@ -636,11 +634,12 @@ fn cause_fault(u: &v1::Uncovered) -> Fault {
             .collect();
         // A place by its names alone; anything else by its title, and its names with what the
         // source said of the whole, as the full account gives them, where none has a reason.
+        let read = match u.id == crate::fault::NO_LONGER_READ.id {
+            true => "Can no longer be read",
+            false => "Could not read",
+        };
         let (words, names) = match (place, with_reasons) {
-            (true, _) => (
-                "Could not read",
-                names.join(if with_reasons { "; " } else { ", " }),
-            ),
+            (true, _) => (read, names.join(if with_reasons { "; " } else { ", " })),
             (false, true) => (unstopped(&u.title), names.join("; ")),
             (false, false) => (unstopped(&u.title), examples(u)),
         };
@@ -939,10 +938,8 @@ pub(crate) fn answer(
         )
     };
     // In part never shows a bare ✓: a fault line says what was not read in full, or this one does
-    // where none says it and the message does not show that only a limit the design accepts
-    // holds it.
-    if said.starts_with('✓') && headline == Ok(H::InPart) && faults.is_empty() && !accepted_limit(s)
-    {
+    // where none says it. A limit never holds it in part (`fault.rs`).
+    if said.starts_with('✓') && headline == Ok(H::InPart) && faults.is_empty() {
         faults.push(Fault::new("Something was not read in full").run("immunity status --coverage"));
     }
     // A watcher watching live says so under a headline that says what was found.
@@ -976,22 +973,6 @@ pub(crate) fn answer(
         out.extend(fault_lines(screen, 2, f));
     }
     out
-}
-
-/// That the message shows an answer held in part only by the limits the design accepts, decided
-/// over every reason it gives: there is one, no reading failed, and each is explained by its own
-/// limit: `coverage` by machines beyond this Mac not reached. A reason of any other kind, or one
-/// this build does not know, is never explained by a limit; `this_mac` is not, since a log file
-/// the size cap deleted after it was read no longer holds this Mac in part.
-fn accepted_limit(s: &v1::Status) -> bool {
-    use v1::HeadlineBecause as B;
-    let failed = s.coverage.as_ref().map_or(0, |c| c.failed);
-    let unreached = s.coverage.as_ref().is_some_and(|c| c.unreached_total > 0);
-    let explained = |b: &i32| match B::try_from(*b) {
-        Ok(B::Coverage) => unreached,
-        _ => false,
-    };
-    !s.headline_because.is_empty() && failed == 0 && s.headline_because.iter().all(explained)
 }
 
 /// What needs a look, by rule as the message orders them, each on two lines: its level and what
@@ -1678,7 +1659,7 @@ fn coverage_text(s: &v1::Status, screen: &Screen, out: &mut Vec<String>) {
     // Every cause in two groups: what should work here and does not now, the faults the default
     // status says, each cause of them whole; and the limits of this version here.
     let (failed, limits): (Vec<&v1::Uncovered>, Vec<&v1::Uncovered>) =
-        s.not_covered.iter().partition(|u| is_failure(u));
+        s.not_covered.iter().partition(|u| u.fault);
     let others = faults(s, screen, false);
     if !others.is_empty() || !failed.is_empty() {
         out.push(String::new());
@@ -2208,6 +2189,8 @@ mod tests {
             id: id.to_string(),
             who: who.to_string(),
             class: class_of(id) as i32,
+            // As the core gives a cause that no reading of this Mac sorts.
+            fault: class_of(id) == v1::Cause::Failed,
             title: title.to_string(),
             holds_on: if every_mac {
                 v1::HoldsOn::EveryMac as i32
@@ -3692,17 +3675,13 @@ mod tests {
     fn in_part_never_shows_a_bare_check_mark_unless_only_a_limit_the_design_accepts_holds_it() {
         let line = ["! Something was not read in full   immunity status --coverage"];
         let pipe = |s: &v1::Status| super::status(s, &Screen::pipe(), false);
-        // A reading failed with no cause to say it; this Mac watched in part with nothing else.
-        let mut failed = calm_status();
-        failed.coverage.as_mut().unwrap().failed = 1;
+        // This Mac watched in part with nothing else to say it.
         let mut in_part = calm_status();
         in_part.this_mac.as_mut().unwrap().state = v1::ThisMacState::WatchedInPart as i32;
-        for s in [failed, in_part] {
-            let s = crate::headline::headed(s);
-            assert_eq!(s.headline, v1::Headline::InPart as i32);
-            assert!(pipe(&s).starts_with("✓ Nothing needs a look"));
-            assert_eq!(fault_lines_of(&pipe(&s)), line, "{}", pipe(&s));
-        }
+        let s = crate::headline::headed(in_part);
+        assert_eq!(s.headline, v1::Headline::InPart as i32);
+        assert!(pipe(&s).starts_with("✓ Nothing needs a look"));
+        assert_eq!(fault_lines_of(&pipe(&s)), line, "{}", pipe(&s));
         // A reason, or a state of this Mac, this build does not know.
         let mut s = calm_status();
         s.headline = v1::Headline::InPart as i32;
@@ -3711,12 +3690,14 @@ mod tests {
         s.headline_because = vec![v1::HeadlineBecause::ThisMac as i32];
         s.this_mac.as_mut().unwrap().state = 99;
         assert_eq!(fault_lines_of(&pipe(&s)), line);
-        // Machines beyond this Mac not reached, as the core heads it: no line.
+        // Readings counted as failed and machines not reached with no fault that names them, as
+        // the core heads it: in part, and the one line.
         let mut s = calm_status();
-        s.coverage.as_mut().unwrap().unreached_total = 2;
+        let c = s.coverage.as_mut().unwrap();
+        (c.failed, c.unreached_total) = (3, 2);
         let s = crate::headline::headed(s);
         assert_eq!(s.headline, v1::Headline::InPart as i32);
-        assert!(fault_lines_of(&pipe(&s)).is_empty(), "{}", pipe(&s));
+        assert_eq!(fault_lines_of(&pipe(&s)), line, "{}", pipe(&s));
         // Deleted unread as well as by the cap: said as its own fault, not as unexplained.
         let mut s = calm_status();
         s.headline = v1::Headline::InPart as i32;
@@ -3740,68 +3721,46 @@ mod tests {
     }
 
     #[test]
-    fn an_answer_held_in_part_only_by_the_limits_the_design_accepts_prints_no_line_and_a_gap_beside_them_prints_it()
+    fn an_answer_in_part_with_no_fault_line_says_something_was_not_read_in_full_and_a_fault_says_itself()
      {
+        // No limit holds an answer in part, so every reason with no line of its own, a reason
+        // this build does not know among them, is said by the one line; a fault says itself.
         use v1::HeadlineBecause as B;
         let line =
             vec!["! Something was not read in full   immunity status --coverage".to_string()];
-        // In part, with machines not reached, log files the cap deleted since the check after
-        // they were read, readings failed, and the reasons the message gives.
-        let status = |unreached: bool, cap: bool, failed: u64, because: &[i32]| {
+        let status = |because: &[i32]| {
             let mut s = calm_status();
             s.headline = v1::Headline::InPart as i32;
             s.headline_because = because.to_vec();
-            let c = s.coverage.as_mut().unwrap();
-            c.unreached_total = u64::from(unreached);
-            c.failed = failed;
-            s.event_level = Some(v1::EventLevel {
-                state: v1::CollectorState::Running as i32,
-                files_removed_by_cap: cap.then_some(v1::Span {
-                    since_check: 3,
-                    last_day: 3,
-                }),
-                ..Default::default()
-            });
             s
         };
-        let (c, m, w) = (B::Coverage as i32, B::ThisMac as i32, B::Watcher as i32);
-        let none: Vec<String> = Vec::new();
-        for (case, s, expected) in [
-            ("not reached alone", status(true, false, 0, &[c]), &none),
-            (
-                "not reached, the cap",
-                status(true, true, 0, &[c, c]),
-                &none,
-            ),
-            // A file the cap deleted after it was read no longer holds this Mac in part, so a
-            // reason of this Mac with no line of its own is never explained by it.
-            ("this Mac, the cap", status(false, true, 0, &[m]), &line),
-            (
-                "both reasons, the cap",
-                status(true, true, 0, &[c, m]),
-                &line,
-            ),
-            (
-                "not reached, a reading failed",
-                status(true, false, 1, &[c]),
-                &line,
-            ),
-            (
-                "a limit, an unknown reason",
-                status(true, false, 0, &[c, 99]),
-                &line,
-            ),
-            (
-                "a limit, another reason",
-                status(true, false, 0, &[c, w]),
-                &line,
-            ),
-            ("no reason", status(true, true, 0, &[]), &line),
+        let (m, w) = (B::ThisMac as i32, B::Watcher as i32);
+        for (case, s) in [
+            ("this Mac", status(&[m])),
+            ("a reason repeated", status(&[m, m])),
+            ("an unknown reason", status(&[m, 99])),
+            ("another reason", status(&[m, w])),
+            ("no reason", status(&[])),
         ] {
             let text = super::status(&s, &Screen::pipe(), false);
             assert!(text.starts_with("✓ Nothing needs a look"), "{case}\n{text}");
-            assert_eq!(&fault_lines_of(&text), expected, "{case}\n{text}");
+            assert_eq!(fault_lines_of(&text), line, "{case}\n{text}");
         }
+        let mut s = status(&[m, B::NotCovered as i32]);
+        s.not_covered.push(v1::Uncovered {
+            scope: "this_mac".to_string(),
+            ..uncovered(
+                "could-not-read",
+                "nothing",
+                false,
+                "1 thing could not be read.",
+                &[("~/a", None)],
+            )
+        });
+        assert_eq!(
+            fault_lines_of(&super::status(&s, &Screen::pipe(), false)),
+            ["! Could not read: ~/a"]
+        );
     }
 
     #[test]
@@ -3992,35 +3951,44 @@ mod tests {
     }
 
     #[test]
-    fn every_cause_of_class_failed_is_a_fault_line_whoever_can_fix_it() {
+    fn every_cause_with_fault_is_a_fault_line_whoever_can_fix_it_and_a_limit_never_is() {
         let screen = Screen::terminal(400, true);
-        // Every cause the core can raise, alone in that status, as the core gives it.
-        for cause in crate::covered::CAUSES {
-            let title = format!("What the cause {} says.", cause.id);
-            let mut s = calm_status();
-            s.not_covered.push(v1::Uncovered {
-                scope: cause.scope.to_string(),
-                ..uncovered(cause.id, cause.who, false, &title, &[])
-            });
-            let faults = faults_in(&s);
-            match cause.class == crate::store::Cause::Failed {
-                true => assert_eq!(faults, [format!("! {}", unstopped(&title))], "{}", cause.id),
-                false => assert!(faults.is_empty(), "{}: {faults:?}", cause.id),
+        // Every cause the core can raise, alone in that status, a fault and a limit, whatever its
+        // class, and a class this build does not know, or none.
+        let later = |class| v1::Uncovered {
+            id: "a-cause-of-a-later-core".to_string(),
+            who: "nothing".to_string(),
+            class,
+            title: "What the cause a-cause-of-a-later-core says.".to_string(),
+            ..Default::default()
+        };
+        let causes = crate::covered::CAUSES.iter().map(|cause| v1::Uncovered {
+            scope: cause.scope.to_string(),
+            ..uncovered(
+                cause.id,
+                cause.who,
+                false,
+                &format!("What the cause {} says.", cause.id),
+                &[],
+            )
+        });
+        for u in causes.chain([later(0), later(99)]) {
+            for fault in [true, false] {
+                let mut s = calm_status();
+                s.not_covered.push(v1::Uncovered { fault, ..u.clone() });
+                let faults = faults_in(&s);
+                match fault {
+                    true => assert_eq!(faults, [format!("! {}", unstopped(&u.title))], "{}", u.id),
+                    false => assert!(faults.is_empty(), "{}: {faults:?}", u.id),
+                }
+                // The headline stays as the status's rule has it: `in_part` is green too.
+                assert!(
+                    status(&s, &screen, false).starts_with("\u{1b}[1;32m✓ Nothing needs a look")
+                );
+                // In the full account a fault is red and a limit is not.
+                let red = screen.paint(RED, &view::shown(unstopped(&u.title)));
+                assert_eq!(status(&s, &screen, true).contains(&red), fault, "{}", u.id);
             }
-            // The headline stays as the status's rule has it: `in_part` is green too.
-            assert!(status(&s, &screen, false).starts_with("\u{1b}[1;32m✓ Nothing needs a look"));
-        }
-        // A class this build does not know, or none, is a failure.
-        for class in [0, 99] {
-            let mut s = calm_status();
-            s.not_covered.push(v1::Uncovered {
-                id: "a-cause-of-a-later-core".to_string(),
-                who: "nothing".to_string(),
-                class,
-                title: "Something a later core says.".to_string(),
-                ..Default::default()
-            });
-            assert_eq!(faults_in(&s), ["! Something a later core says"], "{class}");
         }
     }
 
@@ -4155,18 +4123,14 @@ mod tests {
                 .to_string()
         };
         assert!(first(&calm_status()).starts_with("\u{1b}[1;32m✓ Nothing needs a look\u{1b}[0m"));
-        // In part: the same words; what keeps it from calm is a fault line under it, or for
-        // machines beyond this Mac not reached, nothing in this text.
+        // In part: the same words, and what keeps it from calm is a fault line under it.
         let mut s = calm_status();
         s.coverage.as_mut().unwrap().unreached_total = 1;
         assert_eq!(
             crate::headline::headed(s.clone()).headline,
             v1::Headline::InPart as i32
         );
-        assert_eq!(
-            status(&s, &screen, false),
-            status(&calm_status(), &screen, false)
-        );
+        assert_eq!(first(&s), first(&calm_status()));
         // Something to look at: red when some of it is urgent, yellow when none is.
         let mut s = calm_status();
         s.needs_a_look = Some(v1::NeedsALook {
@@ -4341,7 +4305,7 @@ mod tests {
     #[test]
     fn the_default_text_never_says_coverage_reading_store_or_estate_but_in_what_a_source_said() {
         let mut s = status_of("x");
-        s.not_covered.retain(is_failure);
+        s.not_covered.retain(|u| u.fault);
         for screen in screens() {
             let text = visible(&status(&s, &screen, false)).to_lowercase();
             for word in ["coverage", "reading", "store", "estate"] {
@@ -4402,5 +4366,5 @@ mod tests {
     }
 
     /// The JSON of the status above, as this build gives it and gave it before its text changed.
-    const JSON_GOLDEN: &str = r#"{"format":0,"answered_at":1794807960,"store_id":null,"running":false,"store":null,"cannot_judge":[],"rules":null,"watching":{"since_at":null,"last_read_at":null,"failed":[{"what":"read","at":1794807780,"detail_text":"busy"}],"cannot_see":[]},"this_mac":{"state":"watched","live":true,"checked_at":1794807780,"live_read_at":null,"watched":[],"fresh":true,"stale_reason":null,"fresh_for_seconds":0},"event_level":null,"not_covered":[{"id":"could-not-read","who":"nothing","scope":"","kind":"","title":"1 thing.","meaning":"","advice":"","count":0,"since_at":null,"value_text":null,"examples_text":["~/a"],"holds_on":"this_mac","examples":[{"name_text":"~/a","reason_text":null}],"class":"failed"},{"id":"not-understood","who":"nothing","scope":"","kind":"","title":"Some files.","meaning":"","advice":"","count":0,"since_at":null,"value_text":null,"examples_text":["x.lock"],"holds_on":"this_mac","examples":[{"name_text":"x.lock","reason_text":null}],"class":"no_reader"}],"last_run":null,"last_finished_run":null,"estate":null,"watched":null,"threats":null,"vulnerability_data":null,"vulnerabilities":null,"integrity":null,"no_reader_for":null,"coverage":null,"needs_a_look":{"items":[],"total":0,"urgent_total":0,"by_rule":[]},"answers_note":"","answered_outside_app":null,"statements_outside_app":null,"not_computed":[],"journal_seq":null,"login_job_installed":null,"watcher_restarting_since_at":null,"turned_on_at":null,"turned_off_at":null,"turned_on_latest":null,"check_stage":null,"check_stage_started_at":null,"headline":"in_part","headline_because":["watcher","not_covered"]}"#;
+    const JSON_GOLDEN: &str = r#"{"format":0,"answered_at":1794807960,"store_id":null,"running":false,"store":null,"cannot_judge":[],"rules":null,"watching":{"since_at":null,"last_read_at":null,"failed":[{"what":"read","at":1794807780,"detail_text":"busy"}],"cannot_see":[]},"this_mac":{"state":"watched","live":true,"checked_at":1794807780,"live_read_at":null,"watched":[],"fresh":true,"stale_reason":null,"fresh_for_seconds":0},"event_level":null,"not_covered":[{"id":"could-not-read","who":"nothing","scope":"","kind":"","title":"1 thing.","meaning":"","advice":"","count":0,"since_at":null,"value_text":null,"examples_text":["~/a"],"holds_on":"this_mac","examples":[{"name_text":"~/a","reason_text":null}],"class":"failed","fault":true},{"id":"not-understood","who":"nothing","scope":"","kind":"","title":"Some files.","meaning":"","advice":"","count":0,"since_at":null,"value_text":null,"examples_text":["x.lock"],"holds_on":"this_mac","examples":[{"name_text":"x.lock","reason_text":null}],"class":"no_reader","fault":false}],"last_run":null,"last_finished_run":null,"estate":null,"watched":null,"threats":null,"vulnerability_data":null,"vulnerabilities":null,"integrity":null,"no_reader_for":null,"coverage":null,"needs_a_look":{"items":[],"total":0,"urgent_total":0,"by_rule":[]},"answers_note":"","answered_outside_app":null,"statements_outside_app":null,"not_computed":[],"journal_seq":null,"login_job_installed":null,"watcher_restarting_since_at":null,"turned_on_at":null,"turned_off_at":null,"turned_on_latest":null,"check_stage":null,"check_stage_started_at":null,"headline":"in_part","headline_because":["watcher","not_covered"]}"#;
 }

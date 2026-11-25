@@ -932,6 +932,12 @@ fn a_known_project_that_cannot_be_looked_at_is_kept_and_the_reading_says_why_unt
     );
     assert_eq!(checkouts_cause(&e), "failed");
     assert_eq!(presence(&e, rel), "held");
+    // The walk's failure is a fault and tells why; their hooks, read before and not read now,
+    // are named beside it, as no reading of hooks failed.
+    let hooks = [rel, ".work/shut"].map(|r| format!("~/{r}/.git/hooks"));
+    assert_eq!(lost(&e), hooks);
+    let faults = ["read-before-not-read-now", "could-not-read"];
+    assert_eq!(held(&said(&e).1).1, faults);
     e.full();
     assert_eq!(e.coverage(CHECKOUTS_KIND), "full|");
     assert_eq!(presence(&e, rel), "held");
@@ -954,6 +960,20 @@ fn a_walk_whose_folder_is_not_one_writes_a_failed_reading_and_the_next_whole_wal
     );
     assert_eq!(checkouts_cause(&e), "failed");
     assert_eq!(presence(&e, "dev/shop"), "held");
+    // Its root is the unit of the failure. Listed before, the failed walk tells it; once a
+    // narrower walk is full, it is named by itself until a walk finds it absent.
+    let notes = e.home().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    e.full();
+    std::fs::remove_dir(&notes).unwrap();
+    put(&notes, "not a folder\n");
+    e.run_in(&notes);
+    assert!(lost(&e).is_empty(), "{:?}", lost(&e));
+    e.run_in(&e.home().join("dev"));
+    assert_eq!(lost(&e), ["~/notes"]);
+    e.full();
+    assert!(lost(&e).is_empty(), "{:?}", lost(&e));
+    std::fs::remove_file(&notes).unwrap();
     e.full();
     assert_eq!(e.coverage(CHECKOUTS_KIND), "full|");
 }
@@ -1024,8 +1044,9 @@ fn a_known_project_under_a_folder_a_link_replaced_is_kept_and_named_as_not_walke
     // Looked at through the link, the project is there; the walk does not go through links,
     // so it read nothing in it. Where the link leads into a folder macOS asks permission for,
     // nothing past the link is looked up and that folder is named. Its hooks read before
-    // raise nothing.
+    // raise nothing, and are not read now: a fault by their name.
     after_a_link_took_the_place_of("dev", true, |e, target, unchanged| {
+        assert_eq!(lost(e), ["~/dev/shop/.git/hooks"], "{target}");
         assert_eq!(presence(e, "dev/shop"), "held");
         assert!(projects_removed(e).is_empty());
         let (coverage, cause) = match target {
@@ -1145,6 +1166,193 @@ fn a_known_project_under_a_link_stays_held_and_named_at_every_walk_and_goes_once
         let app = "checkout:machine:mac/dev/group/app".to_string();
         assert!(projects_removed(&e).contains(&app));
     }
+}
+
+#[test]
+fn a_folder_the_walk_listed_before_and_cannot_list_now_is_named_once_a_narrower_walk_is_full() {
+    // While the walk fails it tells the folder itself; a walk pointed elsewhere is full and
+    // does not look at it, and the folder is named by itself.
+    let e = Estate::new("walk-unlisted");
+    e.checkout("dev/shop");
+    let (old, new) = (e.home().join("dev/old"), e.home().join("dev/new"));
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::create_dir_all(&new).unwrap();
+    mode(&new, 0o000);
+    e.run();
+    mode(&old, 0o000);
+    e.run();
+    let told = lost(&e);
+    e.run_in(&e.home().join("dev/shop"));
+    let named = lost(&e);
+    mode(&old, 0o755);
+    mode(&new, 0o755);
+    assert!(told.is_empty(), "{told:?}");
+    assert_eq!(named, ["~/dev/old"]);
+}
+
+/// The units the baseline marks not read now, of every reader and kind, as `unit` or
+/// `unit#part`.
+fn marks(e: &Estate) -> Vec<String> {
+    e.rows(
+        "SELECT unit FROM unit_unread UNION ALL SELECT unit || '#' || part FROM part_unread
+         ORDER BY 1",
+    )
+}
+
+#[test]
+fn a_mark_ends_when_its_unit_is_read_again() {
+    // A folder the walk could not list, what Git's configuration says of a checkout's hooks,
+    // and what a startup item runs.
+    let e = Estate::new("mark-read-again");
+    let tree = e.checkout("dev/tree");
+    let config = tree.join(".git/config");
+    put(&config, "[core]\n hooksPath = hooks\n");
+    let old = e.home().join("dev/old");
+    std::fs::create_dir_all(&old).unwrap();
+    e.shipped("usr/local/bin/runner");
+    let agent = e.agent("a");
+    launch_item(&agent, &["/usr/local/bin/runner"]);
+    e.run();
+    assert!(marks(&e).is_empty(), "{:?}", marks(&e));
+    mode(&old, 0o000);
+    put(&config, "[unclosed\n");
+    put(&agent, "not a property list\n");
+    e.run();
+    let marked = marks(&e);
+    mode(&old, 0o755);
+    assert_eq!(
+        marked,
+        [
+            "Library/LaunchAgents/org.example.a.plist",
+            "dev/old",
+            "dev/tree/.git/config#core.hooksPath",
+        ]
+    );
+    put(&config, "[core]\n hooksPath = hooks\n");
+    launch_item(&agent, &["/usr/local/bin/runner"]);
+    e.run();
+    assert!(marks(&e).is_empty(), "{:?}", marks(&e));
+}
+
+#[test]
+fn a_mark_ends_when_something_inside_it_is_read() {
+    // Git runs the hooks of `core.hooksPath` by name, so the folder is never listed: what is
+    // read inside it is read there, before and again. This one is outside the checkout.
+    let e = Estate::new("mark-inside");
+    let tree = e.checkout("dev/tree");
+    let shared = e.home().join("shared");
+    let config = format!("[core]\n hooksPath = {}\n", shared.join("hooks").display());
+    put(&tree.join(".git/config"), &config);
+    put(&shared.join("hooks/pre-push"), "# hook\n");
+    e.run();
+    mode(&shared, 0o000);
+    e.run();
+    let marked = marks(&e);
+    mode(&shared, 0o755);
+    assert_eq!(marked, ["shared", "shared/hooks"]);
+    e.run();
+    assert!(marks(&e).is_empty(), "{:?}", marks(&e));
+}
+
+#[test]
+fn a_checkout_inside_one_whose_hooks_git_told_keeps_the_marks_of_its_own_reading() {
+    // The walk does not look into a checkout inside another, so only a check pointed at it
+    // reads its hooks. A reading of the outer one that Git told of finds absent only what it
+    // did not reach outside such a checkout.
+    let e = Estate::new("mark-nested");
+    let tree = e.checkout("dev/tree");
+    put(
+        &tree.join(".git/config"),
+        "[core]\n hooksPath = tools/hooks\n",
+    );
+    put(&tree.join("tools/hooks/pre-push"), "# hook\n");
+    let sub = e.checkout("dev/tree/sub");
+    put(
+        &sub.join(".git/config"),
+        "[core]\n hooksPath = tools/hooks\n",
+    );
+    put(&sub.join("tools/hooks/pre-push"), "# hook\n");
+    e.run_in(&sub);
+    mode(&sub.join("tools"), 0o000);
+    e.run_in(&sub);
+    let marked = marks(&e);
+    e.run();
+    let kept = marks(&e);
+    mode(&sub.join("tools"), 0o755);
+    assert_eq!(marked, ["dev/tree/sub/tools/hooks"]);
+    assert_eq!(kept, marked);
+}
+
+#[test]
+fn a_mark_ends_when_it_or_a_folder_holding_it_is_found_absent() {
+    let e = Estate::new("mark-absent");
+    // A folder the walk could not list, then the folder above it removed with all it held.
+    let leaf = e.home().join("dev/group/leaf");
+    std::fs::create_dir_all(&leaf).unwrap();
+    // A configured hooks folder that could not be looked at, then removed.
+    let tree = e.checkout("dev/tree");
+    put(
+        &tree.join(".git/config"),
+        "[core]\n hooksPath = tools/hooks\n",
+    );
+    put(&tree.join("tools/hooks/pre-push"), "# hook\n");
+    e.run();
+    mode(&leaf, 0o000);
+    mode(&tree.join("tools"), 0o000);
+    e.run();
+    let marked = marks(&e);
+    mode(&leaf, 0o755);
+    mode(&tree.join("tools"), 0o755);
+    assert_eq!(marked, ["dev/group/leaf", "dev/tree/tools/hooks"]);
+    std::fs::remove_dir_all(e.home().join("dev/group")).unwrap();
+    std::fs::remove_dir_all(tree.join("tools")).unwrap();
+    e.run();
+    assert!(marks(&e).is_empty(), "{:?}", marks(&e));
+}
+
+#[test]
+fn a_mark_ends_when_the_configuration_told_no_longer_names_its_folder() {
+    let e = Estate::new("mark-unset");
+    let tree = e.checkout("dev/tree");
+    let config = tree.join(".git/config");
+    put(&config, "[core]\n hooksPath = tools/hooks\n");
+    put(&tree.join("tools/hooks/pre-push"), "# hook\n");
+    e.run();
+    mode(&tree.join("tools"), 0o000);
+    e.run();
+    assert_eq!(marks(&e), ["dev/tree/tools/hooks"]);
+    put(&config, "[core]\n bare = false\n");
+    e.run();
+    let marked = marks(&e);
+    mode(&tree.join("tools"), 0o755);
+    assert!(marked.is_empty(), "{marked:?}");
+}
+
+#[test]
+fn a_mark_ends_when_its_file_is_gone() {
+    let e = Estate::new("mark-gone");
+    let plist = e.home().join("Library/LaunchAgents/com.example.a.plist");
+    put(&plist, "<plist><dict/></plist>\n");
+    e.run();
+    mode(&plist, 0o000);
+    e.run();
+    // Its failed reading tells it.
+    assert!(lost(&e).is_empty(), "{:?}", lost(&e));
+    std::fs::remove_file(&plist).unwrap();
+    e.run();
+    assert!(lost(&e).is_empty(), "{:?}", lost(&e));
+    assert_eq!(held(&said(&e).1).1, Vec::<String>::new());
+}
+
+/// The names `immunity status` gives of what was read here before and is not read now.
+fn lost(e: &Estate) -> Vec<String> {
+    let items = said(e).1["not_covered"].as_array().unwrap().clone();
+    let lost = items.iter().find(|u| u["id"] == "read-before-not-read-now");
+    lost.map(|u| u["examples_text"].as_array().unwrap().clone())
+        .unwrap_or_default()
+        .iter()
+        .map(|n| n.as_str().unwrap().to_string())
+        .collect()
 }
 
 #[test]
@@ -8465,5 +8673,188 @@ fn a_program_a_startup_item_runs_whose_hash_is_on_the_list_is_matched() {
             "/usr/local/bin/runner".to_string(),
             format!("[file:hashes.'SHA-256' = '{sha}']")
         )]
+    );
+}
+
+/// `immunity status` for a person and as JSON, with the estate's home folder as `HOME`.
+fn said(e: &Estate) -> (String, serde_json::Value) {
+    let out = |form: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_immunity"))
+            .env("HOME", e.home())
+            .arg("status")
+            .args(form)
+            .arg("--store")
+            .arg(e.store())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    };
+    let text = String::from_utf8(out(&[])).unwrap();
+    (text, serde_json::from_slice(&out(&["--json"])).unwrap())
+}
+
+/// What keeps the status from calm beside the watcher and the downloads, which no test here
+/// runs or gives: the reasons, the faults of `not_covered` by id, and the state of this Mac.
+fn held(s: &serde_json::Value) -> (Vec<String>, Vec<String>, String) {
+    let downloads = [
+        "vulnerability-list-not-downloaded",
+        "vulnerability-data-old",
+    ];
+    let items = s["not_covered"].as_array().unwrap().iter();
+    let faults = items
+        .filter(|u| u["fault"] == true)
+        .map(|u| u["id"].as_str().unwrap());
+    let faults: Vec<String> = faults
+        .filter(|id| !downloads.contains(id))
+        .map(str::to_string)
+        .collect();
+    let because = s["headline_because"].as_array().unwrap().iter();
+    let because = because
+        .map(|b| b.as_str().unwrap())
+        .filter(|b| *b != "watcher");
+    let because = because.filter(|b| *b != "not_covered" || !faults.is_empty());
+    (
+        because.map(str::to_string).collect(),
+        faults,
+        s["this_mac"]["state"].to_string(),
+    )
+}
+
+/// The items of `not_covered` that are about `name`, each as its id and whether it is a fault.
+fn about(s: &serde_json::Value, name: &str) -> Vec<(String, bool)> {
+    let items = s["not_covered"].as_array().unwrap().iter();
+    items
+        .filter(|u| {
+            u["examples_text"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n == name)
+        })
+        .map(|u| (u["id"].as_str().unwrap().to_string(), u["fault"] == true))
+        .collect()
+}
+
+#[test]
+fn a_unit_read_before_and_unreadable_now_keeps_the_headline_from_calm_whoever_owns_it() {
+    // At one check a watched file is read; at the next it is closed. Losing sight of it is a
+    // finding, and once the person has answered it the file still holds this Mac in part as a
+    // fault: its failed reading, on one `!` line with why, which names it, so it is not named
+    // again as read before; until a reading reads it again or finds it gone.
+    use std::os::unix::fs::PermissionsExt;
+    let e = Estate::new("fault-read-before");
+    let zshrc = e.home().join(".zshrc");
+    let mode = |m| std::fs::set_permissions(&zshrc, std::fs::Permissions::from_mode(m)).unwrap();
+    let calm = (Vec::new(), Vec::new(), "\"watched\"".to_string());
+    let held_in_part = (
+        vec![
+            "this_mac".to_string(),
+            "coverage".to_string(),
+            "not_covered".to_string(),
+        ],
+        vec!["not-permitted".to_string()],
+        "\"watched_in_part\"".to_string(),
+    );
+    for ending in ["read again", "gone"] {
+        put(&zshrc, "export A=1\n");
+        e.run();
+        assert_eq!(held(&said(&e).1), calm, "{ending}");
+        mode(0o000);
+        e.run();
+        assert_eq!(said(&e).1["headline"], "needs_a_look", "{ending}");
+        e.seen();
+        let (text, s) = said(&e);
+        assert_eq!(held(&s), held_in_part, "{ending}");
+        assert_eq!(about(&s, "~/.zshrc"), [("not-permitted".to_string(), true)]);
+        let lines: Vec<&str> = (text.lines())
+            .filter(|l| l.starts_with("  ! ") && l.contains("~/.zshrc"))
+            .collect();
+        assert!(
+            lines.len() == 1 && lines[0].starts_with("  ! Could not read: ~/.zshrc: "),
+            "{text}"
+        );
+        // Another check that cannot read it changes nothing.
+        e.run();
+        assert_eq!(held(&said(&e).1), held_in_part, "{ending}");
+        mode(0o644);
+        if ending == "gone" {
+            std::fs::remove_file(&zshrc).unwrap();
+        }
+        e.run();
+        let (text, s) = said(&e);
+        assert_eq!(held(&s), calm, "{ending}");
+        assert!(about(&s, "~/.zshrc").is_empty(), "{ending}");
+        assert!(
+            !text.contains("Could not read") && !text.contains("no longer"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn a_file_read_before_that_the_guard_of_protected_folders_now_turns_away_is_a_fault_after_its_finding_is_answered()
+ {
+    // A watched file read before that becomes a link into a folder macOS protects is not
+    // looked into. Losing sight of it raises its finding; its reading is not given, and once
+    // the finding is answered the file, read here before, still holds this Mac in part.
+    let e = Estate::new("fault-guarded");
+    let zshrc = e.home().join(".zshrc");
+    put(&zshrc, "export A=1\n");
+    e.run();
+    std::fs::remove_file(&zshrc).unwrap();
+    put(&e.home().join("Documents/x/zshrc"), "export A=2\n");
+    link(e.home().join("Documents/x/zshrc").to_str().unwrap(), &zshrc);
+    e.run();
+    assert_eq!(e.found(), [pair("watched.shell-profile", "~/.zshrc")]);
+    e.seen();
+    let (text, s) = said(&e);
+    let lost = "read-before-not-read-now".to_string();
+    assert_eq!(
+        held(&s),
+        (
+            vec!["this_mac".to_string(), "not_covered".to_string()],
+            vec![lost.clone()],
+            "\"watched_in_part\"".to_string()
+        )
+    );
+    assert_eq!(about(&s, "~/.zshrc"), [(lost, true)], "{s:#}");
+    assert!(
+        text.contains("\n  ! Can no longer be read: ~/.zshrc\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_narrower_check_that_does_not_look_at_a_unit_read_before_leaves_its_fault_standing() {
+    // A project's file read at one check and closed at the next is a fault, which its failed
+    // reading tells; a check pointed at another project, which reads the projects' ways of
+    // running code by itself as one reading of this Mac and does not look at this one, is full,
+    // and the file read before is named by itself.
+    use std::os::unix::fs::PermissionsExt;
+    let e = Estate::new("fault-narrower");
+    let shop = e.checkout("dev/shop");
+    let other = e.checkout("dev/other");
+    let mcp = shop.join(".mcp.json");
+    put(&mcp, "{\"mcpServers\": {}}\n");
+    e.run();
+    let mode = |m| std::fs::set_permissions(&mcp, std::fs::Permissions::from_mode(m)).unwrap();
+    mode(0o000);
+    e.run();
+    e.seen();
+    let lost = ("read-before-not-read-now".to_string(), true);
+    assert_eq!(held(&said(&e).1).1, ["not-permitted"]);
+    e.run_in(&other);
+    let (text, s) = said(&e);
+    mode(0o644);
+    assert!(about(&s, "~/dev/shop/.mcp.json").contains(&lost), "{s:#}");
+    assert_eq!(s["this_mac"]["state"], "watched_in_part");
+    assert!(
+        text.contains("! Can no longer be read: ~/dev/shop/.mcp.json"),
+        "{text}"
     );
 }

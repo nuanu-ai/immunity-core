@@ -93,6 +93,10 @@ pub struct Targets {
     counts: BTreeMap<&'static str, usize>,
     /// Rows for the run: the item, and why its target was not read.
     pub rows: Vec<(String, &'static str)>,
+    /// The items whose program was told, and those read whose program could not be: each item
+    /// stands for what it runs (`fault.rs`).
+    pub told: Vec<Unit>,
+    pub untold: Vec<Unit>,
 }
 
 impl Targets {
@@ -310,8 +314,10 @@ pub fn read(
         };
         let Some((target, arguments)) = told else {
             unread.insert(id);
+            t.untold.push(e.unit.clone());
             continue;
         };
+        t.told.push(e.unit.clone());
         let not_read = match target {
             Named::Path(p) if plain(&p) => {
                 named.entry(Unit::whole(p)).or_default().insert(id);

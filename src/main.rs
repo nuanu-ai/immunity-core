@@ -23,6 +23,7 @@ mod codesign;
 mod contract;
 mod covered;
 mod events;
+mod fault;
 mod finding_answer;
 mod finding_text;
 mod findings;
@@ -3052,6 +3053,9 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
         );
         let gap = Gap::of(Cause::Failed);
         run.apply(&reading, checkouts::BASIS, "none", Some(&reason), &gap, &[])?;
+        // Its root is the unit of the failure (`fault.rs`).
+        let unit = Unit::whole(checkouts::rel(&start.home, root));
+        baseline::judged_unread(run.tx, checkouts::READER, checkouts::KIND, &unit, &run_id)?;
         return Ok((
             None,
             Some("the checkout walk could not open its root folder"),
@@ -3065,6 +3069,7 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
     // comes back gone, as one the disk names as a checkout the walk met: it is held already.
     let prefix = format!("checkout:{machine}/");
     let (mut kept, mut unknown, mut linked) = (Vec::new(), Vec::new(), Vec::new());
+    let mut guarded = Vec::new();
     for rel in store::live_subjects(run.tx, checkouts::READER)?
         .into_iter()
         .filter_map(|id| id.strip_prefix(&prefix).map(str::to_string))
@@ -3089,9 +3094,17 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
                 if !walk.guarded.contains(&g) {
                     walk.guarded.push(g);
                 }
+                guarded.push(rel.clone());
                 kept.push(rel);
             }
         }
+    }
+    // A known checkout there that is not looked into, under a link, in a folder macOS protects
+    // or not told by the disk, has its hooks not read now (`fault.rs`). A reading of them that
+    // reads them again ends it; none raises a finding.
+    for rel in unknown.iter().chain(&linked).chain(&guarded) {
+        let hooks = Unit::whole(format!("{rel}/.git/hooks"));
+        baseline::judged_unread(run.tx, watched::READER, watched::HOOK_KIND, &hooks, &run_id)?;
     }
     let mut raw = String::new();
     for c in &walk.checkouts {
@@ -3172,6 +3185,18 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
         compared: "full",
     };
     run.apply_found(&reading, checkouts::BASIS, &applied, &statements)?;
+    // A folder that could not be listed is a unit not read, and one a listing shows is gone
+    // is no longer one (`fault.rs`).
+    for (folder, _) in &walk.unlisted {
+        let unit = Unit::whole(folder);
+        baseline::judged_unread(run.tx, checkouts::READER, checkouts::KIND, &unit, &run_id)?;
+    }
+    let met: BTreeSet<&str> = (walk.listed.iter().chain(&walk.seen))
+        .chain(walk.unlisted.iter().map(|(folder, _)| folder))
+        .map(String::as_str)
+        .collect();
+    let listed: Vec<Unit> = walk.listed.iter().map(Unit::whole).collect();
+    baseline::found_absent(run.tx, checkouts::READER, checkouts::KIND, &listed, &met)?;
     // The folders the walk listed in full and those it found in them: a checkout found later
     // in a folder listed before is new (`baseline.rs`).
     baseline::record(
@@ -3923,6 +3948,12 @@ fn read_watched(
             .map(|p| &p.look)
             .collect();
         let (look, read) = targets::read(run.tx, &run_id, &machine, &roots, &items, &all)?;
+        // What each startup item runs, told or not, is a unit of its own (`fault.rs`).
+        let (tx, kind) = (run.tx, targets::KIND);
+        baseline::record(tx, watched::READER, kind, &run_id, run.at, &read.told, &[])?;
+        for unit in &read.untold {
+            baseline::judged_unread(tx, watched::READER, kind, unit, &run_id)?;
+        }
         let (completeness, reason, gap) = read.coverage(&look);
         for (item, why) in &read.rows {
             rows.push(not_read_row(targets::TARGET, item, "", why));
@@ -4338,6 +4369,17 @@ fn read_watched(
                 }
                 Verdict::Baseline => {}
             }
+        }
+        // The units a failure said as a whole names are marked with it and raise nothing.
+        for unit in p.look.named_units() {
+            baseline::judged_unread(tx, watched::READER, &p.kind, unit, &run_id)?;
+        }
+        // Told where Git runs the checkout's hooks from, the reading found absent what it did
+        // not reach in the checkout, as a folder no longer configured.
+        if let Some(c) = (p.checkouts.first()).filter(|c| {
+            p.kind == watched::HOOK_KIND && p.look.read_units().contains(&watched::hooks_told(c))
+        }) {
+            baseline::found_absent_within(tx, watched::READER, &p.kind, &machine, c, &run_id)?;
         }
         for u in p.look.not_read() {
             let how = match u.cause {

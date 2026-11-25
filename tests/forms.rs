@@ -992,7 +992,8 @@ fn words_taken_from_the_mac_never_enter_a_field_that_is_not_text_nor_a_sentence(
         .unwrap();
     let managers = db
         .execute(
-            "UPDATE coverage SET completeness = 'none', reason = 'not read: ' || ?1
+            "UPDATE coverage SET completeness = 'none', reason = 'not read: ' || ?1,
+                                 cause = 'no_reader'
              WHERE kind = 'software of package managers this version does not read'",
             [MARKER],
         )

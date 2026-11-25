@@ -231,6 +231,9 @@ pub struct Look {
     /// or by the project that holds them, and those left out by design, which no reason says
     /// and which leave the reading full. What was known of each is kept.
     hidden: Vec<Unit>,
+    /// The units of `hidden` a `short` names: not read, and marked so with the reading
+    /// (`short_named`), so that a failure of the reading is of a unit (`fault.rs`).
+    named: Vec<Unit>,
     /// The units read in full, by their paths as ids name them: a file looked at, found or
     /// absent, and a folder listed or found absent (`baseline.rs`).
     read: Vec<Unit>,
@@ -329,6 +332,7 @@ impl Look {
             self.short(cause, why);
         }
         self.hidden.extend(other.hidden);
+        self.named.extend(other.named);
         self.read.extend(other.read);
         self.seen.extend(other.seen);
         self.listed.extend(other.listed);
@@ -356,6 +360,24 @@ impl Look {
     pub fn short_of(&mut self, units: impl IntoIterator<Item = Unit>, cause: Cause, why: String) {
         self.hidden.extend(units);
         self.short(cause, why);
+    }
+
+    /// Units not read, said together by `why` with its cause, each marked not read with the
+    /// reading and judged by nothing else: the units of a failure the reason says as a whole.
+    pub fn short_named(
+        &mut self,
+        units: impl IntoIterator<Item = Unit>,
+        cause: Cause,
+        why: String,
+    ) {
+        let units: Vec<Unit> = units.into_iter().collect();
+        self.named.extend(units.iter().cloned());
+        self.short_of(units, cause, why);
+    }
+
+    /// The units a `short` names (`short_named`).
+    pub fn named_units(&self) -> &[Unit] {
+        &self.named
     }
 
     /// A unit the reader leaves out by design: what was known of it is kept, and the reading is

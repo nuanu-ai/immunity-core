@@ -3438,8 +3438,9 @@ fn no_rule_for_files_watches_until_the_collector_here_is_established_to_record_f
     // No false calm. The rules for files created and renamed count as watching only when the
     // install's record of what the collector records names both kinds and is no older than
     // the launch daemon installed. Until then each is named as not watching, with why, file
-    // events are a limit the owner can lift by installing again, and program starts are judged
-    // as before. A record that is there and cannot be read is a failed reading.
+    // events not recorded by the collector installed are a fault the owner can end by
+    // installing again, which keeps the answer from calm, and program starts are judged as
+    // before. A record that is there and cannot be read is a failed reading.
     let dir = Dir::new("files-unproven");
     dir.install_before_file_events();
     let h = "exec-20261004T00.jsonl";
@@ -3503,9 +3504,16 @@ fn no_rule_for_files_watches_until_the_collector_here_is_established_to_record_f
                 .contains(&json!(FILES_NOT_SEEN))
         );
         assert_eq!(files_coverage_of(&r).unwrap(), format!("{class}|{why}"));
+        let item = not_covered(&r, "file-events-not-seen").unwrap();
         assert_eq!(
-            not_covered(&r, "file-events-not-seen").unwrap()["who"],
-            "you"
+            (&item["who"], &item["fault"]),
+            (&json!("you"), &json!(true))
+        );
+        assert!(
+            r["headline_because"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("not_covered"))
         );
         assert_eq!(coverage_of(&r), None);
         assert_eq!(l["program_starts"]["last_day"], 1);
