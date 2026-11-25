@@ -472,6 +472,31 @@ fn a_keg_or_package_changed_in_place_is_one_changed_event_and_a_new_version_is_n
 }
 
 #[test]
+fn a_package_changed_in_place_behind_a_folder_swapped_for_a_link_keeps_its_version_and_is_found() {
+    // Whoever owns the prefix can move `node_modules` aside and leave a link in its place. The
+    // version must still be read through it: a version that went missing would make the change
+    // of files in the same run read as an update.
+    let e = Estate::new("linked-modules");
+    package(&e.package(), "1.0.0");
+    e.run();
+    assert_eq!(e.live(PACKAGE, "has_version"), ["1.0.0"]);
+    let modules = e.system().join("opt/homebrew/lib/node_modules");
+    std::fs::rename(&modules, modules.with_file_name("moved")).unwrap();
+    std::os::unix::fs::symlink("moved", &modules).unwrap();
+    append(&e.package().join("lib/cli.js"), "steal();\n");
+    e.run();
+    assert_eq!(e.live(PACKAGE, "has_version"), ["1.0.0"]);
+    let events = of(&e.events(), PACKAGE);
+    assert!(
+        !events.iter().any(|(_, p)| p == "has_version"),
+        "{events:?}"
+    );
+    let found = e.findings();
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].0, "integrity.package-files");
+}
+
+#[test]
 fn the_first_reading_is_the_baseline_and_a_second_on_unchanged_inputs_reports_no_changes() {
     let e = Estate::new("baseline");
     bundle(&e.app(), "1.0");

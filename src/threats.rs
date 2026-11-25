@@ -288,11 +288,12 @@ fn valid_etag(etag: &str) -> Option<String> {
 
 /// Reads a saved copy of the catalogue instead of fetching it.
 pub fn read_file(path: &Path) -> Fetched {
-    match std::fs::File::open(path) {
-        Ok(file) => match capped(file) {
+    match crate::open::open(path, crate::open::Reach::Given, MAX_BYTES) {
+        Ok((file, _)) => match capped(file) {
             Ok(bytes) => Fetched::Body { bytes, etag: None },
             Err(reason) => Fetched::Failed(reason),
         },
+        Err(crate::open::Refused::Over(_)) => Fetched::Failed(larger()),
         Err(e) => Fetched::Failed(format!("cannot read {}: {e}", path.display())),
     }
 }
@@ -303,9 +304,13 @@ fn capped(from: impl Read) -> Result<Vec<u8>, String> {
         .read_to_end(&mut bytes)
         .map_err(|e| format!("could not be read: {e}"))?;
     if bytes.len() as u64 > MAX_BYTES {
-        return Err(format!("larger than the cap of {MAX_BYTES} bytes"));
+        return Err(larger());
     }
     Ok(bytes)
+}
+
+fn larger() -> String {
+    format!("larger than the cap of {MAX_BYTES} bytes")
 }
 
 /// The entries of the catalogue, in its order, each id once. Anything that is not the

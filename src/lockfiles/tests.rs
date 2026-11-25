@@ -314,7 +314,7 @@ pub(super) struct Dir(PathBuf);
 
 impl Dir {
     pub(super) fn new(tag: &str, files: &[(&str, &str)]) -> Dir {
-        let dir = std::env::temp_dir().join(format!("immunity-lock-{tag}-{}", std::process::id()));
+        let dir = crate::common::temp().join(format!("immunity-lock-{tag}-{}", std::process::id()));
         crate::common::remove(&dir);
         for (name, text) in files {
             let path = dir.join(name);

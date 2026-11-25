@@ -305,13 +305,9 @@ impl Check {
 /// or a file that cannot be read, is no stage. Whether the run is under way is not said here:
 /// `check_in_progress` says that, and a run that ended leaves its last stage in the file.
 pub fn check_stage(home: &Path, run_id: &str) -> Option<(CheckStage, i64)> {
-    let mut text = String::new();
     // The longest text written is under 64 bytes, so a file of megabytes is never read whole.
-    std::fs::File::open(check_lock(home, run_id))
-        .ok()?
-        .take(64)
-        .read_to_string(&mut text)
-        .ok()?;
+    let bytes = crate::open::read(&check_lock(home, run_id), crate::open::Reach::Own, 64).ok()?;
+    let text = String::from_utf8(bytes).ok()?;
     let (at, name) = text.split_once('\n')?;
     let stage = CheckStage::from_str_name(name).filter(|s| *s != CheckStage::Unspecified)?;
     Some((stage, at.parse().ok()?))
@@ -649,8 +645,12 @@ pub fn record(
 /// The SHA-256 of the archive, if it is a zip archive under the cap. Read in pieces, so that
 /// the archive is never held in memory.
 fn archive_sha(path: &Path, cap: u64) -> Result<String, String> {
-    let cannot = |e: std::io::Error| format!("cannot read {}: {e}", path.display());
-    let mut file = std::fs::File::open(path).map_err(cannot)?.take(cap + 1);
+    let cannot = |e: &dyn std::fmt::Display| format!("cannot read {}: {e}", path.display());
+    let mut file = match crate::open::open(path, crate::open::Reach::Given, cap) {
+        Err(crate::open::Refused::Over(_)) => return Err(larger(cap)),
+        Err(refused) => return Err(cannot(&refused)),
+        Ok((file, _)) => file.take(cap + 1),
+    };
     let mut hasher = sha256::Hasher::new();
     let mut piece = vec![0u8; 1024 * 1024];
     let (mut total, mut head) = (0u64, Vec::<u8>::with_capacity(4));
@@ -659,7 +659,7 @@ fn archive_sha(path: &Path, cap: u64) -> Result<String, String> {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(cannot(e)),
+            Err(e) => return Err(cannot(&e)),
         };
         let want = 4 - head.len();
         head.extend(piece[..n].iter().take(want));
@@ -667,12 +667,16 @@ fn archive_sha(path: &Path, cap: u64) -> Result<String, String> {
         total += n as u64;
     }
     if total > cap {
-        return Err(format!("the archive is larger than the cap of {cap} bytes"));
+        return Err(larger(cap));
     }
     if head != b"PK\x03\x04" {
         return Err("not a zip archive".to_string());
     }
     Ok(hasher.hex())
+}
+
+fn larger(cap: u64) -> String {
+    format!("the archive is larger than the cap of {cap} bytes")
 }
 
 /// Why a reading stopped: the feed, named for a person, or the store.

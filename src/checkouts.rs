@@ -90,11 +90,9 @@ pub struct Start {
 /// person gave it, so following it is asked for. One that cannot be made real stays as given,
 /// and the walk says it is not a folder.
 pub fn start(given: Option<&Path>, home: &Path) -> Start {
-    let real_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
-    let root = given.map_or_else(
-        || home.to_path_buf(),
-        |g| std::fs::canonicalize(g).unwrap_or_else(|_| g.to_path_buf()),
-    );
+    let real_home = crate::watched::real(home.to_path_buf());
+    // Made real either way, since every place is opened by a path with no link in it.
+    let root = crate::watched::real(given.unwrap_or(home).to_path_buf());
     let home = match root.starts_with(home) {
         true => home.to_path_buf(),
         false => real_home.clone(),

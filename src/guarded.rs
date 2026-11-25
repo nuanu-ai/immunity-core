@@ -292,11 +292,12 @@ pub fn followed(path: &Path, homes: &[&Path]) -> Result<PathBuf, PathBuf> {
 }
 
 /// `rel` under `base`, each of its parts `followed` in turn. `base` is a folder the reader
-/// was given, taken as it is.
+/// was given, made real as it is (`watched::real`), since a place is opened by a path with no
+/// link in it.
 pub fn under(base: &Path, rel: &Path, homes: &[&Path]) -> Result<PathBuf, PathBuf> {
-    rel.components().try_fold(base.to_path_buf(), |at, part| {
-        followed(&at.join(part), homes)
-    })
+    let base = crate::watched::real(base.to_path_buf());
+    rel.components()
+        .try_fold(base, |at, part| followed(&at.join(part), homes))
 }
 
 /// Why something was not looked into, as a reason says it.

@@ -1913,7 +1913,10 @@ impl Lock {
         #[cfg(test)]
         tests::READS.with(|n| n.set(n.get() + 1));
         let path = folder.join(store::WATCH_LOCK);
-        let text = || Some(String::from_utf8_lossy(&std::fs::read(&path).ok()?).into_owned());
+        let text = || {
+            let bytes = crate::open::read(&path, crate::open::Reach::Own, crate::open::UNCAPPED);
+            Some(String::from_utf8_lossy(&bytes.ok()?).into_owned())
+        };
         Lock(match store::watch_in_progress(folder) {
             Err(_) => Held::Unknown,
             Ok(false) => Held::No(text().as_deref().and_then(left_at)),
@@ -1958,10 +1961,12 @@ impl Lock {
 /// start time.
 fn heard(path: &Path) -> Option<(Option<i64>, LockState)> {
     let starting = Some((None, LockState::Starting));
-    let Ok(mut file) = std::fs::File::open(path) else {
+    let Ok((mut file, meta)) =
+        crate::open::open(path, crate::open::Reach::Own, crate::open::UNCAPPED)
+    else {
         return starting;
     };
-    let Ok(modified) = file.metadata().and_then(|m| m.modified()) else {
+    let Ok(modified) = meta.modified() else {
         return starting;
     };
     if modified.elapsed().ok()? >= STALLED {
@@ -3242,7 +3247,7 @@ mod tests {
     #[test]
     fn a_place_is_named_by_the_real_path_of_its_folder_before_it_exists_and_one_not_looked_at_fails()
      {
-        let dir = std::env::temp_dir().join(format!("immunity-watch-real-{}", std::process::id()));
+        let dir = crate::common::temp().join(format!("immunity-watch-real-{}", std::process::id()));
         let _removed = crate::common::Scratch::at(dir.clone());
         std::fs::create_dir_all(dir.join("real")).unwrap();
         let _ = std::fs::remove_file(dir.join("link"));

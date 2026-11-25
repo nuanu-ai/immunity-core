@@ -304,9 +304,8 @@ fn cache_tag(name: &str, path: &Path) -> bool {
     use std::io::Read;
     let mut head = [0u8; CACHE_SIGNATURE.len()];
     name == CACHE_MARK
-        && std::fs::File::open(path)
-            .and_then(|mut f| f.read_exact(&mut head))
-            .is_ok()
+        && crate::open::open(path, crate::open::Reach::Place, crate::open::UNCAPPED)
+            .is_ok_and(|(mut f, _)| f.read_exact(&mut head).is_ok())
         && head == CACHE_SIGNATURE
 }
 
@@ -379,7 +378,7 @@ fn walk(checkout: &Path, prefix: &str, limit: usize, say: Say) -> Walk {
             // as a named pipe, is met and cannot be read: it is never opened, and said with what
             // it is.
             if let (false, Some(kind)) = (link, kind) {
-                let what = crate::watched::kind_of(file_type);
+                let what = crate::open::kind_of(file_type);
                 special.push((name, (say.file)(kind), what));
                 continue;
             }
@@ -537,7 +536,8 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize, cap: u64) -> Option<
         };
         // Opened as the walk found it: a regular file, a link in its place not followed,
         // without waiting, up to the cap. One refused could not be read.
-        let text = crate::autorun::read_capped_resolved(&path, cap)
+        let text = crate::open::read(&path, crate::open::Reach::Place, cap)
+            .map_err(|e| e.to_string())
             .and_then(|t| String::from_utf8(t).map_err(|_| "not UTF-8 text".to_string()));
         let parsed = match text {
             Err(why) => {
