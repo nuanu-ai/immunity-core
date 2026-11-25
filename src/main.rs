@@ -19,6 +19,7 @@ mod baseline;
 mod beyond;
 mod brew;
 mod checkouts;
+mod closed;
 mod codesign;
 mod contract;
 mod covered;
@@ -3947,7 +3948,7 @@ fn read_watched(
             .filter(|p| targets::runs_of(p.watched_as).is_some())
             .map(|p| &p.look)
             .collect();
-        let (look, read) = targets::read(run.tx, &run_id, &machine, &roots, &items, &all)?;
+        let (look, read) = targets::read(run.tx, &machine, &roots, &items, &all)?;
         // What each startup item runs, told or not, is a unit of its own (`fault.rs`).
         let (tx, kind) = (run.tx, targets::KIND);
         baseline::record(tx, watched::READER, kind, &run_id, run.at, &read.told, &[])?;
@@ -4089,6 +4090,9 @@ fn read_watched(
         });
     }
 
+    // A file that could not be read is weighed by everything this pass read, before any row.
+    let mut looks: Vec<&mut look::Look> = placed.iter_mut().map(|p| &mut p.look).collect();
+    closed::settle(run.tx, &machine, &roots, &mut looks, &[])?;
     // The raw copy: kind, path, checksum and link target, one line per entry; never content.
     let mut raw = String::new();
     let mut lines: Vec<Vec<usize>> = Vec::new();
@@ -4418,7 +4422,7 @@ fn read_watched(
             let read_before =
                 store::read_before(tx, watched::READER, &id, watched::CONTENT, &run_id)?;
             let (completeness, reason, gap) =
-                watched::content_coverage(&e.content, e.link.is_some(), read_before);
+                watched::content_coverage(&e.content, e.link.is_some());
             let reading = Reading {
                 scope: &id,
                 kind: watched::CONTENT,

@@ -6022,6 +6022,15 @@ fn a_watched_file_read_before_that_cannot_be_read_now_is_a_finding_with_why_and_
         ),
         ["Permission denied (os error 13)"]
     );
+    // The copy of what was read says why too.
+    let copies = std::fs::read_dir(e.store().with_file_name("raw")).unwrap();
+    let copies = copies.map(|d| d.unwrap().path().join("watched-places.txt"));
+    let why = "\t.zshrc\tnot read: Permission denied (os error 13)\t";
+    assert!(
+        copies
+            .filter_map(|p| std::fs::read_to_string(p).ok())
+            .any(|c| c.contains(why))
+    );
     e.seen();
     put(&zshrc, "export A=2\n");
     e.run();

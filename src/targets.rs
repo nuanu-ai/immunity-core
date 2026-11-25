@@ -11,7 +11,7 @@ use crate::codesign;
 use crate::guarded::{self, Real};
 use crate::look::{Absent, Look};
 use crate::plist::{self, Text};
-use crate::store::{self, Cause, Gap, Lack, Statement};
+use crate::store::{Cause, Gap, Lack, Statement};
 use crate::watched::{self, Content, Entry, Roots};
 use rusqlite::{OptionalExtension, Transaction, params};
 use std::collections::{BTreeMap, BTreeSet};
@@ -184,6 +184,26 @@ impl Targets {
     fn count(&mut self, why: &'static str) {
         *self.counts.entry(why).or_default() += 1;
     }
+
+    /// Counts each program in `look` that could not be opened by its cause, decided as for any
+    /// watched file (`closed::settle`).
+    fn settle(
+        &mut self,
+        tx: &Transaction,
+        machine: &str,
+        roots: &Roots,
+        look: &mut Look,
+        others: &[&Look],
+    ) -> rusqlite::Result<()> {
+        for cause in crate::closed::settle(tx, machine, roots, &mut [look], others)? {
+            self.count(if cause == Cause::NotGiven {
+                CLOSED
+            } else {
+                FAILED
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Why a target was not read or not judged, as a cause: what is in a guarded folder, or closed
@@ -194,24 +214,6 @@ fn cause(why: &str) -> Cause {
         GUARDED | CLOSED => Cause::NotGiven,
         FAILED | ITEMS => Cause::Failed,
         _ => Cause::NoReader,
-    }
-}
-
-/// A target there that could not be opened, as its content and the bucket it counts in: one of
-/// another account closed to this one is not given while it was never read here (`read_here`),
-/// else it failed, as any other (`watched::unread_cause`).
-fn not_opened(content: Content, read_here: bool) -> (Content, &'static str) {
-    match content {
-        Content::Unread(cause, why) => {
-            let cause = watched::unread_cause(cause, &why, read_here);
-            let bucket = if cause == Cause::NotGiven {
-                CLOSED
-            } else {
-                FAILED
-            };
-            (Content::Unread(cause, why), bucket)
-        }
-        other => (other, FAILED),
     }
 }
 
@@ -287,7 +289,6 @@ fn named_by(runs: Runs, bytes: &[u8], part: &str) -> Option<(Named, Vec<String>)
 /// the targets the store says it named, and is counted.
 pub fn read(
     tx: &Transaction,
-    run_id: &str,
     machine: &str,
     roots: &Roots,
     items: &[&Look],
@@ -383,16 +384,9 @@ pub fn read(
             (Content::Unread(Cause::NoReader, why.into()), None)
         } else {
             let before = previous(tx, &id)?;
-            let read_here = store::read_before(tx, watched::READER, &id, watched::CONTENT, run_id)?;
             let mut resolve = || guarded::real(&on_disk(roots, &unit.path), &homes);
-            let (content, after, why) = read_target(
-                &mut resolve,
-                roots,
-                &unit.path,
-                &before,
-                read_here,
-                &mut look,
-            );
+            let (content, after, why) =
+                read_target(&mut resolve, roots, &unit.path, &before, &mut look);
             why.into_iter().for_each(|why| t.count(why));
             let link = after.link.clone();
             t.before.insert(unit.clone(), before);
@@ -410,6 +404,7 @@ pub fn read(
             bytes,
         });
     }
+    t.settle(tx, machine, roots, &mut look, others)?;
     t.short_of(&mut look);
     Ok((look, t))
 }
@@ -451,7 +446,7 @@ fn previous(tx: &Transaction, id: &str) -> rusqlite::Result<Signature> {
 }
 
 /// A path the guard made real, as from the Mac's root whatever root it was read under.
-fn from_root(system: &Path, real: &Path) -> String {
+pub fn from_root(system: &Path, real: &Path) -> String {
     let root = std::fs::canonicalize(system).unwrap_or_else(|_| system.to_path_buf());
     match real.strip_prefix(&root) {
         Ok(rest) if root != Path::new("/") => format!("/{}", rest.display()),
@@ -462,13 +457,13 @@ fn from_root(system: &Path, real: &Path) -> String {
 /// Reads one target, which `resolve` makes real with the guard watched files keep, and says the
 /// bucket it counts in. The name is made real again and the identity taken again after the
 /// read: if either moved it is read once more, then not read. Out of reach: a file swapped
-/// during the read with its identity put back, since the signature is asked of a name.
+/// during the read with its identity put back, since the signature is asked of a name. A file
+/// that could not be opened counts once its cause is decided (`closed::settle`).
 fn read_target(
     resolve: &mut dyn FnMut() -> Real,
     roots: &Roots,
     path: &str,
     before: &Signature,
-    read_here: bool,
     look: &mut Look,
 ) -> (Content, Signature, Option<&'static str>) {
     let not = |content, why| (content, Signature::default(), why);
@@ -503,10 +498,8 @@ fn read_target(
             Err(content @ Content::Unread(Cause::NoReader, _)) => {
                 return not(content, Some(watched::OVER_CAP));
             }
-            Err(content) => {
-                let (content, why) = not_opened(content, read_here);
-                return not(content, Some(why));
-            }
+            Err(content @ Content::Failed(_)) => return not(content, None),
+            Err(content) => return not(content, Some(FAILED)),
         };
         let content = format!("sha256:{}", crate::sha256::hex(&bytes));
         drop(bytes);
@@ -798,24 +791,66 @@ mod tests {
     }
 
     #[test]
-    fn a_program_of_another_account_closed_here_is_not_given_until_read_here_and_then_failed() {
-        // Never read here: not given, and the reading is never full. Read here before: losing
-        // sight of it failed, as for any program that could not be opened.
-        let closed = |cause| Content::Unread(cause, watched::CLOSED.to_string());
-        let read_before = not_opened(closed(Cause::NotGiven), true);
-        assert_eq!(read_before, (closed(Cause::Failed), FAILED));
-        let (never, why) = not_opened(closed(Cause::NotGiven), false);
-        assert_eq!(never, closed(Cause::NotGiven));
+    fn a_program_a_startup_item_runs_that_could_not_be_opened_counts_by_the_one_decision() {
+        // Another account's program closed to this one and never read here is not given, and
+        // the reading is never full; the person's own closed program, read by `read`, failed.
+        use std::os::unix::fs::PermissionsExt;
+        let (_removed, dir) = scratch("closed");
+        let conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        let roots = Roots {
+            home: &dir,
+            system: &dir,
+        };
+        let said = |t: &Targets, look: &mut Look| {
+            t.short_of(look);
+            let (completeness, reason, gap) = t.coverage(look);
+            (completeness, reason.unwrap_or_default(), gap.cause)
+        };
         let mut t = Targets::default();
-        t.count(why);
         let mut look = Look::default();
         look.read(Unit::whole("/Library/Example/helper"));
-        t.short_of(&mut look);
-        let (completeness, reason, gap) = t.coverage(&look);
-        assert_eq!(completeness, "partial");
-        let said = format!("not read in full: {CLOSED}: 1; {AT_CHECKS}");
-        assert_eq!(reason.as_deref(), Some(said.as_str()));
-        assert_eq!(gap.cause, Some(Cause::NotGiven));
+        look.entries.push(Entry {
+            unit: Unit::whole("/Library/Example/helper"),
+            watched_as: TARGET,
+            content: Content::Failed(crate::closed::Failure {
+                errno: Some(libc::EACCES),
+                owner: 0,
+                us: 501,
+                real: dir.join("Library/Example/helper"),
+                why: "Permission denied (os error 13)".to_string(),
+            }),
+            link: None,
+            bytes: None,
+        });
+        t.settle(&tx, "example-mac", &roots, &mut look, &[])
+            .unwrap();
+        let closed = format!("not read in full: {CLOSED}: 1; {AT_CHECKS}");
+        assert_eq!(
+            said(&t, &mut look),
+            ("partial", closed, Some(Cause::NotGiven))
+        );
+
+        let program = dir.join("runner");
+        std::fs::write(&program, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let mut items = Look::default();
+        let agent = AGENT.replace("/Users/example/bin/agent", "/runner");
+        items.entries.push(Entry {
+            unit: Unit::whole("Library/LaunchAgents/org.example.agent.plist"),
+            watched_as: watched::AUTOSTART,
+            content: Content::Hash("sha256:00".to_string()),
+            link: None,
+            bytes: Some(std::sync::Arc::from(agent.into_bytes())),
+        });
+        let (mut look, t) = read(&tx, "example-mac", &roots, &[&items], &[&items]).unwrap();
+        let why = "Permission denied (os error 13)".to_string();
+        assert_eq!(look.entries[0].content, Content::Unread(Cause::Failed, why));
+        let failed = format!("not read in full: {FAILED}: 1; {AT_CHECKS}");
+        assert_eq!(
+            said(&t, &mut look),
+            ("partial", failed, Some(Cause::Failed))
+        );
     }
 
     #[test]
@@ -862,14 +897,7 @@ mod tests {
             home: dir,
             system: dir,
         };
-        let (content, s, _) = read_target(
-            resolve,
-            &roots,
-            "/runner",
-            before,
-            false,
-            &mut Look::default(),
-        );
+        let (content, s, _) = read_target(resolve, &roots, "/runner", before, &mut Look::default());
         (content, s)
     }
 
