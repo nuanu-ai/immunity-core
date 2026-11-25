@@ -196,6 +196,11 @@ impl Mac {
     /// Appends to the event level's log a program start that the high rule "Binary Padding -
     /// MacOS" matches, with invented content.
     fn exec(&self, seq: u64) {
+        self.exec_in("exec-20261004T00.jsonl", seq);
+    }
+
+    /// The same program start, appended to the log file `name`.
+    fn exec_in(&self, name: &str, seq: u64) {
         use std::io::Write;
         let out = Command::new("/bin/date")
             .args(["-u", "+%Y-%m-%dT%H:%M:%S.000001Z"])
@@ -208,7 +213,7 @@ impl Mac {
         std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(self.sys().join(EVENT_LOG).join("exec-20261004T00.jsonl"))
+            .open(self.sys().join(EVENT_LOG).join(name))
             .unwrap()
             .write_all(line.as_bytes())
             .unwrap();
@@ -876,6 +881,33 @@ fn a_sample_or_a_reading_of_program_starts_that_met_a_busy_store_is_no_failure_a
     let status = mac.status();
     assert_ne!(status["event_level"]["state"], "failed", "{status}");
     assert_eq!(failing(&mac), (true.into(), vec![]));
+    assert!(w.stop().success());
+}
+
+#[test]
+fn a_backlog_of_log_files_is_read_one_file_a_step_and_on_at_once_while_log_is_left() {
+    // A watcher that fell behind reads the log one file a step, each step committed, and the
+    // next at once while log is left, not at the next reading an hour later.
+    let mac = Mac::new("events-steps");
+    mac.event_level();
+    for (seq, hour) in [(1, "00"), (2, "01"), (3, "02")] {
+        mac.exec_in(
+            &format!("exec-20261004T000013-20261004T{hour}0000.jsonl"),
+            seq,
+        );
+    }
+    let quiet = ["--events-every", "3600", "--sample-every", "3600"];
+    let mut w = mac.watch_with(&[&quiet[..], &["--alive-every", "1"]].concat());
+    w = w.started();
+    for _ in 0..3 {
+        w.until("program_starts", |v| v["starts"] == 1);
+    }
+    // Once nothing is left, it reads no more until the next reading is due: a second of
+    // alive is about a thousand turns of its loop.
+    w.next("alive");
+    let rows = "SELECT CAST(COUNT(*) AS TEXT) || ' ' || SUM(starts) FROM event_count";
+    assert_eq!(mac.rows(rows), ["3 3"]);
+    assert_eq!(mac.rows("SELECT name FROM event_file").len(), 3);
     assert!(w.stop().success());
 }
 
