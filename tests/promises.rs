@@ -3475,6 +3475,128 @@ fn each_tailscale_state_is_told_as_what_it_is_with_the_date_the_tailnet_was_last
 }
 
 #[test]
+fn an_uncovered_meaning_is_the_same_whatever_the_mac_holds_and_the_places_are_its_examples_shown_as_data()
+ {
+    // Homebrew and Tailscale lost sight of at places of two Macs, one named with a comma, a
+    // quote and a semicolon: the item's words are the same on both, and every place it looked
+    // is an example of its own, whole, which the terminal shows quoted beside the title.
+    let lost = |tag: &str, folder: &str| {
+        let h = Home::new(tag, None, None);
+        let absent = h.dir.0.join("absent");
+        h.run(&absent, &fake(&h.dir.0.join("bin/on/tailscale"), TAILNET));
+        let at = h.dir.0.join(folder);
+        ok(immunity_run(&h.home, &h.store())
+            .arg("--brew")
+            .arg(at.join("brew"))
+            .args(["--servers-input".as_ref(), absent.as_os_str()])
+            .args(["--checkouts-root".as_ref(), absent.as_os_str()])
+            .arg("--tailscale")
+            .arg(at.join("tailscale")));
+        let status = status_json(&h.store());
+        let item = (status["not_covered"].as_array().unwrap().iter())
+            .find(|u| u["id"] == "read-before-not-found")
+            .cloned()
+            .unwrap_or_else(|| panic!("{status:#}"));
+        let places = ["brew", "tailscale"].map(|t| at.join(t).display().to_string());
+        assert_eq!(item["examples_text"], serde_json::json!(places), "{item:#}");
+        let (_, text, _) = status_out(&h.store(), &["--coverage"]);
+        let shown = places.map(|p| format!("\"{}\"", p.replace('"', "\\\"")));
+        assert!(text.contains(&shown.join("; ")), "{text}");
+        (item["meaning"].clone(), h)
+    };
+    let (one, _a) = lost("tool-words-a", "elsewhere");
+    let (two, _b) = lost("tool-words-b", "other, \"disk\"; here");
+    assert_eq!(one, two);
+    assert!(!one.as_str().unwrap().contains("elsewhere"), "{one}");
+}
+
+/// What every name and path from the Mac holds in the canary's store: a quote, "; " and ", "
+/// beside a word no sentence of the core holds, by which it is found.
+const CANARY: &str = "canary-7f3 \"q\"; s, c";
+const CANARY_WORD: &str = "canary-7f3";
+
+/// Where in `v` a string holds the canary's word outside a field named for text from a source.
+/// No field without `_text` holds an id or a path from the Mac in these answers, so none is let
+/// through: one that the schema says holds one as data would be named here, with why.
+fn outside_text_fields(v: &serde_json::Value, key: &str, at: &str, out: &mut Vec<String>) {
+    use serde_json::Value;
+    match v {
+        Value::String(s) if s.contains(CANARY_WORD) && !key.ends_with("_text") => {
+            out.push(format!("{at}: {s}"));
+        }
+        Value::Array(a) => (a.iter().enumerate())
+            .for_each(|(i, x)| outside_text_fields(x, key, &format!("{at}[{i}]"), out)),
+        Value::Object(o) => {
+            (o.iter()).for_each(|(k, x)| outside_text_fields(x, k, &format!("{at}.{k}"), out))
+        }
+        _ => {}
+    }
+}
+
+#[test]
+fn text_from_the_mac_reaches_the_contracts_json_only_in_fields_named_for_it() {
+    // A Mac whose home folder, project, sessions and the places tools were looked for all hold
+    // the marker: a tool read before and lost sight of, a project found by a walk and by a
+    // session whose lockfile declares a package named as malicious, and sessions of an agent
+    // this version does not read. The answers that carry what is not covered, the vulnerability
+    // data and the projects found hold the marker only in fields whose names say they hold
+    // text from a source.
+    let dir = Dir::new("canary");
+    let mac = dir.0.join(CANARY);
+    let home = mac.join("home");
+    let project = checkout(&home, &format!("dev/{CANARY}"));
+    let lock = r#"{"name": "shop", "lockfileVersion": 3, "packages": {"": {"name": "shop"},
+        "node_modules/cxp-jquery": {"version": "0.0.1-security"}}}"#;
+    put(&project, "package-lock.json", lock);
+    osv_npm(&home, &["MAL-2021-1"]);
+    std::fs::create_dir_all(home.join(".gemini/tmp")).unwrap();
+    let sessions = mac.join("sessions");
+    session(&sessions, "s1", &[&project]);
+    let (absent, store) = (dir.0.join("absent"), dir.store());
+    let run = |brew: Option<&Path>, tailscale: &Path| {
+        let mut cmd = immunity_run(&home, &store);
+        match brew {
+            Some(input) => cmd.arg("--brew-input").arg(input),
+            None => cmd.arg("--brew").arg(mac.join("lost/brew")),
+        };
+        ok(cmd
+            .args(["--servers-input".as_ref(), absent.as_os_str()])
+            .args(["--sessions-root".as_ref(), sessions.as_os_str()])
+            .arg("--tailscale")
+            .arg(tailscale))
+    };
+    run(
+        Some(&dir.input("brew.txt", SAMPLE)),
+        &fake(&dir.0.join("bin/tailscale"), TAILNET),
+    );
+    run(None, &mac.join("lost/tailscale"));
+    let contract = |args: &[&str]| -> serde_json::Value {
+        let out = ok(immunity_cmd(&home)
+            .args(args)
+            .args(["--json", "--store"])
+            .arg(&store));
+        serde_json::from_str(&out).unwrap()
+    };
+    let answers = [
+        ("status", status_json(&store)),
+        ("vulnerabilities", contract(&["vulnerabilities"])),
+        ("vulnerability", contract(&["vulnerability", "MAL-2021-1"])),
+    ];
+    assert_eq!(answers[1].1["affected"]["total"], 1, "{:#}", answers[1].1);
+    // The marker is there to be found: the lost places and the project are named.
+    assert!(
+        answers[0].1.to_string().contains(CANARY_WORD),
+        "{:#}",
+        answers[0].1
+    );
+    let mut found = Vec::new();
+    for (command, v) in &answers {
+        outside_text_fields(v, "", command, &mut found);
+    }
+    assert!(found.is_empty(), "{found:#?}");
+}
+
+#[test]
 fn a_tool_read_before_and_not_found_now_is_lost_sight_of_and_never_told_as_not_installed() {
     // An earlier version found Homebrew and Tailscale through PATH; this one looks only at
     // their installers' places. "Read in full, not installed" would close every fact read
@@ -3933,14 +4055,15 @@ fn a_checkout_named_only_in_a_codex_session_compressed_or_not_is_found_and_an_ag
     );
     let (_, text, _) = status_out(&a.store(), &["--coverage"]);
     assert!(text.contains("Gemini CLI"), "{text}");
-    // What is said of the projects as a whole speaks of the projects found, with why.
+    // What is said of the projects as a whole speaks of the projects found, with why in the
+    // core's words: which agent's sessions is the item above.
     let found = &status["vulnerabilities"]["projects_found"];
     assert_eq!(
         (&found["all"], &found["cause"], &found["why"]),
         (
             &serde_json::json!(false),
             &serde_json::json!("not_given"),
-            &serde_json::json!(why)
+            &serde_json::json!(SESSIONS_NOT_READ)
         ),
         "{found}"
     );
@@ -4016,11 +4139,13 @@ fn a_folder_of_codex_sessions_inside_a_folder_macos_protects_is_not_looked_into_
     std::fs::create_dir_all(a.home.join(".gemini/tmp")).unwrap();
     a.run();
     let found = &status_json(&a.store())["vulnerabilities"]["projects_found"];
-    assert_eq!(
-        found["why"], "sessions of Gemini CLI are not read",
-        "{found}"
-    );
+    assert_eq!(found["why"], SESSIONS_NOT_READ, "{found}");
 }
+
+/// Why not every project was found when sessions this version has no reader for were met, as
+/// `ProjectsFound.why` gives it: the core's words alone, never the reading's reason, which
+/// names what it met. Which agent's sessions the status's item for what is not understood names.
+const SESSIONS_NOT_READ: &str = "some agent sessions here are not read by this version";
 
 #[test]
 fn a_checkout_seen_by_both_readers_is_one_entity() {
@@ -11919,7 +12044,7 @@ fn a_change_in_a_watched_place_stays_open_through_quiet_runs_and_is_the_number_t
     assert_eq!(shown["technique_text"], item["technique_text"]);
     assert_eq!(
         shown["evidence"],
-        serde_json::json!({ "place_changed": { "change": "new", "presence_only": false, "read_as_before_at": null } })
+        serde_json::json!({ "place_changed": { "change": "new", "presence_only": false, "read_as_before_at": null, "runs": [], "started_by": [] } })
     );
     assert_eq!(shown["answer"], serde_json::Value::Null);
     let (_, text, _) = finding_out(&w.store(), &[id]);
