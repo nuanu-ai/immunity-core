@@ -516,8 +516,9 @@ fn a_client_has_a_status_of_real_size_to_be_drawn_from() {
         mode(&mac, rel, 0o644);
     }
 
-    // What the binary made: a place read for the first time among what needs a look, and the
-    // closed files as one cause the person can fix, a fault, with four of them.
+    // What the binary made: a place read for the first time among what needs a look, the closed
+    // files read before as one fault by their names, and their readings as one cause the person
+    // can fix, a limit beside it.
     let items = status["needs_a_look"]["items"].as_array().unwrap().clone();
     let first_read = items
         .iter()
@@ -530,14 +531,18 @@ fn a_client_has_a_status_of_real_size_to_be_drawn_from() {
         .unwrap_or_else(|| panic!("no change: {items:#?}"))
         .clone();
     let not_covered = status["not_covered"].as_array().unwrap().clone();
-    let permitted = not_covered
-        .iter()
-        .find(|u| u["id"] == "not-permitted")
-        .unwrap_or_else(|| panic!("no closed files: {not_covered:#?}"));
-    assert!(
-        permitted["examples_text"].as_array().unwrap().len() >= 3 && permitted["fault"] == true,
-        "{permitted:#}"
-    );
+    let cause = |id: &str, fault: bool| {
+        let item = not_covered
+            .iter()
+            .find(|u| u["id"] == id)
+            .unwrap_or_else(|| panic!("no {id}: {not_covered:#?}"));
+        assert!(
+            item["examples_text"].as_array().unwrap().len() >= 3 && item["fault"] == fault,
+            "{item:#}"
+        );
+    };
+    cause("read-before-not-read-now", true);
+    cause("not-permitted", false);
 
     // Two findings: the place read for the first time and the change.
     let urgent = [&first_read, &changed]

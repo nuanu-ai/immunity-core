@@ -1024,8 +1024,9 @@ fn a_known_project_under_a_folder_a_link_replaced_is_kept_and_named_as_not_walke
     // Looked at through the link, the project is there; the walk does not go through links,
     // so it read nothing in it. Where the link leads into a folder macOS asks permission for,
     // nothing past the link is looked up and that folder is named. Its hooks read before
-    // raise nothing.
+    // raise nothing, and are not read now: a fault by their name.
     after_a_link_took_the_place_of("dev", true, |e, target, unchanged| {
+        assert_eq!(lost(e), ["~/dev/shop/.git/hooks"], "{target}");
         assert_eq!(presence(e, "dev/shop"), "held");
         assert!(projects_removed(e).is_empty());
         let (coverage, cause) = match target {
@@ -1145,6 +1146,57 @@ fn a_known_project_under_a_link_stays_held_and_named_at_every_walk_and_goes_once
         let app = "checkout:machine:mac/dev/group/app".to_string();
         assert!(projects_removed(&e).contains(&app));
     }
+}
+
+#[test]
+fn a_folder_the_walk_listed_before_and_cannot_list_now_is_a_fault_and_one_never_listed_a_limit() {
+    let e = Estate::new("walk-unlisted");
+    e.checkout("dev/shop");
+    let (old, new) = (e.home().join("dev/old"), e.home().join("dev/new"));
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::create_dir_all(&new).unwrap();
+    mode(&new, 0o000);
+    e.run();
+    mode(&old, 0o000);
+    e.run();
+    let names = lost(&e);
+    mode(&old, 0o755);
+    mode(&new, 0o755);
+    assert_eq!(names, ["~/dev/old"]);
+    // Listed again, it ends; and so does one gone from a folder listed without it.
+    e.run();
+    assert!(lost(&e).is_empty(), "{:?}", lost(&e));
+    mode(&old, 0o000);
+    e.run();
+    assert_eq!(lost(&e), ["~/dev/old"]);
+    std::fs::remove_dir(&old).unwrap();
+    e.run();
+    assert!(lost(&e).is_empty(), "{:?}", lost(&e));
+}
+
+#[test]
+fn a_watched_file_read_before_is_a_fault_until_its_folder_is_listed_without_it() {
+    let e = Estate::new("lost-then-gone");
+    let plist = e.home().join("Library/LaunchAgents/com.example.a.plist");
+    put(&plist, "<plist><dict/></plist>\n");
+    e.run();
+    mode(&plist, 0o000);
+    e.run();
+    assert_eq!(lost(&e), ["~/Library/LaunchAgents/com.example.a.plist"]);
+    std::fs::remove_file(&plist).unwrap();
+    e.run();
+    assert!(lost(&e).is_empty(), "{:?}", lost(&e));
+}
+
+/// The names `immunity status` gives of what was read here before and is not read now.
+fn lost(e: &Estate) -> Vec<String> {
+    let items = said(e).1["not_covered"].as_array().unwrap().clone();
+    let lost = items.iter().find(|u| u["id"] == "read-before-not-read-now");
+    lost.map(|u| u["examples_text"].as_array().unwrap().clone())
+        .unwrap_or_default()
+        .iter()
+        .map(|n| n.as_str().unwrap().to_string())
+        .collect()
 }
 
 #[test]
@@ -8536,8 +8588,9 @@ fn about(s: &serde_json::Value, name: &str) -> Vec<(String, bool)> {
 fn a_unit_read_before_and_unreadable_now_keeps_the_headline_from_calm_whoever_owns_it() {
     // At one check a watched file is read; at the next it is closed. Losing sight of it is a
     // finding, and once the person has answered it the file still holds this Mac in part as a
-    // fault, named by a `!` line, until a reading reads it again or finds it gone. A file of
-    // another account is sorted by the same rule (`fault.rs`); a test cannot make one here.
+    // fault, named by its own item and one `!` line, its failed reading a limit beside it with
+    // why, until a reading reads it again or finds it gone. A file of another account is sorted
+    // by the same rule (`fault.rs`); a test cannot make one here.
     use std::os::unix::fs::PermissionsExt;
     let e = Estate::new("fault-read-before");
     let zshrc = e.home().join(".zshrc");
@@ -8545,7 +8598,7 @@ fn a_unit_read_before_and_unreadable_now_keeps_the_headline_from_calm_whoever_ow
     let calm = (Vec::new(), Vec::new(), "\"watched\"".to_string());
     let held_in_part = (
         vec!["this_mac".to_string(), "not_covered".to_string()],
-        vec!["not-permitted".to_string()],
+        vec!["read-before-not-read-now".to_string()],
         "\"watched_in_part\"".to_string(),
     );
     for ending in ["read again", "gone"] {
@@ -8558,8 +8611,17 @@ fn a_unit_read_before_and_unreadable_now_keeps_the_headline_from_calm_whoever_ow
         e.seen();
         let (text, s) = said(&e);
         assert_eq!(held(&s), held_in_part, "{ending}");
-        assert_eq!(about(&s, "~/.zshrc"), [("not-permitted".to_string(), true)]);
-        assert!(text.contains("\n  ! Could not read: ~/.zshrc: "), "{text}");
+        assert_eq!(
+            about(&s, "~/.zshrc"),
+            [
+                ("read-before-not-read-now".to_string(), true),
+                ("not-permitted".to_string(), false)
+            ]
+        );
+        let lines: Vec<&str> = (text.lines())
+            .filter(|l| l.starts_with("  ! ") && l.contains("~/.zshrc"))
+            .collect();
+        assert_eq!(lines, ["  ! Can no longer be read: ~/.zshrc"], "{text}");
         // Another check that cannot read it changes nothing.
         e.run();
         assert_eq!(held(&said(&e).1), held_in_part, "{ending}");
@@ -8571,14 +8633,18 @@ fn a_unit_read_before_and_unreadable_now_keeps_the_headline_from_calm_whoever_ow
         let (text, s) = said(&e);
         assert_eq!(held(&s), calm, "{ending}");
         assert!(about(&s, "~/.zshrc").is_empty(), "{ending}");
-        assert!(!text.contains("Could not read"), "{text}");
+        assert!(
+            !text.contains("Could not read") && !text.contains("no longer"),
+            "{text}"
+        );
     }
 }
 
 #[test]
 fn a_unit_never_read_here_is_a_limit_and_leaves_calm() {
     // A watched file closed from the first check on was never given here: it is listed as a
-    // limit by `--coverage`, and nothing of it keeps the answer from calm.
+    // limit by `--coverage`, and nothing of it keeps the answer from calm. The answer here is in
+    // part only for what this estate does not give: a watcher and the downloads.
     use std::os::unix::fs::PermissionsExt;
     let e = Estate::new("fault-never-read");
     let zshrc = e.home().join(".zshrc");
@@ -8589,6 +8655,11 @@ fn a_unit_never_read_here_is_a_limit_and_leaves_calm() {
     e.run();
     let (text, s) = said(&e);
     mode(0o644);
+    assert_eq!(s["headline"], "in_part", "{s:#}");
+    assert_eq!(
+        s["headline_because"],
+        serde_json::json!(["watcher", "not_covered"])
+    );
     assert_eq!(
         held(&s),
         (Vec::new(), Vec::new(), "\"watched\"".to_string())
@@ -8615,11 +8686,11 @@ fn a_unit_never_read_here_is_a_limit_and_leaves_calm() {
 }
 
 #[test]
-fn a_file_read_before_that_the_guard_of_protected_folders_now_turns_away_is_found_and_then_a_limit()
-{
-    // Today's behaviour, pinned: a watched file read before that becomes a link into a folder
-    // macOS protects is not looked into. Losing sight of it raises its finding; its reading is
-    // not given, a limit, so once the finding is answered nothing keeps the answer from calm.
+fn a_file_read_before_that_the_guard_of_protected_folders_now_turns_away_is_a_fault_after_its_finding_is_answered()
+ {
+    // A watched file read before that becomes a link into a folder macOS protects is not
+    // looked into. Losing sight of it raises its finding; its reading is not given, and once
+    // the finding is answered the file, read here before, still holds this Mac in part.
     let e = Estate::new("fault-guarded");
     let zshrc = e.home().join(".zshrc");
     put(&zshrc, "export A=1\n");
@@ -8630,10 +8701,48 @@ fn a_file_read_before_that_the_guard_of_protected_folders_now_turns_away_is_foun
     e.run();
     assert_eq!(e.found(), [pair("watched.shell-profile", "~/.zshrc")]);
     e.seen();
-    let s = said(&e).1;
+    let (text, s) = said(&e);
+    let lost = "read-before-not-read-now".to_string();
     assert_eq!(
         held(&s),
-        (Vec::new(), Vec::new(), "\"watched\"".to_string())
+        (
+            vec!["this_mac".to_string(), "not_covered".to_string()],
+            vec![lost.clone()],
+            "\"watched_in_part\"".to_string()
+        )
     );
-    assert!(about(&s, "~/.zshrc").is_empty(), "{s:#}");
+    assert_eq!(about(&s, "~/.zshrc"), [(lost, true)], "{s:#}");
+    assert!(
+        text.contains("\n  ! Can no longer be read: ~/.zshrc\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_narrower_check_that_does_not_look_at_a_unit_read_before_leaves_its_fault_standing() {
+    // A project's file read at one check and closed at the next is a fault; a check pointed at
+    // another project, which reads the projects' ways of running code by itself as one reading
+    // of this Mac and does not look at this one, leaves it standing.
+    use std::os::unix::fs::PermissionsExt;
+    let e = Estate::new("fault-narrower");
+    let shop = e.checkout("dev/shop");
+    let other = e.checkout("dev/other");
+    let mcp = shop.join(".mcp.json");
+    put(&mcp, "{\"mcpServers\": {}}\n");
+    e.run();
+    let mode = |m| std::fs::set_permissions(&mcp, std::fs::Permissions::from_mode(m)).unwrap();
+    mode(0o000);
+    e.run();
+    e.seen();
+    let lost = ("read-before-not-read-now".to_string(), true);
+    assert!(about(&said(&e).1, "~/dev/shop/.mcp.json").contains(&lost));
+    e.run_in(&other);
+    let (text, s) = said(&e);
+    mode(0o644);
+    assert!(about(&s, "~/dev/shop/.mcp.json").contains(&lost), "{s:#}");
+    assert_eq!(s["this_mac"]["state"], "watched_in_part");
+    assert!(
+        text.contains("! Can no longer be read: ~/dev/shop/.mcp.json"),
+        "{text}"
+    );
 }

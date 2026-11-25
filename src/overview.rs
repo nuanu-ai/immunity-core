@@ -635,11 +635,12 @@ fn cause_fault(u: &v1::Uncovered) -> Fault {
             .collect();
         // A place by its names alone; anything else by its title, and its names with what the
         // source said of the whole, as the full account gives them, where none has a reason.
+        let read = match u.id == crate::covered::NO_LONGER_READ.id {
+            true => "Can no longer be read",
+            false => "Could not read",
+        };
         let (words, names) = match (place, with_reasons) {
-            (true, _) => (
-                "Could not read",
-                names.join(if with_reasons { "; " } else { ", " }),
-            ),
+            (true, _) => (read, names.join(if with_reasons { "; " } else { ", " })),
             (false, true) => (unstopped(&u.title), names.join("; ")),
             (false, false) => (unstopped(&u.title), examples(u)),
         };

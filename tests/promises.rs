@@ -8305,21 +8305,27 @@ fn a_watched_folder_that_cannot_be_listed_retracts_nothing_and_reports_no_change
         printed.contains("0 new, 0 changed, 0 gone since the last reading; not read in full: launch agents and daemons (partial), programs that launch agents, daemons and login hooks run (nothing read)."),
         "{printed}"
     );
-    // Each place not read is named with why where a fault is said: on a fault line of the
-    // status, which the run prints too, and among the faults of the full account.
+    // Each place read before and not read now is a fault named once, on one fault line of the
+    // status, which the run prints too; why it was not read is in the full account, beside the
+    // reading, a limit as a reading.
     let (_, text, _) = status_out(&w.store(), &[]);
     let (_, whole, _) = status_out(&w.store(), &["--coverage"]);
-    let faults = &whole[whole.find("\n  Faults\n").expect(&whole)..];
+    let limits = &whole[whole
+        .find("\n  Limits of this version here\n")
+        .expect(&whole)..];
     for place in [
-        "Library/LaunchAgents/com.example.a.plist",
+        "~/Library/LaunchAgents/com.example.a.plist",
         "/Library/LaunchDaemons",
     ] {
+        let told: Vec<&str> = (text.lines())
+            .filter(|l| l.starts_with("  ! ") && l.contains(place))
+            .collect();
         assert!(
-            text.lines()
-                .any(|l| l.starts_with("  ! ") && l.contains(place) && l.contains(denied)),
+            told.len() == 1 && told[0].starts_with("  ! Can no longer be read: "),
             "{text}"
         );
-        assert!(faults.contains(&format!("{place} ({denied})")), "{whole}");
+        let place = place.trim_start_matches("~/");
+        assert!(limits.contains(&format!("{place} ({denied})")), "{whole}");
     }
     assert!(watched_rows(&w.store()).is_empty(), "{printed}");
 
@@ -10688,9 +10694,9 @@ fn a_machine_that_could_not_be_reached_is_named_once_and_what_it_leaves_unread_i
 }
 
 #[test]
-fn an_incomplete_reading_without_a_cause_is_never_called_milder_than_failed() {
+fn an_incomplete_reading_without_a_cause_is_read_as_failed_everywhere_the_status_sorts_it() {
     // An incomplete reading whose cause the store does not hold is, not knowing why, never
-    // called anything milder than failed.
+    // called anything milder than failed, as the schema says of a class it does not know.
     let w = Watch::new("before-causes");
     std::fs::create_dir_all(w.home()).unwrap();
     let shop = checkout(w.home(), "dev/shop");
@@ -10708,16 +10714,15 @@ fn an_incomplete_reading_without_a_cause_is_never_called_milder_than_failed() {
         .unwrap();
     let r = status_json(&w.store());
     assert_eq!(classes(&r), [2, 0, 0]);
-    // For a person they are not a failure of his Mac: the next run reads them again and says
-    // why, so a status read before it, or while it runs, is not alarmed by numbers that run is
-    // about to change.
-    assert_eq!(r["this_mac"]["state"], "watched", "{r:#}");
+    // The same where the status sorts them: failed readings of whole sources, faults, which
+    // hold this Mac in part until the next run reads them again and says why.
+    assert_eq!(r["this_mac"]["state"], "watched_in_part", "{r:#}");
     assert!(
         r["not_covered"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|u| u["id"] != "could-not-read"),
+            .any(|u| u["id"] == "could-not-read" && u["fault"] == true),
         "{r:#}"
     );
 }

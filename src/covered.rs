@@ -184,12 +184,11 @@ fn on_this_mac(scope: &str, this: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-/// Whether a reading failed, its cause kept. A reading written before causes were kept has none,
-/// and is not taken for a failure here: the next run reads it again and says why (`coverage`
-/// still counts it as failed, for agents). Whether it is a fault is `fault::reading`.
+/// Whether a reading failed: one not full whose cause is `failed`, or that kept none, as the
+/// schema says of a class it does not know (`status::class`). Whether it is a fault is
+/// `fault::reading`.
 fn failed(r: &Latest) -> bool {
-    r.cause.is_some()
-        && status::class(&r.completeness, r.reason.as_deref(), r.cause.as_deref()) == Some("failed")
+    status::class(&r.completeness, r.reason.as_deref(), r.cause.as_deref()) == Some("failed")
 }
 
 /// A reading of a server file an earlier probe printed, which only the person can make again.
@@ -198,9 +197,9 @@ fn earlier_probe(r: &Latest) -> bool {
 }
 
 /// Is this Mac watched, and how: from the latest readings, `live` and when a watcher last
-/// read. `not_checked` before any reading of this Mac; `watched_in_part` when a reading of its
-/// own places failed and that is a fault (`fault::reading`), such as a file read here before;
-/// else `watched`, a place never read here a limit.
+/// read. `not_checked` before any reading of this Mac; `watched_in_part` when something of its
+/// own places read here before is not read now (`fault::lost`), or a reading of them failed and
+/// that is a fault (`fault::reading`); else `watched`, a place never read here a limit.
 pub fn this_mac(conn: &Connection, latest: &[Latest], live: bool) -> rusqlite::Result<ThisMac> {
     let this = this_machine(conn)?;
     let checked_at = status::latest_finished(conn)?.and_then(|r| r.finished_at);
@@ -216,7 +215,10 @@ pub fn this_mac(conn: &Connection, latest: &[Latest], live: bool) -> rusqlite::R
         .iter()
         .filter(|r| on_this_mac(&r.scope, &this))
         .collect();
-    let mut state = "watched";
+    let mut state = match crate::fault::lost(conn, latest)?.iter().any(|l| !l.project) {
+        true => "watched_in_part",
+        false => "watched",
+    };
     for r in mine.iter().filter(|r| failed(r)) {
         if crate::fault::reading(conn, r)? {
             state = "watched_in_part";
@@ -370,6 +372,22 @@ pub const SERVERS_NOT_OPENED: Cause = Cause {
     advice: "If you still use them, check that you can log in to them yourself and run the server check again. If one is no longer yours, mark it as retired.",
 };
 
+/// What was read here before and is not read now, by name, whatever the cause (`fault::lost`).
+pub const NO_LONGER_READ: Cause = Cause {
+    id: "read-before-not-read-now",
+    who: YOU,
+    class: store::Cause::Failed,
+    scope: "this_mac",
+    kind: "read here before, not read now",
+    title: [
+        "{n} thing read here before can no longer be read.",
+        "{n} things read here before can no longer be read.",
+    ],
+    meaning: "An earlier check read them and the latest could not, so a change in them goes unseen. They are listed by name.",
+    meaning_none: None,
+    advice: "If you did not change them on purpose, your agent can find out why. Each stays here until a check reads it again or finds it gone.",
+};
+
 pub const NOT_PERMITTED: Cause = Cause {
     id: "not-permitted",
     who: YOU,
@@ -401,7 +419,8 @@ pub const READING_FAILED: Cause = Cause {
 };
 
 /// Files of another account whose permissions do not let this account open them: their reason
-/// is `watched::CLOSED`. A fault when read here before, a limit otherwise (`fault.rs`).
+/// is `watched::CLOSED`. A limit as a reading; one read here before is named by
+/// `NO_LONGER_READ` (`fault.rs`).
 pub const OTHER_ACCOUNTS: Cause = Cause {
     id: "other-accounts-files",
     who: NOTHING,
@@ -771,9 +790,10 @@ pub const NOT_CHECKED_ON_MACOS: Cause = Cause {
 };
 
 /// Every cause, in the order items are listed: what the owner can fix first.
-pub const CAUSES: [&Cause; 28] = [
+pub const CAUSES: [&Cause; 29] = [
     &SERVERS_NOT_CHECKED,
     &SERVERS_NOT_OPENED,
+    &NO_LONGER_READ,
     &NOT_PERMITTED,
     &READING_FAILED,
     &OTHER_ACCOUNTS,
@@ -1053,9 +1073,24 @@ pub fn not_covered(
         });
     }
 
+    // What was read here before and is not read now, each by its name, whatever the readings
+    // of its kind say since (`fault::lost`).
+    let lost = crate::fault::lost(conn, latest)?;
+    if !lost.is_empty() {
+        out.push(Uncovered {
+            scope: if lost.iter().all(|l| l.project) {
+                "projects"
+            } else {
+                "this_mac"
+            },
+            examples: lost.iter().map(|l| Example::named(place(&l.id))).collect(),
+            ..Uncovered::new(&NO_LONGER_READ, lost.len())
+        });
+    }
+
     // Readings that failed: those kept closed by permissions, which the owner can open, files of
     // another account closed to this one, and the rest. On a server that could not be opened
-    // they are implied by it and told there.
+    // they are implied by it and told there. Each is a fault or a limit by `fault::reading`.
     let away: BTreeSet<&str> = p.unreached.iter().map(|u| u.scope.as_str()).collect();
     let mut by_cause: [(&Cause, Vec<&Latest>); 3] = [
         (&NOT_PERMITTED, Vec::new()),
@@ -1735,7 +1770,12 @@ pub const EXAMPLES: usize = 3;
 /// a person needs by name to know what is left out, and the ways and places not read, which
 /// are counted by way and named by each of a way's names, so a first three would leave a way
 /// out unsaid.
-const EVERY_EXAMPLE: [&str; 3] = [OTHER_MANAGERS.id, PROJECT_AUTORUN.id, HOME_AUTORUN.id];
+const EVERY_EXAMPLE: [&str; 4] = [
+    NO_LONGER_READ.id,
+    OTHER_MANAGERS.id,
+    PROJECT_AUTORUN.id,
+    HOME_AUTORUN.id,
+];
 
 /// The examples of the ways or places not read: each name of each way, a name of its own, never
 /// a way's names joined into one.
@@ -1794,6 +1834,7 @@ mod tests {
             "not-permitted",
             "could-not-read",
             "other-accounts-files",
+            "read-before-not-read-now",
             "eslogger-refused",
             "event-level-failing",
             "event-level-silent",

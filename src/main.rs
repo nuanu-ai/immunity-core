@@ -3060,6 +3060,7 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
     // comes back gone, as one the disk names as a checkout the walk met: it is held already.
     let prefix = format!("checkout:{machine}/");
     let (mut kept, mut unknown, mut linked) = (Vec::new(), Vec::new(), Vec::new());
+    let mut guarded = Vec::new();
     for rel in store::live_subjects(run.tx, checkouts::READER)?
         .into_iter()
         .filter_map(|id| id.strip_prefix(&prefix).map(str::to_string))
@@ -3084,9 +3085,17 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
                 if !walk.guarded.contains(&g) {
                     walk.guarded.push(g);
                 }
+                guarded.push(rel.clone());
                 kept.push(rel);
             }
         }
+    }
+    // A known checkout there that is not looked into, under a link, in a folder macOS protects
+    // or not told by the disk, has its hooks not read now: read before, a fault (`fault.rs`).
+    // A reading of them that reads them again ends it; none raises a finding.
+    for rel in unknown.iter().chain(&linked).chain(&guarded) {
+        let hooks = Unit::whole(format!("{rel}/.git/hooks"));
+        baseline::judged_unread(run.tx, watched::READER, watched::HOOK_KIND, &hooks, &run_id)?;
     }
     let mut raw = String::new();
     for c in &walk.checkouts {
@@ -3141,7 +3150,8 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
         look.short(Cause::NotGiven, why);
     }
     if !unknown.is_empty() {
-        let why = format!("{}{}", checkouts::NOT_TOLD, unknown.join(", "));
+        let rels = unknown.join(", ");
+        let why = format!("known checkouts that could not be looked at, kept as they were: {rels}");
         look.short(Cause::Failed, why);
     }
     // A known checkout there through a link on its path was not walked into, as a folder on
@@ -3166,6 +3176,18 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
         compared: "full",
     };
     run.apply_found(&reading, checkouts::BASIS, &applied, &statements)?;
+    // A folder that could not be listed is a unit not read, and one a listing shows is gone
+    // is no longer one; whether it was read before decides whether it is a fault (`fault.rs`).
+    for (folder, _) in &walk.unlisted {
+        let unit = Unit::whole(folder);
+        baseline::judged_unread(run.tx, checkouts::READER, checkouts::KIND, &unit, &run_id)?;
+    }
+    let met: BTreeSet<&str> = (walk.listed.iter().chain(&walk.seen))
+        .chain(walk.unlisted.iter().map(|(folder, _)| folder))
+        .map(String::as_str)
+        .collect();
+    let listed: Vec<Unit> = walk.listed.iter().map(Unit::whole).collect();
+    baseline::found_absent(run.tx, checkouts::READER, checkouts::KIND, &listed, &met)?;
     // The folders the walk listed in full and those it found in them: a checkout found later
     // in a folder listed before is new (`baseline.rs`).
     baseline::record(

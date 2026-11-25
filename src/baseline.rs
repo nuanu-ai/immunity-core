@@ -276,7 +276,9 @@ pub fn record(
     Ok(())
 }
 
-/// Records an unread unit once while it stays unread.
+/// Records an unread unit, and whether an earlier run judged it unread already: it is judged
+/// once while it stays unread. The mark keeps the latest run that found it unread, so that the
+/// marks of a reading are those with its run (`fault.rs`).
 pub fn judged_unread(
     tx: &Transaction,
     reader: &str,
@@ -284,35 +286,67 @@ pub fn judged_unread(
     unit: &Unit,
     run_id: &str,
 ) -> rusqlite::Result<bool> {
-    if unit.part.is_empty() {
-        let added = tx.execute(
-            "INSERT OR IGNORE INTO unit_unread (reader, kind, unit, run_id) VALUES (?1, ?2, ?3, ?4)",
-            params![reader, kind, unit.path, run_id],
-        )?;
-        if added == 1 {
-            return Ok(false);
-        }
-        tx.query_row(
-            "SELECT run_id != ?4 FROM unit_unread WHERE reader = ?1 AND kind = ?2 AND unit = ?3",
-            params![reader, kind, unit.path, run_id],
+    let part = (!unit.part.is_empty()).then_some(&unit.part);
+    let before: Option<String> = tx
+        .query_row(
+            "SELECT run_id FROM unit_unread WHERE ?4 IS NULL
+               AND reader = ?1 AND kind = ?2 AND unit = ?3
+             UNION ALL SELECT run_id FROM part_unread WHERE ?4 IS NOT NULL
+               AND reader = ?1 AND kind = ?2 AND unit = ?3 AND part = ?4",
+            params![reader, kind, unit.path, part],
             |r| r.get(0),
         )
-    } else {
-        let added = tx.execute(
-            "INSERT OR IGNORE INTO part_unread (reader, kind, unit, part, run_id)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![reader, kind, unit.path, unit.part, run_id],
-        )?;
-        if added == 1 {
-            return Ok(false);
-        }
-        tx.query_row(
-            "SELECT run_id != ?5 FROM part_unread
-             WHERE reader = ?1 AND kind = ?2 AND unit = ?3 AND part = ?4",
-            params![reader, kind, unit.path, unit.part, run_id],
-            |r| r.get(0),
-        )
+        .optional()?;
+    match part {
+        None => tx.execute(
+            "INSERT INTO unit_unread (reader, kind, unit, run_id) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT DO UPDATE SET run_id = excluded.run_id",
+            params![reader, kind, unit.path, run_id],
+        )?,
+        Some(part) => tx.execute(
+            "INSERT INTO part_unread (reader, kind, unit, part, run_id) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT DO UPDATE SET run_id = excluded.run_id",
+            params![reader, kind, unit.path, part, run_id],
+        )?,
+    };
+    Ok(before.is_some_and(|b| b != run_id))
+}
+
+/// Forgets the unread marks of units a reading shows are not there: inside a folder whose
+/// listing it read in full and met by none of its units, as the checkout walk shows a folder
+/// gone. Reading a unit again forgets its mark too (`record`). A watched file that is gone
+/// takes what was known of it with it, and `fault::lost` leaves out what is gone.
+pub fn found_absent(
+    tx: &Transaction,
+    reader: &str,
+    kind: &str,
+    listed: &[Unit],
+    met: &BTreeSet<&str>,
+) -> rusqlite::Result<()> {
+    if listed.is_empty() {
+        return Ok(());
     }
+    let marked: Vec<String> = tx
+        .prepare(
+            "SELECT unit FROM unit_unread WHERE reader = ?1 AND kind = ?2
+             UNION SELECT unit FROM part_unread WHERE reader = ?1 AND kind = ?2",
+        )?
+        .query_map(params![reader, kind], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    for unit in marked {
+        let shown = listed
+            .iter()
+            .any(|l| l.part.is_empty() && l.path == parent(&unit));
+        if shown && !met.contains(unit.as_str()) {
+            for table in ["unit_unread", "part_unread"] {
+                tx.execute(
+                    &format!("DELETE FROM {table} WHERE reader = ?1 AND kind = ?2 AND unit = ?3"),
+                    params![reader, kind, unit],
+                )?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Forgets a whole content reading's unread mark.
@@ -447,7 +481,7 @@ pub fn found_as(
 
 /// Judges what one reading found.
 pub struct Judge<'a> {
-    pub tx: &'a Transaction<'a>,
+    pub tx: &'a Connection,
     pub reader: &'a str,
     pub kind: &'a str,
     pub run_id: &'a str,
@@ -478,10 +512,11 @@ impl Judge<'_> {
             .optional()
     }
 
+    /// Whether an earlier run read the part `unit` names, or any part of a whole `unit`.
     pub fn part_read_before(&self, unit: &Unit) -> rusqlite::Result<bool> {
         self.tx.query_row(
             "SELECT EXISTS (SELECT 1 FROM part_read
-             WHERE reader = ?1 AND kind = ?2 AND unit = ?3 AND part = ?4 AND run_id != ?5)",
+             WHERE reader = ?1 AND kind = ?2 AND unit = ?3 AND ?4 IN ('', part) AND run_id != ?5)",
             params![self.reader, self.kind, unit.path, unit.part, self.run_id],
             |r| r.get(0),
         )
@@ -535,8 +570,8 @@ impl Judge<'_> {
     pub fn facts(&self, observed: &Unit) -> rusqlite::Result<Facts> {
         let unit = &observed.path;
         let read = self.before(self.met(self.reader, self.kind, unit, "read")?);
-        let part_read =
-            read.is_none() && !observed.part.is_empty() && self.part_read_before(observed)?;
+        // A file read whole covers its parts; a part read covers the file it is a part of.
+        let part_read = read.is_none() && self.part_read_before(observed)?;
         let seen = self.met(self.reader, self.kind, unit, "seen")?;
         let listing = self.before(self.met(self.reader, self.kind, parent(unit), "read")?);
         let seen_before = seen.as_ref().filter(|s| s.run != self.run_id);

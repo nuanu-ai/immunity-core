@@ -1289,7 +1289,7 @@ pub(crate) fn cause_class(c: crate::store::Cause) -> crate::contract::v1::Cause 
     }
 }
 
-fn uncovered_message(u: &crate::covered::Uncovered) -> crate::contract::v1::Uncovered {
+pub(crate) fn uncovered_message(u: &crate::covered::Uncovered) -> crate::contract::v1::Uncovered {
     use crate::known::whole;
     crate::contract::v1::Uncovered {
         id: u.cause.id.to_string(),

@@ -69,7 +69,7 @@ pub(crate) fn headline(s: &Status) -> (Headline, Vec<B>) {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// One change to a status.
@@ -77,7 +77,7 @@ mod tests {
 
     /// A fresh status with nothing to look at, this Mac watched by a live watcher, and no fault:
     /// the one calm is for.
-    fn calm() -> Status {
+    pub(crate) fn calm() -> Status {
         Status {
             needs_a_look: Some(v1::NeedsALook::default()),
             this_mac: Some(v1::ThisMac {
