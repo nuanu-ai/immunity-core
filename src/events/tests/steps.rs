@@ -457,6 +457,79 @@ fn a_place_that_no_longer_fits_its_file_is_its_start() {
 }
 
 #[test]
+fn an_empty_file_no_step_reads_is_kept_at_its_start_and_its_deletion_loses_nothing() {
+    // An empty file is read to its end as it is: deleted later, it was not deleted unread, as
+    // after one reading of the log.
+    let root = installed("steps-empty");
+    write_at(&root, &named(0), &plain(1), NOW - 300);
+    write_at(&root, &named(1), "", NOW - 250);
+    write_at(&root, &named(2), &plain(2), NOW - 200);
+    let (_dir, mut conn) = store("steps-empty-store");
+    assert_eq!(stepped(&mut conn, &root, NOW), 2);
+    let sql = "SELECT offset FROM event_file WHERE name = ?1";
+    let offset: i64 = conn.query_row(sql, [named(1)], |r| r.get(0)).unwrap();
+    assert_eq!(offset, 0);
+    std::fs::remove_file(root.join(LOG).join(named(1))).unwrap();
+    let note = format!("{} {} 0 cap\n", NOW + 5, named(1));
+    std::fs::write(root.join(LOG).join(REMOVED), note).unwrap();
+    reading(&mut conn, &root, NOW + 10, None);
+    let t = level(&conn, NOW + 10).unwrap().unwrap().last_day;
+    assert_eq!((t.removed_cap, t.removed_unread), (1, 0));
+}
+
+#[test]
+fn whether_file_events_are_collected_stays_as_the_last_whole_reading_said_until_the_pass_ends() {
+    // A step with log left neither drops a file-event gap that holds this Mac in part because
+    // the record of file events went, nor lets file rules watch because it came: the status
+    // and the rules judged say what the last whole reading said until the pass ends.
+    let collects = r#"["/usr/bin/eslogger","exec","create","rename"]"#;
+    for had in [true, false] {
+        let root = installed(&format!("steps-collects-{had}"));
+        let record = root.join(COLLECTS);
+        std::fs::create_dir_all(record.parent().unwrap()).unwrap();
+        let swap = |on: bool| match on {
+            true => std::fs::write(&record, collects).unwrap(),
+            false => std::fs::remove_file(&record).unwrap(),
+        };
+        if had {
+            swap(true);
+        }
+        // One file event of three is lost.
+        let files = created(1, "/Users/example/a") + "\n" + &created(3, "/Users/example/b") + "\n";
+        write_at(&root, &named(0), &(plain(1) + &files), NOW - 3600);
+        let (dir, mut conn) = fresh(&format!("steps-collects-{had}-store"));
+        reading(&mut conn, &root, NOW - 3590, None);
+        swap(!had);
+        write_at(&root, &named(1), &plain(2), NOW - 200);
+        write_at(&root, &named(2), &plain(3), NOW - 100);
+        let said = |conn: &Connection| {
+            let l = level(conn, NOW).unwrap().unwrap();
+            let rules = crate::status::rules_now(Some(&l));
+            let partly = rules.judged == crate::contract::v1::Judged::Part as i32;
+            let status = concluded_at(conn, &dir, NOW);
+            let files = format!("{:?}", message(&l).file_events);
+            (
+                l.lost_since_check(),
+                partly,
+                format!("{rules:?}"),
+                status,
+                files,
+            )
+        };
+        let before = said(&conn);
+        assert_eq!((before.0, before.1), (had, had));
+        let mut pass = Pass::default();
+        reading(&mut conn, &root, NOW, Some(&mut pass));
+        assert!(pass.more());
+        assert_eq!(said(&conn), before, "{had}");
+        reading(&mut conn, &root, NOW, Some(&mut pass));
+        assert!(!pass.more());
+        let after = said(&conn);
+        assert_eq!((after.0, after.1), (!had, !had));
+    }
+}
+
+#[test]
 fn after_a_downgrade_only_the_file_being_written_tells_what_arrives_whichever_step_reads_it() {
     // No false calm after a downgrade. The earlier collector's file sorts first and is read by
     // the first step; the later collector's file, written before, by the next. Once the first

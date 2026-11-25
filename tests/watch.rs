@@ -915,6 +915,33 @@ fn a_backlog_of_log_files_is_read_one_file_a_step_and_on_at_once_while_log_is_le
 }
 
 #[test]
+fn a_step_with_log_left_and_no_program_starts_says_nothing_of_a_state_it_did_not_conclude() {
+    // eslogger said something after the log was last written: the state is failing, and only the
+    // step that ends the pass concludes it, so the first `program_starts` line is that step's.
+    let mac = Mac::new("events-steps-said");
+    mac.event_level();
+    mac.run();
+    let log = mac.sys().join(EVENT_LOG);
+    let written = SystemTime::now() - Duration::from_secs(60);
+    for hour in ["00", "01", "02"] {
+        let name = format!("exec-20261004T000013-20261004T{hour}0000.jsonl");
+        let line = r#"{"schema_version":1,"seq_num":1,"time":"2026-10-04T00:00:03.000003Z","process":{"executable":{"path":"/usr/bin/curl"}},"event":{"create":{"destination":"/Users/example/a"}}}"#;
+        std::fs::write(log.join(&name), format!("{line}\n")).unwrap();
+        let f = std::fs::File::options().write(true).open(log.join(&name));
+        f.unwrap().set_modified(written).unwrap();
+    }
+    std::fs::write(log.join("eslogger.err"), "eslogger: example failure\n").unwrap();
+    let quiet = ["--events-every", "3600", "--sample-every", "3600"];
+    let mut w = mac.watch_with(&quiet).started();
+    let first = w.next("program_starts");
+    assert_eq!(
+        (&first["state"], &first["starts"]),
+        (&"failing".into(), &0.into())
+    );
+    assert!(w.stop().success());
+}
+
+#[test]
 fn two_readings_in_a_row_that_met_a_busy_store_are_told_until_a_reading_reads() {
     // A reading that never ends holds the store: the watcher reads nothing, so it is not live.
     let mac = Mac::new("events-busy-twice");

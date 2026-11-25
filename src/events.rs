@@ -1282,7 +1282,9 @@ fn look(
         if step.is_some_and(|k| k != Some(i)) {
             times.push(f.mtime.0);
             let fits = |&(inode, to): &(u64, u64)| inode == f.inode && to <= f.len;
-            let kept = place(f).map(|p| if fits(&p) { p } else { (f.inode, 0) });
+            // An empty file no step selects has its start as its place, as a reading saves it.
+            let saved = place(f).or((f.len == 0).then_some((f.inode, 0)));
+            let kept = saved.map(|p| if fits(&p) { p } else { (f.inode, 0) });
             files.extend(kept.map(|(inode, to)| (name.clone(), inode, to)));
             continue;
         }
@@ -2524,10 +2526,10 @@ fn collected(conn: &Connection) -> rusqlite::Result<(bool, Option<String>)> {
 /// counts, where each file was read up to, and coverage of this machine, one row in place of
 /// the one before, as samples keep theirs. With a `pass`, of one step of it (`Pass`); without,
 /// of every file, as a full check reads it. A step that leaves log after its file writes what it
-/// counted and where it is, and leaves the state, what was said and the coverage of the last
-/// whole reading standing. With no reading of the level in the store there is nothing to leave
-/// standing, and the reading is whole, as it was before readings in steps: nothing is read in
-/// part where no conclusion stands.
+/// counted and where it is, and leaves the state, what was said, whether file events are
+/// collected and the coverage of the last whole reading standing. With no reading of the level
+/// in the store there is nothing to leave standing, and the reading is whole, as it was before
+/// readings in steps: nothing is read in part where no conclusion stands.
 pub fn read(
     tx: &Transaction,
     run_id: &str,
@@ -2604,17 +2606,21 @@ pub fn read(
                 params![now, f.files, f.lost, f.unknown_gaps, f.unreadable],
             )?;
             let seq = |k: usize| log.file_seq[k].map(|s| s as i64);
+            // Whether file events are collected is part of the conclusion: a standing step
+            // leaves it as the last whole reading did.
             tx.execute(
                 "INSERT INTO event_files (id, collected, why, last_create, last_rename)
                  VALUES (1, ?1, ?2, ?3, ?4)
-                 ON CONFLICT (id) DO UPDATE SET collected = excluded.collected,
-                     why = excluded.why, last_create = excluded.last_create,
-                     last_rename = excluded.last_rename",
+                 ON CONFLICT (id) DO UPDATE SET
+                     collected = CASE WHEN ?5 THEN collected ELSE excluded.collected END,
+                     why = CASE WHEN ?5 THEN why ELSE excluded.why END,
+                     last_create = excluded.last_create, last_rename = excluded.last_rename",
                 params![
                     log.collects.is_ok(),
                     log.collects.as_ref().err().map(|e| &e.1),
                     seq(0),
-                    seq(1)
+                    seq(1),
+                    standing
                 ],
             )?;
             put_arrivals(tx, &log.arrivals)?;
