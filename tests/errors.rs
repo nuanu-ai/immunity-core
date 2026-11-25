@@ -270,14 +270,17 @@ fn a_store_another_process_holds_is_one_to_ask_again_in_every_form_and_never_unr
             .unwrap();
     db.execute_batch("BEGIN EXCLUSIVE").unwrap();
     // Each command waits out SQLite's busy timeout of five seconds, so they wait side by side.
-    let asked: [&[&str]; 7] = [
+    let asked: [&[&str]; 10] = [
         &["status", "--json"],
         &["findings", "--proto"],
         &["vulnerabilities"],
+        &["vulnerability", "CVE-2023-4863", "--json"],
         &["owner", "--json"],
         &["rules", "--json"],
         &["matches", "--json", "--system-root", "."],
         &["sample", "--json", "--sample-input", "bad.json"],
+        &["view", "--no-open"],
+        &["servers"],
     ];
     let outs: Vec<Output> = std::thread::scope(|s| {
         let waits: Vec<_> = asked.iter().map(|a| s.spawn(|| e.on(&store, a))).collect();
@@ -286,8 +289,9 @@ fn a_store_another_process_holds_is_one_to_ask_again_in_every_form_and_never_unr
     db.execute_batch("ROLLBACK").unwrap();
     for (args, out) in asked.iter().zip(&outs) {
         assert_eq!(out.status.code(), Some(4), "{args:?}: {}", stderr(out));
-        let (code, outcome) = match args.get(1) {
-            Some(&"--proto") => {
+        let form = ["--proto", "--json"].into_iter().find(|f| args.contains(f));
+        let (code, outcome) = match form {
+            Some("--proto") => {
                 let e = v1::Failure::decode(&out.stdout[..]).unwrap().errors[0].clone();
                 (e.code, e.outcome.unwrap_or_default())
             }
