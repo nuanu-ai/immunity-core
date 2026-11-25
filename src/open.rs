@@ -1,5 +1,5 @@
 //! Every file the core reads is opened here, one way, and `scripts/lint.sh` fails a read of a
-//! file anywhere else outside `store.rs` and `service.rs`.
+//! file anywhere else outside the files it names with their reasons.
 //!
 //! The path is looked at first, by `lstat`: an error there is the only one a reader may take
 //! as nothing there (`look::Absent`), and anything but a regular file is refused by what it is
