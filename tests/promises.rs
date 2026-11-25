@@ -11919,7 +11919,7 @@ fn a_change_in_a_watched_place_stays_open_through_quiet_runs_and_is_the_number_t
     assert_eq!(shown["technique_text"], item["technique_text"]);
     assert_eq!(
         shown["evidence"],
-        serde_json::json!({ "place_changed": { "change": "new", "presence_only": false } })
+        serde_json::json!({ "place_changed": { "change": "new", "presence_only": false, "read_as_before_at": null } })
     );
     assert_eq!(shown["answer"], serde_json::Value::Null);
     let (_, text, _) = finding_out(&w.store(), &[id]);

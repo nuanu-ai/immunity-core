@@ -305,6 +305,7 @@ pub fn evidence(conn: &Connection, f: &Found) -> rusqlite::Result<Option<v1::evi
         return Ok(Some(Body::PlaceChanged(v1::PlaceChanged {
             change,
             presence_only: crate::watched::last_presence_only(conn, &f.about)?,
+            read_as_before_at: read_as_before(&findings::basis(conn, &f.id)?),
         })));
     }
     let became = || f.became.as_deref().map(whole);
@@ -341,6 +342,33 @@ pub fn evidence(conn: &Connection, f: &Found) -> rusqlite::Result<Option<v1::evi
             _ => return Ok(None),
         },
     ))
+}
+
+/// The journal's time of a reading that read a file's whole content with the checksum it had
+/// before the first change of content the finding rests on, from the finding's own `has_content`
+/// entries alone. Only when they are of one file and form one chain of whole-content checksums
+/// (`sha256:`), each entry's value before being the one after the entry before it; and when the
+/// value before the first is the value after the latest: then the time of the latest. It is said
+/// of that reading alone: a change the journal holds and the finding does not (one the rule
+/// stays quiet on, a removal and a return) may lie between two entries whose values still meet. A reading that could not read the file
+/// writes no `has_content` entry, so the time is never later than the last reading that read it.
+/// `None` when anything else holds, a `value sha256:` of one selected value among it.
+fn read_as_before(basis: &[findings::Basis]) -> Option<i64> {
+    let content: Vec<&findings::Basis> = basis
+        .iter()
+        .filter(|b| b.predicate.as_deref() == Some("has_content"))
+        .collect();
+    let (first, latest) = (content.first()?, content.last()?);
+    let whole = |v: &Option<String>| v.clone().filter(|d| d.starts_with("sha256:"));
+    let subject = first.subject.as_deref()?;
+    let one_file = content
+        .iter()
+        .all(|b| b.subject.as_deref() == Some(subject));
+    let chained = content
+        .windows(2)
+        .all(|w| whole(&w[0].new_value).is_some() && w[0].new_value == w[1].old_value);
+    let back = whole(&first.old_value)? == whole(&latest.new_value)?;
+    (one_file && chained && back).then_some(latest.at)
 }
 
 /// What happened to the place a finding is about, for a rule whose evidence is a place that
@@ -517,7 +545,66 @@ fn package_in(
 
 #[cfg(test)]
 mod tests {
-    use super::{change, v1};
+    use super::{change, read_as_before, v1};
+
+    #[test]
+    fn a_read_back_is_said_only_of_one_file_s_unbroken_chain_of_whole_content_checksums() {
+        type Value<'a> = Option<&'a str>;
+        let entry = |at: i64, predicate: &str, subject: Value, old: Value, new: Value| {
+            crate::findings::Basis {
+                seq: at,
+                at,
+                run_id: at.to_string(),
+                entry: "changed".into(),
+                reader: None,
+                kind: None,
+                predicate: Some(predicate.into()),
+                subject: subject.map(str::to_string),
+                old_value: old.map(str::to_string),
+                new_value: new.map(str::to_string),
+            }
+        };
+        let file = Some("file:machine:mac/.zshrc");
+        let content = |at, old, new| entry(at, "has_content", file, old, new);
+        let (a, b, c) = (Some("sha256:aa"), Some("sha256:bb"), Some("sha256:cc"));
+        // A whole chain back to where it began: the latest reading's time, however long, and
+        // whatever else of the place changed beside it.
+        assert_eq!(
+            read_as_before(&[content(1, a, b), content(2, b, a)]),
+            Some(2)
+        );
+        let long = [content(1, a, b), content(2, b, c), content(3, c, a)];
+        assert_eq!(read_as_before(&long), Some(3));
+        let signer = entry(3, "signed_by", file, Some("x"), Some("y"));
+        let beside = [content(1, a, b), content(2, b, a), signer];
+        assert_eq!(read_as_before(&beside), Some(2));
+        // A checksum of one selected value is not of the file's whole content.
+        let (v, w) = (Some("value sha256:aa"), Some("value sha256:bb"));
+        assert_eq!(read_as_before(&[content(1, v, w), content(2, w, v)]), None);
+        // Two things, or a thing not named: nothing.
+        let other = entry(2, "has_content", Some("file:machine:mac/.bashrc"), b, a);
+        assert_eq!(read_as_before(&[content(1, a, b), other]), None);
+        let unnamed = entry(2, "has_content", None, b, a);
+        assert_eq!(read_as_before(&[content(1, a, b), unnamed]), None);
+        let unnamed = |at, old, new| entry(at, "has_content", None, old, new);
+        assert_eq!(read_as_before(&[unnamed(1, a, b), unnamed(2, b, a)]), None);
+        // A change the finding does not hold lay between two of its entries, first or later.
+        assert_eq!(read_as_before(&[content(1, a, b), content(2, c, a)]), None);
+        let later = [content(1, a, b), content(2, b, c), content(3, b, a)];
+        assert_eq!(read_as_before(&later), None);
+        // Removed and added again: no checksum links the two.
+        assert_eq!(
+            read_as_before(&[content(1, a, None), content(2, None, a)]),
+            None
+        );
+        // What is not a checksum, however equal; a first reading, with nothing before it.
+        let link = Some("dangling link");
+        assert_eq!(
+            read_as_before(&[content(1, link, b), content(2, b, link)]),
+            None
+        );
+        assert_eq!(read_as_before(&[content(1, None, a)]), None);
+    }
 
     #[test]
     fn every_change_the_store_words_is_a_value_of_the_contract_and_never_unspecified() {
