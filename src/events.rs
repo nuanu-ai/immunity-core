@@ -124,6 +124,10 @@ pub const FILE_KINDS: [&str; 2] = ["create", "rename"];
 /// Why file events are not counted as collected, in the program's words.
 pub const STARTS_ONLY: &str = "the collector installed here records program starts only; installing the event level again adds files created and renamed";
 pub const REPLACED: &str = "the collector's launch daemon was replaced after the record of what it collects was written, so file events are not counted as collected; installing the event level again settles it";
+/// Why, when the record of what the collector records is there and could not be read: what the
+/// system said follows apart (`NotCollected`). Not a JSON list is the program's words alone.
+const UNREAD_RECORD: &str = "what the collector records could not be read";
+const NOT_A_LIST: &str = "what the collector records could not be read: it is not a JSON list";
 /// What a collector may keep beyond what the first one kept, by the names the status and the
 /// contract give them, each with what it is in a person's words:
 /// - `identity`: the pid version, start time, users and groups of a program started and of the
@@ -1182,7 +1186,7 @@ struct Log {
     said: Option<(&'static str, String)>,
     /// Whether the collector installed here is established to record file events, or why not:
     /// not given, or a record that is there and could not be read.
-    collects: Result<(), (Cause, String)>,
+    collects: Result<(), NotCollected>,
     /// What the lines say of each of `KEEPS`, after the last line read.
     arrivals: Arrivals,
     /// The filter's markers no gap has taken in yet.
@@ -1387,28 +1391,25 @@ fn bytes_of(text: &str) -> Option<u64> {
 
 /// Whether the collector installed here is established to record file events: the installer's
 /// record of what it collects names every kind in `FILE_KINDS` and was written no earlier than
-/// the launch daemon now installed. Otherwise why not, in the program's words: not given, or a
-/// record that is there and cannot be read, a failed reading with what failed.
-fn collects(root: &Path, daemon: &std::fs::Metadata) -> Result<(), (Cause, String)> {
+/// the launch daemon now installed. Otherwise why not: not given, or a record that is there and
+/// cannot be read, a failed reading with what failed.
+fn collects(root: &Path, daemon: &std::fs::Metadata) -> Result<(), NotCollected> {
     let path = root.join(COLLECTS);
-    let unread = |e: String| {
-        (
-            Cause::Failed,
-            format!("what the collector records could not be read: {e}"),
-        )
-    };
-    let not_given = |why: &str| (Cause::NotGiven, why.to_string());
+    let not = |cause, why, said| NotCollected { cause, why, said };
+    let unread = |e: std::io::Error| not(Cause::Failed, UNREAD_RECORD, Some(e.to_string()));
     let meta = match std::fs::metadata(&path) {
         Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(not_given(STARTS_ONLY)),
-        Err(e) => return Err(unread(e.to_string())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(not(Cause::NotGiven, STARTS_ONLY, None));
+        }
+        Err(e) => return Err(unread(e)),
     };
     if (meta.mtime(), meta.mtime_nsec()) < (daemon.mtime(), daemon.mtime_nsec()) {
-        return Err(not_given(REPLACED));
+        return Err(not(Cause::NotGiven, REPLACED, None));
     }
-    let bytes = std::fs::read(&path).map_err(|e| unread(e.to_string()))?;
+    let bytes = std::fs::read(&path).map_err(unread)?;
     let Ok(Value::Array(names)) = serde_json::from_slice::<Value>(&bytes) else {
-        return Err(unread("it is not a JSON list".into()));
+        return Err(not(Cause::Failed, NOT_A_LIST, None));
     };
     if FILE_KINDS
         .iter()
@@ -1416,7 +1417,27 @@ fn collects(root: &Path, daemon: &std::fs::Metadata) -> Result<(), (Cause, Strin
     {
         Ok(())
     } else {
-        Err(not_given(STARTS_ONLY))
+        Err(not(Cause::NotGiven, STARTS_ONLY, None))
+    }
+}
+
+/// Why file events are not counted as collected: the cause, why in the program's words, and
+/// apart what the system said, so that only the program's words reach `event_files.why` and
+/// `FileEvents.not_collected_reason`.
+#[derive(Clone, Debug)]
+pub struct NotCollected {
+    pub cause: Cause,
+    pub why: &'static str,
+    pub said: Option<String>,
+}
+
+impl NotCollected {
+    /// The reading's reason: why, then what the system said, cut where it is printed.
+    pub fn reason(&self) -> String {
+        match &self.said {
+            Some(said) => format!("{}: {said}", self.why),
+            None => self.why.to_string(),
+        }
     }
 }
 
@@ -1945,7 +1966,7 @@ fn read_file(
 /// hours, and how many other files the folder holds.
 struct Opened {
     installed_at: i64,
-    collects: Result<(), (Cause, String)>,
+    collects: Result<(), NotCollected>,
     dir: std::path::PathBuf,
     files: Vec<LogFile>,
     /// Files in the log folder that are not the collector's own, by their names: not read.
@@ -2579,7 +2600,7 @@ pub fn read(
                      last_create = excluded.last_create, last_rename = excluded.last_rename",
                 params![
                     log.collects.is_ok(),
-                    log.collects.as_ref().err().map(|e| &e.1),
+                    log.collects.as_ref().err().map(|e| e.why),
                     seq(0),
                     seq(1),
                     standing
@@ -3355,7 +3376,7 @@ pub struct Stretch {
     pub state: &'static str,
     pub said: Option<(&'static str, String)>,
     pub written: Option<i64>,
-    pub collects: Result<(), (Cause, String)>,
+    pub collects: Result<(), NotCollected>,
     /// Files in the log folder that are not the collector's own: not read.
     pub foreign: u64,
     /// What of `KEEPS` the lines it judged did not give, by kind.
@@ -3627,12 +3648,12 @@ pub fn instant(text: &str) -> Option<(i64, u32)> {
 /// could not be made out, or a line could not be read or an hour was deleted before it was
 /// read, over the last day, which is partial with the cause `covered` gives.
 fn files_covered(
-    collects: &Result<(), (Cause, String)>,
+    collects: &Result<(), NotCollected>,
     t: &Tally,
     f: &FileTally,
 ) -> (&'static str, Option<String>, Option<Cause>) {
-    if let Err((cause, why)) = collects {
-        return ("none", Some(why.clone()), Some(*cause));
+    if let Err(n) = collects {
+        return ("none", Some(n.reason()), Some(n.cause));
     }
     let mut said = f.gaps();
     if !t.shared_whole() {
