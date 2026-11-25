@@ -527,6 +527,25 @@ impl Judge<'_> {
         met.filter(|m| m.run != self.run_id)
     }
 
+    /// Whether an earlier run read in full something inside the folder `unit`, as the hooks a
+    /// configured folder holds are read without the folder being listed: what is inside a
+    /// folder was read there before whatever lists it.
+    fn inside_read_before(&self, unit: &str) -> rusqlite::Result<bool> {
+        let mut stmt = self.tx.prepare(
+            "SELECT unit FROM unit_read WHERE reader = ?1 AND kind = ?2 AND how = 'read'
+               AND run_id != ?3 AND unit != ?4",
+        )?;
+        let rows = stmt.query_map(params![self.reader, self.kind, self.run_id, unit], |r| {
+            r.get::<_, String>(0)
+        })?;
+        for inside in rows {
+            if under(&inside?, unit) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Whether an earlier run read the unit in full.
     pub fn read_before(&self, unit: &str) -> rusqlite::Result<bool> {
         Ok(self
@@ -572,6 +591,7 @@ impl Judge<'_> {
         let read = self.before(self.met(self.reader, self.kind, unit, "read")?);
         // A file read whole covers its parts; a part read covers the file it is a part of.
         let part_read = read.is_none() && self.part_read_before(observed)?;
+        let inside = read.is_none() && observed.part.is_empty() && self.inside_read_before(unit)?;
         let seen = self.met(self.reader, self.kind, unit, "seen")?;
         let listing = self.before(self.met(self.reader, self.kind, parent(unit), "read")?);
         let seen_before = seen.as_ref().filter(|s| s.run != self.run_id);
@@ -594,7 +614,7 @@ impl Judge<'_> {
             }
         };
         Ok(Facts {
-            read_before: read.is_some() || part_read,
+            read_before: read.is_some() || part_read || inside,
             new_to_listing: newer(listing.as_ref(), seen.as_ref(), self.run_id),
             in_new_checkout,
             met_before: first.is_some(),

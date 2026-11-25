@@ -5,25 +5,33 @@
 //! and a source that does not give it are. Who can fix it chooses only the words, never the
 //! sort. Everything here is decided from the store's tables, never from a reading's reason.
 //!
-//! 1. A unit is a fault when the baseline marks it not read now (`unit_unread`, `part_unread`)
-//!    and it was read here before by the baseline's own predicate, the one that makes losing
-//!    sight of it a finding (`baseline::Judge::facts`): whatever the cause, and whatever the
-//!    latest reading of its kind says, so a later reading that did not look at it again leaves
-//!    it standing. It ends when the baseline forgets the mark, as a reading reads it again or
-//!    finds it absent (`baseline::record`, `baseline::found_absent`), or when what holds it is
-//!    gone (`gone_entity`). The content of a watched file is never recorded as read in the
-//!    baseline, and its mark outlives the file: it has a reading of its own per file, which goes
-//!    with the file, and is a fault when that reading is not full and an earlier one was
-//!    (`Latest::last_full`), whatever its cause.
-//! 2. A failed reading of a reader with units (the watched places, the checkout walk) that
-//!    marked no unit unread in its run failed as a whole, the source not walked or not told: a
-//!    fault. So is a failed reading of any other reader, which reads a whole source present on
-//!    this Mac.
-//! 3. A failed reading that marked units unread in its run is a limit as a reading, whatever
-//!    those units are: the ones read before are told by rule 1, each once. So is the reading of
-//!    one file's content and the reading of the programs startup items run: each program it
-//!    could not open has a content reading of its own, and each startup item it could not tell
-//!    is a unit of its own kind, so what of them was read before is told by rule 1 too.
+//! In a reader with units (the watched places, the checkout walk) every failure names a unit
+//! and marks it not read with its run (`unit_unread`, `part_unread`): a file or a folder not
+//! read, a folder the walk could not list, in every reading over checkouts too, what Git's
+//! configuration says of a checkout's hooks (`watched::hooks_told`), and what a startup item
+//! runs, the item standing for it. A unit belongs to the deepest checkout the store ever knew
+//! that holds it.
+//!
+//! 1. A unit is a fault when it is marked not read now and was read here before by the
+//!    baseline's own predicate, the one that makes losing sight of it a finding
+//!    (`baseline::Judge::facts`), which counts what was read inside a folder: whatever the
+//!    cause, and whatever the latest reading of its kind says, so a later reading that did not
+//!    look at it again leaves it standing. It ends when the baseline forgets the mark, as a
+//!    reading reads it again or finds it absent (`baseline::record`, `baseline::found_absent`),
+//!    or when what holds it is gone (`gone_entity`): the file itself, or for a kind read in
+//!    projects, the deepest checkout that held it. The content of a watched file is a unit of
+//!    its own reading, which goes with the file, and is a fault when that reading is not full
+//!    and an earlier one was (`Latest::last_full`), whatever its cause.
+//! 2. What is left of a failed reading of a reader with units that marked no unit of its own
+//!    in its run is a failure that could name none: a fault, so that nothing goes unsaid. A
+//!    failed reading of any other reader reads a whole source present on this Mac: a fault.
+//! 3. A failed reading that marked a unit of its own is a limit as a reading: everything it
+//!    could not read is a unit, and rule 1 tells each read before once, by its name. The
+//!    reading of one file's content and the reading of the programs startup items run are
+//!    limits as readings for the same reason, though what they could not read is marked under
+//!    other kinds: the content is its own reading's unit, each program has a content reading of
+//!    its own, each item is a unit of its own kind and of the programs' kind for what it runs,
+//!    and what another kind watches is that kind's unit. What is left there has no reader.
 //!
 //! A server is judged by the machine where its causes are made (`server_read`).
 
@@ -31,6 +39,7 @@ use crate::baseline::{self, Unit};
 use crate::view::Latest;
 use crate::{checkouts, servers, targets, watched};
 use rusqlite::{Connection, params};
+use std::collections::BTreeSet;
 
 /// Whether `r`, a reading that failed, is a fault by rules 2 and 3.
 pub fn reading(conn: &Connection, r: &Latest) -> rusqlite::Result<bool> {
@@ -43,16 +52,11 @@ pub fn reading(conn: &Connection, r: &Latest) -> rusqlite::Result<bool> {
     }
 }
 
-/// Whether the reading `r` marked a unit unread in its run: within its checkout, for a reading
-/// of one.
+/// Whether the reading `r` marked a unit unread in its run: for a reading of one checkout, a
+/// unit whose deepest known checkout is that one, not one nested in it.
 fn marked_unread(conn: &Connection, r: &Latest) -> rusqlite::Result<bool> {
-    let checkout = r
-        .scope
-        .strip_prefix("checkout:")
-        .map(|c| match c.split_once('/') {
-            Some((_, rel)) => rel,
-            None => c,
-        });
+    let own = r.scope.strip_prefix("checkout:");
+    let known = baseline::past_checkouts(conn)?;
     let units: Vec<String> = conn
         .prepare(
             "SELECT unit FROM unit_unread WHERE reader = ?1 AND kind = ?2 AND run_id = ?3
@@ -61,9 +65,18 @@ fn marked_unread(conn: &Connection, r: &Latest) -> rusqlite::Result<bool> {
         )?
         .query_map(params![r.reader, r.kind, r.run_id], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-    Ok(units
-        .iter()
-        .any(|u| checkout.is_none_or(|rel| baseline::under(u, rel))))
+    let machine = own.and_then(|c| c.split_once('/')).map_or("", |(m, _)| m);
+    Ok((units.iter()).any(|u| own.is_none_or(|c| deepest(&known, machine, u) == Some(c))))
+}
+
+/// The deepest checkout the store ever knew on `machine` that holds `path`, as
+/// `<machine>/<path>`, the way `baseline::past_checkouts` names it.
+fn deepest<'a>(known: &'a BTreeSet<String>, machine: &str, path: &str) -> Option<&'a str> {
+    let rel = |c: &'a String| c.strip_prefix(machine)?.strip_prefix('/');
+    (known.iter())
+        .filter(|c| rel(c).is_some_and(|rel| baseline::under(path, rel)))
+        .max_by_key(|c| c.len())
+        .map(String::as_str)
 }
 
 /// Whether a unit marked unread by `run_id` was read before that run, by the baseline's own
@@ -91,8 +104,8 @@ fn read_before(
 pub struct Lost {
     /// The file it is, as ids name it: `file:<machine>/<unit>`.
     pub id: String,
-    /// Whether it is in a project, as a checkout's hooks are, rather than in this Mac's own
-    /// places.
+    /// Whether it is of a kind read in projects, as a checkout's hooks are, rather than of this
+    /// Mac's own places.
     pub project: bool,
 }
 
@@ -106,12 +119,14 @@ pub fn lost(conn: &Connection, latest: &[Latest]) -> rusqlite::Result<Vec<Lost>>
         .query_map([], |r| r.get(0))?
         .collect::<rusqlite::Result<_>>()?;
     let file = format!("file:{machine}/");
-    let checkout = format!("checkout:{machine}/");
-    let held = |unit: &Unit| {
+    let known = baseline::past_checkouts(conn)?;
+    // A gone file takes its marks; a gone checkout, those of the kinds read in projects whose
+    // deepest known checkout it was.
+    let held = |project: bool, unit: &Unit| {
+        let checkout = (deepest(&known, &machine, &unit.path)).map(|c| format!("checkout:{c}"));
         !gone.iter().any(|g| {
             g.strip_prefix(&file) == Some(&unit.to_string())
-                || g.strip_prefix(&checkout)
-                    .is_some_and(|rel| baseline::under(&unit.path, rel))
+                || project && checkout.as_ref() == Some(g)
         })
     };
     let marks: Vec<(String, String, Unit, String)> = conn
@@ -126,10 +141,11 @@ pub fn lost(conn: &Connection, latest: &[Latest]) -> rusqlite::Result<Vec<Lost>>
         .collect::<rusqlite::Result<_>>()?;
     let mut out = Vec::new();
     for (reader, kind, unit, run_id) in marks {
-        if held(&unit) && read_before(conn, &reader, &kind, &unit, &run_id)? {
+        let project = crate::autorun::in_projects(&kind);
+        if held(project, &unit) && read_before(conn, &reader, &kind, &unit, &run_id)? {
             out.push(Lost {
                 id: format!("{file}{unit}"),
-                project: kind == watched::HOOK_KIND,
+                project,
             });
         }
     }
@@ -375,22 +391,61 @@ mod tests {
         record(&conn, AGENTS, "run-3", &[B], &[]);
         assert_eq!(scope(&conn), "projects");
         let shop = format!("checkout:{MAC}/dev/shop");
+        located(&conn, &shop, checkouts::READER, checkouts::KIND, false);
+        assert!(!lost(&conn, &latest).unwrap().contains(&hook));
+    }
+
+    /// A thing, `subject`, located on this Mac by a reading of `reader` and `kind`: still
+    /// there, or gone.
+    fn located(conn: &Connection, subject: &str, reader: &str, kind: &str, there: bool) {
         let tx = conn.unchecked_transaction().unwrap();
-        crate::store::put_entity(&tx, &shop).unwrap();
-        tx.execute(
-            "INSERT OR IGNORE INTO coverage_kind (name) VALUES (?1)",
-            [checkouts::KIND],
-        )
-        .unwrap();
+        crate::store::put_entity(&tx, subject).unwrap();
+        let kinds = "INSERT OR IGNORE INTO coverage_kind (name) VALUES (?1)";
+        tx.execute(kinds, [kind]).unwrap();
+        let (layer, retracted) = if there {
+            ("live", None)
+        } else {
+            ("retracted", Some(3))
+        };
         tx.execute(
             "INSERT INTO assertion (layer, subject, predicate, object, reader, scope, kind,
                                     source_ref, basis, observed_at, run_id, retracted_at)
-             VALUES ('retracted', ?1, 'located_on', ?2, ?3, ?2, ?4, 'x', 'observed', 1, 'run-1', 3)",
-            params![shop, MAC, checkouts::READER, checkouts::KIND],
+             VALUES (?5, ?1, 'located_on', ?2, ?3, ?2, ?4, 'x', 'observed', 1, 'run-1', ?6)",
+            params![subject, MAC, reader, kind, layer, retracted],
         )
         .unwrap();
         tx.commit().unwrap();
-        assert!(!lost(&conn, &latest).unwrap().contains(&hook));
+    }
+
+    #[test]
+    fn a_gone_checkout_takes_only_the_marks_of_projects_it_held_deepest_and_a_gone_file_its_own() {
+        let (_dir, conn) = store("fault-gone");
+        // The home folder was once a checkout, as a repository of settings files is, and so
+        // was `dev`, which holds a checkout still there.
+        for (rel, there) in [(".", false), ("dev", false), ("dev/shop", true)] {
+            let checkout = format!("checkout:{MAC}/{rel}");
+            located(&conn, &checkout, checkouts::READER, checkouts::KIND, there);
+        }
+        let (kept, gone) = (
+            "dev/shop/.git/hooks/pre-commit",
+            "dev/.git/hooks/pre-commit",
+        );
+        record(&conn, AGENTS, "run-1", &[A, B], &[]);
+        record(&conn, watched::HOOK_KIND, "run-1", &[kept, gone], &[]);
+        unread(&conn, AGENTS, "run-2", &[A, B]);
+        unread(&conn, watched::HOOK_KIND, "run-2", &[kept, gone]);
+        // A file gone takes its own mark alone.
+        located(
+            &conn,
+            &format!("file:{MAC}/{B}"),
+            watched::READER,
+            AGENTS,
+            false,
+        );
+        assert_eq!(
+            lost_ids(&conn),
+            [A, kept].map(|u| format!("file:{MAC}/{u}"))
+        );
     }
 
     #[test]
@@ -426,9 +481,10 @@ mod tests {
         put(&conn, PLACES, "run-2", Some((DENIED, Cause::Failed)));
         let limit = (vec![(NOT_PERMITTED.id, 1, false)], "watched", "calm");
         assert_eq!(sorted(&conn), limit);
-        // Read in the run that judged it unread is not read before it.
+        // Read in the run that judged it unread is not read before it, and neither is a
+        // folder something inside which was read in that run.
         record(&conn, AGENTS, "run-2", &[B], &[]);
-        unread(&conn, AGENTS, "run-2", &[B]);
+        unread(&conn, AGENTS, "run-2", &[B, "Library/LaunchAgents"]);
         assert_eq!(sorted(&conn), limit);
     }
 
@@ -456,7 +512,12 @@ mod tests {
         unread(&conn, AGENTS, "run-2", &[A]);
         assert!(!fault(&conn, PLACES));
         assert_eq!(lost_ids(&conn), [format!("file:{MAC}/{A}")]);
-        // A reading of one checkout is judged by the units within it.
+        // A reading of one checkout is judged by the units whose deepest known checkout it is,
+        // not those of a checkout nested in it.
+        for rel in ["dev/shop", "dev/shop/vendor/lib"] {
+            let checkout = format!("checkout:{MAC}/{rel}");
+            located(&conn, &checkout, checkouts::READER, checkouts::KIND, true);
+        }
         let hooks = (
             watched::READER,
             "checkout:machine:example-mac/dev/shop",
@@ -472,7 +533,7 @@ mod tests {
             &conn,
             watched::HOOK_KIND,
             "run-3",
-            &["dev/other/.git/hooks/x"],
+            &["dev/shop/vendor/lib/.git/hooks/x"],
         );
         assert!(fault(&conn, hooks));
         unread(

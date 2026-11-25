@@ -421,7 +421,9 @@ pub fn look_checkout(
     let mut told = untold.is_none();
     let before = look.not_read().count();
     for (path, names) in folder.configured() {
-        let unit = Unit::whole(crate::checkouts::rel(at.homes[0], path));
+        // Named as its hooks are, by the home folder it is under, as given or made real.
+        let home = (at.homes.into_iter()).find(|h| path.starts_with(h));
+        let unit = Unit::whole(crate::checkouts::rel(home.unwrap_or(at.homes[0]), path));
         configured_hooks(&mut look, path, unit.clone(), names, &at);
         // A folder that could not be looked at is not told yet.
         told &= !look.not_read().any(|u| u.unit == unit);
@@ -434,7 +436,7 @@ pub fn look_checkout(
     }
     match untold {
         Some((cause, why)) => {
-            look.short(cause, why);
+            look.short_named([hooks_told(&checkout.rel)], cause, why);
             look.unplaced();
         }
         None if told => look.read(hooks_told(&checkout.rel)),

@@ -998,6 +998,11 @@ pub fn places() -> impl Iterator<Item = (&'static Point, Kind)> {
         .filter_map(|p| Some((p, p.place?)))
 }
 
+/// Whether a coverage kind is of a row read in each checkout, as the hooks are.
+pub fn in_projects(kind: &str) -> bool {
+    (POINTS.iter()).any(|p| p.scope == Scope::Checkout && p.kind() == kind)
+}
+
 /// The version of macOS this Mac runs, by its major number, as the kernel holds it; or not
 /// known, which is never a version a row was checked on. The status says how many rows were
 /// not checked on it (`not_checked_said`).

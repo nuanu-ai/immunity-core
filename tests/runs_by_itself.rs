@@ -932,6 +932,11 @@ fn a_known_project_that_cannot_be_looked_at_is_kept_and_the_reading_says_why_unt
     );
     assert_eq!(checkouts_cause(&e), "failed");
     assert_eq!(presence(&e, rel), "held");
+    // Each is a unit of the walk's failure, which is a limit as a reading: what was read in
+    // them before, their hooks, is the one fault.
+    let hooks = [rel, ".work/shut"].map(|r| format!("~/{r}/.git/hooks"));
+    assert_eq!(lost(&e), hooks);
+    assert_eq!(held(&said(&e).1).1, ["read-before-not-read-now"]);
     e.full();
     assert_eq!(e.coverage(CHECKOUTS_KIND), "full|");
     assert_eq!(presence(&e, rel), "held");
@@ -954,6 +959,18 @@ fn a_walk_whose_folder_is_not_one_writes_a_failed_reading_and_the_next_whole_wal
     );
     assert_eq!(checkouts_cause(&e), "failed");
     assert_eq!(presence(&e, "dev/shop"), "held");
+    // Its root is the unit of the failure, in the walk and in every reading over checkouts:
+    // never listed, a limit everywhere; listed before, a fault by its name.
+    assert_eq!(held(&said(&e).1).1, Vec::<String>::new());
+    let notes = e.home().join("notes");
+    std::fs::create_dir_all(&notes).unwrap();
+    e.full();
+    std::fs::remove_dir(&notes).unwrap();
+    put(&notes, "not a folder\n");
+    e.run_in(&notes);
+    assert_eq!(lost(&e), ["~/notes"]);
+    assert_eq!(held(&said(&e).1).1, ["read-before-not-read-now"]);
+    std::fs::remove_file(&notes).unwrap();
     e.full();
     assert_eq!(e.coverage(CHECKOUTS_KIND), "full|");
 }
@@ -1186,6 +1203,102 @@ fn a_watched_file_read_before_is_a_fault_until_its_folder_is_listed_without_it()
     std::fs::remove_file(&plist).unwrap();
     e.run();
     assert!(lost(&e).is_empty(), "{:?}", lost(&e));
+}
+
+#[test]
+fn a_folder_the_walk_never_listed_holds_no_reading_over_checkouts_from_calm() {
+    // The walk's failure is said by every reading over checkouts; the folder it could not
+    // list is the unit of each, so one never listed is a limit everywhere.
+    let e = Estate::new("walk-never-listed");
+    e.checkout("dev/shop");
+    let closed = e.home().join("dev/closed");
+    std::fs::create_dir_all(&closed).unwrap();
+    mode(&closed, 0o000);
+    e.run();
+    e.run();
+    let (_, s) = said(&e);
+    mode(&closed, 0o755);
+    assert_eq!(held(&s).1, Vec::<String>::new(), "{s:#}");
+}
+
+#[test]
+fn a_configured_hooks_folder_whose_hooks_were_read_and_that_cannot_be_looked_at_now_is_a_fault() {
+    // Git runs the hooks of `core.hooksPath` by name, so the folder is never listed: what was
+    // read inside it makes it read before.
+    let e = Estate::new("hooks-folder-closed");
+    let tree = e.checkout("dev/tree");
+    put(
+        &tree.join(".git/config"),
+        "[core]\n hooksPath = tools/hooks\n",
+    );
+    put(&tree.join("tools/hooks/pre-push"), "# hook\n");
+    e.run();
+    assert!(lost(&e).is_empty(), "{:?}", lost(&e));
+    mode(&tree.join("tools"), 0o000);
+    e.run();
+    let names = lost(&e);
+    mode(&tree.join("tools"), 0o755);
+    assert_eq!(names, ["~/dev/tree/tools/hooks"]);
+}
+
+#[test]
+fn what_git_told_of_a_checkouts_hooks_and_cannot_tell_now_is_a_fault_until_it_tells_again() {
+    let e = Estate::new("hooks-untold");
+    let tree = e.checkout("dev/tree");
+    let config = tree.join(".git/config");
+    put(&config, "[core]\n hooksPath = hooks\n");
+    put(&tree.join("hooks/pre-push"), "# hook\n");
+    // A hook in `.git/hooks` unreadable since it was first met: a unit of the same reading,
+    // never read, which leaves the untold folder a fault of its own.
+    let shut = tree.join(".git/hooks/pre-commit");
+    put(&shut, "# hook\n");
+    mode(&shut, 0o000);
+    e.run();
+    put(&config, "[unclosed\n");
+    e.run();
+    let names = lost(&e);
+    assert_eq!(names, ["~/dev/tree/.git/config#core.hooksPath"]);
+    put(&config, "[core]\n hooksPath = hooks\n");
+    e.run();
+    mode(&shut, 0o644);
+    assert!(lost(&e).is_empty(), "{:?}", lost(&e));
+}
+
+#[test]
+fn a_startup_item_whose_program_can_no_longer_be_told_is_a_fault_by_its_name_and_one_never_told_a_limit()
+ {
+    let e = Estate::new("target-told-before");
+    e.shipped("usr/local/bin/runner");
+    let agent = e.agent("a");
+    launch_item(&agent, &["/usr/local/bin/runner"]);
+    put(&e.agent("broken"), "not a property list\n");
+    e.run();
+    assert!(lost(&e).is_empty(), "{:?}", lost(&e));
+    // Its file is read in full; what it runs is not.
+    put(&agent, "not a property list\n");
+    e.run();
+    assert_eq!(lost(&e), ["~/Library/LaunchAgents/org.example.a.plist"]);
+    launch_item(&agent, &["/usr/local/bin/runner"]);
+    e.run();
+    assert!(lost(&e).is_empty(), "{:?}", lost(&e));
+}
+
+#[test]
+fn hooks_never_read_of_a_known_project_now_behind_a_link_are_a_limit() {
+    // The hooks folder of a project is closed at its first check; then a link takes the place
+    // of the project's folder, and its hooks are not looked at through it.
+    let e = Estate::new("moved-never-read");
+    let shop = e.checkout("dev/shop");
+    let hooks = shop.join(".git/hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    mode(&hooks, 0o000);
+    e.full();
+    mode(&hooks, 0o755);
+    let away = e.0.join("away");
+    std::fs::rename(&shop, &away).unwrap();
+    std::os::unix::fs::symlink(&away, &shop).unwrap();
+    e.full();
+    assert_eq!(held(&said(&e).1).1, Vec::<String>::new());
 }
 
 /// The names `immunity status` gives of what was read here before and is not read now.
@@ -8740,7 +8853,9 @@ fn a_narrower_check_that_does_not_look_at_a_unit_read_before_leaves_its_fault_st
     let (text, s) = said(&e);
     mode(0o644);
     assert!(about(&s, "~/dev/shop/.mcp.json").contains(&lost), "{s:#}");
-    assert_eq!(s["this_mac"]["state"], "watched_in_part");
+    // A project's, it holds the answer in part and leaves this Mac's own places watched.
+    assert_eq!(s["headline"], "in_part");
+    assert_eq!(s["this_mac"]["state"], "watched");
     assert!(
         text.contains("! Can no longer be read: ~/dev/shop/.mcp.json"),
         "{text}"
