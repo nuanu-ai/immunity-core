@@ -1,0 +1,3 @@
+#!/bin/sh
+# The program the filter job (ai.nuanu.immunity.core.event-filter) names, so macOS lists the job by this name.
+exec /bin/sh "$@"

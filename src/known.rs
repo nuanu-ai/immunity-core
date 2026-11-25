@@ -389,7 +389,10 @@ type ReadingKey = (String, String, String);
 /// reading full: after a partial reading, what it did not read again is kept as it was, so a
 /// unit no longer held may only not have been read. Then the thing is `unknown`. A held thing
 /// whose owning reading was partial is held, and that reading comes with the answer, so it reads
-/// as not read now. A thing the store has no entity of is `unknown`.
+/// as not read now. A thing the store has no entity of is `unknown`. So is a unit an owning
+/// reading's latest retraction of it, in the order of runs, set aside with a journal entry
+/// `retired` without looking at it (`lifecycle::retire`, `look::retire_facts`): that says nothing
+/// of whether it is there, whatever the latest reading of its kind was.
 fn presence<'a>(
     conn: &Connection,
     units: impl Iterator<Item = &'a String>,
@@ -403,10 +406,27 @@ fn presence<'a>(
         "SELECT DISTINCT reader, scope, kind FROM assertion
          WHERE subject = ?1 AND layer IN ('live', 'retracted')",
     )?;
+    // The run of a retraction, in the store's order: the first reading it wrote.
+    let mut set_aside = conn.prepare(
+        "SELECT EXISTS (SELECT 1 FROM journal j
+                        WHERE j.run_id = a.retracted_by AND j.entry = 'retired'
+                          AND j.reader = a.reader AND j.scope = a.scope AND j.kind = a.kind
+                          AND j.subject = a.subject)
+         FROM assertion a
+         WHERE a.subject = ?1 AND a.reader = ?2 AND a.scope = ?3 AND a.kind = ?4
+           AND a.layer = 'retracted'
+         ORDER BY (SELECT MIN(id) FROM coverage WHERE run_id = a.retracted_by) DESC, a.id DESC
+         LIMIT 1",
+    )?;
+    let mut aside = false;
     for unit in units {
         held = held || live.query_row([unit], |r| r.get::<_, bool>(0))?;
         for row in owning.query_map([unit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))? {
-            owners.insert(row?);
+            let (reader, scope, kind): ReadingKey = row?;
+            let of = [unit, &reader, &scope, &kind];
+            aside =
+                aside || !held && set_aside.query_row(of, |r| r.get(0)).optional()? == Some(true);
+            owners.insert((reader, scope, kind));
         }
     }
     if held {
@@ -416,7 +436,7 @@ fn presence<'a>(
         "SELECT completeness FROM coverage WHERE reader = ?1 AND scope = ?2 AND kind = ?3
          ORDER BY id DESC LIMIT 1",
     )?;
-    let mut all_full = !owners.is_empty();
+    let mut all_full = !owners.is_empty() && !aside;
     for (reader, scope, kind) in &owners {
         let completeness: Option<String> = latest
             .query_row([reader, scope, kind], |r| r.get(0))
@@ -840,5 +860,130 @@ mod tests {
         ] {
             assert!(!super::named_in(at, own), "{at} in {own}");
         }
+    }
+
+    #[test]
+    fn a_thing_a_reading_set_aside_without_looking_is_never_gone_whatever_the_clock_or_its_other_readings()
+     {
+        // `immunity project`, `program` and `machine` say gone only when the latest retraction
+        // of each reading that held the thing, by the order of runs, was a look.
+        use crate::contract::v1::Presence::{Gone, Unknown};
+        use crate::indicators::{LIST_KIND, MATCH_KIND, READER, UNMATCHED_KIND};
+        let path = std::env::temp_dir().join(format!("immunity-known-{}.db", std::process::id()));
+        // One a run that failed left behind.
+        let _ = std::fs::remove_file(&path);
+        let conn = crate::store::open_or_make(&path).unwrap();
+        conn.execute_batch(
+            "INSERT INTO entity (id, type) VALUES ('machine:mac', 'machine'),
+                 ('file:machine:mac/a', 'file'), ('file:machine:mac/b', 'file'),
+                 ('file:machine:mac/c', 'file'), ('file:machine:mac/d', 'file');",
+        )
+        .unwrap();
+        // A fact of `thing` in `kind`, made by `made` and retracted by `by` at `at`, `entry`
+        // journaled.
+        let fact = |thing: &str, kind: &str, made: &str, by: &str, at: i64, entry: &str| {
+            conn.execute(
+                "INSERT INTO assertion (layer, subject, predicate, object, reader, scope, kind,
+                     source_ref, basis, observed_at, run_id, retracted_at, retracted_by)
+                 VALUES ('retracted', ?1, 'matches_indicator', 'x', ?2, 'machine:mac', ?3, 'raw',
+                         'observed', 0, ?4, ?5, ?6)",
+                rusqlite::params![thing, READER, kind, made, at, by],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO journal (at, run_id, entry, reader, scope, kind, subject)
+                 VALUES (?1, ?2, ?3, ?4, 'machine:mac', ?5, ?6)",
+                rusqlite::params![at, by, entry, READER, kind, thing],
+            )
+            .unwrap();
+        };
+        // Each run reads `kind` in full, in the order given.
+        let read = |kind: &str, runs: &[&str]| {
+            for run in runs {
+                conn.execute(
+                    "INSERT INTO coverage (reader, run_id, observed_at, scope, kind, completeness)
+                     VALUES (?1, ?2, 0, 'machine:mac', ?3, 'full')",
+                    [READER, run, kind],
+                )
+                .unwrap();
+            }
+        };
+        let presence = |thing: &str| {
+            let unit = format!("file:machine:mac/{thing}");
+            super::presence(&conn, std::iter::once(&unit), false)
+                .unwrap()
+                .0
+        };
+        // Removed by a full reading that looked, the latest: gone.
+        read(MATCH_KIND, &["run-1", "run-2"]);
+        fact(
+            "file:machine:mac/a",
+            MATCH_KIND,
+            "run-1",
+            "run-2",
+            200,
+            "removed",
+        );
+        assert_eq!(presence("a"), Gone);
+        // Removed, found again, then set aside by a run whose clock was set back.
+        read(LIST_KIND, &["run-3", "run-4", "run-5"]);
+        fact(
+            "file:machine:mac/b",
+            LIST_KIND,
+            "run-3",
+            "run-4",
+            200,
+            "removed",
+        );
+        fact(
+            "file:machine:mac/b",
+            LIST_KIND,
+            "run-4",
+            "run-5",
+            100,
+            "retired",
+        );
+        assert_eq!(presence("b"), Unknown);
+        // Set aside in one reading, removed later in another.
+        read(UNMATCHED_KIND, &["run-6"]);
+        read(MATCH_KIND, &["run-7"]);
+        fact(
+            "file:machine:mac/c",
+            UNMATCHED_KIND,
+            "run-1",
+            "run-6",
+            100,
+            "retired",
+        );
+        fact(
+            "file:machine:mac/c",
+            MATCH_KIND,
+            "run-1",
+            "run-7",
+            200,
+            "removed",
+        );
+        assert_eq!(presence("c"), Unknown);
+        // Set aside, found again, then removed by a full reading that looked: gone.
+        read(MATCH_KIND, &["run-8", "run-9", "run-10"]);
+        fact(
+            "file:machine:mac/d",
+            MATCH_KIND,
+            "run-8",
+            "run-9",
+            100,
+            "retired",
+        );
+        fact(
+            "file:machine:mac/d",
+            MATCH_KIND,
+            "run-9",
+            "run-10",
+            200,
+            "removed",
+        );
+        assert_eq!(presence("d"), Gone);
+        drop(conn);
+        std::fs::remove_file(&path).unwrap();
     }
 }

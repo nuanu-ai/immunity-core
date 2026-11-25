@@ -842,6 +842,24 @@ fn evidence_lines(s: &Screen, f: &v1::Finding) -> Vec<String> {
     out
 }
 
+/// The earlier occurrence of a finding: its id and state, and its answer with when and how it was
+/// given and its reason as source text.
+fn earlier_lines(s: &Screen, f: &v1::Finding) -> Vec<String> {
+    let Some(e) = &f.earlier else {
+        return Vec::new();
+    };
+    let r = e.finding.clone().unwrap_or_default();
+    let said = match &e.answer {
+        Some(a) => format!("{}, {}", r.id, given(s, a, f.answered_at)),
+        None => format!("{}, {}", r.id, words::<v1::FindingState>(r.state)),
+    };
+    let mut out = field(s, 2, LABEL, "Earlier", &[(&said, PLAIN)]);
+    if let Some(reason) = e.answer.as_ref().and_then(|a| a.reason_text.as_deref()) {
+        out.extend(field(s, 2, LABEL, "Said then", &[(reason, PLAIN)]));
+    }
+    out
+}
+
 /// What a verdict about a match whose line had left the event log says of it, in Immunity Core's words.
 const EVENT_GONE: &str = "The line of the match it names was no longer in the event log when it came, so Immunity Core did not read that event again or check that the rule matched it.";
 
@@ -991,23 +1009,33 @@ fn answer_said(s: &Screen, a: &v1::Answer, now: i64) -> String {
     }
 }
 
+/// An answer, when and how it was given. Who gave it follows when it was given; that it is not
+/// known is a clause of its own.
+fn given(s: &Screen, a: &v1::Answer, now: i64) -> String {
+    let by = match v1::Via::try_from(a.via) {
+        Ok(v1::Via::App | v1::Via::Agent | v1::Via::Command) => format!(" {}", given_by(a.via)),
+        _ => format!(", {}", given_by(a.via)),
+    };
+    format!(
+        "{}, given {}{by}",
+        answer_said(s, a, now),
+        s.time(a.given_at, now)
+    )
+}
+
 /// The person's answer: what it is, when and how it was given, its reason as source text, and
 /// that it no longer hides the finding when it does not.
 fn answer_lines(s: &Screen, f: &v1::Finding) -> Vec<String> {
     let Some(a) = &f.answer else {
         return Vec::new();
     };
-    // Who gave it follows when it was given; that it is not known is a clause of its own.
-    let by = match v1::Via::try_from(a.via) {
-        Ok(v1::Via::App | v1::Via::Agent | v1::Via::Command) => format!(" {}", given_by(a.via)),
-        _ => format!(", {}", given_by(a.via)),
-    };
-    let said = format!(
-        "{}, given {}{by}",
-        answer_said(s, a, f.answered_at),
-        s.time(a.given_at, f.answered_at),
+    let mut out = field(
+        s,
+        2,
+        LABEL,
+        "Your answer",
+        &[(&given(s, a, f.answered_at), PLAIN)],
     );
-    let mut out = field(s, 2, LABEL, "Your answer", &[(&said, PLAIN)]);
     if let Some(reason) = &a.reason_text {
         out.extend(field(s, 2, LABEL, "Reason", &[(reason, PLAIN)]));
     }
@@ -1149,10 +1177,12 @@ pub fn finding(f: &v1::Finding, s: &Screen) -> String {
     let mut top = first_line(s, f);
     top.extend(second_line(s, f));
     let mut answered = verdict_lines(s, f);
-    if !answered.is_empty() && f.answer.is_some() {
+    let mut own = answer_lines(s, f);
+    own.extend(earlier_lines(s, f));
+    if !answered.is_empty() && !own.is_empty() {
         answered.push(String::new());
     }
-    answered.extend(answer_lines(s, f));
+    answered.extend(own);
     parts_joined(vec![
         top,
         words_lines(s, f),
@@ -1547,6 +1577,21 @@ mod tests {
                 }),
             }),
             journal_seq: 57,
+            // Found before and seen through an agent, `odd` in the reason given then.
+            earlier: Some(v1::EarlierOccurrence {
+                finding: Some(v1::FindingRef {
+                    id: "f0e26d7c725".to_string(),
+                    state: v1::FindingState::Seen as i32,
+                    ..Default::default()
+                }),
+                answer: Some(v1::Answer {
+                    given: v1::AnswerKind::Seen as i32,
+                    via: v1::Via::Agent as i32,
+                    given_at: NOW - 86_400,
+                    reason_text: Some(format!("earlier reason {odd}")),
+                    ..Default::default()
+                }),
+            }),
             ..Default::default()
         }
     }
