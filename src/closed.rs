@@ -824,4 +824,53 @@ mod tests {
         std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
         shut
     }
+
+    #[test]
+    fn the_walk_to_a_name_in_roots_home_stops_there_having_passed_nothing_of_this_accounts() {
+        let Some(home) = real_folder::root_home() else {
+            return;
+        };
+        let name = home.join(real_folder::NOT_THERE);
+        let (Real::Failed(e), stopped) = guarded::real_to(&name, &[]) else {
+            panic!("walked into root's home");
+        };
+        assert_eq!(e.raw_os_error(), Some(libc::EACCES));
+        assert_eq!(stopped.part.as_deref().and_then(Path::parent), Some(home));
+        assert!(!stopped.own_on_the_way);
+        let found = Folder {
+            own_on_the_way: false,
+            ..folder(home.to_path_buf(), 0)
+        };
+        assert_eq!(By::stopped(&stopped), By::Folder(found));
+    }
+}
+
+/// For the tests that go through a real folder of another account: root's home, which a normal
+/// account on every Mac can see and cannot search. Nothing in it is read, listed or made: a
+/// test only names a file that is not there, and the kernel refuses the lookup.
+#[cfg(test)]
+pub mod real_folder {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+
+    /// A name no file in root's home has.
+    pub const NOT_THERE: &str = "immunity-example-no-such-file";
+
+    /// Root's home, after asserting what the tests rest on: a real folder of root's that this
+    /// account cannot search, so a test never passes without having tested anything. `None`
+    /// when the tests run as root, which may search it: such a test returns at once.
+    pub fn root_home() -> Option<&'static Path> {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            return None;
+        }
+        let home = Path::new("/private/var/root");
+        let m = std::fs::symlink_metadata(home).expect("root's home is there");
+        let theirs = m.file_type().is_dir() && m.uid() == 0 && !super::searchable(home);
+        assert!(
+            theirs,
+            "root's home is a folder of root's closed to this account"
+        );
+        Some(home)
+    }
 }

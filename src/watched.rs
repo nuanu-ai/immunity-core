@@ -932,6 +932,59 @@ mod tests {
     }
 
     #[test]
+    fn a_watched_link_of_this_accounts_into_roots_home_is_failed_with_root_s_folder_named() {
+        // The walk names root's home, of root's and closed to this account, and passed the
+        // link and the folders of this account's that hold it, so it is never the limit. A
+        // watched link of another account's in folders of other accounts, which would be,
+        // cannot be made without root.
+        let Some(home) = crate::closed::real_folder::root_home() else {
+            return;
+        };
+        let dir = crate::common::Scratch::new("watched-into-roots-home");
+        let target = home.join(crate::closed::real_folder::NOT_THERE);
+        let link = dir.join("profile");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let d: &Path = &dir;
+        let at = Where {
+            homes: [d, d],
+            home: d,
+            given: &[],
+        };
+        let Examined::Present(failed @ Content::Failed(_), ..) =
+            examine(&link, &mut Look::default(), &at, None)
+        else {
+            panic!("examined");
+        };
+        let Content::Failed(f) = &failed else {
+            unreachable!()
+        };
+        let found = crate::closed::Folder {
+            path: home.to_path_buf(),
+            owner: 0,
+            dir: true,
+            own_on_the_way: true,
+            search: false,
+        };
+        assert_eq!(f.by, crate::closed::By::Folder(found));
+        let mut look = Look::default();
+        look.entries.push(Entry {
+            unit: Unit::whole("profile"),
+            watched_as: PROFILE,
+            content: failed,
+            link: Some(target.to_string_lossy().into_owned()),
+            bytes: None,
+        });
+        let conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
+        let roots = Roots {
+            home: d,
+            system: Path::new("/"),
+        };
+        crate::closed::settle(&conn, "example-mac", &roots, &mut [&mut look], &[]).unwrap();
+        let why = "Permission denied (os error 13)".to_string();
+        assert_eq!(look.entries[0].content, Content::Unread(Cause::Failed, why));
+    }
+
+    #[test]
     fn a_file_swapped_for_a_named_pipe_after_it_was_looked_at_never_holds_the_run() {
         // Between looking at a regular file and opening it, it may become a named pipe, which
         // a plain open waits on for a writer forever.

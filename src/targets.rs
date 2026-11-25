@@ -1005,6 +1005,99 @@ mod tests {
         }
     }
 
+    /// What reading the programs startup items name gives, on a store that holds a full content
+    /// reading of `stored` if any: each program as decided, with the reading's reason. The
+    /// Mac's root is read under, and the home is a scratch folder.
+    fn read_named(tag: &str, programs: &[&Path], stored: Option<&Path>) -> (Vec<Content>, String) {
+        let (_removed, dir) = scratch(tag);
+        let conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        let kinds = "INSERT OR IGNORE INTO coverage_kind (name) VALUES (?1)";
+        tx.execute(kinds, [watched::CONTENT]).unwrap();
+        if let Some(stored) = stored {
+            let scope = format!("file:example-mac/{}", stored.display());
+            crate::store::put_entity(&tx, &scope).unwrap();
+            let r = crate::store::Reading {
+                reader: watched::READER,
+                scope: &scope,
+                kind: watched::CONTENT,
+                run_id: "run-1",
+                at: 1,
+                observed_at: 1,
+            };
+            crate::store::put_coverage(&tx, &r, "full", None, &Gap::default()).unwrap();
+        }
+        let roots = Roots {
+            home: &dir,
+            system: Path::new("/"),
+        };
+        let mut items = Look::default();
+        for (n, program) in programs.iter().enumerate() {
+            // No argument names a file: only the program is looked at.
+            let agent = (AGENT.replace("/Users/example/bin/agent", &program.to_string_lossy()))
+                .replace("/Users/example/agent.conf", "agent.conf");
+            items.entries.push(Entry {
+                unit: Unit::whole(format!("Library/LaunchAgents/org.example.{n}.plist")),
+                watched_as: watched::AUTOSTART,
+                content: Content::Hash("sha256:00".to_string()),
+                link: None,
+                bytes: Some(std::sync::Arc::from(agent.into_bytes())),
+            });
+        }
+        let (mut look, t) = read(&tx, "example-mac", &roots, &[&items], &[&items]).unwrap();
+        t.short_of(&mut look);
+        let reason = t.coverage(&look).1.unwrap_or_default();
+        (
+            look.entries.into_iter().map(|e| e.content).collect(),
+            reason,
+        )
+    }
+
+    #[test]
+    fn a_program_in_roots_home_with_nothing_inside_read_here_is_a_limit_through_the_reader() {
+        let Some(home) = crate::closed::real_folder::root_home() else {
+            return;
+        };
+        let program = home.join(crate::closed::real_folder::NOT_THERE);
+        let (read, reason) = read_named("in-roots-home", &[&program], None);
+        let limit = Content::Unread(Cause::NotGiven, watched::CLOSED_ON_THE_WAY.into());
+        assert_eq!(read, vec![limit]);
+        assert_eq!(
+            reason,
+            format!("not read in full: {CLOSED}: 1; {AT_CHECKS}")
+        );
+    }
+
+    #[test]
+    fn a_program_in_roots_home_is_failed_once_the_store_holds_a_reading_of_a_name_inside_it() {
+        let Some(home) = crate::closed::real_folder::root_home() else {
+            return;
+        };
+        let program = home.join(crate::closed::real_folder::NOT_THERE);
+        let (read, reason) = read_named("in-roots-home-read", &[&program], Some(&home.join("x")));
+        let failed = Content::Unread(Cause::Failed, watched::CLOSED_ON_THE_WAY.into());
+        assert_eq!(read, vec![failed]);
+        assert_eq!(
+            reason,
+            format!("not read in full: {FAILED}: 1; {AT_CHECKS}")
+        );
+    }
+
+    #[test]
+    fn a_program_in_roots_home_reached_through_a_link_of_this_accounts_is_failed() {
+        // The link can be pointed anywhere by anything running as the person.
+        let Some(home) = crate::closed::real_folder::root_home() else {
+            return;
+        };
+        let (_removed, dir) = scratch("through-own-link");
+        let link = std::fs::canonicalize(&dir).unwrap().join("runner");
+        std::os::unix::fs::symlink(home.join(crate::closed::real_folder::NOT_THERE), &link)
+            .unwrap();
+        let (read, _) = read_named("through-own-link-store", &[&link], None);
+        let failed = Content::Unread(Cause::Failed, "Permission denied (os error 13)".into());
+        assert_eq!(read, vec![failed]);
+    }
+
     /// A folder of its own in the temporary folder, removed with it.
     fn scratch(name: &str) -> (crate::common::Scratch, PathBuf) {
         let dir = crate::common::Scratch::new(name);
