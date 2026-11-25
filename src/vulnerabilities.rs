@@ -1349,11 +1349,12 @@ fn affecting_in(
         .prepare(&format!(
             "SELECT v.checkout, v.ecosystem, v.package, v.source, v.advisory, v.modified,
                     a.kind, a.severity, a.summary, a.aliases, v.entries, v.fixed, v.read_at,
-                    v.since_at,
-                    EXISTS (SELECT 1 FROM vulnerability_linked l
-                            WHERE l.source = v.source AND l.advisory = v.advisory)
+                    v.since_at, k.advisory IS NOT NULL
              FROM {table} v
              JOIN advisory a ON a.source = v.source AND a.id = v.advisory
+             -- Each linked record once, though several CVEs may link it.
+             LEFT JOIN (SELECT DISTINCT source, advisory FROM vulnerability_linked) k
+                    ON k.source = v.source AND k.advisory = v.advisory
              WHERE v.answer = 'affected' AND {condition}"
         ))?
         .query_map(values, |r| {
@@ -1419,7 +1420,11 @@ pub fn ended(
     about: &str,
     since: &str,
 ) -> rusqlite::Result<(&'static str, Value)> {
-    let run = |of: &str| format!("(SELECT MIN(seq) FROM journal WHERE run_id = {of})");
+    // A run is placed by its `run_started` entry, one look-up on `journal_run`: every run these
+    // ids name is a full check, and a check writes that entry before anything else of its id.
+    let run = |of: &str| {
+        format!("(SELECT seq FROM journal WHERE run_id = {of} AND entry = 'run_started')")
+    };
     let began = format!("{} <= {}", run("v.since_run"), run("?1"));
     let stood = format!("{began} AND {} > {}", run("v.until_run"), run("?1"));
     let mut was = affecting_in(conn, "vulnerability_answer", &began, &[&since])?;
@@ -3291,6 +3296,28 @@ mod tests {
             })
             .collect();
         assert_eq!((why, kept), (NOT_NAMED, vec![(first, "1.0.0")]));
+    }
+
+    #[test]
+    fn a_record_the_catalogue_links_through_two_cves_is_one_answer_used_in_attacks() {
+        let dir = crate::common::Scratch::new("linked-twice");
+        let mut conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
+        let tx = conn.transaction().unwrap();
+        let at = "package-lock.json#node_modules/left-pad";
+        let entries = [("shop", Source::Registry, &["1.2.0"][..], at)];
+        by_hand(&tx, "left-pad", &entries, &[(LEFT_PAD, LEFT_PAD_RANGES)]);
+        match_all(&tx, "r1", NOW).unwrap();
+        for cve in ["CVE-2099-0001", "CVE-2099-0002"] {
+            tx.execute(
+                "INSERT INTO vulnerability_linked (cve, source, advisory) VALUES (?1, 'osv-npm', ?2)",
+                params![cve, LEFT_PAD],
+            )
+            .unwrap();
+        }
+        let shown: Vec<(String, bool)> = (affecting(&tx).unwrap().into_iter())
+            .map(|a| (a.advisory, a.exploited))
+            .collect();
+        assert_eq!(shown, [(LEFT_PAD.to_string(), true)]);
     }
 
     fn v(s: &str) -> semver::Version {
