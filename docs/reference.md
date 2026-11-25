@@ -188,7 +188,7 @@ Types and predicates are rows in the store, not code. A reader cannot create a n
 | `located_on` | checkout or container → machine; a watched file → machine, or → its checkout for a git hook; a keg or an application's folder under Application Support → machine |
 | `part_of` | component → machine, container or checkout |
 | `has_lockfile` | checkout → the path, relative to the checkout, of a lockfile found in it, of any kind, opened or not |
-| `has_version` | component → version string, exactly as the source gives it. An application's is `CFBundleShortVersionString`, with `CFBundleVersion` in brackets when it differs |
+| `has_version` | component → version string, exactly as the source gives it. An application's is `CFBundleShortVersionString`, with `CFBundleVersion` in brackets when it differs; each is a string, or a number as its text (`3`, `2.500000`) |
 | `installed_at` | application or global npm package → its path |
 | `signed_by` | application or a program a startup item runs → `apple`, `app store`, `developer id` or `other certificate`, each with `, team <id>` where the signature names one; `ad hoc, cdhash <hex>`; or `unsigned`. For a program, `, identifier <id>` follows where its code names one |
 | `has_seal` | application or a program a startup item runs → `verifies`, or `does not verify: <why>` |
