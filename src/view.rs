@@ -2795,9 +2795,10 @@ mod tests {
         );
         let summary = page(super::SUMMARY);
         // The reading that failed is a fault: the band says what its source said as data, as
-        // the terminal does, cut once.
-        let said =
-            format!("~/.zshrc: a tool answered: fetch https://example.invalid/?t={mark} refused");
+        // the terminal does, each name and reason quoted, cut once.
+        let said = format!(
+            "\"~/.zshrc\": \"a tool answered: fetch https://example.invalid/?t={mark} refused\""
+        );
         let fault = summary
             .split("<p class=\"sub fault\">! Could not read: <span class=\"said\">")
             .nth(1)
