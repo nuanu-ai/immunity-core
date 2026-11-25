@@ -3317,8 +3317,8 @@ pub enum Queue {
 /// A file the place holds with the same inode is read on from its offset. A file it does not
 /// hold is read from its start, whatever its name; so is one of a held name with another inode,
 /// or shorter than the offset, which is another file. A held file that is gone, or replaced,
-/// had lines the place had not read when the root side's note of its deletion says it held
-/// more than the offset, or, with no note, when it was not finished: then the answer says the
+/// had lines the place had not read when the root side's note of its deletion gives a size other
+/// than the offset, or, with no note, when it was not finished: then the answer says the
 /// lines are `gone`.
 pub fn queue(root: &Path, after: Option<&Place>, limit: usize, now: i64, awake: &Awake) -> Queue {
     let Opened {
@@ -3356,10 +3356,11 @@ pub fn queue(root: &Path, after: Option<&Place>, limit: usize, now: i64, awake: 
         Err(e) => return Queue::Failed(failed(REMOVED, e)),
     }
     // Whether a file the place held, now gone or replaced, had lines the place did not read. The
-    // root side's note says how much it held when it was deleted; without one, as after an
-    // uninstall, only a file read to its end with its hour over held no more.
+    // root side's note says how much it held when it was deleted, and only as much as the place
+    // read is no more: a shorter file is not the one read, as in `removed`. Without a note, as
+    // after an uninstall, only a file read to its end with its hour over held no more.
     let unread = |k: &Kept| match deleted.get(&name_of(k.key)) {
-        Some(bytes) => *bytes > k.offset,
+        Some(bytes) => *bytes != k.offset,
         None => !k.finished,
     };
     let held_of: BTreeMap<Key, &Kept> = held.files.iter().map(|k| (k.key, k)).collect();
