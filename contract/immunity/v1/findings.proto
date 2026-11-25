@@ -329,13 +329,17 @@ message ChangedPath {
 message IndicatorMatched {
   // The indicators matched, as STIX comparisons, as the list gives them, such as
   // `[ipv4-addr:value = '203.0.113.7']`. Absent when the journal entry that holds them is gone.
+  // Of a file, the latest the file matched. Of a connection, the address `process` was sampled
+  // for. A finding of one program that holds both gives both, the file's first, joined by
+  // ` OR ` as a STIX pattern joins observations. Both since 1.32.0.
   optional string indicators_text = 1;
   // For a connection to a listed address that a sample saw, the process that held it, as the
-  // latest sample that raised the finding read it. Absent for a match of a file. A finding raised
-  // before 1.32.0 gives its pid and start alone. Since 1.32.0.
+  // latest sample that raised the finding read it. Absent for a finding that holds only a match
+  // of a file. A finding raised before 1.32.0 gives its pid and start alone. Since 1.32.0.
   DetachedProcess process = 2;
-  // The remote port of that connection, and its transport, `tcp` or `udp`. Absent for a match of
-  // a file and for a finding raised before 1.32.0. Since 1.32.0.
+  // The remote port of that connection, and its transport, `tcp` or `udp`: of a process's sockets
+  // to the address, the lowest port, then tcp before udp. Absent when `process` is, when the
+  // reading did not give them, and for a finding raised before 1.32.0. Since 1.32.0.
   optional uint32 port = 3;
   optional string transport = 4;
 }

@@ -224,14 +224,46 @@ fn a_process_connected_to_a_listed_address_keeps_its_command_line_cut_and_a_pare
 }
 
 #[test]
+fn a_process_that_started_after_the_child_bears_a_pid_used_again_and_is_not_its_parent() {
+    let seen = |pid, start, parent| Seen {
+        pid,
+        start,
+        parent,
+        executable: Some(format!("/x/{pid}")),
+        name: String::new(),
+        terminal: false,
+        args: None,
+        around: Around::default(),
+    };
+    let reading = Reading {
+        at: 0,
+        processes: vec![seen(9, 50, 1), seen(11, 40, 9), seen(12, 50, 9)],
+        connections: Vec::new(),
+        other_users: vec![1],
+        unreadable: 0,
+        ended: 0,
+        sockets_unreadable: 0,
+        arguments_layout_unknown: false,
+    };
+    let s = derive(reading, &HashSet::from([(11, 40), (12, 50)]));
+    let parents: Vec<_> = s
+        .processes
+        .iter()
+        .map(|p| p.parent.as_ref().map(|l| l.pid))
+        .collect();
+    // Started at the same moment as its child, it may be its parent; started later, never.
+    assert_eq!(parents, [None, None, Some(9)]);
+}
+
+#[test]
 fn connections_to_a_listed_address_are_found_in_either_form_and_others_are_not() {
     let c = |a: &str, port| Connection {
         pid: 1,
         start: 1,
-        transport: "tcp",
+        transport: Some("tcp"),
         state: "established",
         address: a.parse::<IpAddr>().unwrap().to_canonical(),
-        port,
+        port: Some(port),
     };
     let all = [
         c("192.0.2.7", 80),
@@ -327,19 +359,23 @@ fn the_reading_of_the_system_sees_this_process_its_child_with_code_and_its_conne
     let to_listener = r
         .connections
         .iter()
-        .find(|c| c.pid == me && c.port == port && c.transport == "tcp")
+        .find(|c| c.pid == me && c.port == Some(port) && c.transport == Some("tcp"))
         .unwrap();
     assert_eq!(to_listener.start, this.start);
     assert_eq!(to_listener.address, IpAddr::V4(Ipv4Addr::LOCALHOST));
     assert_eq!(
         (to_listener.transport, to_listener.state),
-        ("tcp", "established")
+        (Some("tcp"), "established")
     );
-    let mine = |port| r.connections.iter().find(|c| c.pid == me && c.port == port);
+    let mine = |port| {
+        r.connections
+            .iter()
+            .find(|c| c.pid == me && c.port == Some(port))
+    };
     let datagram = r
         .connections
         .iter()
-        .find(|c| c.pid == me && c.transport == "udp" && c.port == port)
+        .find(|c| c.pid == me && c.transport == Some("udp") && c.port == Some(port))
         .unwrap();
     assert_eq!(datagram.state, "connected");
     assert_eq!(

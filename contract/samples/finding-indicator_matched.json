@@ -1,5 +1,5 @@
 {
-  "advice": "The address is on the list you gave. Look at the process shown here: its command, the program that started it and the folder it ran in. Until you know why it reached that address, treat this Mac as affected; if nobody knows, ask your agent to look into it.",
+  "advice": "The program named here reached an address on the list you gave. Look at what is shown here of the process that did. Until you know why it reached that address, treat this Mac as affected; if nobody knows, ask your agent to look into it.",
   "answer": null,
   "answered_at": 1795588225,
   "answered_together": [],

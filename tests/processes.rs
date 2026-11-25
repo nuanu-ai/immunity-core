@@ -892,10 +892,7 @@ fn a_connection_match_keeps_its_port_transport_parent_and_cut_command_line_after
     let args = ["node", "server.js", "--password", "Fake-Pa55word"];
     let mut node = process(4242, 7, 500, "/usr/local/bin/node", &args, false);
     node["working_directory"] = json!("/Users/example/dev/shop");
-    let table = [
-        process(500, 1, 1, "/opt/tools/bin/tool", &["tool"], false),
-        node,
-    ];
+    let table = [process(500, 1, 1, "/bin/zsh", &["zsh"], false), node];
     let said = sample_with(&dir, T, &table, &[to_listed(4242)]);
     assert_eq!(said["findings_opened"], 1);
     sample_with(&dir, T + 60, &[], &[]);
@@ -914,8 +911,10 @@ fn a_connection_match_keeps_its_port_transport_parent_and_cut_command_line_after
     assert_eq!(p["working_directory_text"], "/Users/example/dev/shop");
     assert_eq!(
         (&p["parent"]["pid"], &p["parent"]["executable_text"]),
-        (&json!(500), &json!("/opt/tools/bin/tool"))
+        (&json!(500), &json!("/bin/zsh"))
     );
+    let signer = p["parent"]["signed_by_text"].as_str().unwrap();
+    assert!(signer.starts_with("apple"), "{signer}");
     assert!(
         v["advice"]
             .as_str()
@@ -930,7 +929,7 @@ fn a_connection_match_keeps_its_port_transport_parent_and_cut_command_line_after
         "    Process      pid 4242, started 1970-01-01 00:00 UTC\n",
         &format!("    Command      node server.js --password {cut}\n"),
         "    Folder       /Users/example/dev/shop\n",
-        "    Parent       pid 500, signer not known: /opt/tools/bin/tool\n",
+        &format!("    Parent       pid 500, signed by {signer}: /bin/zsh\n"),
     ] {
         assert!(shown.contains(line), "{line}\n{shown}");
     }
@@ -938,7 +937,7 @@ fn a_connection_match_keeps_its_port_transport_parent_and_cut_command_line_after
     for fact in [
         "<dt>Port</dt><dd><span class=\"mono\">8443</span></dd>",
         "<dt>Transport</dt><dd><span class=\"w\">tcp</span></dd>",
-        "<dt>Parent</dt><dd><span class=\"mono\">/opt/tools/bin/tool</span>, pid 500,",
+        "<dt>Parent</dt><dd><span class=\"mono\">/bin/zsh</span>, pid 500, signed by",
     ] {
         assert!(page.contains(fact), "{fact}");
     }
@@ -981,6 +980,13 @@ fn text_of_a_connected_process_cannot_forge_a_line_of_the_finding() {
         m["process"]["parent"]["executable_text"],
         format!("/opt/{escaped}/tool")
     );
+    assert_eq!(
+        m["process"]["working_directory_text"],
+        format!("/Users/example/{escaped}")
+    );
+    let page = pages(&dir);
+    assert!(!page.contains(forged) && !page.contains('\u{1b}'));
+    assert!(page.contains("/Users/example/x\\u{a}    Parent"), "{page}");
     let text = String::from_utf8(printed(&dir, &["finding", &id])).unwrap();
     // One line each, none of them the forged one, and no raw escape.
     for label in ["    Command ", "    Folder ", "    Parent "] {
@@ -1023,4 +1029,93 @@ fn what_a_connection_sample_could_not_read_is_absent_and_an_older_finding_says_o
         1,
         "{text}"
     );
+}
+
+#[test]
+fn a_finding_of_a_file_and_a_connection_shows_both_indicators_and_the_process_beside_its_address() {
+    // One program both matched by its file's hash and connected to a listed address is one
+    // finding: it names both indicators, the process the connection's, and its advice holds.
+    let dir = Dir::new("connection-and-file");
+    let program = dir.0.join(".zshrc");
+    std::fs::write(&program, "export INVENTED=1\n").unwrap();
+    let out = Command::new("/usr/bin/shasum")
+        .args(["-a", "256"])
+        .arg(&program)
+        .output()
+        .unwrap();
+    let hash = String::from_utf8(out.stdout).unwrap()[..64].to_string();
+    let list = json!([{ "kind": "file:hashes.'SHA-256'", "value": hash },
+                      { "kind": "ipv4-addr:value", "value": "203.0.113.7" }]);
+    std::fs::write(dir.0.join("indicators.json"), list.to_string()).unwrap();
+    run(&dir);
+    let exe = program.to_str().unwrap();
+    sample_with(
+        &dir,
+        T,
+        &[process(4242, 7, 1, exe, &["x"], false)],
+        &[to_listed(4242)],
+    );
+    let matched: Vec<Value> = findings(&dir)
+        .into_iter()
+        .filter(|f| f["finding"]["rule"] == "indicator.match")
+        .collect();
+    assert_eq!(matched.len(), 1, "{matched:?}");
+    let m = &matched[0]["evidence"]["indicator_matched"];
+    let both = format!("[file:hashes.'SHA-256' = '{hash}'] OR [ipv4-addr:value = '203.0.113.7']");
+    assert_eq!(m["indicators_text"], both);
+    assert_eq!(
+        (&m["process"]["pid"], &m["port"]),
+        (&json!(4242), &json!(8443))
+    );
+    let advice = matched[0]["advice"].as_str().unwrap();
+    assert!(
+        advice.starts_with("The program named here reached an address"),
+        "{advice}"
+    );
+}
+
+#[test]
+fn the_socket_a_connection_finding_shows_does_not_depend_on_the_order_the_sample_read_them_in() {
+    // Two programs, each with the same two sockets to the listed address, read in opposite
+    // orders: each finding shows the lowest port.
+    let dir = listed("connection-order");
+    let table = [
+        process(60, 7, 1, "/opt/a/agent", &["agent"], false),
+        process(61, 7, 1, "/opt/b/agent", &["agent"], false),
+    ];
+    let to = |pid, transport, port| {
+        json!({ "pid": pid, "start": 7, "transport": transport, "address": "203.0.113.7",
+                "port": port })
+    };
+    let sockets = [
+        to(60, "udp", 9000),
+        to(60, "tcp", 443),
+        to(61, "tcp", 443),
+        to(61, "udp", 9000),
+    ];
+    sample_with(&dir, T, &table, &sockets);
+    let shown: Vec<(Value, Value)> = findings(&dir)
+        .iter()
+        .map(|f| {
+            let m = &f["evidence"]["indicator_matched"];
+            (m["port"].clone(), m["transport"].clone())
+        })
+        .collect();
+    assert_eq!(
+        shown,
+        [(json!(443), json!("tcp")), (json!(443), json!("tcp"))]
+    );
+}
+
+#[test]
+fn a_port_or_transport_a_reading_does_not_give_is_absent_and_never_made_up() {
+    let dir = listed("connection-unknown");
+    let socket = json!({ "pid": 4242, "start": 7, "address": "203.0.113.7", "port": 70_000 });
+    let node = process(4242, 7, 1, "/usr/local/bin/node", &["node"], false);
+    sample_with(&dir, T, &[node], &[socket]);
+    let id = the_finding(&dir);
+    let m = contract(&dir, &["finding", &id])["evidence"]["indicator_matched"].clone();
+    assert!(m["port"].is_null() && m["transport"].is_null(), "{m}");
+    let text = String::from_utf8(printed(&dir, &["finding", &id])).unwrap();
+    assert_eq!(lines_of(&text, "    Connection "), 0, "{text}");
 }

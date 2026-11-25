@@ -294,13 +294,14 @@ pub struct Leader {
 pub struct Connection {
     pub pid: i32,
     pub start: i64,
-    /// `tcp` or `udp`.
-    pub transport: &'static str,
+    /// `tcp` or `udp`; `None` only when a reading from JSON does not give one.
+    pub transport: Option<&'static str>,
     /// The TCP state in the header's words, `connected` for UDP.
     pub state: &'static str,
     /// Canonical: an IPv4 address mapped into IPv6 is that IPv4 address.
     pub address: IpAddr,
-    pub port: u16,
+    /// `None` only when a reading from JSON gives none that fits.
+    pub port: Option<u16>,
 }
 
 /// What one reading of the system gave.
@@ -364,13 +365,18 @@ pub fn derive(r: Reading, listed: &HashSet<(i32, i64)>) -> Sample {
         .map(|p| p.pid)
         .chain(r.other_users.iter().copied())
         .collect();
-    // Launchd and other users' processes are not read, so they are no one's parent here.
+    // Launchd and other users' processes are not read, so they are no one's parent here. A
+    // process with the parent's pid that started after the child bears a pid used again: the
+    // parent has ended, and there is none.
     let mut parents: HashMap<i32, Leader> = r
         .processes
         .iter()
         .filter(|p| listed.contains(&(p.pid, p.start)))
         .filter_map(|p| {
-            let q = r.processes.iter().find(|q| q.pid == p.parent)?;
+            let q = r
+                .processes
+                .iter()
+                .find(|q| q.pid == p.parent && q.start <= p.start)?;
             let executable = q.executable.clone()?;
             Some((
                 p.pid,
@@ -702,25 +708,32 @@ fn sampled(p: &Process, mut signed: impl FnMut(&str) -> Option<String>) -> Value
 }
 
 /// What the latest journal entry `sampled` of `kind` that a finding rests on keeps, as `sampled`
-/// wrote it; `None` when it rests on none, or the entry's text is not JSON.
+/// wrote it, with what was derived or matched, the entry's value, as `value`; `None` when it
+/// rests on none, or the entry's text is not a JSON object.
 pub fn sampled_note(
     conn: &rusqlite::Connection,
     finding: &str,
     kind: &str,
 ) -> rusqlite::Result<Option<Value>> {
-    let text: Option<String> = conn
+    let entry: Option<(Option<String>, Option<String>)> = conn
         .query_row(
-            "SELECT j.text FROM finding_basis b JOIN journal j ON j.seq = b.journal
+            "SELECT j.text, j.new_value FROM finding_basis b JOIN journal j ON j.seq = b.journal
              WHERE b.finding = ?1 AND j.entry = 'sampled' AND j.kind = ?2
              ORDER BY j.seq DESC LIMIT 1",
             // Only this kind's entry: a process of the same program that matched an indicator
             // in the same sample as a detached script has one too, linked by its subject.
             params![finding, kind],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .optional()?
-        .flatten();
-    Ok(text.and_then(|t| serde_json::from_str(&t).ok()))
+        .optional()?;
+    let Some((Some(text), value)) = entry else {
+        return Ok(None);
+    };
+    let Ok(Value::Object(mut note)) = serde_json::from_str(&text) else {
+        return Ok(None);
+    };
+    note.insert("value".to_string(), json!(value));
+    Ok(Some(Value::Object(note)))
 }
 
 /// The journal entry a raise rests on: the program, what was derived or matched, and in `text`
@@ -785,8 +798,11 @@ fn match_connections(
     mut signed: impl FnMut(&str) -> Option<String>,
 ) -> rusqlite::Result<usize> {
     use crate::indicators::{self, IPV4, Indicator};
-    // Indicators: the list's addresses are matched against the sample's connections here.
-    let found = connections_to(&sample.connections, addresses);
+    // Indicators: the list's addresses are matched against the sample's connections here. Of a
+    // process's sockets to one address the first in a fixed order is kept, whatever order the
+    // sample read them in: the lowest port, then tcp before udp.
+    let mut found = connections_to(&sample.connections, addresses);
+    found.sort_by_key(|c| (c.pid, c.start, c.address, c.port, c.transport));
     for c in &found {
         let Some(p) = sample
             .processes
@@ -1023,14 +1039,10 @@ impl Reading {
             connections.push(Connection {
                 pid: int(c, "pid")? as i32,
                 start: int(c, "start")?,
-                transport: if c["transport"] == "udp" {
-                    "udp"
-                } else {
-                    "tcp"
-                },
+                transport: ["tcp", "udp"].into_iter().find(|t| c["transport"] == *t),
                 state: "established",
                 address: address.to_canonical(),
-                port: int(c, "port")? as u16,
+                port: c["port"].as_u64().and_then(|p| u16::try_from(p).ok()),
             });
         }
         Ok(Reading {
@@ -1438,14 +1450,14 @@ fn connection(s: &SocketInfo, pid: i32, start: i64) -> Option<Connection> {
     (port != 0 && !address.is_unspecified()).then_some(Connection {
         pid,
         start,
-        transport: if s.soi_kind == SOCKINFO_TCP {
+        transport: Some(if s.soi_kind == SOCKINFO_TCP {
             "tcp"
         } else {
             "udp"
-        },
+        }),
         state,
         address,
-        port,
+        port: Some(port),
     })
 }
 
