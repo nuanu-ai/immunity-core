@@ -1211,7 +1211,10 @@ struct Left {
 /// order one reading reads them: a step reads the first file after the one the step before
 /// read that holds bytes past its place, so the file being written, or one that ends in a line
 /// not yet finished, never keeps the files after it waiting. The file whose lines say what
-/// arrives (`writing`) is told at the pass's first step, as one reading tells it. A step gives
+/// arrives (`writing`) is told at each step, the one an earlier step told among the candidates.
+/// A step that leaves log after its file commits what it counted and where it is, and leaves
+/// the conclusion of the last whole reading standing: the state and the coverage are written by
+/// the step that ends the pass, as by a reading (`read`). A step gives
 /// the pass that follows it in its outcome, which the caller takes once the step committed: a
 /// step that did not commit leaves the pass where the last one that did left it, so the next
 /// step reads its file again. The pass goes on only from a step that read with log left after
@@ -1266,13 +1269,7 @@ fn look(
     let mut files = Vec::new();
     let mut times = Vec::new();
     let place = |f: &LogFile| left.files.get(&f.name).copied();
-    let now_written = match was {
-        Some(Pass {
-            after: Some(_),
-            writing,
-        }) => listed.iter().position(|f| Some(f.key) == *writing),
-        _ => writing(&listed, place),
-    };
+    let now_written = writing(&listed, place, was.and_then(|p| p.writing));
     let left_after = |k: usize| listed[k + 1..].iter().any(|f| unread(f, place(f)));
     let step = was.map(|p| {
         let next = |f: &LogFile| p.after.is_none_or(|a| f.key > a) && unread(f, place(f));
@@ -1280,10 +1277,13 @@ fn look(
     });
     for (i, f) in listed.iter().enumerate() {
         let name = &f.name;
-        // Not this step's file: its place and its time stand as they are.
+        // Not this step's file: its time, and its place where it still fits the file as listed;
+        // one that does not, as after the file was emptied, is its start, as a reading saves it.
         if step.is_some_and(|k| k != Some(i)) {
             times.push(f.mtime.0);
-            files.extend(place(f).map(|(inode, to)| (name.clone(), inode, to)));
+            let fits = |&(inode, to): &(u64, u64)| inode == f.inode && to <= f.len;
+            let kept = place(f).map(|p| if fits(&p) { p } else { (f.inode, 0) });
+            files.extend(kept.map(|(inode, to)| (name.clone(), inode, to)));
             continue;
         }
         let mut into = Into {
@@ -2098,12 +2098,18 @@ fn name_of(key: Key) -> String {
 /// back. A file nobody writes any more holds nothing new, so from the second reading on only the
 /// file being written is a candidate, whatever its name and whatever the clock said. When a
 /// reading finds several, at the first reading or across a new file, the time each was last
-/// written decides, as `tidy.sh` keeps the one written last.
-fn writing(files: &[LogFile], read: impl Fn(&LogFile) -> Option<(u64, u64)>) -> Option<usize> {
+/// written decides, as `tidy.sh` keeps the one written last. Within a pass (`Pass`) the file an
+/// earlier step told stays a candidate when it holds nothing new, so a file it read is not
+/// passed over for an older one, and a newer file, as after a rotation, takes over.
+fn writing(
+    files: &[LogFile],
+    read: impl Fn(&LogFile) -> Option<(u64, u64)>,
+    told: Option<Key>,
+) -> Option<usize> {
     files
         .iter()
         .enumerate()
-        .filter(|(_, f)| unread(f, read(f)))
+        .filter(|(_, f)| unread(f, read(f)) || Some(f.key) == told)
         .max_by_key(|(i, f)| (f.mtime, *i))
         .map(|(i, _)| i)
 }
@@ -2517,7 +2523,11 @@ fn collected(conn: &Connection) -> rusqlite::Result<(bool, Option<String>)> {
 /// One reading of the event level under `root`, at `now`, recorded in `tx`: the state, the
 /// counts, where each file was read up to, and coverage of this machine, one row in place of
 /// the one before, as samples keep theirs. With a `pass`, of one step of it (`Pass`); without,
-/// of every file, as a full check reads it.
+/// of every file, as a full check reads it. A step that leaves log after its file writes what it
+/// counted and where it is, and leaves the state, what was said and the coverage of the last
+/// whole reading standing. With no reading of the level in the store there is nothing to leave
+/// standing, and the reading is whole, as it was before readings in steps: nothing is read in
+/// part where no conclusion stands.
 pub fn read(
     tx: &Transaction,
     run_id: &str,
@@ -2526,9 +2536,11 @@ pub fn read(
     now: i64,
     pass: Option<&Pass>,
 ) -> rusqlite::Result<Outcome> {
+    let pass = if state(tx)?.is_some() { pass } else { None };
     let left = left(tx)?;
     let awake = Awake::read(tx)?;
     let found = look(root, &left, now, Rules::shipped(), &awake, pass);
+    let standing = matches!(&found, Found::Read(log) if log.pass.more());
     // The row stands on its own, so a failed reading leaves it for the next one.
     match &found {
         Found::Read(log) => put_awake(tx, log.kept.as_ref())?,
@@ -2623,18 +2635,30 @@ pub fn read(
                 Some((by, said)) => (Some(*by), Some(said.as_str())),
                 None => (None, None),
             };
-            put_level(
-                tx,
-                now,
-                state,
-                log.written,
-                (by, said),
-                (
-                    log.last_seq.map(|s| s as i64),
-                    log.version.map(|v| v as i64),
-                    Some(now),
-                ),
-            )?;
+            if standing {
+                tx.execute(
+                    "UPDATE event_level SET last_seq = ?1, version = COALESCE(?2, version),
+                         counted = ?3",
+                    params![
+                        log.last_seq.map(|s| s as i64),
+                        log.version.map(|v| v as i64),
+                        now
+                    ],
+                )?;
+            } else {
+                put_level(
+                    tx,
+                    now,
+                    state,
+                    log.written,
+                    (by, said),
+                    (
+                        log.last_seq.map(|s| s as i64),
+                        log.version.map(|v| v as i64),
+                        Some(now),
+                    ),
+                )?;
+            }
         }
     }
     tx.execute("DELETE FROM event_count WHERE at < ?1", [now - KEEP])?;
@@ -2643,58 +2667,60 @@ pub fn read(
         "DELETE FROM rule_match WHERE hour < ?1",
         [(now - KEEP_MATCHES) / HOUR],
     )?;
-    let (completeness, reason, cause): (&str, Option<String>, Option<Cause>) = match &found {
-        Found::NotInstalled => (
-            "none",
-            Some("the event level is not installed".to_string()),
-            Some(Cause::NotGiven),
-        ),
-        Found::Failed(why) => ("none", Some(why.clone()), Some(Cause::Failed)),
-        Found::Read(log) => covered(log.state, &tally_since(tx, Since::At(now - DAY))?),
-    };
-    tx.execute(
-        "DELETE FROM coverage WHERE reader = ?1 AND scope = ?2 AND kind = ?3",
-        params![READER, machine, KIND],
-    )?;
-    let reading = Reading {
-        reader: READER,
-        scope: machine,
-        kind: KIND,
-        run_id,
-        at: now,
-        observed_at: now,
-    };
-    crate::store::put_coverage(
-        tx,
-        &reading,
-        completeness,
-        reason.as_deref(),
-        &Gap::when(cause),
-    )?;
-    // File events have coverage of their own while the level runs; otherwise the level's
-    // state, above, says why nothing is recorded, once.
-    tx.execute(
-        "DELETE FROM coverage WHERE reader = ?1 AND scope = ?2 AND kind = ?3",
-        params![READER, machine, KIND_FILES],
-    )?;
-    if let Found::Read(log) = &found
-        && log.state == RUNNING
-    {
-        let (completeness, reason, cause) = files_covered(
-            &log.collects,
-            &tally_since(tx, Since::At(now - DAY))?,
-            &file_tally_since(tx, Since::At(now - DAY))?,
-        );
+    if !standing {
+        let (completeness, reason, cause): (&str, Option<String>, Option<Cause>) = match &found {
+            Found::NotInstalled => (
+                "none",
+                Some("the event level is not installed".to_string()),
+                Some(Cause::NotGiven),
+            ),
+            Found::Failed(why) => ("none", Some(why.clone()), Some(Cause::Failed)),
+            Found::Read(log) => covered(log.state, &tally_since(tx, Since::At(now - DAY))?),
+        };
+        tx.execute(
+            "DELETE FROM coverage WHERE reader = ?1 AND scope = ?2 AND kind = ?3",
+            params![READER, machine, KIND],
+        )?;
+        let reading = Reading {
+            reader: READER,
+            scope: machine,
+            kind: KIND,
+            run_id,
+            at: now,
+            observed_at: now,
+        };
         crate::store::put_coverage(
             tx,
-            &Reading {
-                kind: KIND_FILES,
-                ..reading
-            },
+            &reading,
             completeness,
             reason.as_deref(),
             &Gap::when(cause),
         )?;
+        // File events have coverage of their own while the level runs; otherwise the level's
+        // state, above, says why nothing is recorded, once.
+        tx.execute(
+            "DELETE FROM coverage WHERE reader = ?1 AND scope = ?2 AND kind = ?3",
+            params![READER, machine, KIND_FILES],
+        )?;
+        if let Found::Read(log) = &found
+            && log.state == RUNNING
+        {
+            let (completeness, reason, cause) = files_covered(
+                &log.collects,
+                &tally_since(tx, Since::At(now - DAY))?,
+                &file_tally_since(tx, Since::At(now - DAY))?,
+            );
+            crate::store::put_coverage(
+                tx,
+                &Reading {
+                    kind: KIND_FILES,
+                    ..reading
+                },
+                completeness,
+                reason.as_deref(),
+                &Gap::when(cause),
+            )?;
+        }
     }
     let (starts, failed, pass) = match found {
         Found::Read(log) => (log.tally.starts, None, log.pass),

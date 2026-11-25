@@ -1058,7 +1058,7 @@ pub fn read_events_held(
     *pass = outcome.pass;
     Ok(EventsRead {
         starts: outcome.starts,
-        changed: before.as_deref() != Some(outcome.state),
+        changed: before != events::state(&conn)?,
         level: events::level(&conn, at)?,
         failed: outcome.failed,
         at,

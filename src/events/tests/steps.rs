@@ -28,10 +28,26 @@ fn plain(seq: u64) -> String {
     exec(seq, OBJECT) + "\n"
 }
 
-/// A store of its own.
+/// A store of its own that holds this Mac, and a whole reading of an empty log an hour before
+/// `NOW`, so that a step has a conclusion to leave standing.
 fn store(tag: &str) -> (crate::common::Scratch, Connection) {
+    let (dir, mut conn) = fresh(tag);
+    reading(
+        &mut conn,
+        &installed(&format!("{tag}-empty")),
+        NOW - 3600,
+        None,
+    );
+    (dir, conn)
+}
+
+/// A store of its own that holds this Mac and no reading of the event level.
+fn fresh(tag: &str) -> (crate::common::Scratch, Connection) {
     let dir = crate::common::Scratch::new(tag);
     let conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
+    let mac =
+        "INSERT INTO meta (key, value) VALUES ('machine', 'machine:mac'), ('machine_name', 'mac')";
+    conn.execute_batch(mac).unwrap();
     (dir, conn)
 }
 
@@ -246,7 +262,7 @@ fn a_full_check_reads_every_file_in_its_one_reading_and_keeps_nothing_of_it_when
             NOW - 300 + i64::from(hour),
         );
     }
-    let (_dir, mut conn) = store("steps-check-store");
+    let (_dir, mut conn) = fresh("steps-check-store");
     assert_eq!(rolled_back(&mut conn, &root, NOW, None).starts, 3);
     assert!(rows(&conn, "SELECT name FROM event_file").is_empty());
     assert!(rows(&conn, "SELECT at FROM event_count").is_empty());
@@ -255,36 +271,189 @@ fn a_full_check_reads_every_file_in_its_one_reading_and_keeps_nothing_of_it_when
     assert_eq!(rows(&conn, "SELECT at FROM event_count").len(), 1);
 }
 
+/// What the status concludes of the event level at `now`: the headline and its reasons, this
+/// Mac's state, and the level's state, the time of its reading and its coverage rows.
+type Concluded = (i32, Vec<i32>, i32, String, i64, Vec<String>);
+
+fn concluded_at(conn: &Connection, dir: &Path, now: i64) -> Concluded {
+    let st = crate::status::state(conn, dir, now).unwrap();
+    let store = dir.join("store.db");
+    let m = crate::status::message(Some(conn), Some(&st), false, &store, now).unwrap();
+    let l = level(conn, now).unwrap().unwrap();
+    let coverage = "SELECT kind, completeness, reason, cause FROM coverage
+                    WHERE reader = 'events' ORDER BY kind";
+    let mac = m.this_mac.map_or(0, |t| t.state);
+    let because = m.headline_because;
+    (
+        m.headline,
+        because,
+        mac,
+        l.state,
+        l.read_at,
+        rows(conn, coverage),
+    )
+}
+
 #[test]
-fn between_two_steps_the_status_says_no_more_than_one_reading_of_the_files_read_so_far() {
-    // No false calm while files are left unread. A step that read the first of three files,
-    // an hour old, says what one reading of that file said when it was written: the coverage
-    // of the day and the losses come from what was read, and a file left unread has no place.
-    // The state is the collector's, told from every file's time as one reading tells it. A
-    // loss in a later file is said by the step that reads it.
+fn a_step_with_log_left_leaves_the_conclusion_of_the_last_whole_reading_standing() {
+    // No false calm while files are left unread. The last whole reading found the collector
+    // silent; five files arrive, the third with a start a high rule matches. Until the step that
+    // ends the pass, the status says what that reading concluded, as while one reading of the
+    // five went on: the state, the time of the reading, the coverage, this Mac and the headline.
+    let root = installed("steps-standing");
+    let (dir, mut conn) = store("steps-standing-store");
+    crate::store::journal_note(&conn, NOW - 60, "check", "run_started", "").unwrap();
+    crate::store::journal_note(&conn, NOW - 30, "check", "run_finished", "").unwrap();
+    for hour in 0..5 {
+        let start = if hour == 2 {
+            high(3)
+        } else {
+            plain(u64::from(hour) + 1)
+        };
+        write_at(
+            &root,
+            &named(hour),
+            &start,
+            NOW - 500 + 100 * i64::from(hour),
+        );
+    }
+    let before = concluded_at(&conn, &dir, NOW);
+    assert_eq!(before.3, SILENT);
+    let level_said = crate::contract::v1::HeadlineBecause::EventLevel as i32;
+    assert!(before.1.contains(&level_said), "{before:?}");
+    let mut pass = Pass::default();
+    for _ in 0..2 {
+        reading(&mut conn, &root, NOW, Some(&mut pass));
+        assert!(pass.more());
+        assert_eq!(concluded_at(&conn, &dir, NOW), before);
+    }
+    // The third file's match is a finding at once: louder, never calmer.
+    reading(&mut conn, &root, NOW, Some(&mut pass));
+    let third = concluded_at(&conn, &dir, NOW);
+    let needs = crate::contract::v1::Headline::NeedsALook as i32;
+    assert_eq!(third.0, needs);
+    assert_eq!(
+        (&third.3, third.4, &third.5),
+        (&before.3, before.4, &before.5)
+    );
+    reading(&mut conn, &root, NOW, Some(&mut pass));
+    reading(&mut conn, &root, NOW, Some(&mut pass));
+    assert!(!pass.more());
+    let after = concluded_at(&conn, &dir, NOW);
+    assert_eq!((after.3.as_str(), after.4), (RUNNING, NOW));
+}
+
+#[test]
+fn a_store_with_no_reading_of_the_level_reads_its_first_pass_whole() {
+    // With no conclusion of an earlier reading to leave standing, nothing is read in part: the
+    // first reading of a store is whole, as a reading was before steps.
+    let root = installed("steps-first");
+    for hour in 0..3 {
+        let at = NOW - 300 + i64::from(hour);
+        write_at(&root, &named(hour), &plain(u64::from(hour) + 1), at);
+    }
+    let (_dir, mut conn) = fresh("steps-first-store");
+    assert_eq!(stepped(&mut conn, &root, NOW), 1);
+    assert_eq!(rows(&conn, "SELECT name FROM event_file").len(), 3);
+}
+
+#[test]
+fn between_two_steps_the_status_says_no_more_than_the_last_whole_reading() {
+    // A step that read the second of three files, with the whole backlog present, leaves the
+    // state, the time and the coverage of the reading of the first standing, and what arrives.
+    // The losses it counted are said at once, which is louder; the coverage of the day says
+    // them from the step that ends the pass.
     let root = installed("steps-between");
     write_at(&root, &named(0), &plain(1), NOW - 3600);
-    let (_once_dir, mut once) = store("steps-between-once");
-    reading(&mut once, &root, NOW - 3590, None);
+    let (dir, mut conn) = store("steps-between-store");
+    reading(&mut conn, &root, NOW - 3590, None);
+    let before = concluded_at(&conn, &dir, NOW);
+    let told_before = told(&arrivals(&conn).unwrap());
     write_at(&root, &named(1), &plain(5), NOW - 200);
     write_at(&root, &named(2), &plain(6), NOW - 100);
-    let (_steps_dir, mut steps) = store("steps-between-steps");
     let mut pass = Pass::default();
-    reading(&mut steps, &root, NOW, Some(&mut pass));
-    let said = |conn: &Connection| {
-        let l = level(conn, NOW).unwrap().unwrap();
-        let coverage = "SELECT kind, completeness, reason, cause FROM coverage
-                        WHERE reader = 'events' ORDER BY kind";
-        let lost = l.lost_since_check();
-        (l.state, lost, l.last_day, rows(conn, coverage))
-    };
-    assert_eq!(said(&steps), said(&once));
-    assert_eq!(rows(&steps, "SELECT name FROM event_file").len(), 1);
-    // What arrives is told only by the file being written, which is not read yet: not known.
-    assert_eq!(told(&arrivals(&steps).unwrap()), ["-", "-", "-"]);
-    reading(&mut steps, &root, NOW, Some(&mut pass));
-    let l = level(&steps, NOW).unwrap().unwrap();
+    reading(&mut conn, &root, NOW, Some(&mut pass));
+    assert!(pass.more());
+    let between = concluded_at(&conn, &dir, NOW);
+    assert_eq!(
+        (&between.3, between.4, &between.5),
+        (&before.3, before.4, &before.5)
+    );
+    assert!(
+        before.1.iter().all(|b| between.1.contains(b)),
+        "{before:?} {between:?}"
+    );
+    assert_eq!(told(&arrivals(&conn).unwrap()), told_before);
+    assert_eq!(rows(&conn, "SELECT name FROM event_file").len(), 2);
+    let l = level(&conn, NOW).unwrap().unwrap();
     assert!(l.lost_since_check() && l.last_day.lost == 3);
+    reading(&mut conn, &root, NOW, Some(&mut pass));
+    let after = concluded_at(&conn, &dir, NOW);
+    assert_eq!(after.4, NOW);
+    assert!(after.5.iter().any(|r| r.contains("partial")), "{after:?}");
+}
+
+#[test]
+fn a_newer_file_takes_over_as_the_one_being_written_within_a_pass() {
+    // The file being written moves on with a rotation during a pass, and after a full check read
+    // between two steps: the lines of the newer file say what arrives, as in one reading of the
+    // log as it ends. The older file's lines keep who each process is; the newer file's do not.
+    let kept = |seq, at| kept_start(seq, at, true, false);
+    for check in [false, true] {
+        let root = installed(&format!("steps-rotation-{check}"));
+        write_at(&root, &named(0), &plain(1), NOW - 300);
+        write_at(&root, &named(1), &kept(2, NOW - 200), NOW - 200);
+        let (_dir, mut conn) = store(&format!("steps-rotation-{check}-store"));
+        let mut pass = Pass::default();
+        reading(&mut conn, &root, NOW, Some(&mut pass));
+        if check {
+            reading(&mut conn, &root, NOW, None);
+        } else {
+            write_at(&root, &named(1), &kept(3, NOW - 150), NOW - 150);
+        }
+        write_at(&root, &named(2), &plain(4), NOW - 100);
+        for _ in 0..3 {
+            if pass.more() {
+                reading(&mut conn, &root, NOW, Some(&mut pass));
+            }
+        }
+        assert!(!pass.more());
+        let (_once_dir, mut once) = store(&format!("steps-rotation-{check}-once"));
+        reading(&mut once, &root, NOW, None);
+        let said = told(&arrivals(&conn).unwrap());
+        assert_eq!(said, told(&arrivals(&once).unwrap()), "{check}");
+        assert_ne!(said, ["-", "0", "-"]);
+    }
+}
+
+#[test]
+fn a_place_that_no_longer_fits_its_file_is_its_start() {
+    // A file emptied on the same inode while a step reads another keeps no place past its end:
+    // once it holds lines again, as many bytes as before, they are read.
+    let root = installed("steps-emptied");
+    write_at(&root, &named(0), &(plain(1) + &plain(2)), NOW - 300);
+    write_at(&root, &named(1), &plain(3), NOW - 200);
+    let (_dir, mut conn) = store("steps-emptied-store");
+    reading(&mut conn, &root, NOW - 150, None);
+    let first = root.join(LOG).join(named(0));
+    let emptied = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&first)
+        .unwrap();
+    emptied.set_len(0).unwrap();
+    write_at(&root, &named(1), &plain(4), NOW - 120);
+    write_at(&root, &named(2), &plain(5), NOW - 110);
+    let mut pass = Pass::default();
+    reading(&mut conn, &root, NOW, Some(&mut pass));
+    assert!(pass.more());
+    let sql = "SELECT offset FROM event_file WHERE name = ?1";
+    let offset: i64 = conn.query_row(sql, [named(0)], |r| r.get(0)).unwrap();
+    assert_eq!(offset, 0);
+    write_at(&root, &named(0), &(plain(6) + &plain(7)), NOW - 100);
+    reading(&mut conn, &root, NOW, Some(&mut pass));
+    stepped(&mut conn, &root, NOW + 10);
+    let l = level(&conn, NOW + 10).unwrap().unwrap();
+    assert_eq!(l.last_day.starts, 7);
 }
 
 #[test]
@@ -319,13 +488,15 @@ fn a_file_that_ends_in_a_line_not_yet_finished_does_not_keep_the_files_after_it_
     // A file being written can end in a line not yet finished, which no step can read. When it
     // sorts before files left unread, as after a downgrade or a clock set back, the pass goes
     // on after it to them, and ends.
+    // Two such files, each written after the next, come before a readable one.
     let root = installed("steps-unfinished");
     let earlier = "exec-20261004T00.jsonl";
-    write_at(&root, &named(0), &plain(1), NOW - 200);
-    write_at(&root, earlier, &(plain(2) + "{\"schema"), NOW - 100);
+    write_at(&root, earlier, &(plain(1) + "{\"schema"), NOW - 100);
+    write_at(&root, &named(0), &(plain(2) + "{\"sch"), NOW - 200);
+    write_at(&root, &named(1), &plain(3), NOW - 300);
     let (_dir, mut conn) = store("steps-unfinished-store");
-    assert_eq!(stepped(&mut conn, &root, NOW), 2);
+    assert_eq!(stepped(&mut conn, &root, NOW), 3);
     let sql = "SELECT offset FROM event_file WHERE name = ?1";
-    let offset: i64 = conn.query_row(sql, [named(0)], |r| r.get(0)).unwrap();
-    assert_eq!(offset, plain(1).len() as i64);
+    let offset: i64 = conn.query_row(sql, [named(1)], |r| r.get(0)).unwrap();
+    assert_eq!(offset, plain(3).len() as i64);
 }

@@ -890,6 +890,8 @@ fn a_backlog_of_log_files_is_read_one_file_a_step_and_on_at_once_while_log_is_le
     // next at once while log is left, not at the next reading an hour later.
     let mac = Mac::new("events-steps");
     mac.event_level();
+    // A full check concludes a first reading; a store with none reads its first pass whole.
+    mac.run();
     for (seq, hour) in [(1, "00"), (2, "01"), (3, "02")] {
         mac.exec_in(
             &format!("exec-20261004T000013-20261004T{hour}0000.jsonl"),
@@ -905,8 +907,9 @@ fn a_backlog_of_log_files_is_read_one_file_a_step_and_on_at_once_while_log_is_le
     // Once nothing is left, it reads no more until the next reading is due: a second of
     // alive is about a thousand turns of its loop.
     w.next("alive");
+    // The check's row, and one a step.
     let rows = "SELECT CAST(COUNT(*) AS TEXT) || ' ' || SUM(starts) FROM event_count";
-    assert_eq!(mac.rows(rows), ["3 3"]);
+    assert_eq!(mac.rows(rows), ["4 3"]);
     assert_eq!(mac.rows("SELECT name FROM event_file").len(), 3);
     assert!(w.stop().success());
 }
