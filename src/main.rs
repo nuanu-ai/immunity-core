@@ -2478,7 +2478,9 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
         read_lockfiles(&mut run, args, &found)?;
     }
     stage(CheckStage::Places);
-    let (mut watched, mut opened) = watch_places(&mut run, args, &found, None, walk_failure)?;
+    let parsed = &mut git_hooks::Parsed::default();
+    let (mut watched, mut opened) =
+        watch_places(&mut run, args, &found, None, walk_failure, parsed)?;
     // What was set aside as no longer read, by this run or by a watcher since the last run's
     // line, is said once, here: a watcher's own line is not where a person is told.
     let set_aside = lifecycle::set_aside(run.tx, run.run_id, Some(watched::READER))?;
@@ -3812,8 +3814,9 @@ fn watch_places(
     checkouts: &[checkouts::Checkout],
     only: Option<&BTreeSet<watch::Reading>>,
     walk_failure: Option<&str>,
+    parsed: &mut git_hooks::Parsed,
 ) -> Result<(Rows, usize), Box<dyn Error>> {
-    let (rows, seen) = read_watched(run, args, checkouts, only, walk_failure)?;
+    let (rows, seen) = read_watched(run, args, checkouts, only, walk_failure, parsed)?;
     let mut opened = findings::detect(run.tx, run.run_id, run.at, &seen)?;
     targets::evidence(run.tx, run.run_id)?;
     opened += usize::from(findings::first_read(
@@ -3849,6 +3852,7 @@ fn read_watched(
     checkouts: &[checkouts::Checkout],
     only: Option<&BTreeSet<watch::Reading>>,
     walk_failure: Option<&str>,
+    parsed: &mut git_hooks::Parsed,
 ) -> Result<(Rows, Vec<findings::Observed>), Box<dyn Error>> {
     let (run_id, machine) = (run.run_id.to_string(), run.machine.to_string());
     let wanted = |scope: &str, kind: &str| {
@@ -3948,8 +3952,10 @@ fn read_watched(
         if !wanted(&scope, watched::HOOK_KIND) {
             continue;
         }
-        let git = git
-            .get_or_insert_with(|| git_hooks::Config::new(&args.home, &args.system_root, &homes));
+        let git = git.get_or_insert_with(|| {
+            let last = std::mem::take(parsed);
+            git_hooks::Config::new(&args.home, &args.system_root, &homes, last)
+        });
         // A walk pointed into a guarded folder may read its checkout. The paths in
         // Git config do not extend that permission to another guarded location.
         // The walk names a checkout under the root as given or made real: both names are allowed.
@@ -3997,6 +4003,9 @@ fn read_watched(
             coverage: None,
             checkouts: vec![rel],
         });
+    }
+    if let Some(git) = git {
+        *parsed = git.kept();
     }
     // Each way code runs by itself that is read here, in every checkout or in the home
     // folder, as one reading of this machine. Before checkouts were ever looked for on this

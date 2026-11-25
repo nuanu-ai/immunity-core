@@ -1027,7 +1027,10 @@ impl Tally {
         self.gaps().is_empty()
     }
 
-    /// What was lost, unreadable or deleted early, each with its count, in coverage's words.
+    /// What was lost, unreadable or deleted before it was read, each with its count, in
+    /// coverage's words. A file the size cap deleted after this reader read it to its end lost
+    /// nothing a rule judges: it shortens only what can be read again (`event_gone`), so
+    /// `removed_cap` is not a gap. One the cap deleted before that is in `removed_unread`.
     fn gaps(&self) -> Vec<String> {
         let mut said = Vec::new();
         if self.lost > 0 {
@@ -1045,12 +1048,6 @@ impl Tally {
         if self.unreadable > 0 {
             said.push(format!("lines that could not be read: {}", self.unreadable));
         }
-        if self.removed_cap > 0 {
-            said.push(format!(
-                "log files deleted to stay under the size cap before their day was over: {}",
-                self.removed_cap
-            ));
-        }
         if self.removed_unread > 0 {
             said.push(format!(
                 "log files deleted before this reader read them to their end: {}",
@@ -1060,10 +1057,10 @@ impl Tally {
         said
     }
 
-    /// Nothing the log held was unreadable or deleted early, whatever its kind: what file
-    /// events share with program starts.
+    /// Nothing the log held was unreadable or deleted before it was read, whatever its kind:
+    /// what file events share with program starts.
     fn shared_whole(&self) -> bool {
-        self.unreadable + self.removed_cap + self.removed_unread == 0
+        self.unreadable + self.removed_unread == 0
     }
 }
 
@@ -1662,7 +1659,10 @@ fn notes(dir: &Path) -> std::io::Result<Vec<(i64, String, u64, String)>> {
 }
 
 /// Counts what the root side's notes say it deleted since the last reading: files deleted to
-/// stay under the size cap, and files deleted before this reader read them to their end.
+/// stay under the size cap, and files deleted before this reader read them to their end. A
+/// file was read to its end when the position this reader keeps for its name is the size the
+/// note gives. A name with no position kept was never read, and a file shorter than that
+/// position is not the one read, so it cannot be told and is counted unread.
 fn removed(dir: &Path, left: &Left, tally: &mut Tally) -> std::io::Result<()> {
     for (when, name, bytes, why) in notes(dir)? {
         if left.counted.is_some_and(|at| when <= at) {
@@ -1674,7 +1674,7 @@ fn removed(dir: &Path, left: &Left, tally: &mut Tally) -> std::io::Result<()> {
         if left
             .files
             .get(&name)
-            .is_none_or(|(_, offset)| *offset < bytes)
+            .is_none_or(|(_, offset)| *offset != bytes)
         {
             tally.removed_unread += 1;
         }
@@ -3317,8 +3317,8 @@ pub enum Queue {
 /// A file the place holds with the same inode is read on from its offset. A file it does not
 /// hold is read from its start, whatever its name; so is one of a held name with another inode,
 /// or shorter than the offset, which is another file. A held file that is gone, or replaced,
-/// had lines the place had not read when the root side's note of its deletion says it held
-/// more than the offset, or, with no note, when it was not finished: then the answer says the
+/// had lines the place had not read when the root side's note of its deletion gives a size other
+/// than the offset, or, with no note, when it was not finished: then the answer says the
 /// lines are `gone`.
 pub fn queue(root: &Path, after: Option<&Place>, limit: usize, now: i64, awake: &Awake) -> Queue {
     let Opened {
@@ -3356,10 +3356,11 @@ pub fn queue(root: &Path, after: Option<&Place>, limit: usize, now: i64, awake: 
         Err(e) => return Queue::Failed(failed(REMOVED, e)),
     }
     // Whether a file the place held, now gone or replaced, had lines the place did not read. The
-    // root side's note says how much it held when it was deleted; without one, as after an
-    // uninstall, only a file read to its end with its hour over held no more.
+    // root side's note says how much it held when it was deleted, and only as much as the place
+    // read is no more: a shorter file is not the one read, as in `removed`. Without a note, as
+    // after an uninstall, only a file read to its end with its hour over held no more.
     let unread = |k: &Kept| match deleted.get(&name_of(k.key)) {
-        Some(bytes) => *bytes > k.offset,
+        Some(bytes) => *bytes != k.offset,
         None => !k.finished,
     };
     let held_of: BTreeMap<Key, &Kept> = held.files.iter().map(|k| (k.key, k)).collect();
@@ -3570,8 +3571,8 @@ pub fn instant(text: &str) -> Option<(i64, u32)> {
 
 /// The coverage of file events while the level runs: none while the collector installed here
 /// is not established to record them, with why; else full unless a file event was lost or
-/// could not be made out, or a line could not be read or an hour was deleted early, over the
-/// last day.
+/// could not be made out, or a line could not be read or an hour was deleted before it was
+/// read, over the last day, which is partial with the cause `covered` gives.
 fn files_covered(
     collects: &Result<(), (Cause, String)>,
     t: &Tally,
@@ -3585,7 +3586,6 @@ fn files_covered(
         said.extend(
             Tally {
                 unreadable: t.unreadable,
-                removed_cap: t.removed_cap,
                 removed_unread: t.removed_unread,
                 ..Tally::default()
             }
@@ -3595,22 +3595,22 @@ fn files_covered(
     if said.is_empty() {
         return ("full", None, None);
     }
-    let cause = if f.unreadable + t.unreadable > 0 {
-        Cause::Failed
-    } else {
-        Cause::NotGiven
-    };
     (
         "partial",
         Some(format!("over the last day, {}", said.join("; "))),
-        Some(cause),
+        Some(Cause::NotGiven),
     )
 }
 
 /// The coverage of a log that was read. Running, it is full unless something was lost,
-/// could not be read or was deleted early over the last day `t`, the span the log keeps,
-/// which makes it partial with the counts; refused, failing or silent, no program start is
-/// being recorded, and the state says why.
+/// could not be read or was deleted before it was read over the last day `t`, the span the
+/// log keeps, which makes it partial with the counts; refused, failing or silent, no program
+/// start is being recorded, and the state says why.
+///
+/// A partial day names the cause `not_given`, a line that could not be read too: the log was
+/// read, and what it holds there is no message. Never `failed`, which would hold this Mac in
+/// part for the whole day the row speaks of; a loss of any kind holds it from when it was read
+/// until a full check that began after it finishes (`Level::lost_since_check`).
 fn covered(state: &str, t: &Tally) -> (&'static str, Option<String>, Option<Cause>) {
     match state {
         RUNNING => {
@@ -3618,17 +3618,10 @@ fn covered(state: &str, t: &Tally) -> (&'static str, Option<String>, Option<Caus
             if said.is_empty() {
                 ("full", None, None)
             } else {
-                // Lines this reader could not read are its failure; what never reached the
-                // log is not in the source.
-                let cause = if t.unreadable > 0 {
-                    Cause::Failed
-                } else {
-                    Cause::NotGiven
-                };
                 (
                     "partial",
                     Some(format!("over the last day, {}", said.join("; "))),
-                    Some(cause),
+                    Some(Cause::NotGiven),
                 )
             }
         }
@@ -3860,7 +3853,7 @@ impl Level {
     }
 
     /// Every file event the log held over the last day was read: none lost, none that could
-    /// not be made out, no line unreadable and no file deleted early.
+    /// not be made out, no line unreadable and no file deleted before it was read.
     pub fn files_whole(&self) -> bool {
         self.files.last_day.gaps().is_empty() && self.last_day.shared_whole()
     }
@@ -3870,8 +3863,9 @@ impl Level {
     /// finished full check, its own reading included, or in any reading kept when none has
     /// finished (`Since::Check`). That check read again everything installed and every place
     /// where something is set to run, so a loss read before it is behind it. While this holds
-    /// of a running level, this Mac is watched in part; `rules.judged` keeps its own span, the
-    /// last day, and lines that could not be read are a failed reading for the day.
+    /// of a running level, this Mac is watched in part, lines that could not be read included;
+    /// `rules.judged` keeps its own span, the last day. A file the size cap deleted after it was
+    /// read to its end is no loss (`Tally::gaps`).
     pub fn lost_since_check(&self) -> bool {
         !self.since_check.whole()
             || (self.files_watched() && !self.files.since_check.gaps().is_empty())

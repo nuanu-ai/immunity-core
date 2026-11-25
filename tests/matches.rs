@@ -1480,6 +1480,20 @@ fn a_file_the_place_held_is_gone_only_when_lines_in_it_were_not_read() {
         (&m["stretch"]["gone"], &m["stretch"]["kept_from"]),
         (&json!(true), &json!(dir.position(h03, 0)))
     );
+    // A note of a file shorter than where the place read it to its end is not the file the
+    // place read, as the core's own reading counts it: what that one held is gone.
+    let (h04, h05) = ("exec-20261004T04.jsonl", "exec-20261004T05.jsonl");
+    dir.append(h04, &git(9));
+    std::thread::sleep(Duration::from_millis(20));
+    dir.append(h05, &git(10));
+    let read = place(&[]);
+    std::fs::remove_file(dir.log().join(h04)).unwrap();
+    dir.append("removed", &format!("0 {h04} 1 age\n"));
+    let m = dir.matches(&["--after", &read]);
+    assert_eq!(
+        (&m["stretch"]["gone"], &m["stretch"]["kept_from"]),
+        (&json!(true), &json!(dir.position(h05, 0)))
+    );
 }
 
 /// A place as an earlier build printed it, version 1: the last numbers, then for each
