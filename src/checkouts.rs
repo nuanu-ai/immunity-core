@@ -38,6 +38,10 @@ pub const ANOTHER_FILE_SYSTEM: &str = "on another file system, not walked: ";
 /// (`Linked`), not walked into; they follow, named as checkouts are.
 pub const UNDER_LINK: &str =
     "known checkouts there through a link on their path, not walked into, kept as they were: ";
+/// How the reading says which checkouts the store holds the disk could not tell (`NotTold`),
+/// kept as they were; they follow, named as checkouts are. The store holds them, so they were
+/// given before (`fault.rs`).
+pub const NOT_TOLD: &str = "known checkouts that could not be looked at, kept as they were: ";
 
 /// The device of the file system `path` is on: of what it leads to when `follow`, as the
 /// walk's root is taken, since a home folder may be reached through a link; of `path` itself

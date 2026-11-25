@@ -676,6 +676,7 @@ mod tests {
                 reason_text: Some(reason.to_string()),
             }],
             class: v1::Cause::Failed as i32,
+            fault: true,
             holds_on: v1::HoldsOn::ThisMac as i32,
             ..Default::default()
         }

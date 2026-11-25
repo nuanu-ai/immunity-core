@@ -59,6 +59,17 @@ impl Absent {
 /// The note of a full reading when none of its places is on this machine.
 pub const NOT_HERE: &str = "none of these places is on this machine";
 
+/// How a reason begins the units that could not be read (`Said::Failed`).
+const FAILED_HEAD: &str = "could not be read: ";
+
+/// Whether a reason names `unit` among the units that could not be read, as `Said::Failed` says
+/// each: `could not be read: a (why); b (why)`. A unit not looked into is said `a: why`, never so.
+pub fn names_failed(reason: &str, unit: &str) -> bool {
+    [FAILED_HEAD, "; "]
+        .iter()
+        .any(|before| reason.contains(&format!("{before}{unit} (")))
+}
+
 /// A unit a reading did not read, with why and how its reason says it, which gives its cause:
 /// it failed, or it was not given, as when it leads into a folder macOS asks permission for.
 /// Whether it holds anything is not known.
@@ -164,9 +175,7 @@ impl Said {
         };
         let counted = |one: &str, many: &str| crate::things(n, one, many);
         match self {
-            Said::Failed => named("could not be read: ", "; ", |u| {
-                format!("{} ({})", u.unit, u.why)
-            }),
+            Said::Failed => named(FAILED_HEAD, "; ", |u| format!("{} ({})", u.unit, u.why)),
             Said::SessionFile => format!(
                 "{n} of {} could not be read",
                 crate::things(look.files_met() as i64, "session file", "session files")

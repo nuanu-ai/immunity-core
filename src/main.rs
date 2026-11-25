@@ -23,6 +23,7 @@ mod codesign;
 mod contract;
 mod covered;
 mod events;
+mod fault;
 mod finding_answer;
 mod finding_text;
 mod findings;
@@ -3138,8 +3139,7 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
         look.short(Cause::NotGiven, why);
     }
     if !unknown.is_empty() {
-        let rels = unknown.join(", ");
-        let why = format!("known checkouts that could not be looked at, kept as they were: {rels}");
+        let why = format!("{}{}", checkouts::NOT_TOLD, unknown.join(", "));
         look.short(Cause::Failed, why);
     }
     // A known checkout there through a link on its path was not walked into, as a folder on
@@ -3912,7 +3912,7 @@ fn read_watched(
             .filter(|p| targets::runs_of(p.watched_as).is_some())
             .map(|p| &p.look)
             .collect();
-        let (look, read) = targets::read(run.tx, &run_id, &machine, &roots, &items, &all)?;
+        let (look, read) = targets::read(run.tx, &machine, &roots, &items, &all)?;
         let (completeness, reason, gap) = read.coverage(&look);
         for (item, why) in &read.rows {
             rows.push(not_read_row(targets::TARGET, item, "", why));
@@ -4361,7 +4361,7 @@ fn read_watched(
             let read_before =
                 store::read_before(tx, watched::READER, &id, watched::CONTENT, &run_id)?;
             let (completeness, reason, gap) =
-                watched::content_coverage(&e.content, e.link.is_some(), read_before);
+                watched::content_coverage(&e.content, e.link.is_some());
             let reading = Reading {
                 scope: &id,
                 kind: watched::CONTENT,

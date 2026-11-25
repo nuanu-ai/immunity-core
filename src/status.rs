@@ -1295,6 +1295,7 @@ fn uncovered_message(u: &crate::covered::Uncovered) -> crate::contract::v1::Unco
         id: u.cause.id.to_string(),
         who: u.cause.who.to_string(),
         class: cause_class(u.cause.class) as i32,
+        fault: u.fault,
         scope: u.scope.to_string(),
         kind: u.cause.kind.to_string(),
         title: u.title(),

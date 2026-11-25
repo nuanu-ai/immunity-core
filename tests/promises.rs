@@ -10698,14 +10698,15 @@ fn a_machine_that_could_not_be_reached_is_named_once_and_what_it_leaves_unread_i
         rows[0].ends_with("2026-01-03 04:00 UTC  Permission denied (publickey)."),
         "{printed}"
     );
-    // The status names it once too, on the fault line of the servers that could not be opened,
-    // and has no line of machines not reached of its own.
+    // The status names web-new, read before, on the fault line of the servers that could not be
+    // opened; db-1, never reached, is a limit it leaves to `--coverage`. It has no line of
+    // machines not reached of its own.
     let (_, printed, _) = status_out(&h.store(), &[]);
-    assert_eq!(printed.matches("db-1").count(), 1, "{printed}");
+    assert_eq!(printed.matches("db-1").count(), 0, "{printed}");
     assert!(
-        printed.contains(
-            "\n  ! 2 servers could not be opened at the last server check: db-1: Permission denied (publickey).; "
-        ) && !printed.contains("not reached"),
+        printed.contains(&format!(
+            "\n  ! 1 server could not be opened at the last server check: web-new: {timed_out}\n"
+        )) && !printed.contains("not reached"),
         "{printed}"
     );
 }
@@ -12370,22 +12371,16 @@ fn a_server_that_cannot_be_opened_is_one_thing_the_owner_can_fix_with_its_reason
         (&2.into(), &1.into()),
         "{r:#}"
     );
-    // A server that could not be opened is a fault, though the owner can fix it: a fault line
-    // with the name and its reason, without quotes, and in the full account among the faults,
-    // the reason on the line under the cause.
+    // A server never opened here is a limit, though the owner can fix it: no fault line, and in
+    // the full account among the limits, the reason on the line under the cause. One read
+    // before is a fault (`a_machine_that_could_not_be_reached_is_named_once_…`).
     let (_, printed, _) = status_out(&h.store(), &[]);
-    assert!(
-        printed.contains("\n  ! 1 server could not be opened at the last server check: db-1: Permission denied (publickey).\n"),
-        "{printed}"
-    );
+    assert!(!printed.contains("db-1"), "{printed}");
     let (_, printed, _) = status_out(&h.store(), &["--coverage"]);
     let cause = "\n    1 server could not be opened at the last server check\n      \"db-1\": \"Permission denied (publickey).\"\n";
     let at = printed.find(cause).unwrap_or_else(|| panic!("{printed}"));
-    let faults = printed[..=at]
-        .rfind("\n  Faults\n")
-        .unwrap_or_else(|| panic!("{printed}"));
     assert!(
-        !printed[faults..at].contains("\n  Limits of this version here\n"),
+        printed[..=at].contains("\n  Limits of this version here\n"),
         "{printed}"
     );
 
@@ -12418,6 +12413,7 @@ fn a_server_that_cannot_be_opened_is_one_thing_the_owner_can_fix_with_its_reason
     );
     // A server that could not be opened is the owner's to fix, with its name and reason.
     let item = uncovered(&r, "servers-not-opened").remove(0);
+    assert_eq!(item["fault"], false, "{item:#}");
     assert_eq!(
         item["title"],
         "1 server could not be opened at the last server check."
@@ -12468,12 +12464,18 @@ fn a_name_and_what_its_source_said_stay_apart_as_data_and_a_secret_in_what_it_sa
     let servers = h.sweep();
     let name = "odd: <img src=x>\u{7}";
     let password = "Sd7fQ2pLx9Wm3Rt8";
+    // Two servers read before, so that the status says them on a fault line, and each reason is
+    // seen to stay with its own name.
+    for alias in [name, "db-1"] {
+        let read = format!("##taken_at\n1767323045\n{WEB_1}");
+        put(&servers, &format!("{alias}.txt"), &read);
+    }
+    h.run(&servers, &h.none());
     put(
         &servers,
         &format!("{name}.failed"),
         &format!("1767412800\n<i>refused</i>\u{1b} tool --password {password} done\n"),
     );
-    // A second, so that each reason is seen to stay with its own name.
     put(&servers, "db-1.failed", "1767412800\nConnection refused\n");
     h.run(&servers, &h.none());
     let r = status_json(&h.store());

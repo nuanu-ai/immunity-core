@@ -8467,3 +8467,173 @@ fn a_program_a_startup_item_runs_whose_hash_is_on_the_list_is_matched() {
         )]
     );
 }
+
+/// `immunity status` for a person and as JSON, with the estate's home folder as `HOME`.
+fn said(e: &Estate) -> (String, serde_json::Value) {
+    let out = |form: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_immunity"))
+            .env("HOME", e.home())
+            .arg("status")
+            .args(form)
+            .arg("--store")
+            .arg(e.store())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out.stdout
+    };
+    let text = String::from_utf8(out(&[])).unwrap();
+    (text, serde_json::from_slice(&out(&["--json"])).unwrap())
+}
+
+/// What keeps the status from calm beside the watcher and the downloads, which no test here
+/// runs or gives: the reasons, the faults of `not_covered` by id, and the state of this Mac.
+fn held(s: &serde_json::Value) -> (Vec<String>, Vec<String>, String) {
+    let downloads = [
+        "vulnerability-list-not-downloaded",
+        "vulnerability-data-old",
+    ];
+    let items = s["not_covered"].as_array().unwrap().iter();
+    let faults = items
+        .filter(|u| u["fault"] == true)
+        .map(|u| u["id"].as_str().unwrap());
+    let faults: Vec<String> = faults
+        .filter(|id| !downloads.contains(id))
+        .map(str::to_string)
+        .collect();
+    let because = s["headline_because"].as_array().unwrap().iter();
+    let because = because
+        .map(|b| b.as_str().unwrap())
+        .filter(|b| *b != "watcher");
+    let because = because.filter(|b| *b != "not_covered" || !faults.is_empty());
+    (
+        because.map(str::to_string).collect(),
+        faults,
+        s["this_mac"]["state"].to_string(),
+    )
+}
+
+/// The items of `not_covered` that are about `name`, each as its id and whether it is a fault.
+fn about(s: &serde_json::Value, name: &str) -> Vec<(String, bool)> {
+    let items = s["not_covered"].as_array().unwrap().iter();
+    items
+        .filter(|u| {
+            u["examples_text"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|n| n == name)
+        })
+        .map(|u| (u["id"].as_str().unwrap().to_string(), u["fault"] == true))
+        .collect()
+}
+
+#[test]
+fn a_unit_read_before_and_unreadable_now_keeps_the_headline_from_calm_whoever_owns_it() {
+    // At one check a watched file is read; at the next it is closed. Losing sight of it is a
+    // finding, and once the person has answered it the file still holds this Mac in part as a
+    // fault, named by a `!` line, until a reading reads it again or finds it gone. A file of
+    // another account is sorted by the same rule (`fault.rs`); a test cannot make one here.
+    use std::os::unix::fs::PermissionsExt;
+    let e = Estate::new("fault-read-before");
+    let zshrc = e.home().join(".zshrc");
+    let mode = |m| std::fs::set_permissions(&zshrc, std::fs::Permissions::from_mode(m)).unwrap();
+    let calm = (Vec::new(), Vec::new(), "\"watched\"".to_string());
+    let held_in_part = (
+        vec!["this_mac".to_string(), "not_covered".to_string()],
+        vec!["not-permitted".to_string()],
+        "\"watched_in_part\"".to_string(),
+    );
+    for ending in ["read again", "gone"] {
+        put(&zshrc, "export A=1\n");
+        e.run();
+        assert_eq!(held(&said(&e).1), calm, "{ending}");
+        mode(0o000);
+        e.run();
+        assert_eq!(said(&e).1["headline"], "needs_a_look", "{ending}");
+        e.seen();
+        let (text, s) = said(&e);
+        assert_eq!(held(&s), held_in_part, "{ending}");
+        assert_eq!(about(&s, "~/.zshrc"), [("not-permitted".to_string(), true)]);
+        assert!(text.contains("\n  ! Could not read: ~/.zshrc: "), "{text}");
+        // Another check that cannot read it changes nothing.
+        e.run();
+        assert_eq!(held(&said(&e).1), held_in_part, "{ending}");
+        mode(0o644);
+        if ending == "gone" {
+            std::fs::remove_file(&zshrc).unwrap();
+        }
+        e.run();
+        let (text, s) = said(&e);
+        assert_eq!(held(&s), calm, "{ending}");
+        assert!(about(&s, "~/.zshrc").is_empty(), "{ending}");
+        assert!(!text.contains("Could not read"), "{text}");
+    }
+}
+
+#[test]
+fn a_unit_never_read_here_is_a_limit_and_leaves_calm() {
+    // A watched file closed from the first check on was never given here: it is listed as a
+    // limit by `--coverage`, and nothing of it keeps the answer from calm.
+    use std::os::unix::fs::PermissionsExt;
+    let e = Estate::new("fault-never-read");
+    let zshrc = e.home().join(".zshrc");
+    put(&zshrc, "export A=1\n");
+    let mode = |m| std::fs::set_permissions(&zshrc, std::fs::Permissions::from_mode(m)).unwrap();
+    mode(0o000);
+    e.run();
+    e.run();
+    let (text, s) = said(&e);
+    mode(0o644);
+    assert_eq!(
+        held(&s),
+        (Vec::new(), Vec::new(), "\"watched\"".to_string())
+    );
+    assert_eq!(
+        about(&s, "~/.zshrc"),
+        [("not-permitted".to_string(), false)]
+    );
+    // The downloads this estate is not given failed: the core's own work, faults.
+    let items = s["not_covered"].as_array().unwrap().iter();
+    let downloads = items.filter(|u| u["id"].as_str().unwrap().starts_with("vulnerability-"));
+    assert!(downloads.clone().count() >= 2 && downloads.clone().all(|u| u["fault"] == true));
+    assert!(!text.contains("Could not read"), "{text}");
+    let out = Command::new(env!("CARGO_BIN_EXE_immunity"))
+        .env("HOME", e.home())
+        .args(["status", "--coverage", "--store"])
+        .arg(e.store())
+        .output()
+        .unwrap();
+    let coverage = String::from_utf8(out.stdout).unwrap();
+    let (faults, limits) = coverage.split_once("Limits of this version here").unwrap();
+    assert!(limits.contains("~/.zshrc"), "{coverage}");
+    assert!(!faults.contains("~/.zshrc"), "{coverage}");
+}
+
+#[test]
+fn a_file_read_before_that_the_guard_of_protected_folders_now_turns_away_is_found_and_then_a_limit()
+{
+    // Today's behaviour, pinned: a watched file read before that becomes a link into a folder
+    // macOS protects is not looked into. Losing sight of it raises its finding; its reading is
+    // not given, a limit, so once the finding is answered nothing keeps the answer from calm.
+    let e = Estate::new("fault-guarded");
+    let zshrc = e.home().join(".zshrc");
+    put(&zshrc, "export A=1\n");
+    e.run();
+    std::fs::remove_file(&zshrc).unwrap();
+    put(&e.home().join("Documents/x/zshrc"), "export A=2\n");
+    link(e.home().join("Documents/x/zshrc").to_str().unwrap(), &zshrc);
+    e.run();
+    assert_eq!(e.found(), [pair("watched.shell-profile", "~/.zshrc")]);
+    e.seen();
+    let s = said(&e).1;
+    assert_eq!(
+        held(&s),
+        (Vec::new(), Vec::new(), "\"watched\"".to_string())
+    );
+    assert!(about(&s, "~/.zshrc").is_empty(), "{s:#}");
+}

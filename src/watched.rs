@@ -738,32 +738,16 @@ fn reason(e: &std::io::Error) -> String {
 /// open it.
 pub const CLOSED: &str = "another account's file, closed to this account";
 
-/// The cause of a file not read, with `why` said of it. A file of another account closed to
-/// this one is not given by its source while its content was never read on this Mac; once it
-/// was (`read_here`, as `store::read_before` tells of its content reading), losing sight of
-/// what was read is a failure. It is still not the person's to fix: its reason stays `CLOSED`,
-/// which the test of permissions they can change (`covered::not_permitted`) does not take.
-pub fn unread_cause(cause: Cause, why: &str, read_here: bool) -> Cause {
-    match cause {
-        Cause::NotGiven if why == CLOSED && read_here => Cause::Failed,
-        _ => cause,
-    }
-}
-
 /// The completeness, the reason and the gap of the reading of a file's content, from what was
 /// found there, reached through a link or not (`linked`): full when read, else `none` with why.
 /// A link whose target is not given is `partial`, as a link into a folder macOS asks
 /// permission for: where it points is read, what it leads to is not, and what was known of
 /// that stays.
-pub fn content_coverage(
-    content: &Content,
-    linked: bool,
-    read_here: bool,
-) -> (&'static str, Option<&str>, Gap) {
+pub fn content_coverage(content: &Content, linked: bool) -> (&'static str, Option<&str>, Gap) {
     let Content::Unread(cause, why) = content else {
         return ("full", None, Gap::default());
     };
-    let cause = unread_cause(*cause, why, read_here);
+    let cause = *cause;
     let mut gap = Gap::of(cause);
     if cause == Cause::NotGiven && linked {
         return ("partial", Some(why), gap);
@@ -783,9 +767,10 @@ pub fn bytes(path: &Path, meta: &Metadata, cap: u64) -> Result<Vec<u8>, Content>
 }
 
 /// `bytes`, read as the account `us`. A file whose permissions do not let `us` open it while
-/// another account owns it, as `meta` tells without opening it, is `CLOSED`: not the person's
-/// to fix, and not given by its source unless it was read here before (`unread_cause`). A
-/// closed file of their own failed, which they can fix.
+/// another account owns it, as `meta` tells without opening it, failed with the reason
+/// `CLOSED`: not the person's to fix, which the test of permissions they can change
+/// (`covered::not_permitted`) does not take. A closed file of their own failed with the
+/// system's reason, which they can fix. Whether either is a fault is `fault.rs`'s.
 fn bytes_as(path: &Path, meta: &Metadata, cap: u64, us: u32) -> Result<Vec<u8>, Content> {
     if !meta.is_file() {
         return Err(Content::Special(kind_of(meta.file_type())));
@@ -801,7 +786,7 @@ fn bytes_as(path: &Path, meta: &Metadata, cap: u64, us: u32) -> Result<Vec<u8>, 
     };
     match read() {
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied && meta.uid() != us => {
-            Err(Content::Unread(Cause::NotGiven, CLOSED.to_string()))
+            Err(Content::Unread(Cause::Failed, CLOSED.to_string()))
         }
         Err(e) => Err(Content::Unread(Cause::Failed, reason(&e))),
         Ok(Err(what)) => Err(Content::Special(what)),
@@ -858,9 +843,9 @@ mod tests {
 
     #[test]
     fn a_closed_file_is_the_persons_to_fix_only_when_it_is_theirs_and_is_never_read() {
-        // A file its permissions keep closed failed when the person owns it, as they can open
-        // it; when another account owns it, it is said as another account's file. Either way
-        // nothing of it is read. Another owner is made by reading as an account that is not ours.
+        // A file its permissions keep closed failed whoever owns it; when another account owns
+        // it, it is said as another account's file. Either way nothing of it is read. Another
+        // owner is made by reading as an account that is not ours.
         use std::os::unix::fs::PermissionsExt;
         let dir = crate::common::Scratch::new("watched-closed");
         let path = dir.join("helper");
@@ -871,30 +856,15 @@ mod tests {
         let said = |us| bytes_as(&path, &meta, CAP, us);
         let failed = Content::Unread(Cause::Failed, "Permission denied (os error 13)".into());
         assert_eq!(said(ours), Err(failed));
-        let theirs = Content::Unread(Cause::NotGiven, CLOSED.to_string());
-        assert_eq!(said(ours.wrapping_add(1)), Err(theirs));
-    }
-
-    #[test]
-    fn a_file_of_another_account_closed_here_is_not_given_until_read_here_and_then_failed_also_through_a_link()
-     {
-        // Never read here: not given, `partial` through a link as a link into a folder macOS
-        // protects. Read here before: failed and `none`, with a link or without, as any file
-        // that could not be opened, so losing sight of what was read stays said.
-        let closed = Content::Unread(Cause::NotGiven, CLOSED.to_string());
-        let said = |linked, read_here| {
-            let (completeness, reason, gap) = content_coverage(&closed, linked, read_here);
-            assert_eq!(reason, Some(CLOSED));
-            (completeness, gap.cause)
-        };
-        assert_eq!(said(false, false), ("none", Some(Cause::NotGiven)));
-        assert_eq!(said(true, false), ("partial", Some(Cause::NotGiven)));
+        let theirs = || Content::Unread(Cause::Failed, CLOSED.to_string());
+        assert_eq!(said(ours.wrapping_add(1)), Err(theirs()));
+        // Through a link too it is a failed reading of nothing, never the `partial` of a link
+        // into a folder macOS protects, whose target is not given.
         for linked in [false, true] {
-            assert_eq!(
-                said(linked, true),
-                ("none", Some(Cause::Failed)),
-                "{linked}"
-            );
+            let closed = theirs();
+            let (completeness, reason, gap) = content_coverage(&closed, linked);
+            assert_eq!((completeness, reason), ("none", Some(CLOSED)));
+            assert_eq!(gap.cause, Some(Cause::Failed));
         }
     }
 

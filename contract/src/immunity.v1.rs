@@ -3560,7 +3560,8 @@ pub struct Caveat {
     #[prost(string, tag = "2")]
     pub short: ::prost::alloc::string::String,
 }
-/// One thing the core does not cover, in its words: one per cause, never one per machine or file.
+/// One thing the core does not cover, in its words: one per cause and `fault`, never one per
+/// machine or file.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -3624,6 +3625,12 @@ pub struct Uncovered {
         deserialize_with = "crate::enum_from_name::<Cause, _>"
     )]
     pub class: i32,
+    /// A fault: something the core has reason to expect to work on this Mac now and that does not,
+    /// such as a file read here before that cannot be read now, or a download that failed. False for
+    /// a limit, such as a file never read on this Mac. A cause is listed twice when it is both, each
+    /// item holding only its own things. Since 1.32.0.
+    #[prost(bool, tag = "15")]
+    pub fault: bool,
 }
 /// One thing a cause of what is not covered is about.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -4296,11 +4303,12 @@ pub enum Headline {
     /// Nothing needed a look at the latest full check, and it is not fresh: `this_mac.fresh`.
     #[serde(rename = "stale")]
     Stale = 4,
-    /// Nothing needs a look in a fresh answer, and `headline_because` names what kept it from calm.
+    /// Nothing needs a look in a fresh answer, and `headline_because` names the fault that kept it
+    /// from calm. A limit of this version, such as a file never read on this Mac, never does.
     #[serde(rename = "in_part")]
     InPart = 5,
-    /// Nothing needs a look, the answer is fresh, this Mac is watched whole by a live watcher, and
-    /// nothing failed.
+    /// Nothing needs a look, the answer is fresh, this Mac is watched by a live watcher, and no fault
+    /// stands. What is left uncovered is limits alone.
     #[serde(rename = "calm")]
     Calm = 6,
 }
@@ -4348,11 +4356,11 @@ pub enum HeadlineBecause {
     /// `this_mac.state` is `watched_in_part`.
     #[serde(rename = "this_mac")]
     ThisMac = 2,
-    /// A reading failed or a machine was not reached: `coverage.failed` or
-    /// `coverage.unreached_total` is more than 0.
+    /// Not given since 1.32.0: a reading that failed or a machine not reached is a fault only by the
+    /// rule of `Uncovered.fault`, and is said by `not_covered`.
     #[serde(rename = "coverage")]
     Coverage = 3,
-    /// An item of `not_covered` is of class `failed`, or of a class the reader does not know.
+    /// An item of `not_covered` has `fault`.
     #[serde(rename = "not_covered")]
     NotCovered = 4,
     /// The event level is installed and its state is not `running`.
@@ -4570,14 +4578,17 @@ pub enum ThisMacState {
     /// Nothing of this Mac has been read yet.
     #[serde(rename = "not_checked")]
     NotChecked = 1,
-    /// Its places are read, and none that is there failed to be read.
+    /// Its places are read, and no fault stands in reading them: a place there and not read is a
+    /// limit, such as a file never read on this Mac.
     #[serde(rename = "watched")]
     Watched = 2,
-    /// A place of its own is there and was not read whole: a reading of it failed; or the event
+    /// A place of its own is there and was not read whole, and that is a fault: a reading of it
+    /// failed that `not_covered` holds with `fault`, such as a file read here before; or the event
     /// level is installed and records no program start (refused, failing or silent); or it runs and
     /// lost part of what it was to record in a reading since the latest finished full check, or at
     /// any time when none has finished; or it could not read some lines over the last day, a failed
-    /// reading. `not_covered`, or the counts `since_check` of `event_level`, say which.
+    /// reading. `not_covered`, or the counts `since_check` of `event_level`, say which. A reading
+    /// that failed and is a limit, such as of a file never read here, leaves it `watched`.
     #[serde(rename = "watched_in_part")]
     WatchedInPart = 3,
 }
