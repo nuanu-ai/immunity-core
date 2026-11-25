@@ -483,8 +483,13 @@ fn read_target(
                     _ => not(Content::Missing, Some(ABSENT)),
                 };
             }
+            // Counted once its cause is decided, as a file that could not be opened.
             Real::Failed(e) => {
-                return not(Content::Unread(Cause::Failed, e.to_string()), Some(FAILED));
+                let met = on_disk(roots, path);
+                let homes = watched::homes(roots.home);
+                let by = crate::closed::By::walk(&met, &[&homes[0], &homes[1]]);
+                let failed = crate::closed::Failure::of(&e, by, &met, e.to_string());
+                return not(Content::Failed(failed), None);
             }
         };
         let shown = from_root(roots.system, &real);
@@ -815,7 +820,7 @@ mod tests {
             watched_as: TARGET,
             content: Content::Failed(crate::closed::Failure {
                 errno: Some(libc::EACCES),
-                owner: 0,
+                by: crate::closed::By::File(0),
                 us: 501,
                 real: dir.join("Library/Example/helper"),
                 why: "Permission denied (os error 13)".to_string(),
@@ -834,22 +839,51 @@ mod tests {
         let program = dir.join("runner");
         std::fs::write(&program, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // And a program behind a folder closed to this account, counted once, as the file.
+        let shut = std::fs::canonicalize(&dir).unwrap().join("shut");
+        std::fs::create_dir_all(&shut).unwrap();
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
         let mut items = Look::default();
-        let agent = AGENT.replace("/Users/example/bin/agent", "/runner");
-        items.entries.push(Entry {
-            unit: Unit::whole("Library/LaunchAgents/org.example.agent.plist"),
-            watched_as: watched::AUTOSTART,
-            content: Content::Hash("sha256:00".to_string()),
-            link: None,
-            bytes: Some(std::sync::Arc::from(agent.into_bytes())),
-        });
+        for (name, runs) in [("agent", "/runner"), ("shut", "/shut/runner")] {
+            let agent = AGENT.replace("/Users/example/bin/agent", runs);
+            items.entries.push(Entry {
+                unit: Unit::whole(format!("Library/LaunchAgents/org.example.{name}.plist")),
+                watched_as: watched::AUTOSTART,
+                content: Content::Hash("sha256:00".to_string()),
+                link: None,
+                bytes: Some(std::sync::Arc::from(agent.into_bytes())),
+            });
+        }
         let (mut look, t) = read(&tx, "example-mac", &roots, &[&items], &[&items]).unwrap();
         let why = "Permission denied (os error 13)".to_string();
-        assert_eq!(look.entries[0].content, Content::Unread(Cause::Failed, why));
-        let failed = format!("not read in full: {FAILED}: 1; {AT_CHECKS}");
+        // Neither keeps a link, so its row is `none` whatever its cause (`closed::Read::of`).
+        for e in &look.entries {
+            assert_eq!(e.content, Content::Unread(Cause::Failed, why.clone()));
+            assert_eq!(e.link, None);
+        }
+        let failed = format!("not read in full: {FAILED}: 2; {AT_CHECKS}");
         assert_eq!(
             said(&t, &mut look),
             ("partial", failed, Some(Cause::Failed))
+        );
+        // The program behind the folder is said with that folder.
+        let mut resolve = || guarded::real(&dir.join("shut/runner"), &[]);
+        let unread = &mut Look::default();
+        let (content, ..) = read_target(
+            &mut resolve,
+            &roots,
+            "/shut/runner",
+            &Default::default(),
+            unread,
+        );
+        let Content::Failed(f) = content else {
+            panic!("{content:?}");
+        };
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let us = unsafe { libc::geteuid() };
+        assert_eq!(
+            (f.by, f.real),
+            (crate::closed::By::Folder(shut, us), dir.join("shut/runner"))
         );
     }
 

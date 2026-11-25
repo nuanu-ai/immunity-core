@@ -973,7 +973,7 @@ fn scope_of(scope: &str, this: Option<&str>) -> &'static str {
 
 /// Whether a reading that failed did because of permissions, which the owner can change. A file
 /// of another account closed to this one is not, whether it failed or was not given: its
-/// reason is `watched::CLOSED`, with no number of the system's. Readers keep
+/// reason is fixed (`closed::of_another`), with no number of the system's. Readers keep
 /// the system's error as the reason, and Rust writes an error from the system with its
 /// number: EPERM is 1 and EACCES is 13 on macOS and on Linux (errno.h).
 fn not_permitted(reason: Option<&str>) -> bool {
@@ -1066,7 +1066,7 @@ pub fn not_covered(
     let theirs: Vec<&Latest> = latest
         .iter()
         .filter(|r| r.cause.as_deref() == Some(store::Cause::NotGiven.literal()))
-        .filter(|r| r.reason.as_deref() == Some(watched::CLOSED))
+        .filter(|r| crate::closed::of_another(r.reason.as_deref()))
         .collect();
     for (cause, list) in [
         (&NOT_PERMITTED, closed),

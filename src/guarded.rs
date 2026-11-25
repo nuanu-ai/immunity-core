@@ -113,6 +113,13 @@ pub fn real(path: &Path, homes: &[&Path]) -> Real {
     real_in(path, homes, &[])
 }
 
+/// Like `real`, with the part it could not look at when that is where it failed: the folder
+/// it reached, made real, joined with the part's name (`closed::By::walk`).
+pub fn real_to(path: &Path, homes: &[&Path]) -> (Real, Option<PathBuf>) {
+    let mut stopped = None;
+    (walk(path, homes, &[], &mut stopped), stopped)
+}
+
 /// A folder's device and inode: what every spelling of it shares.
 type Id = (u64, u64);
 
@@ -141,6 +148,10 @@ fn identities(homes: &[&Path]) -> (Option<Id>, Vec<(Id, PathBuf, PathBuf)>) {
 /// Like `real`, with the given checkout allowed under both its supplied and resolved names.
 /// Its guarded ancestors may be traversed to reach it.
 pub fn real_in(path: &Path, homes: &[&Path], given: &[&Path]) -> Real {
+    walk(path, homes, given, &mut None)
+}
+
+fn walk(path: &Path, homes: &[&Path], given: &[&Path], stopped: &mut Option<PathBuf>) -> Real {
     let exempt = |p: &Path, on_the_way: bool| {
         given
             .iter()
@@ -202,7 +213,10 @@ pub fn real_in(path: &Path, homes: &[&Path], given: &[&Path]) -> Real {
             return Real::Guarded(name.clone());
         }
         match std::fs::symlink_metadata(&next) {
-            Err(e) => return Real::Failed(e),
+            Err(e) => {
+                *stopped = Some(next);
+                return Real::Failed(e);
+            }
             Ok(m) if m.file_type().is_symlink() => {
                 links += 1;
                 if links > MAX_LINKS {
