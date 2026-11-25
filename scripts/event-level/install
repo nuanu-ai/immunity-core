@@ -47,8 +47,9 @@ DAEMONS=/Library/LaunchDaemons
 LABELS='ai.nuanu.immunity.core.event-filter ai.nuanu.immunity.core.eslogger ai.nuanu.immunity.core.event-tidy'
 # Run by /bin/sh, so read, not executed.
 SCRIPTS='collect.sh filter.jq tidy.sh'
-# Executed by rotatelogs at each new file, so executable.
-HOOK=rotated.sh
+# Executed, so executable: rotated.sh by rotatelogs at each new file, and the two others by
+# launchd as the filter's and the tidy job's program, so that macOS lists each job by its name.
+EXECUTED='rotated.sh immunity-event-filter immunity-log-cleanup'
 
 here=$(cd "$(/usr/bin/dirname "$0")" && pwd -P) || exit 1
 
@@ -268,7 +269,7 @@ else
         fail "SUDO_USER and SUDO_UID do not name one account"
 fi
 
-for f in $SCRIPTS $HOOK uninstall; do
+for f in $SCRIPTS $EXECUTED uninstall; do
     [ -f "$here/$f" ] || fail "$here/$f is missing"
 done
 for l in $LABELS; do
@@ -322,9 +323,9 @@ fi
 cat <<EOF
 This installs the event level, and changes nothing else on this Mac:
   $LIB
-      root, 755: collect.sh, filter.jq, tidy.sh (root, 644) and rotated.sh (root, 755);
-      collects, the arguments eslogger is started with (root, 644); uninstall, which
-      removes all of this (root, 755)
+      root, 755: collect.sh, filter.jq, tidy.sh (root, 644); rotated.sh,
+      immunity-event-filter and immunity-log-cleanup (root, 755); collects, the arguments
+      eslogger is started with (root, 644); uninstall, which removes all of this (root, 755)
   $RUN
       root, 700: events.fifo, the pipe from eslogger to the filter (root, 600)
   $LOG
@@ -335,10 +336,12 @@ This installs the event level, and changes nothing else on this Mac:
   $DAEMONS/ai.nuanu.immunity.core.eslogger.plist
       runs /usr/bin/eslogger exec create rename as root
   $DAEMONS/ai.nuanu.immunity.core.event-filter.plist
-      runs collect.sh as root: jq keeps what the reader uses, rotatelogs writes the log and
-      runs rotated.sh, and so tidy.sh, at each new file
+      runs collect.sh as root through immunity-event-filter, the name macOS lists it by: jq
+      keeps what the reader uses, rotatelogs writes the log and runs rotated.sh, and so
+      tidy.sh, at each new file
   $DAEMONS/ai.nuanu.immunity.core.event-tidy.plist
-      runs tidy.sh as root every ten minutes; it holds the log's cap, $capw ($cap bytes),
+      runs tidy.sh as root every ten minutes through immunity-log-cleanup, the name macOS
+      lists it by; it holds the log's cap, $capw ($cap bytes),
       $from. tidy.sh deletes logs older than a day, and the oldest while the log is larger
       than its cap
 It records every program start on this Mac, of every account, with its arguments, and every
@@ -406,7 +409,9 @@ done
 for f in $SCRIPTS; do
     step /usr/bin/install -o root -g wheel -m 644 "$here/$f" "$LIB/$f"
 done
-step /usr/bin/install -o root -g wheel -m 755 "$here/$HOOK" "$LIB/$HOOK"
+for f in $EXECUTED; do
+    step /usr/bin/install -o root -g wheel -m 755 "$here/$f" "$LIB/$f"
+done
 # The removal script, so that removing the collector needs no checkout.
 step /usr/bin/install -o root -g wheel -m 755 "$here/uninstall" "$LIB/uninstall"
 

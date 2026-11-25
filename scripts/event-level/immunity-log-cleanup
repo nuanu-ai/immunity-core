@@ -1,0 +1,3 @@
+#!/bin/sh
+# The program the tidy job (ai.nuanu.immunity.core.event-tidy) names, so macOS lists the job by this name.
+exec /bin/sh "$@"
