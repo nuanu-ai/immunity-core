@@ -341,6 +341,13 @@ mod tests {
                 ),
             ),
             (
+                "no store, in a read access",
+                refused(
+                    crate::store::read(&dir.join("none.db"), |_| Ok(())).unwrap_err(),
+                    Code::NoStore,
+                ),
+            ),
+            (
                 "not a store",
                 refused(
                     crate::store::open_read_only(&notes).unwrap_err(),

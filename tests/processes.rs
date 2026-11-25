@@ -172,6 +172,14 @@ fn table(at: i64) -> Vec<Value> {
 }
 
 #[test]
+fn a_sample_names_the_store_it_wrote_to_as_every_answer_read_from_a_store_does() {
+    let dir = Dir::new("store-id");
+    let answer = sample(&dir, T, &table(T));
+    let id = &contract(&dir, &["status"])["store_id"];
+    assert_eq!((&answer["store_id"], id.is_string()), (id, true));
+}
+
+#[test]
 fn a_detached_interpreter_given_code_is_a_finding_once_two_samples_a_minute_apart_saw_it() {
     let dir = Dir::new("fires");
     // A first sample can fire nothing: it only starts tracking.

@@ -474,7 +474,7 @@ fn package_in(
             at_text: whole(&vulnerabilities::at_shown(line)),
         })
         .collect();
-    let listed = crate::threats::last_good(conn).unwrap_or(None).is_some();
+    let listed = crate::threats::last_good(conn)?.is_some();
     for a in &mine {
         out.records.push(v1::PackageRecord {
             id_text: whole(&a.advisory),

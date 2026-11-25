@@ -922,7 +922,7 @@ pub fn message(
             ))
             .collect(),
         rules: Some(rules_now(state.and_then(|s| s.event_level.as_ref()))),
-        watching: crate::watch::watcher(path),
+        watching: crate::watch::watcher(path, conn)?,
         answers_note: findings::ANSWERS_NOTE.to_string(),
         login_job_installed: login_job_installed(path),
         watcher_restarting_since_at: crate::watch::restarting_since(&crate::home(path), now),

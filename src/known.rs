@@ -28,7 +28,6 @@
 
 use crate::answer::{self, Form};
 use crate::contract::{self, v1, value_of};
-use crate::outcome::Outcome;
 use crate::{checkouts, findings, guarded, status, store};
 use prost::Message;
 use rusqlite::{Connection, OptionalExtension};
@@ -214,7 +213,11 @@ pub fn command_told<M: Message + serde::Serialize>(
     text: impl FnOnce(&M) -> String,
     refused: impl FnOnce(&v1::Failure) -> String,
 ) -> ExitCode {
-    match read(store, |conn| ask(conn, crate::now_secs())) {
+    let read = match store.is_file() {
+        false => Err(store::absent(store)),
+        true => store::read(store, |conn| Ok(ask(conn, crate::now_secs())?)),
+    };
+    match read {
         Ok(Ok(m)) => answer::print(op, form, &m, text),
         Ok(Err(r)) => answer::fail_as(op, form, r.error(), crate::EXIT_USAGE, refused),
         Err(o) => {
@@ -222,18 +225,6 @@ pub fn command_told<M: Message + serde::Serialize>(
             answer::fail(op, form, error, o.exit())
         }
     }
-}
-
-fn read<T>(
-    store: &Path,
-    ask: impl FnOnce(&Connection) -> rusqlite::Result<T>,
-) -> Result<T, Outcome> {
-    if !store.is_file() {
-        return Err(store::absent(store));
-    }
-    let conn = store::open_read_only(store)?;
-    let tx = conn.unchecked_transaction()?;
-    Ok(ask(&tx)?)
 }
 
 /// Whether the store has an entity with this id, of any type.

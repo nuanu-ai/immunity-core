@@ -927,18 +927,19 @@ fn store_folder(folder: &Path) -> Result<(), String> {
 }
 
 /// Takes one sample under the run lock, records what the rule tracks and raises what it finds.
-fn sample(args: &SampleArgs) -> Result<processes::Report, Box<dyn Error>> {
+/// Returns its report and the store's id, read under the same lock before the sample.
+fn sample(args: &SampleArgs) -> Result<(processes::Report, String), Box<dyn Error>> {
     let home = home(&args.store);
     store_folder(&home)?;
     let _lock = store::lock_run(&home)?.ok_or(Outcome::new(Code::RunLockHeld, ""))?;
     // `immunity sample` makes the store where there is none; a watcher's sample only opens it.
-    drop(store::open_or_make(&args.store)?);
+    let id = store::id(&store::open_or_make(&args.store)?).map_err(Outcome::from)?;
     let (report, _) = sample_held(
         &args.store,
         args.input.as_deref(),
         &mut processes::Signers::default(),
     )?;
-    Ok(report)
+    Ok((report, id))
 }
 
 /// One sample, with the run lock held by the caller: of the system, or of the reading in
@@ -980,12 +981,10 @@ pub fn sample_held(
 
 fn sample_cmd(args: &SampleArgs) -> ExitCode {
     match sample(args) {
-        Ok(report) => {
+        Ok((report, id)) => {
             let mut m = report.message();
             m.answered_at = now_secs();
-            m.store_id = store::open_read_only(&args.store)
-                .ok()
-                .and_then(|c| store::id(&c).ok());
+            m.store_id = Some(id);
             answer::print("sample", args.form, &m, |m| {
                 after_run::sample(m, &screen::Screen::of_stdout())
             })
@@ -1077,13 +1076,12 @@ fn rules_cmd(args: &RulesArgs) -> ExitCode {
         return replay_cmd(root, args.form);
     }
     let now = now_secs();
-    let read = (|| -> Result<(Option<events::Level>, Option<String>), Outcome> {
-        if !args.store.exists() {
-            return Ok((None, None));
-        }
-        let conn = store::open_read_only(&args.store)?;
-        Ok((events::level(&conn, now)?, Some(store::id(&conn)?)))
-    })();
+    let read = match args.store.exists() {
+        false => Ok((None, None)),
+        true => store::read(&args.store, |c| {
+            Ok((events::level(c, now)?, Some(store::id(c)?)))
+        }),
+    };
     let (level, store_id) = match read {
         Ok(read) => read,
         Err(o) => {
@@ -1210,21 +1208,24 @@ fn status_answer(store: &Path, now: i64) -> Result<contract::v1::Status, Outcome
         let path = std::path::absolute(store).unwrap_or_else(|_| store.to_path_buf());
         return Ok(status::message(None, None, false, &path, now)?);
     }
-    status_read(store, now).map(|(_, m)| m)
+    store::read(store, |tx| status_read(tx, store, now)).map(|(_, m)| m)
 }
 
-/// What the store holds and the contract's `Status` built from it, of one state of the store.
-fn status_read(store: &Path, now: i64) -> Result<(status::State, contract::v1::Status), Outcome> {
+/// What the store holds and the contract's `Status` built from it, read in `tx`, a read of
+/// `store` (`store::read`).
+fn status_read(
+    tx: &rusqlite::Connection,
+    store: &Path,
+    now: i64,
+) -> Result<(status::State, contract::v1::Status), Box<dyn Error>> {
     let path = std::path::absolute(store).unwrap_or_else(|_| store.to_path_buf());
-    let conn = store::open_read_only(store)?;
-    let tx = conn.unchecked_transaction()?;
-    let st = status::state(&tx, &home(store), now)?;
+    let st = status::state(tx, &home(store), now)?;
     // Running is said only of the latest start this state of the store holds, by its own lock.
     let running = match &st.last {
-        Some(l) => osv::check_in_progress(&home(store), &l.id).map_err(|e| outcome::of(&e))?,
+        Some(l) => osv::check_in_progress(&home(store), &l.id)?,
         None => false,
     };
-    let mut m = status::message(Some(&tx), Some(&st), running, &path, now)?;
+    let mut m = status::message(Some(tx), Some(&st), running, &path, now)?;
     // The stage is read only of the check its lock says runs, and changes nothing else.
     if let Some((stage, at)) = st
         .last
@@ -1336,36 +1337,35 @@ fn vulnerabilities_cmd(args: &VulnerabilityArgs) -> ExitCode {
     } else {
         "vulnerabilities"
     };
-    let failed = |e: &(dyn Error + 'static)| {
-        let o = outcome::of(e);
-        answer::fail(
-            op,
-            args.form,
-            o.error(op, "immunity vulnerabilities --json"),
-            o.exit(),
-        )
+    let failed = |o: Outcome| {
+        let error = o.error(op, "immunity vulnerabilities --json");
+        answer::fail(op, args.form, error, o.exit())
     };
     let now = now_secs();
-    let conn = match args.store.exists() {
-        false => None,
-        true => match store::open_read_only(&args.store) {
-            Ok(conn) => Some(conn),
-            Err(e) => return failed(&e),
-        },
-    };
     match &args.id {
-        None => match vulnerabilities::list(conn.as_ref(), now) {
+        None => match read_or_none(&args.store, |c| vulnerabilities::list(c, now)) {
             Ok(m) => answer::print(op, args.form, &m, |m| {
                 answers_text::vulnerabilities(m, &screen::Screen::of_stdout())
             }),
-            Err(e) => failed(&e),
+            Err(o) => failed(o),
         },
-        Some(id) => match vulnerabilities::one(conn.as_ref(), id, now) {
+        Some(id) => match read_or_none(&args.store, |c| vulnerabilities::one(c, id, now)) {
             Ok(m) => answer::print(op, args.form, &m, |m| {
                 answers_text::vulnerability(m, &screen::Screen::of_stdout())
             }),
-            Err(e) => failed(&e),
+            Err(o) => failed(o),
         },
+    }
+}
+
+/// What `ask` answers from one read of the store, or without a store where there is none.
+fn read_or_none<T>(
+    store: &Path,
+    ask: impl FnOnce(Option<&rusqlite::Connection>) -> rusqlite::Result<T>,
+) -> Result<T, Outcome> {
+    match store.exists() {
+        false => Ok(ask(None)?),
+        true => store::read(store, |c| Ok(ask(Some(c))?)),
     }
 }
 
@@ -1550,18 +1550,7 @@ fn finding_cmd(args: &FindingArgs) -> ExitCode {
 }
 
 fn view(args: &ViewArgs) -> Result<(), Box<dyn Error>> {
-    if !args.store.is_file() {
-        return Err(store::absent(&args.store).into());
-    }
-    let written = if args.if_stale {
-        match current_view(&args.store, now_secs())? {
-            Current::Yes(pages) => pages,
-            Current::Events(pages) => write_event_pages(&args.store, pages)?,
-            Current::No => write_view(&args.store)?,
-        }
-    } else {
-        write_view(&args.store)?
-    };
+    let written = write_view(&args.store, args.if_stale)?;
     for path in &written {
         println!("{}", path.display());
     }
@@ -1574,21 +1563,36 @@ fn view(args: &ViewArgs) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-/// Writes every page of the view and returns their paths, the summary first: the path given
-/// first is the page to open. Every link of the summary leads to a page written here.
-fn write_view(store: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+/// Writes every page of the view, or with `if_stale` only those that are not current, and
+/// returns every page's path, the summary first: the path given first is the page to open. Every
+/// link of the summary leads to a page written here. The pages and what tells whether they are
+/// current are read in one read of the store, so a page set is of one state of it.
+fn write_view(store: &Path, if_stale: bool) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+    if !store.is_file() {
+        return Err(store::absent(store).into());
+    }
     let now = now_secs();
     let folder = home(store);
-    // Taken before the pages are read, so that they hold at least what it names.
-    let (basis, events_basis) = {
-        let conn = store::open_read_only(store)?;
-        (view::basis(&conn, &folder)?, events::basis(&conn)?)
-    };
-    // The summary is built from what `immunity status --json` answers, read the same way.
-    let (state, result) = status_read(store, now)?;
-    let conn = store::open_read_only(store)?;
-    let pages = view::pages(&conn, &state, &result, &store.display().to_string(), now)?;
-    drop(conn);
+    let (current, pages, basis, events_basis) = store::read(store, |tx| {
+        let current = match if_stale {
+            true => current_view(tx, store, now)?,
+            false => Current::No,
+        };
+        if let Current::Yes(_) = current {
+            return Ok((current, Vec::new(), String::new(), String::new()));
+        }
+        // Taken before the pages are read: a basis also names what is not in the store, the
+        // watcher's lock, so the pages hold at least what it names and a watcher that stops
+        // meanwhile moves the basis of the next look.
+        let (basis, events_basis) = (view::basis(tx, &folder)?, events::basis(tx)?);
+        // The summary is built from what `immunity status --json` answers, read the same way.
+        let (state, result) = status_read(tx, store, now)?;
+        let pages = match current {
+            Current::Events(_) => view::event_pages(tx, &state, &result, now)?,
+            _ => view::pages(tx, &state, &result, &store.display().to_string(), now)?,
+        };
+        Ok((current, pages, basis, events_basis))
+    })?;
     std::fs::create_dir_all(folder.join(view::DETAILS))?;
     let mut written = Vec::new();
     let mut names = Vec::new();
@@ -1597,6 +1601,18 @@ fn write_view(store: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
         std::fs::write(&path, html)?;
         written.push(path);
         names.push(rel);
+    }
+    match current {
+        Current::Yes(all) => return Ok(all),
+        // Only the pages that show the event level were written: the rest stand as they are.
+        Current::Events(all) => {
+            let mut made: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(folder.join(view::MADE))?)?;
+            made["events"] = events_basis.into();
+            std::fs::write(folder.join(view::MADE), made.to_string())?;
+            return Ok(all);
+        }
+        Current::No => {}
     }
     std::fs::write(folder.join(happens::SCRIPT_FILE), happens::SCRIPT)?;
     // Last, so that pages cut short by a failure are never named as current.
@@ -1608,26 +1624,6 @@ fn write_view(store: &Path) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     });
     std::fs::write(folder.join(view::MADE), made.to_string())?;
     Ok(written)
-}
-
-/// Writes again only the pages that show what the event level counts (`view::event_pages`),
-/// when nothing else they rest on moved, and returns every page, the summary first.
-fn write_event_pages(store: &Path, pages: Vec<PathBuf>) -> Result<Vec<PathBuf>, Box<dyn Error>> {
-    let now = now_secs();
-    let folder = home(store);
-    let events_basis = events::basis(&store::open_read_only(store)?)?;
-    let (state, result) = status_read(store, now)?;
-    let conn = store::open_read_only(store)?;
-    let written = view::event_pages(&conn, &state, &result, now)?;
-    drop(conn);
-    for (rel, html) in written {
-        std::fs::write(folder.join(rel), html)?;
-    }
-    let mut made: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(folder.join(view::MADE))?)?;
-    made["events"] = events_basis.into();
-    std::fs::write(folder.join(view::MADE), made.to_string())?;
-    Ok(pages)
 }
 
 /// Whether the pages are current, see `current_view`.
@@ -1643,8 +1639,13 @@ enum Current {
 
 /// Whether the pages are current at `now`: every one is there, they are younger than
 /// `view::CURRENT_FOR`, and their basis has not moved since they were made. When only the
-/// event level's basis moved, the pages that show it are written again, not every page.
-fn current_view(store: &Path, now: i64) -> Result<Current, Box<dyn Error>> {
+/// event level's basis moved, the pages that show it are written again, not every page. `tx` is
+/// a read of `store`.
+fn current_view(
+    tx: &rusqlite::Connection,
+    store: &Path,
+    now: i64,
+) -> Result<Current, Box<dyn Error>> {
     let folder = home(store);
     let Ok(text) = std::fs::read_to_string(folder.join(view::MADE)) else {
         return Ok(Current::No);
@@ -1668,11 +1669,10 @@ fn current_view(store: &Path, now: i64) -> Result<Current, Box<dyn Error>> {
         }
         paths.push(path);
     }
-    let conn = store::open_read_only(store)?;
-    if view::basis(&conn, &folder)? != basis {
+    if view::basis(tx, &folder)? != basis {
         return Ok(Current::No);
     }
-    if made["events"].as_str() != Some(events::basis(&conn)?.as_str()) {
+    if made["events"].as_str() != Some(events::basis(tx)?.as_str()) {
         return Ok(Current::Events(paths));
     }
     Ok(Current::Yes(paths))
@@ -1723,8 +1723,7 @@ fn owner_word(store: &Path) -> Result<Option<Vec<owner::Standing>>, Box<dyn Erro
     if !store.is_file() {
         return Ok(None);
     }
-    let conn = store::open_read_only(store)?;
-    Ok(Some(owner::standing(&conn)?))
+    Ok(Some(store::read(store, |c| Ok(owner::standing(c)?))?))
 }
 
 /// Whether the tailnet's name for a system is one the server check cannot read at all.
@@ -2194,11 +2193,11 @@ fn owner_cmd(args: &OwnerArgs) -> ExitCode {
         .unwrap_or_default();
     let at = now.as_secs() as i64;
     let Some((name, act)) = &args.act else {
-        let listed = store::open_read_only(store_path).and_then(|conn| {
+        let listed = store::read(store_path, |c| {
             Ok((
-                owner::standing(&conn)?,
-                owner::withdrawn(&conn)?,
-                Some(store::id(&conn)?),
+                owner::standing(c)?,
+                owner::withdrawn(c)?,
+                Some(store::id(c)?),
             ))
         });
         let (standing, withdrawn, store_id) = match listed {
@@ -6283,5 +6282,40 @@ mod tests {
         let kept = |t| store::last_raw(&tx, integrity::READER, &input(t)).unwrap();
         assert_eq!(kept(&blocked), None);
         assert_eq!(kept(&next), Some(format!("raw/run-1/{}", input(&next))));
+    }
+
+    #[test]
+    fn a_page_set_of_the_view_is_read_through_one_connection_and_only_pages_not_current_are_written()
+     {
+        // Every page and the bases that say it is current come out of one read transaction
+        // (`store::read`), so a check that commits meanwhile is in all of them or in none. A
+        // write cannot be put between two reads of one transaction without timing; what is
+        // pinned here is that each way a view is made opens the store once, and `store::read`
+        // reads in one transaction (`store::tests`).
+        let dir = crate::common::Scratch::new("view-one-read");
+        let path = dir.join("store.db");
+        drop(store::open_or_make(&path).unwrap());
+        let made = |if_stale| store::steps::opened_by(|| write_view(&path, if_stale).unwrap());
+        // When the summary and a page that does not show the event level were written.
+        let times = |all: &[PathBuf]| {
+            let mtime = |p: &PathBuf| std::fs::metadata(p).unwrap().modified().unwrap();
+            (mtime(&all[0]), mtime(&all[1]))
+        };
+        // Every page; then none, as they are current; then those of the event level alone.
+        let (all, opened) = made(false);
+        assert_eq!((opened, all[0].ends_with(view::SUMMARY)), (1, true));
+        let (summary, other) = times(&all);
+        assert_eq!(made(true), (all.clone(), 1));
+        assert_eq!(times(&all), (summary, other));
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO event_level (id, read_at, state) VALUES (1, 1, 'running')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(made(true), (all.clone(), 1));
+        let (now, still) = times(&all);
+        assert_eq!((now != summary, still), (true, other));
     }
 }
