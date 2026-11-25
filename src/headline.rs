@@ -18,9 +18,9 @@ pub(crate) fn headed(mut out: Status) -> Status {
 
 /// The headline and its reasons by the schema's rule, in its order. It is never calmer than a
 /// section of the message: calm needs a live watcher with no failure standing, this Mac watched
-/// with no fault, no cause that is a fault (`Uncovered.fault`), an event level that runs or is
-/// not installed, and no check that died. A limit of this version is none of them: a reading
-/// that failed or a machine not reached keeps it from calm only as a fault.
+/// with no fault, no reading that failed and no machine left unreached, no cause that is a fault
+/// (`Uncovered.fault`), an event level that runs or is not installed, and no check that died. A
+/// limit of this version is none of them.
 pub(crate) fn headline(s: &Status) -> (Headline, Vec<B>) {
     let Some(look) = &s.needs_a_look else {
         return (Headline::Unknown, Vec::new());
@@ -50,6 +50,12 @@ pub(crate) fn headline(s: &Status) -> (Headline, Vec<B>) {
             !m.live || s.watching.as_ref().is_none_or(|w| !w.failed.is_empty()),
         ),
         (B::ThisMac, in_part),
+        (
+            B::Coverage,
+            s.coverage
+                .as_ref()
+                .is_some_and(|c| c.failed > 0 || c.unreached_total > 0),
+        ),
         (B::NotCovered, s.not_covered.iter().any(|u| u.fault)),
         (B::EventLevel, s.event_level.as_ref().is_some_and(level)),
         (
@@ -112,7 +118,7 @@ pub(crate) mod tests {
     #[test]
     fn calm_only_when_no_fault_stands_and_the_rule_keeps_its_order() {
         assert_eq!(headline(&calm()), (Headline::Calm, vec![]));
-        let alone: [(B, Change); 14] = [
+        let alone: [(B, Change); 15] = [
             (B::Watcher, |s| mac(s).live = false),
             (B::Watcher, |s| {
                 s.watching.as_mut().unwrap().failed = vec![v1::WatcherFailure::default()]
@@ -121,6 +127,10 @@ pub(crate) mod tests {
             (B::Watcher, |s| s.watching = None),
             (B::ThisMac, |s| {
                 mac(s).state = ThisMacState::WatchedInPart as i32
+            }),
+            (B::Coverage, |s| s.coverage.as_mut().unwrap().failed = 1),
+            (B::Coverage, |s| {
+                s.coverage.as_mut().unwrap().unreached_total = 1
             }),
             // A fault, whatever its class says.
             (B::NotCovered, |s| {
@@ -149,8 +159,8 @@ pub(crate) mod tests {
                     ..Default::default()
                 }]
             }),
-            // A reading that failed and is a limit, a class this build does not know, readings
-            // counted as failed and a machine not reached: none is a fault on its own.
+            // A cause of class failed that is a limit and a class this build does not know: neither
+            // is a fault on its own.
             (B::Unspecified, |s| {
                 s.not_covered = vec![v1::Uncovered {
                     class: v1::Cause::Failed as i32,
@@ -162,10 +172,6 @@ pub(crate) mod tests {
                     class: 99,
                     ..Default::default()
                 }]
-            }),
-            (B::Unspecified, |s| {
-                let c = s.coverage.as_mut().unwrap();
-                (c.failed, c.unreached_total) = (1, 1);
             }),
             (B::Unspecified, |s| {
                 s.last_run.as_mut().unwrap().finished_at = None;
@@ -193,7 +199,7 @@ pub(crate) mod tests {
         }
         // Every reason at once is named in the schema's order.
         let mut all = calm();
-        for (_, change) in &alone[..8] {
+        for (_, change) in &alone[..10] {
             change(&mut all);
         }
         assert_eq!(
@@ -201,6 +207,7 @@ pub(crate) mod tests {
             [
                 B::Watcher,
                 B::ThisMac,
+                B::Coverage,
                 B::NotCovered,
                 B::EventLevel,
                 B::LastRun

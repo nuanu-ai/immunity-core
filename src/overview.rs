@@ -3690,14 +3690,14 @@ mod tests {
         s.headline_because = vec![v1::HeadlineBecause::ThisMac as i32];
         s.this_mac.as_mut().unwrap().state = 99;
         assert_eq!(fault_lines_of(&pipe(&s)), line);
-        // Readings counted as failed and machines not reached, with no fault among them, as the
-        // core heads it: calm, and no line.
+        // Readings counted as failed and machines not reached with no fault that names them, as
+        // the core heads it: in part, and the one line.
         let mut s = calm_status();
         let c = s.coverage.as_mut().unwrap();
         (c.failed, c.unreached_total) = (3, 2);
         let s = crate::headline::headed(s);
-        assert_eq!(s.headline, v1::Headline::Calm as i32);
-        assert!(fault_lines_of(&pipe(&s)).is_empty(), "{}", pipe(&s));
+        assert_eq!(s.headline, v1::Headline::InPart as i32);
+        assert_eq!(fault_lines_of(&pipe(&s)), line, "{}", pipe(&s));
         // Deleted unread as well as by the cap: said as its own fault, not as unexplained.
         let mut s = calm_status();
         s.headline = v1::Headline::InPart as i32;
@@ -4123,18 +4123,14 @@ mod tests {
                 .to_string()
         };
         assert!(first(&calm_status()).starts_with("\u{1b}[1;32m✓ Nothing needs a look\u{1b}[0m"));
-        // In part: the same words, and what keeps it from calm is a fault line under it. Machines
-        // beyond this Mac not reached are no fault: calm, and nothing in this text.
+        // In part: the same words, and what keeps it from calm is a fault line under it.
         let mut s = calm_status();
         s.coverage.as_mut().unwrap().unreached_total = 1;
         assert_eq!(
             crate::headline::headed(s.clone()).headline,
-            v1::Headline::Calm as i32
+            v1::Headline::InPart as i32
         );
-        assert_eq!(
-            status(&s, &screen, false),
-            status(&calm_status(), &screen, false)
-        );
+        assert_eq!(first(&s), first(&calm_status()));
         // Something to look at: red when some of it is urgent, yellow when none is.
         let mut s = calm_status();
         s.needs_a_look = Some(v1::NeedsALook {

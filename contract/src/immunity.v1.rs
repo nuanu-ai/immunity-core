@@ -4380,8 +4380,8 @@ pub enum HeadlineBecause {
     /// `this_mac.state` is `watched_in_part`.
     #[serde(rename = "this_mac")]
     ThisMac = 2,
-    /// Not given since 1.33.0: a reading that failed or a machine not reached is a fault only by the
-    /// rule of `Uncovered.fault`, and is said by `not_covered`.
+    /// A reading failed or a machine was not reached: `coverage.failed` or
+    /// `coverage.unreached_total` is more than 0.
     #[serde(rename = "coverage")]
     Coverage = 3,
     /// An item of `not_covered` has `fault`.
