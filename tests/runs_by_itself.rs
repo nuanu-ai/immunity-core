@@ -8752,7 +8752,11 @@ fn a_unit_read_before_and_unreadable_now_keeps_the_headline_from_calm_whoever_ow
     let mode = |m| std::fs::set_permissions(&zshrc, std::fs::Permissions::from_mode(m)).unwrap();
     let calm = (Vec::new(), Vec::new(), "\"watched\"".to_string());
     let held_in_part = (
-        vec!["this_mac".to_string(), "not_covered".to_string()],
+        vec![
+            "this_mac".to_string(),
+            "coverage".to_string(),
+            "not_covered".to_string(),
+        ],
         vec!["not-permitted".to_string()],
         "\"watched_in_part\"".to_string(),
     );
