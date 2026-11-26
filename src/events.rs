@@ -2660,9 +2660,10 @@ pub fn read(
             }
         }
     }
-    // A count since the latest finished full check stays, so a clock stepped forward never
-    // takes a loss out of `lost_since_check`; with no check finished, two days are kept.
-    let spared = check_seq(tx)?.unwrap_or(i64::MAX);
+    // A count since the latest finished full check, or since the start of a check that has not
+    // finished, stays, so a clock stepped forward never takes a loss out of `lost_since_check`;
+    // with no check started, two days are kept.
+    let spared = spared_from(tx)?.unwrap_or(i64::MAX);
     for table in ["event_count", "event_file_count"] {
         tx.execute(
             &format!("DELETE FROM {table} WHERE at < ?1 AND journal_seq < ?2"),
@@ -4209,6 +4210,23 @@ fn check_seq(conn: &Connection) -> rusqlite::Result<Option<i64>> {
     .optional()
 }
 
+/// The journal sequence number from which counts are kept whatever their age: the start of the
+/// latest finished full check, or of a check started after it that has not finished, whichever
+/// is earlier, since such a check counts what came after its start once it finishes. `None`
+/// when no check has started.
+fn spared_from(conn: &Connection) -> rusqlite::Result<Option<i64>> {
+    let finished = check_seq(conn)?;
+    let open: Option<i64> = conn.query_row(
+        "SELECT MIN(s.seq) FROM journal s
+         WHERE s.entry = 'run_started' AND s.seq >= ?1
+           AND NOT EXISTS (SELECT 1 FROM journal f
+                           WHERE f.entry = 'run_finished' AND f.run_id = s.run_id)",
+        [finished.unwrap_or(0)],
+        |r| r.get(0),
+    )?;
+    Ok(finished.into_iter().chain(open).min())
+}
+
 /// The counts of every reading `since` counts.
 fn tally_since(conn: &Connection, since: Since) -> rusqlite::Result<Tally> {
     let (rows, at) = since.rows();
@@ -5752,6 +5770,39 @@ mod tests {
         assert!(lost(&conn));
         read(&mut conn, start + 3 * DAY, &[8]);
         assert!(lost(&conn));
+    }
+
+    #[test]
+    fn a_loss_read_while_a_check_downloads_is_kept_past_two_days_and_counted_once_it_finishes() {
+        // No false calm. A check writes its start and lets the store go while it downloads; a
+        // loss a watcher reads then is since that check. A clock stepped forward past two days
+        // before the check finishes must not delete it, though no check has finished yet: once
+        // the check finishes, the loss holds this Mac in part, as its own reading does not meet
+        // it again.
+        let dir = crate::common::Scratch::new("events-spared-open");
+        let root = dir.join("root");
+        std::fs::create_dir_all(root.join(LOG)).unwrap();
+        std::fs::create_dir_all(root.join(PLIST).parent().unwrap()).unwrap();
+        std::fs::write(root.join(PLIST), "<plist/>").unwrap();
+        let log = root.join(LOG).join("exec-20261004T00.jsonl");
+        let mut conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
+        let start = crate::now_secs();
+        let mut lines = String::new();
+        let mut read = |conn: &mut Connection, at: i64, seqs: &[u64]| {
+            for &seq in seqs {
+                lines.push_str(&(exec(seq, OBJECT) + "\n"));
+            }
+            std::fs::write(&log, &lines).unwrap();
+            let tx = conn.transaction().unwrap();
+            crate::store::put_entity(&tx, "machine:mac").unwrap();
+            read(&tx, "events-1", "machine:mac", &root, at, None).unwrap();
+            tx.commit().unwrap();
+        };
+        crate::store::journal_note(&conn, start, "first", "run_started", "").unwrap();
+        read(&mut conn, start + 100, &[1, 3]);
+        read(&mut conn, start + 3 * DAY, &[4]);
+        crate::store::journal_note(&conn, start + 3 * DAY, "first", "run_finished", "").unwrap();
+        assert!(level(&conn, start).unwrap().unwrap().lost_since_check());
     }
 
     #[test]
