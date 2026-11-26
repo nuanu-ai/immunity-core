@@ -3562,6 +3562,7 @@ mod tests {
                 cause: None,
                 at,
                 last_full: Some(at),
+                ..Default::default()
             };
             let ahead = [at(now + crate::store::AHEAD_ALLOWED + 1)];
             let said = unread(&readings_of(count, &ahead), Some(run), now, &[]);
@@ -3588,6 +3589,7 @@ mod tests {
             cause: None,
             at,
             last_full: Some(run - 86_400),
+            ..Default::default()
         };
         let said = |readings: &[&Latest], extra: &[String]| {
             let mut out = String::new();
@@ -4118,6 +4120,7 @@ mod tests {
             cause: cause.map(|c| c.literal().to_string()),
             at: now - 40,
             last_full: Some(now - 40),
+            ..Default::default()
         };
         let failed = Uncovered {
             examples: vec![covered::Example::named(findings::place(scope, None))],

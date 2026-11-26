@@ -307,8 +307,9 @@ pub enum Content {
     Dangling,
     /// A path named, not a link, where nothing is: a program a startup item names.
     Missing,
-    /// Present and not read, with why as data and the reason in words.
-    Unread(Cause, String),
+    /// Present and not read, with why as data and the reason in words, and the system's error
+    /// number where why is what the system said.
+    Unread(Cause, String, Option<i32>),
     /// Present and its bytes could not be read, as the system said it: `closed::settle` makes
     /// it `Unread` before anything is written.
     Failed(crate::closed::Failure),
@@ -689,7 +690,11 @@ fn examine(
                 crate::guarded::leads_into(&guarded, at.home)
             );
             look.met(guarded);
-            return Examined::Present(Content::Unread(Cause::NotGiven, why), Some(link), None);
+            return Examined::Present(
+                Content::Unread(Cause::NotGiven, why, None),
+                Some(link),
+                None,
+            );
         }
         (Real::Failed(e), stopped) => (Err(e), Some(stopped)),
     };
@@ -725,8 +730,8 @@ fn counted(
     let bytes = match bytes(path, meta, CAP) {
         Ok(bytes) => bytes,
         Err(not) if keys.is_none() => return Examined::Present(not, link, None),
-        Err(Content::Unread(_, why)) => return Examined::Unread(why, None),
-        Err(Content::Failed(f)) => return Examined::Unread(f.why(), f.errno),
+        Err(Content::Unread(_, why, errno)) => return Examined::Unread(why, errno),
+        Err(Content::Failed(f)) => return Examined::Unread(f.why(), f.errno()),
         Err(other) => return Examined::Unread(other.literal().unwrap_or_default(), None),
     };
     let Some(keys) = keys else {
@@ -774,12 +779,15 @@ pub const CLOSED_ON_THE_WAY: &str =
 /// permission for: where it points is read, what it leads to is not, and what was known of
 /// that stays. A failure not decided yet (`closed::settle`) failed.
 pub fn content_coverage(content: &Content, linked: bool) -> (&'static str, Option<&str>, Gap) {
-    let (cause, why) = match content {
-        Content::Unread(cause, why) => (*cause, why.as_str()),
-        Content::Failed(f) => (Cause::Failed, f.why.as_str()),
+    let (cause, why, errno) = match content {
+        Content::Unread(cause, why, errno) => (*cause, why.as_str(), *errno),
+        Content::Failed(f) => (Cause::Failed, f.why.as_str(), f.errno),
         _ => return ("full", None, Gap::default()),
     };
-    let mut gap = Gap::of(cause);
+    let mut gap = match cause {
+        Cause::Failed => Gap::failed(errno),
+        _ => Gap::of(cause),
+    };
     if cause == Cause::NotGiven && linked {
         return ("partial", Some(why), gap);
     }
@@ -797,13 +805,14 @@ pub fn bytes(path: &Path, meta: &Metadata, cap: u64) -> Result<Vec<u8>, Content>
     let failed = |e: &std::io::Error, by| Content::Failed(Failure::of(e, by, path, reason(e)));
     crate::open::read(path, Reach::Place, cap).map_err(|refused| match refused {
         Refused::Kind("symbolic link") | Refused::Changed => {
-            Content::Unread(Cause::Failed, crate::open::CHANGED.to_string())
+            Content::Unread(Cause::Failed, crate::open::CHANGED.to_string(), None)
         }
         Refused::Kind(what) => Content::Special(what),
         // The file is there and this build does not read a file that large.
         Refused::Over(cap) => Content::Unread(
             Cause::NoReader,
             format!("over the size cap of {} MiB", cap >> 20),
+            None,
         ),
         Refused::Look(e) | Refused::Failed(e) => failed(&e, By::file(path, meta)),
     })
@@ -847,7 +856,7 @@ mod tests {
         };
         assert_eq!(f, said);
         let failed = Content::Failed(f);
-        let none = ("none", Some(why), Gap::of(Cause::Failed));
+        let none = ("none", Some(why), Gap::failed(Some(libc::EACCES)));
         assert_eq!(content_coverage(&failed, true), none);
         // A file whose parts count is a unit of its kind's reading that failed, with the same.
         let keyed = counted(&path, &meta, Some(&["LoginHook"]), None);
@@ -942,7 +951,8 @@ mod tests {
         };
         crate::closed::settle(&conn, "example-mac", &roots, &mut [&mut look], &[]).unwrap();
         let why = "Permission denied (os error 13)".to_string();
-        assert_eq!(look.entries[0].content, Content::Unread(Cause::Failed, why));
+        let decided = Content::Unread(Cause::Failed, why, Some(libc::EACCES));
+        assert_eq!(look.entries[0].content, decided);
     }
 
     #[test]
@@ -1002,13 +1012,13 @@ mod tests {
         assert_eq!(examined(zero), device);
         let (over, _) = examined(over);
         let why = "over the size cap of 8 MiB".to_string();
-        assert_eq!(over, Content::Unread(Cause::NoReader, why));
+        assert_eq!(over, Content::Unread(Cause::NoReader, why, None));
         assert_eq!(content_coverage(&over, false).0, "none");
         // A link where the reader made the path real and found a file: it changed since.
         let link = dir.join("link");
         std::os::unix::fs::symlink(dir.join("four"), &link).unwrap();
         let looked = std::fs::metadata(&link).unwrap();
-        let changed = Content::Unread(Cause::Failed, crate::open::CHANGED.to_string());
+        let changed = Content::Unread(Cause::Failed, crate::open::CHANGED.to_string(), None);
         assert_eq!(bytes(&link, &looked, CAP), Err(changed));
     }
 }

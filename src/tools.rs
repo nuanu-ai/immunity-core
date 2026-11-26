@@ -11,13 +11,29 @@
 //! This does not protect against a process running as the owner, which can replace a tool in
 //! any folder the owner can write, the Homebrew prefix included.
 
+use crate::baseline::Unit;
+use crate::store::{Cause, Gap, NotRead};
 use std::path::{Path, PathBuf};
 
 /// How the reason of a reading goes on after a tool's name when the tool is not at the places
 /// this version looks and the store holds what an earlier check read from it: lost sight of,
-/// never "not installed". The places follow.
+/// never "not installed". The places follow, for a person; each is also a row of what the
+/// reading did not read, said by `LOOKED_FOR`.
 pub const READ_BEFORE: &str =
     " was read before and is not found now at the places this version looks for it: ";
+
+/// The word of `unread_how` for a place a tool read before was looked for and not found.
+pub const LOOKED_FOR: &str = "looked_for";
+
+/// The gap of the reading of a tool read before and not found now at `places`: not given, with
+/// a row for each place, so that what is told of them never splits a name (`covered.rs`).
+pub fn lost(places: &[String]) -> Gap {
+    let row = |p: &String| NotRead::said(Some(Unit::whole(p)), Cause::NotGiven, LOOKED_FOR);
+    Gap {
+        not_read: places.iter().map(row).collect(),
+        ..Gap::of(Cause::NotGiven)
+    }
+}
 
 /// The system's own tools, where every Mac has them.
 pub const SCUTIL: &str = "/usr/sbin/scutil";

@@ -320,6 +320,9 @@ INSERT OR IGNORE INTO coverage_kind (name) VALUES ('folders macOS asks permissio
 INSERT OR IGNORE INTO unread_how (name) VALUES
     ('unreadable'), ('unparsed'), ('unlisted'), ('kept'), ('same_name'), ('past_limit'),
     ('guarded'), ('untold'), ('no_reader'), ('source');
+-- A place a tool read before was looked for and not found (`tools::LOOKED_FOR`), and a walk
+-- for checkouts limited to the folder given (`checkouts::GIVEN`).
+INSERT OR IGNORE INTO unread_how (name) VALUES ('looked_for'), ('only_given');
 ";
 
 /// Indexes what `immunity status` and the view read by. Without them the status of a store of tens of thousands of
@@ -464,10 +467,11 @@ impl NotRead {
     /// What a reading said as a whole, of a unit or of none: with no reader, or else said by the
     /// reading's source.
     pub fn short(unit: Option<crate::baseline::Unit>, cause: Cause) -> NotRead {
-        let how = match cause {
-            Cause::NoReader => "no_reader",
-            Cause::Failed | Cause::NotGiven => "source",
-        };
+        NotRead::said(unit, cause, NotRead::word(cause))
+    }
+
+    /// The same, said by `how`, a word of `unread_how` of its own.
+    pub fn said(unit: Option<crate::baseline::Unit>, cause: Cause, how: &'static str) -> NotRead {
         NotRead {
             unit,
             cause,
@@ -476,6 +480,78 @@ impl NotRead {
             said: None,
         }
     }
+
+    /// The word of what a reading said as a whole with this cause.
+    pub fn word(cause: Cause) -> &'static str {
+        match cause {
+            Cause::NoReader => "no_reader",
+            Cause::Failed | Cause::NotGiven => "source",
+        }
+    }
+}
+
+/// One row of `coverage_unread` as it is read back (`unread_of`): what a reading did not read.
+/// What a reading did not read is decided from these rows, never from its reason, which names
+/// places in prose a name from the Mac can break.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Unread {
+    /// The unit, as the reading's ids name it; `None` for what is no unit of the reading.
+    pub path: Option<String>,
+    pub part: String,
+    /// As `Cause::literal` writes it.
+    pub cause: String,
+    /// A word of `unread_how`.
+    pub how: String,
+    pub errno: Option<i32>,
+}
+
+impl Unread {
+    /// Whether it failed because the system refused for want of permission, which the person can
+    /// change: EPERM or EACCES. A file of another account closed to this one keeps no number
+    /// (`closed::Failure::errno`), as its reason is the core's.
+    pub fn refused(&self) -> bool {
+        self.cause == Cause::Failed.literal()
+            && matches!(self.errno, Some(libc::EPERM | libc::EACCES))
+    }
+
+    /// Whether its unit is the place at `path`, as ids name it, or holds it.
+    pub fn hides(&self, path: &str) -> bool {
+        use crate::baseline::Unit;
+        (self.path.as_ref()).is_some_and(|p| Unit::part(p, &self.part).hides(&Unit::whole(path)))
+    }
+
+    /// The row a reading writes for `n`, as it is read back.
+    #[cfg(test)]
+    pub fn of(n: &NotRead) -> Unread {
+        Unread {
+            path: n.unit.as_ref().map(|u| u.path.clone()),
+            part: n.unit.as_ref().map(|u| u.part.clone()).unwrap_or_default(),
+            cause: n.cause.literal().to_string(),
+            how: n.how.to_string(),
+            errno: n.errno,
+        }
+    }
+}
+
+/// What each of the readings `coverage` did not read, in the order given, each in the order it was
+/// written.
+pub fn unread_of(conn: &Connection, coverage: &[i64]) -> rusqlite::Result<Vec<Vec<Unread>>> {
+    let mut stmt = conn.prepare(
+        "SELECT path, part, cause, how, errno FROM coverage_unread WHERE coverage = ?1
+         ORDER BY rowid",
+    )?;
+    let row = |r: &rusqlite::Row| {
+        Ok(Unread {
+            path: r.get(0)?,
+            part: r.get(1)?,
+            cause: r.get(2)?,
+            how: r.get(3)?,
+            errno: r.get(4)?,
+        })
+    };
+    (coverage.iter())
+        .map(|id| stmt.query_map([id], row)?.collect())
+        .collect()
 }
 
 /// Why a reading is incomplete, what this build has no reader for in it, and what it did not
@@ -490,6 +566,19 @@ pub struct Gap {
 impl Gap {
     pub fn of(cause: Cause) -> Gap {
         Gap::when(Some(cause))
+    }
+
+    /// The gap of a reading that failed as a whole, with the system's error number when it gave
+    /// one, kept on its row.
+    pub fn failed(errno: Option<i32>) -> Gap {
+        let row = NotRead {
+            errno,
+            ..NotRead::short(None, Cause::Failed)
+        };
+        Gap {
+            not_read: vec![row],
+            ..Gap::of(Cause::Failed)
+        }
     }
 
     /// The gap of a reading with this cause, if it is incomplete at all.

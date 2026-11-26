@@ -527,8 +527,9 @@ fn record_time(t: &str) -> Option<i64> {
 }
 
 /// A checkout's lockfiles reading: its scope, completeness, reason, run, the names of what it
-/// says it did not read (`coverage_lack`), `None` for one without a name, and the ecosystems of
-/// the lockfiles found in it, read or not (`lockfiles::HAS_LOCKFILE`).
+/// says it did not read (`coverage_lack`), `None` for one without a name, the ecosystems of the
+/// lockfiles found in it, read or not (`lockfiles::HAS_LOCKFILE`), and the rows of what it did not
+/// read (`store::unread_of`).
 type LockfileReading = (
     String,
     String,
@@ -536,6 +537,7 @@ type LockfileReading = (
     String,
     Vec<Option<String>>,
     HashSet<&'static str>,
+    Vec<crate::store::Unread>,
 );
 
 /// The lockfiles reader's latest reading of each checkout that is still there.
@@ -577,16 +579,18 @@ fn lockfile_readings(conn: &Connection) -> rusqlite::Result<Vec<LockfileReading>
             let of = (paths.iter())
                 .filter_map(|p| crate::lockfiles::ecosystem_of_file(p))
                 .collect();
-            Ok((scope, completeness, reason, run, names, of))
+            let rows = crate::store::unread_of(conn, &[id])?.concat();
+            Ok((scope, completeness, reason, run, names, of, rows))
         })
         .collect()
 }
 
 /// How the lockfiles of a checkout were read for one ecosystem: `full`, `partial` or
-/// `not_read`, and why.
+/// `not_read`, and why, from what the reading did not read (`lockfiles::partial_for`).
 fn lockfiles_for(
     completeness: &str,
     reason: Option<&str>,
+    rows: &[crate::store::Unread],
     lacks: &[Option<String>],
     reading_run: &str,
     run_id: &str,
@@ -600,11 +604,7 @@ fn lockfiles_for(
     }
     match completeness {
         "full" => ("full", None),
-        "partial"
-            if !crate::lockfiles::partial_for(reason.unwrap_or_default(), lacks, ecosystem) =>
-        {
-            ("full", None)
-        }
+        "partial" if !crate::lockfiles::partial_for(rows, lacks, ecosystem) => ("full", None),
         "partial" => ("partial", reason.map(str::to_string)),
         _ => ("not_read", reason.map(str::to_string)),
     }
@@ -764,12 +764,13 @@ pub fn match_all(tx: &Transaction, run_id: &str, at: i64) -> rusqlite::Result<Ma
     let mut places: HashMap<(String, &'static str), (&'static str, Option<String>)> =
         HashMap::new();
     let mut read = HashSet::new();
-    for (scope, completeness, reason, reading_run, lacks, found) in &readings {
+    for (scope, completeness, reason, reading_run, lacks, found, rows) in &readings {
         for f in &fresh {
             let eco = f.feed.ecosystem;
             let (lockfiles, why) = lockfiles_for(
                 completeness,
                 reason.as_deref(),
+                rows,
                 lacks,
                 reading_run,
                 run_id,
@@ -2765,6 +2766,38 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_lockfile_in_a_folder_whose_name_holds_a_semicolon_leaves_only_its_own_ecosystem_unknown() {
+        // An entry of a PyPI lockfile whose package cannot be told leaves PyPI in part unknown
+        // and crates.io, read in full beside it, known, whatever its folder is named.
+        use crate::baseline::Unit;
+        use crate::look::{Look, Said};
+        let mut look = Look::default();
+        look.present = 1;
+        look.read(Unit::whole("dev/shop/Cargo.lock"));
+        let at = "dev/shop/web; old, new/requirements.txt";
+        look.unread_as(Unit::part(at, "line 1"), Said::Untold, None, String::new());
+        look.read(Unit::whole(at));
+        let (completeness, reason) = look.completeness_noted(None);
+        let gap = look.gap();
+        let rows: Vec<crate::store::Unread> =
+            gap.not_read.iter().map(crate::store::Unread::of).collect();
+        let lacks = [Some("requirements.txt".to_string())];
+        let of = |eco| {
+            lockfiles_for(
+                completeness,
+                reason.as_deref(),
+                &rows,
+                &lacks,
+                "r",
+                "r",
+                eco,
+            )
+            .0
+        };
+        assert_eq!((of("PyPI"), of("crates.io")), ("partial", "full"));
+    }
 
     #[test]
     fn a_feed_is_matched_only_when_some_kind_of_lockfile_of_its_ecosystem_is_read() {

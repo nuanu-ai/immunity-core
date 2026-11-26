@@ -882,13 +882,9 @@ fn cover(
             at: s.at,
             observed_at: s.at,
         };
-        crate::store::put_coverage(
-            tx,
-            &reading,
-            "none",
-            Some(&reason),
-            &Gap::of(Cause::NotGiven),
-        )?;
+        let folders: Vec<PathBuf> = guarded.iter().cloned().collect();
+        let gap = crate::guarded::gap(&folders, w.home);
+        crate::store::put_coverage(tx, &reading, "none", Some(&reason), &gap)?;
     }
     let layout = s.arguments_layout_unknown.then_some(LAYOUT_UNKNOWN);
     let kinds = [

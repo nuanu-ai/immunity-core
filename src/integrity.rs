@@ -376,16 +376,25 @@ fn app_support(
         };
         let path = base.join(&entry);
         // A folder held before that is now a link or a file is there and is not opened: never
-        // taken for a folder that went. Asked before anything that follows a link.
-        if !real_folder(&path) {
-            if before.is_some() {
-                kind.failed(
-                    format!("{APP_SUPPORT_PLACE}/{text}"),
-                    None,
-                    NOT_A_FOLDER.to_string(),
-                );
+        // taken for a folder that went. One the system would not let be looked at may be a
+        // folder: what it said is kept, with its number. Asked before anything that follows a
+        // link.
+        match std::fs::symlink_metadata(&path) {
+            Ok(m) if m.is_dir() => {}
+            Err(e) if e.kind() != ErrorKind::NotFound => {
+                kind.refused(format!("{APP_SUPPORT_PLACE}/{text}"), &e);
+                continue;
             }
-            continue;
+            _ => {
+                if before.is_some() {
+                    kind.failed(
+                        format!("{APP_SUPPORT_PLACE}/{text}"),
+                        None,
+                        NOT_A_FOLDER.to_string(),
+                    );
+                }
+                continue;
+            }
         }
         if own.as_ref() == Some(&same_place(&path)) {
             continue;

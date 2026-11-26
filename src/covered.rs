@@ -960,13 +960,21 @@ fn scope_of(scope: &str, this: Option<&str>) -> &'static str {
     }
 }
 
-/// Whether a reading that failed did because of permissions, which the owner can change. A file
-/// of another account closed to this one is not, whether it failed or was not given: its
-/// reason is fixed (`closed::of_another`), with no number of the system's. Readers keep
-/// the system's error as the reason, and Rust writes an error from the system with its
-/// number: EPERM is 1 and EACCES is 13 on macOS and on Linux (errno.h).
-fn not_permitted(reason: Option<&str>) -> bool {
-    reason.is_some_and(|r| r.contains("(os error 13)") || r.contains("(os error 1)"))
+/// Whether a reading that failed did, in part or whole, because of permissions, which the owner
+/// can change: a row of what it did not read that the system refused (`store::Unread::refused`).
+/// A file of another account closed to this one is not, whether it failed or was not given: its
+/// row keeps no number of the system's (`closed::of_another`).
+fn not_permitted(r: &Latest) -> bool {
+    r.unread.iter().any(store::Unread::refused)
+}
+
+/// Whether a reading that failed did, in part or whole, for another reason: a row that failed
+/// and that the system did not refuse for want of permission, or no row that failed at all, as
+/// of a reading that kept none, which is never taken as calm. A reading with both is told twice.
+fn failed_otherwise(r: &Latest) -> bool {
+    let failed = |u: &&store::Unread| u.cause == store::Cause::Failed.literal();
+    let mut rows = r.unread.iter().filter(failed).peekable();
+    rows.peek().is_none() || rows.any(|u| !u.refused())
 }
 
 /// The first of `SCOPES` among some readings' scopes.
@@ -1046,11 +1054,20 @@ pub fn not_covered(
     // Readings that failed: those kept closed by permissions, which the owner can open, and
     // the rest. On a server that could not be opened they are implied by it and told there.
     let away: BTreeSet<&str> = p.unreached.iter().map(|u| u.scope.as_str()).collect();
-    let (closed, other): (Vec<&Latest>, Vec<&Latest>) = served
+    let failures: Vec<&Latest> = served
         .iter()
         .filter(|r| failed(r) && !earlier_probe(r))
         .filter(|r| !(r.reader == servers::READER && away.contains(r.scope.as_str())))
-        .partition(|r| not_permitted(r.reason.as_deref()));
+        .collect();
+    let closed: Vec<&Latest> = failures
+        .iter()
+        .copied()
+        .filter(|r| not_permitted(r))
+        .collect();
+    let other: Vec<&Latest> = failures
+        .into_iter()
+        .filter(|r| failed_otherwise(r))
+        .collect();
     // Files of another account closed to this one and never read here: their source does not
     // give them, so the cause stored is `not_given`. One read here before failed, and is among
     // `other`, said with what could not be read (`closed::cause`).
@@ -1143,14 +1160,15 @@ pub fn not_covered(
 
     // Tools an earlier check read and this one did not find at the places it looks: one item,
     // since the oldest last full reading of them.
+    let looked_for = |r: &&Latest| {
+        (r.unread.iter())
+            .filter(|u| u.how == crate::tools::LOOKED_FOR)
+            .filter_map(|u| u.path.clone())
+            .collect::<Vec<String>>()
+    };
     let lost: Vec<&Latest> = latest
         .iter()
-        .filter(|r| r.completeness == "none")
-        .filter(|r| {
-            r.reason
-                .as_deref()
-                .is_some_and(|s| s.contains(crate::tools::READ_BEFORE))
-        })
+        .filter(|r| r.completeness == "none" && !looked_for(r).is_empty())
         .collect();
     if !lost.is_empty() {
         let mut what: Vec<&'static str> = Vec::new();
@@ -1164,10 +1182,9 @@ pub fn not_covered(
                 what.push(name);
             }
         }
-        // The places each was looked for, after its name: names from the Mac, given apart.
+        // The places each was looked for, whole: names from the Mac, given apart.
         let examples: Vec<Example> = (lost.iter())
-            .filter_map(|r| r.reason.as_deref()?.split_once(crate::tools::READ_BEFORE))
-            .flat_map(|(_, places)| paths(places))
+            .flat_map(looked_for)
             .map(Example::named)
             .collect();
         let n = what.len();
@@ -1424,28 +1441,13 @@ const GUARDED_WHAT: [(&[&str], &str); 7] = [
     (&[], "files"),
 ];
 
-/// The folders macOS protects that a reading of what a reader did not look into names, as a
-/// person names them.
+/// The folders macOS protects that a reading of what a reader did not look into names, each by
+/// its row (`guarded::gap`), as a person names them.
 fn not_looked_into(r: &Latest) -> Vec<String> {
-    let reason = r.reason.as_deref().unwrap_or_default();
-    let named = (reason.strip_prefix(guarded::NOT_LOOKED_INTO)).unwrap_or_default();
-    paths(named).iter().map(|f| plain_folder(f)).collect()
-}
-
-/// Places a reason joins with ", ". A name from the Mac, such as a disk's, may hold ", " but a
-/// place begins only where a path does (`guarded::shown`), so the rest belongs to the one before.
-fn paths(joined: &str) -> Vec<String> {
-    let mut places: Vec<String> = Vec::new();
-    for part in joined.split(", ").filter(|f| !f.is_empty()) {
-        match places.last_mut() {
-            Some(last) if !part.starts_with('/') && !part.starts_with("~/") => {
-                last.push_str(", ");
-                last.push_str(part);
-            }
-            _ => places.push(part.to_string()),
-        }
-    }
-    places
+    (r.unread.iter())
+        .filter(|u| u.how == guarded::HOW)
+        .filter_map(|u| u.path.as_deref().map(plain_folder))
+        .collect()
 }
 
 /// Why what is said of the ways present in projects is not whole, in the program's words;
@@ -1490,13 +1492,13 @@ pub fn projects_found(latest: &[Latest], this: Option<&str>) -> v1::ProjectsFoun
         // Projects are found by walking and by reading sessions: a gap that is not a place
         // left out is a failure. Sessions this version has no reader for are a place it does
         // not enter. The why is the core's words alone: a reading's reason holds names.
-        let (cause, reason) = (
-            r.and_then(|r| r.cause.as_deref()),
-            r.and_then(|r| r.reason.as_deref()),
-        );
-        let why = match (cause, reason) {
-            (_, Some(crate::checkouts::ONLY_GIVEN)) => crate::checkouts::ONLY_GIVEN.to_string(),
-            (Some("no_reader"), _) => SESSIONS_NOT_READ.to_string(),
+        let cause = r.and_then(|r| r.cause.as_deref());
+        let only_given = r.is_some_and(|r| {
+            !r.unread.is_empty() && r.unread.iter().all(|u| u.how == crate::checkouts::GIVEN)
+        });
+        let why = match cause {
+            _ if only_given => crate::checkouts::ONLY_GIVEN.to_string(),
+            Some("no_reader") => SESSIONS_NOT_READ.to_string(),
             _ => format!("the reading of {kind} was not full"),
         };
         let cause = match cause {
@@ -1632,15 +1634,15 @@ fn guarded_what(reader: &str) -> usize {
         .unwrap_or(GUARDED_WHAT.len() - 1)
 }
 
-/// A folder macOS protects, as a person names it.
-fn plain_folder(shown: &str) -> String {
-    match shown {
-        "~/Library/Mobile Documents" => "iCloud Drive".to_string(),
-        "~/Library/CloudStorage" => "cloud storage folders".to_string(),
-        "~/Library/Containers" | "~/Library/Group Containers" => "other apps' folders".to_string(),
-        _ => match shown.strip_prefix("/Volumes/") {
+/// A folder macOS protects, by its path as ids name it, as a person names it.
+fn plain_folder(rel: &str) -> String {
+    match rel {
+        "Library/Mobile Documents" => "iCloud Drive".to_string(),
+        "Library/CloudStorage" => "cloud storage folders".to_string(),
+        "Library/Containers" | "Library/Group Containers" => "other apps' folders".to_string(),
+        _ => match rel.strip_prefix("/Volumes/") {
             Some(disk) => format!("{DISK}{disk}"),
-            None => shown.strip_prefix("~/").unwrap_or(shown).to_string(),
+            None => rel.to_string(),
         },
     }
 }
@@ -1765,216 +1767,4 @@ pub fn clause(list: &[Uncovered]) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_reading_or_a_download_that_failed_is_a_failure_whoever_can_fix_it() {
-        // The causes raised when a reading or a download was tried and did not succeed (`fault.rs`).
-        let failed = [
-            "servers-not-checked",
-            "servers-not-opened",
-            "not-permitted",
-            "could-not-read",
-            "read-before-not-read-now",
-            "eslogger-refused",
-            "event-level-failing",
-            "event-level-silent",
-            "vulnerability-list-not-downloaded",
-            "vulnerability-list-not-downloaded-fixable",
-            "vulnerability-data-old",
-            "vulnerability-data-not-updated-fixable",
-        ];
-        for c in CAUSES {
-            let is = c.class == store::Cause::Failed;
-            assert_eq!(is, failed.contains(&c.id), "{}", c.id);
-        }
-        // Among them, some the person can fix and some nobody can.
-        for who in [YOU, NOTHING] {
-            assert!(
-                CAUSES
-                    .iter()
-                    .any(|c| c.class == store::Cause::Failed && c.who == who)
-            );
-        }
-    }
-
-    #[test]
-    fn a_reading_kept_closed_by_permissions_is_told_from_one_that_failed_otherwise() {
-        // The owner can open a file whose permissions keep it closed; he can do nothing about
-        // a source that is not there. The samples are the system's own messages.
-        // EPERM is 1, ENOENT 2, EAGAIN 35, EACCES 13 and EIO 5 (sys/errno.h).
-        let said = |errno: i32| std::io::Error::from_raw_os_error(errno).to_string();
-        for (errno, closed) in [(1, true), (13, true), (2, false), (35, false), (5, false)] {
-            assert_eq!(not_permitted(Some(&said(errno))), closed, "{}", said(errno));
-        }
-        assert!(!not_permitted(None));
-    }
-
-    #[test]
-    fn a_file_of_another_account_closed_here_is_never_the_persons_to_fix_and_once_read_here_is_among_what_could_not_be_read()
-     {
-        // Each as the reading of a watched file's content stores it, which no answer to a
-        // finding changes: one never read here is not given and leaves this Mac watched; one
-        // read here before failed, is said among what could not be read and leaves this Mac
-        // watched in part; neither is the person's to fix, as their own closed file is.
-        let dir = crate::common::Scratch::new("covered-closed");
-        let mut conn = store::open_or_make(&dir.join("store.db")).unwrap();
-        let tx = conn.transaction().unwrap();
-        let mac = "machine:example-mac";
-        store::put_entity(&tx, mac).unwrap();
-        tx.execute(
-            "INSERT OR IGNORE INTO coverage_kind (name) VALUES (?1)",
-            [watched::CONTENT],
-        )
-        .unwrap();
-        let r = store::Reading {
-            reader: watched::READER,
-            scope: mac,
-            kind: watched::CONTENT,
-            run_id: "run-1",
-            at: 1,
-            observed_at: 1,
-        };
-        store::put_coverage(&tx, &r, "full", None, &store::Gap::default()).unwrap();
-        tx.commit().unwrap();
-        let reading = |path: &str, reason: &str, cause: &str| Latest {
-            reader: watched::READER.to_string(),
-            scope: format!("file:{mac}/{path}"),
-            kind: watched::CONTENT.to_string(),
-            completeness: "none".to_string(),
-            reason: Some(reason.to_string()),
-            cause: Some(cause.to_string()),
-            at: 1,
-            last_full: None,
-        };
-        let said = |latest: &[Latest]| {
-            let p = status::problems(&conn, latest).unwrap();
-            let items = not_covered(&conn, latest, &p, None, None).unwrap();
-            let ids = [NOT_PERMITTED.id, READING_FAILED.id, OTHER_ACCOUNTS.id];
-            let items: Vec<(&str, usize)> = (items.iter())
-                .filter(|u| ids.contains(&u.cause.id))
-                .map(|u| (u.cause.id, u.count))
-                .collect();
-            (items, this_mac(&conn, latest, false).unwrap().state)
-        };
-        let never = || reading("Library/Example/helper", watched::CLOSED, "not_given");
-        assert_eq!(said(&[never()]), (vec![(OTHER_ACCOUNTS.id, 1)], "watched"));
-        let read_here = reading("Users/example/.zprofile", watched::CLOSED, "failed");
-        let own_closed = reading(
-            "Users/example/.zshrc",
-            "Permission denied (os error 13)",
-            "failed",
-        );
-        let in_part = vec![(READING_FAILED.id, 1), (OTHER_ACCOUNTS.id, 1)];
-        assert_eq!(said(&[never(), read_here]), (in_part, "watched_in_part"));
-        let own = vec![(NOT_PERMITTED.id, 1)];
-        assert_eq!(said(&[own_closed]), (own, "watched_in_part"));
-    }
-
-    #[test]
-    fn every_cause_a_person_can_fix_has_a_short_name_that_fits_its_row() {
-        // The app shows such a cause as a row whose second line is its short name, about 36
-        // characters wide; the sentence, the meaning and the advice carry the detail.
-        for c in CAUSES.iter().filter(|c| c.who == YOU) {
-            assert!(c.kind.chars().count() <= 36, "{}: {:?}", c.id, c.kind);
-        }
-    }
-
-    #[test]
-    fn an_example_whose_source_said_nothing_has_no_reason_and_never_an_empty_one() {
-        // A reader takes an absent reason as nothing said; an empty one would read as words.
-        let e = with_reason("db-1".to_string(), Some(""));
-        assert_eq!((e.name.as_str(), e.reason), ("db-1", None));
-        let e = with_reason("db-1".to_string(), Some("refused"));
-        assert_eq!(e.reason.as_deref(), Some("refused"));
-    }
-
-    #[test]
-    fn what_this_version_does_not_understand_is_named_as_the_owner_knows_it() {
-        // "for example software inside containers on servers and yarn.lock" reads as one
-        // thing; the names of files come first.
-        let kinds: BTreeSet<String> = [
-            plain_lack(servers::CONTAINER_CONTENTS, None),
-            plain_lack(crate::lockfiles::LOCKFILE_KIND, Some("yarn.lock")),
-            plain_lack(servers::PACKAGE_MANAGER, Some("apk")),
-        ]
-        .into_iter()
-        .collect();
-        assert_eq!(
-            names_first(&kinds),
-            [
-                "yarn.lock",
-                "apk packages",
-                "software inside containers on servers"
-            ]
-        );
-        // A lockfile not opened is a kind this version reads, so it is never named bare, as if
-        // the kind were not understood.
-        use crate::lockfiles::{DEEPER, LINKED, NOT_LOOKED, NOT_TOLD, SET_ASIDE};
-        assert_eq!(
-            [
-                plain_lack(DEEPER, Some("Cargo.lock")),
-                plain_lack(SET_ASIDE, Some("package-lock.json")),
-                plain_lack(NOT_LOOKED, None),
-                plain_lack(LINKED, Some("pnpm-lock.yaml")),
-                plain_lack(NOT_TOLD, Some("yarn.lock")),
-            ],
-            [
-                "Cargo.lock deeper than four folders in a project",
-                "package-lock.json in vendor or hidden folders",
-                "folders of very large projects not looked through for lockfiles",
-                "pnpm-lock.yaml that is a link",
-                "entries of yarn.lock whose package cannot be told",
-            ]
-        );
-    }
-
-    #[test]
-    fn every_sentence_this_version_cannot_judge_and_only_those_is_told_to_a_person_as_a_limit() {
-        // A gap an agent reads in `cannot_judge` and the owner never sees would be calm the
-        // program has not earned; a limit told after its gap was closed would be a false one.
-        let told: Vec<&str> = LIMITS.iter().map(|(s, _)| *s).collect();
-        assert_eq!(told, status::CANNOT_JUDGE);
-        assert!(LIMITS.iter().all(|(_, c)| c.who == NOTHING));
-        // An agent learns from the catalogue every item it can meet, a limit's among them.
-        assert!(
-            LIMITS
-                .iter()
-                .all(|(_, c)| CAUSES.iter().any(|known| known.id == c.id))
-        );
-    }
-
-    #[test]
-    fn the_places_not_checked_on_this_macos_are_told_to_an_agent_and_to_a_person_with_one_count() {
-        // The status names the sentence of the Mac it runs on, with or without a store.
-        let path = std::path::Path::new("/nonexistent/store.db");
-        let m = status::message(None, None, false, path, 0).unwrap();
-        let said = autorun::not_checked_said(autorun::MacOs::this_mac()).unwrap();
-        assert_eq!(m.cannot_judge.last(), Some(&said));
-        // The person's item counts the same rows, and says why in either case.
-        for (macos, reason) in [
-            (autorun::MacOs::Major(26), "This Mac runs macOS 26"),
-            (autorun::MacOs::NotKnown, "could not be read"),
-        ] {
-            let item = not_checked_on_macos(macos).unwrap();
-            let n = autorun::not_checked_on(macos).len();
-            assert_eq!(item.count, n);
-            assert!(
-                autorun::not_checked_said(macos)
-                    .unwrap()
-                    .contains(&n.to_string())
-            );
-            assert!(
-                item.title().starts_with(&format!("{n} places")),
-                "{}",
-                item.title()
-            );
-            assert!(item.meaning().contains(reason), "{}", item.meaning());
-            // No row is checked on any version yet, so it holds on every Mac and a person is
-            // not shown it as something about this one.
-            assert!(autorun::POINTS.iter().all(|p| p.checked_on.is_empty()));
-            assert!(item.every_mac);
-        }
-    }
-}
+mod tests;

@@ -51,8 +51,9 @@ pub enum Found {
     Output(String),
     /// No `brew` here: nothing to read, which is not a failure.
     NotInstalled,
-    /// `brew` is here and could not be read, with the reason.
-    Failed(String),
+    /// `brew` is here and could not be read, with the reason and the system's error number when
+    /// it gave one.
+    Failed(String, Option<i32>),
 }
 
 /// `input` is a saved answer of brew to read instead of running it. `brew` is the one place
@@ -60,11 +61,13 @@ pub enum Found {
 pub fn read(input: Option<&Path>, brew: Option<&Path>, home: &Path) -> Found {
     let json = match input {
         Some(path) => match crate::open::read(path, Reach::Given, UNCAPPED)
-            .map_err(|e| e.to_string())
-            .and_then(|b| String::from_utf8(b).map_err(|e| e.to_string()))
+            .map_err(|e| (e.to_string(), e.errno()))
+            .and_then(|b| String::from_utf8(b).map_err(|e| (e.to_string(), None)))
         {
             Ok(text) => text,
-            Err(e) => return Found::Failed(format!("cannot read {}: {e}", path.display())),
+            Err((e, errno)) => {
+                return Found::Failed(format!("cannot read {}: {e}", path.display()), errno);
+            }
         },
         None => {
             let Some(brew) = find(brew, home) else {
@@ -72,33 +75,37 @@ pub fn read(input: Option<&Path>, brew: Option<&Path>, home: &Path) -> Found {
             };
             match run(&brew) {
                 Ok(text) => text,
-                Err(e) => return Found::Failed(e),
+                Err((e, errno)) => return Found::Failed(e, errno),
             }
         }
     };
     match extract(&json) {
         Ok(raw) => Found::Output(raw),
-        Err(e) => Found::Failed(e),
+        Err(e) => Found::Failed(e, None),
     }
 }
 
-fn run(brew: &Path) -> Result<String, String> {
+/// What brew printed, or why it could not be run, with the system's error number when it gave
+/// one.
+fn run(brew: &Path) -> Result<String, (String, Option<i32>)> {
     let out = Command::new(brew)
         .args(ARGS)
         .envs(QUIET)
         .stdin(Stdio::null())
         .output()
-        .map_err(|e| format!("cannot run {}: {e}", brew.display()))?;
+        .map_err(|e| {
+            (
+                format!("cannot run {}: {e}", brew.display()),
+                e.raw_os_error(),
+            )
+        })?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let first = stderr.lines().next().unwrap_or("").trim();
-        return Err(format!(
-            "brew {} failed, {}: {first}",
-            ARGS.join(" "),
-            out.status
-        ));
+        let why = format!("brew {} failed, {}: {first}", ARGS.join(" "), out.status);
+        return Err((why, None));
     }
-    String::from_utf8(out.stdout).map_err(|_| "brew output is not UTF-8".to_string())
+    String::from_utf8(out.stdout).map_err(|_| ("brew output is not UTF-8".to_string(), None))
 }
 
 /// Where brew is, if at either standard place. A `brew` anywhere else is another Homebrew, at a
