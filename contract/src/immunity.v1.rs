@@ -2027,9 +2027,9 @@ pub struct FilesChanged {
     pub changed: u64,
     /// What was added, removed and changed, told by structure, in path order: a folder every file
     /// under which, in either reading, changed in that way, at the outermost such folder, and every
-    /// other file of the kind alone. When the whole thing changed in one way (it had no file
-    /// before, every file went, or every file changed) and holds more than one file, the one entry
-    /// is the thing's own folder, `.`. The entries of a kind cover every file it counts unless the record of the change grew
+    /// other file of the kind alone. The thing's own folder is never an entry: when the whole thing
+    /// changed in one way, its folders are told below it and the files directly in it by name, since
+    /// 1.37.0. The entries of a kind cover every file it counts unless the record of the change grew
     /// too large to keep whole: they stop in path order, and the files they leave out are the count
     /// less the sum of their `files`. Since 1.26.0.
     #[prost(message, repeated, tag = "7")]
@@ -2044,8 +2044,8 @@ pub struct FilesChanged {
 #[serde(default)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ChangedPath {
-    /// The path from the thing's folder, as the file system gives it, cut to 1,024 bytes; `.` for
-    /// the thing's folder itself.
+    /// The path from the thing's folder, as the file system gives it, cut to 1,024 bytes. A change
+    /// recorded by a core before 1.37.0 can hold `.`, the thing's folder itself.
     #[prost(string, tag = "1")]
     pub path_text: ::prost::alloc::string::String,
     /// Whether it is a folder. A folder is an entry only when it holds more than one file of the

@@ -47,6 +47,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+mod changes;
+pub use changes::{LIST_CAP, changes_input, compare, files_changed, kept_file, list_input};
+
 pub const READER: &str = "integrity";
 pub const BASIS: &str = "observed";
 pub const BUNDLES: &str = "application bundles in /Applications and ~/Applications";
@@ -66,8 +69,9 @@ const NODE_MODULES: &str = "lib/node_modules";
 const SKIPPED: [&str; 1] = ["__pycache__"];
 
 /// Kinds of file that are code, by extension: scripts, native modules and libraries, and
-/// archives of code. A file anyone may run is code too, whatever its name. Python's compiled
-/// files are left out: Python writes them by itself.
+/// archives of code. A file anyone may run is code too, whatever its name, and a symbolic link
+/// by what it leads to (`is_code`). Python's compiled files are left out: Python writes them by
+/// itself.
 const CODE: [&str; 13] = [
     "js", "mjs", "cjs", "node", "dylib", "so", "py", "asar", "jar", "wasm", "sh", "rb", "lua",
 ];
@@ -90,7 +94,7 @@ const MAX_FILES: usize = 20_000;
 /// What a reading's note says the reader cannot judge, kind by kind.
 const BUNDLES_CANNOT: &str = "not covered: extended attributes, which no seal covers; a bundle changed and signed again shows only as another signer at the same version; an application that updates itself in place shows as a change of its digest";
 const KEGS_CANNOT: &str = "compared by files' metadata between readings, since Homebrew keeps no record of a keg's files to verify against; __pycache__ folders are not compared";
-const APP_SUPPORT_CANNOT: &str = "compared by the metadata of code files between readings; only a folder named like an application read here that Apple did not sign is looked into, and one an earlier reading held for as long as it is there, so code kept under another name is not compared; caches, web storage, crash reports and logs are not compared";
+const APP_SUPPORT_CANNOT: &str = "compared by the metadata of code files between readings, a symbolic link among them unless what it leads to cannot be run; only a folder named like an application read here that Apple did not sign is looked into, and one an earlier reading held for as long as it is there, so code kept under another name is not compared; caches, web storage, crash reports and logs are not compared";
 const NPM_CANNOT: &str = "compared by files' metadata between readings, since npm keeps no record of a global package's files to verify against; a global folder set in npm's configuration or by a version manager is not looked for, and a linked package is not read";
 
 /// Where places are resolved: the home folder, and the root of the system, `/` unless a test
@@ -203,13 +207,14 @@ enum Walked {
 }
 
 /// The records of every code file under `dir`, by path and change time, as `walk` makes them,
-/// within the caps.
+/// within the caps. A symbolic link is recorded as itself and never walked into (`is_code`).
 fn walk_code(
     dir: &Path,
     rel: &[u8],
     depth: usize,
     out: &mut Vec<u8>,
     files: &mut usize,
+    homes: &[&Path],
 ) -> std::io::Result<Walked> {
     let mut names = std::fs::read_dir(dir)?
         .map(|e| e.map(|e| e.file_name()))
@@ -229,13 +234,12 @@ fn walk_code(
             if depth == MAX_DEPTH {
                 return Ok(Walked::Capped(format!("deeper than {MAX_DEPTH} folders")));
             }
-            if let Walked::Capped(cap) = walk_code(&path, &here, depth + 1, out, files)? {
+            if let Walked::Capped(cap) = walk_code(&path, &here, depth + 1, out, files, homes)? {
                 return Ok(Walked::Capped(cap));
             }
             continue;
         }
-        let extension = text.rsplit_once('.').map_or("", |(_, e)| e);
-        if !CODE.contains(&extension) && m.mode() & 0o111 == 0 {
+        if !is_code(&path, &m, &text, homes) {
             continue;
         }
         *files += 1;
@@ -246,6 +250,48 @@ fn walk_code(
         out.extend_from_slice(format!("\0{}.{}\n", m.ctime(), m.ctime_nsec()).as_bytes());
     }
     Ok(Walked::Done)
+}
+
+/// Whether an entry under a folder of code that is not a folder is code: by a code extension,
+/// whatever it is; a regular file by its execute bit; a symbolic link by what it leads to.
+fn is_code(path: &Path, m: &std::fs::Metadata, name: &str, homes: &[&Path]) -> bool {
+    if CODE.contains(&extension(name)) {
+        return true;
+    }
+    if !m.file_type().is_symlink() {
+        return m.mode() & 0o111 != 0;
+    }
+    leads_to_code(path, homes)
+}
+
+/// Whether a symbolic link with no code extension leads to what may be code. It may, unless
+/// what it leads to cannot be run: nothing is there, it is neither a regular file nor a folder
+/// (a socket, a pipe, a device), or it is a regular file with no execute bit and no code
+/// extension. An app that runs keeps such links beside its code and removes them as it quits,
+/// as Chromium does with its single-instance lock, cookie and socket. A link to a folder may
+/// be: which folder it names decides which code runs. The link is followed one part at a time
+/// by `guarded::real`, which never looks into a folder macOS asks permission for and counts the
+/// links it passes; a link that leads into one, or that cannot be followed for any reason but
+/// nothing being there, may be code. Nothing it leads to is opened.
+fn leads_to_code(link: &Path, homes: &[&Path]) -> bool {
+    let to = match crate::guarded::real(link, homes) {
+        crate::guarded::Real::At(to) => to,
+        crate::guarded::Real::Guarded(_) => return true,
+        crate::guarded::Real::Failed(e) => return e.kind() != ErrorKind::NotFound,
+    };
+    // What the walk looked at a moment ago: if it cannot be looked at again, it is still compared.
+    let Ok(m) = std::fs::symlink_metadata(&to) else {
+        return true;
+    };
+    let name = to.file_name().map(|n| n.to_string_lossy().to_lowercase());
+    m.is_dir()
+        || m.is_file()
+            && (m.mode() & 0o111 != 0 || name.is_some_and(|n| CODE.contains(&extension(&n))))
+}
+
+/// What follows the last `.` of a name, or nothing.
+fn extension(name: &str) -> &str {
+    name.rsplit_once('.').map_or("", |(_, e)| e)
 }
 
 /// Code that applications keep outside their bundle, in `~/Library/Application Support`.
@@ -314,6 +360,7 @@ fn app_support(
         Some(Ok(entries)) => entries,
     };
     let own = roots.store.parent().map(same_place);
+    let [home, real_home] = crate::watched::homes(roots.home);
     kind.listed(APP_SUPPORT_PLACE);
     let (mut matched, mut files, mut kept) = (0, 0, Vec::new());
     for entry in entries {
@@ -349,7 +396,8 @@ fn app_support(
             matched += 1;
         }
         let (mut records, mut count) = (Vec::new(), 0);
-        match walk_code(&path, b"", 0, &mut records, &mut count) {
+        let homes: [&Path; 2] = [&home, &real_home];
+        match walk_code(&path, b"", 0, &mut records, &mut count, &homes) {
             Err(e) => kind.failed(shown, e.to_string()),
             Ok(Walked::Capped(cap)) => kind.not_recorded(shown, Said::OverCap, cap),
             // No application read now matches it and no code is left in it: nothing to hold.
@@ -1077,244 +1125,6 @@ pub fn observed(
     Ok(out)
 }
 
-/// The name among the raw copies of a thing's list (`Thing::list`), and of what changed in it at
-/// its latest change (`Changes`): made from the thing's id by its SHA-256, so that any id is a
-/// safe file name.
-pub fn list_input(subject: &str) -> String {
-    format!("files/{}.txt", crate::sha256::hex(subject.as_bytes()))
-}
-
-pub fn changes_input(subject: &str) -> String {
-    format!("changes/{}.json", crate::sha256::hex(subject.as_bytes()))
-}
-
-/// The file of a raw copy of `input` under the store's folder, from its path as `raw_input`
-/// holds it: only of the shape `Run::keep_raw` writes, `raw/<one folder>/<input>`. Another
-/// program can write that table, so a path of any other shape, absolute or with `..`, is none.
-pub fn kept_file(folder: &Path, path: &str, input: &str) -> Option<PathBuf> {
-    let run = path
-        .strip_prefix("raw/")?
-        .strip_suffix(input)?
-        .strip_suffix('/')?;
-    let one = !run.is_empty() && !run.contains('/') && run != "." && run != "..";
-    one.then(|| folder.join(path))
-}
-
-/// The most a list kept before is read: a line for each of `MAX_FILES` files, of a path as long
-/// as macOS allows and its change time. A larger file is no list.
-pub const LIST_CAP: u64 = MAX_FILES as u64 * 1_100;
-/// The most of what changed that is read, and the longest name passed on, in bytes.
-const CHANGES_CAP: u64 = 64 << 10;
-const NAME_CAP: usize = 1_024;
-/// The most the entries of one kind take in the record as written, so that the record fits
-/// `CHANGES_CAP`: a third of it, less 1 KiB for the digests, the counts and the keys.
-const PART: usize = (CHANGES_CAP as usize - 1_024) / 3;
-
-/// The files of one thing added, removed and changed between two of its lists, with the digests
-/// of both, so that it is told only of the change the journal holds between those two digests.
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct Changes {
-    from: String,
-    to: String,
-    added: Told,
-    removed: Told,
-    changed: Told,
-}
-
-/// The files of one kind of change, counted exactly, and told by structure: in path order, a
-/// folder every file under which, in either list, changed this way, at the outermost, and every
-/// other file alone. The entries stop before they take more than `PART`; the files they leave
-/// out are the count less theirs.
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct Told {
-    count: u64,
-    entries: Vec<Entry>,
-}
-
-/// A path from the thing's folder, `.` for that folder itself, and how many files of the kind
-/// it holds: a file holds 1, and a folder is an entry only when it holds more.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct Entry {
-    path: String,
-    folder: bool,
-    files: u64,
-}
-
-/// The folders a path from a list is in, outermost first: the path before each `/`, which is
-/// `""`, the thing's folder, before the first, since every path in a list begins with one.
-fn folders_of(path: &[u8]) -> impl Iterator<Item = &[u8]> {
-    (0..path.len())
-        .filter(|&i| path[i] == b'/')
-        .map(|i| &path[..i])
-}
-
-/// A list's records as path and change time; `None` when it is not a list `walk` makes. A path
-/// can hold a newline and never a NUL, and a change time holds neither, so each record ends at
-/// the first newline after its NUL.
-fn records(list: &[u8]) -> Option<Vec<(&[u8], &[u8])>> {
-    let mut out = Vec::new();
-    let mut rest = list;
-    while !rest.is_empty() {
-        let (path, after) = rest.split_at(rest.iter().position(|b| *b == 0)?);
-        let (time, after) = after[1..].split_at(after[1..].iter().position(|b| *b == b'\n')?);
-        out.push((path, time));
-        rest = &after[1..];
-    }
-    Some(out)
-}
-
-/// What changed from one list of a thing to the next: a path in the new list only is added, in
-/// the old only removed, in both with another change time changed, and in both alike kept. A
-/// folder changed whole one way when every file under it, in either list, changed that way, as
-/// `git status` tells an untracked folder and `diff -r` a folder only in one tree. `None` when
-/// either is not a list, or when no file is told: what cannot be said is never said as nothing.
-pub fn compare(before: &[u8], now: &[u8]) -> Option<Changes> {
-    const KEPT: usize = 3;
-    let (old, new) = (records(before)?, records(now)?);
-    let (was, is): (BTreeMap<_, _>, BTreeMap<_, _>) =
-        (old.iter().copied().collect(), new.iter().copied().collect());
-    // Each file by its kind, 0 added, 1 removed, 2 changed and `KEPT`, and what each folder
-    // holds of each kind.
-    let mut files = Vec::new();
-    for (path, time) in &new {
-        files.push(match was.get(path) {
-            None => (*path, 0),
-            Some(t) if t != time => (*path, 2),
-            Some(_) => (*path, KEPT),
-        });
-    }
-    files.extend(
-        old.iter()
-            .filter(|(p, _)| !is.contains_key(p))
-            .map(|(p, _)| (*p, 1)),
-    );
-    let mut held: BTreeMap<&[u8], [u64; 4]> = BTreeMap::new();
-    for (path, kind) in &files {
-        for folder in folders_of(path) {
-            held.entry(folder).or_default()[*kind] += 1;
-        }
-    }
-    // The entries of each kind, by path, with how many files each holds.
-    let mut told: [BTreeMap<&[u8], u64>; 3] = Default::default();
-    let mut counts = [0u64; 3];
-    for (path, kind) in files.iter().filter(|(_, kind)| *kind != KEPT) {
-        counts[*kind] += 1;
-        let whole = folders_of(path)
-            .map(|f| (f, held[f]))
-            .find(|(_, n)| (0..4).all(|k| k == *kind || n[k] == 0));
-        let (at, files) = match whole {
-            Some((folder, n)) if n[*kind] > 1 => (folder, n[*kind]),
-            _ => (*path, 1),
-        };
-        told[*kind].insert(at, files);
-    }
-    let [added, removed, changed] = std::array::from_fn(|kind| {
-        let mut out = Told {
-            count: counts[kind],
-            entries: Vec::new(),
-        };
-        let mut part = 0;
-        for (path, files) in &told[kind] {
-            let name = match path.strip_prefix(b"/").unwrap_or(path) {
-                b"" => ".".to_string(),
-                name => String::from_utf8_lossy(name).into_owned(),
-            };
-            let entry = Entry {
-                path: name,
-                folder: *files > 1,
-                files: *files,
-            };
-            part += serde_json::to_vec(&entry).map_or(PART + 1, |b| b.len() + 1);
-            if part > PART {
-                break;
-            }
-            out.entries.push(entry);
-        }
-        out
-    });
-    let c = Changes {
-        from: stat(before),
-        to: stat(now),
-        added,
-        removed,
-        changed,
-    };
-    (counts.iter().sum::<u64>() > 0).then_some(c)
-}
-
-/// What files changed at the latest change of a finding's thing, from the raw copy the reading
-/// kept (`changes_input`): only when the latest journal entry the finding rests on is a change
-/// from the copy's old digest to its new one, so that the copy is of that very change. `None`
-/// otherwise, and the finding says nothing of files.
-pub fn files_changed(
-    conn: &Connection,
-    finding: &str,
-) -> rusqlite::Result<Option<crate::contract::v1::FilesChanged>> {
-    let change: Option<(String, Option<String>, Option<String>)> = conn
-        .query_row(
-            "SELECT j.subject, j.old_value, j.new_value FROM finding_basis b
-             JOIN journal j ON j.seq = b.journal
-             WHERE b.finding = ?1 ORDER BY j.seq DESC LIMIT 1",
-            [finding],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()?;
-    let Some((subject, Some(from), Some(to))) = change else {
-        return Ok(None);
-    };
-    let input = changes_input(&subject);
-    let Some(path) = crate::store::last_raw(conn, READER, &input)? else {
-        return Ok(None);
-    };
-    // Raw copies are kept in the store's folder, as paths from it. What is read is bounded,
-    // whatever the file holds.
-    let folder = conn.path().map(Path::new).and_then(Path::parent);
-    let kept = folder
-        .and_then(|f| kept_file(f, &path, &input))
-        .and_then(|file| crate::open::read(&file, crate::open::Reach::Own, CHANGES_CAP).ok())
-        .and_then(|bytes| serde_json::from_slice::<Changes>(&bytes).ok())
-        .filter(|c| c.from == from && c.to == to);
-    // Entries never cover more files than their kind counts, so that what they leave out is
-    // the count less theirs.
-    let covered = |t: &Told| {
-        t.entries
-            .iter()
-            .try_fold(0u64, |sum, e| sum.checked_add(e.files))
-            .is_some_and(|sum| sum <= t.count)
-    };
-    let kept = kept.filter(|c| {
-        let kinds = [&c.added, &c.removed, &c.changed];
-        kinds.iter().any(|t| t.count > 0) && kinds.iter().all(|t| covered(t))
-    });
-    let paths = |t: &Told| {
-        t.entries
-            .iter()
-            .map(|e| crate::contract::v1::ChangedPath {
-                path_text: crate::known::whole(cut(&e.path)),
-                folder: e.folder,
-                files: e.files,
-            })
-            .collect()
-    };
-    Ok(kept.map(|c| crate::contract::v1::FilesChanged {
-        added: c.added.count,
-        removed: c.removed.count,
-        changed: c.changed.count,
-        added_paths: paths(&c.added),
-        removed_paths: paths(&c.removed),
-        changed_paths: paths(&c.changed),
-    }))
-}
-
-/// A name cut to `NAME_CAP` bytes, at the end of a character.
-fn cut(name: &str) -> &str {
-    let mut end = name.len().min(NAME_CAP);
-    while !name.is_char_boundary(end) {
-        end -= 1;
-    }
-    &name[..end]
-}
-
 /// What the rules are told changed when a fact of an installed thing changed in place.
 fn place(kind: &str, predicate: &str) -> &'static str {
     match (kind, predicate) {
@@ -1536,7 +1346,7 @@ pub fn message(s: &Summary) -> crate::contract::v1::Integrity {
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, NPM, NPM_CANNOT, Said, Told, Unit, bundle_version, compare, kept_file};
+    use super::{Kind, NPM, NPM_CANNOT, Said, Unit, bundle_version};
     use crate::store::Cause;
     use std::path::Path;
 
@@ -1571,219 +1381,6 @@ mod tests {
         let mut whole = Kind::new(NPM, NPM_CANNOT);
         whole.listed("/l");
         assert_eq!(whole.coverage().0, "full");
-    }
-
-    #[test]
-    fn a_kept_copy_is_a_file_only_at_a_path_of_the_shape_the_store_writes() {
-        // The table of raw copies is data another program can write: a path from it never
-        // reaches a file outside the store's folder of raw copies.
-        let (store, input) = (Path::new("/Users/example/store"), "files/ab.txt");
-        let file = kept_file(store, "raw/1795400000-000000001/files/ab.txt", input);
-        assert_eq!(
-            file,
-            Some(store.join("raw/1795400000-000000001/files/ab.txt"))
-        );
-        for path in [
-            "/Users/example/store/raw/1795400000-000000001/files/ab.txt",
-            "raw/../files/ab.txt",
-            "raw/./files/ab.txt",
-            "raw//files/ab.txt",
-            "raw/1795400000-000000001/../../files/ab.txt",
-            "other/1795400000-000000001/files/ab.txt",
-            "raw/1795400000-000000001/files/cd.txt",
-        ] {
-            assert_eq!(kept_file(store, path, input), None, "{path}");
-        }
-    }
-
-    #[test]
-    fn lists_that_tell_no_file_apart_are_never_told_as_no_file_changed() {
-        let list = b"/bin/tool\x001.5\n/lib/a\nb\x002.5\n";
-        assert!(compare(list, list).is_none());
-        assert!(compare(b"damaged", list).is_none());
-        // A name may hold a line break; it is still one file, unchanged here.
-        let c = compare(list, b"/bin/tool\x001.6\n/lib/a\nb\x002.5\n").unwrap();
-        assert_eq!(told(&c.changed), [("bin/tool", false, 1)]);
-        assert_eq!((c.added.count, c.removed.count), (0, 0));
-    }
-
-    /// A list as `walk` makes it, of paths from the thing's folder and their change times.
-    fn list(files: &[(&str, &str)]) -> Vec<u8> {
-        let mut out = Vec::new();
-        for (path, time) in files {
-            out.extend_from_slice(format!("/{path}\0{time}\n").as_bytes());
-        }
-        out
-    }
-
-    fn told(t: &Told) -> Vec<(&str, bool, u64)> {
-        t.entries
-            .iter()
-            .map(|e| (e.path.as_str(), e.folder, e.files))
-            .collect()
-    }
-
-    #[test]
-    fn a_whole_folder_inside_a_whole_folder_is_told_once_at_the_outermost() {
-        let before = list(&[("bin/tool", "1")]);
-        let now = list(&[
-            ("bin/tool", "1"),
-            ("lib/2.0/a.js", "2"),
-            ("lib/2.0/deep/b.js", "2"),
-            ("lib/2.0/deep/c.js", "2"),
-            ("lib/d.js", "2"),
-        ]);
-        let c = compare(&before, &now).unwrap();
-        assert_eq!(told(&c.added), [("lib", true, 4)]);
-        assert_eq!(c.added.count, 4);
-        // The other way round.
-        let c = compare(&now, &before).unwrap();
-        assert_eq!(told(&c.removed), [("lib", true, 4)]);
-    }
-
-    #[test]
-    fn a_file_added_into_a_folder_that_held_files_and_one_removed_from_a_folder_that_keeps_files_are_named()
-     {
-        let before = list(&[("lib/a.js", "1"), ("lib/b.js", "1"), ("bin/x", "1")]);
-        let now = list(&[("lib/a.js", "1"), ("lib/z.js", "2"), ("bin/x", "1")]);
-        let c = compare(&before, &now).unwrap();
-        assert_eq!(told(&c.added), [("lib/z.js", false, 1)]);
-        assert_eq!(told(&c.removed), [("lib/b.js", false, 1)]);
-        assert_eq!(c.changed.count, 0);
-    }
-
-    #[test]
-    fn a_folder_where_every_file_was_written_again_is_one_entry_and_with_one_left_as_it_was_its_files_are_named()
-     {
-        let before = list(&[("bin/x", "1"), ("lib/a.js", "1"), ("lib/b.js", "1")]);
-        let all = list(&[("bin/x", "1"), ("lib/a.js", "2"), ("lib/b.js", "2")]);
-        assert_eq!(
-            told(&compare(&before, &all).unwrap().changed),
-            [("lib", true, 2)]
-        );
-        let before = list(&[("lib/a.js", "1"), ("lib/b.js", "1"), ("lib/c.js", "1")]);
-        let some = list(&[("lib/a.js", "2"), ("lib/b.js", "1"), ("lib/c.js", "2")]);
-        let c = compare(&before, &some).unwrap();
-        assert_eq!(
-            told(&c.changed),
-            [("lib/a.js", false, 1), ("lib/c.js", false, 1)]
-        );
-        // A file added beside the files rewritten keeps the folder from being changed whole.
-        let more = list(&[
-            ("lib/a.js", "2"),
-            ("lib/b.js", "2"),
-            ("lib/c.js", "2"),
-            ("lib/d", "2"),
-        ]);
-        let c = compare(&before, &more).unwrap();
-        assert_eq!(c.changed.entries.len(), 3);
-        assert_eq!(told(&c.added), [("lib/d", false, 1)]);
-    }
-
-    #[test]
-    fn a_folder_of_one_file_is_told_as_the_file() {
-        let before = list(&[("bin/x", "1"), ("old/deep/one.js", "1")]);
-        let now = list(&[("bin/x", "2"), ("new/deep/one.js", "1")]);
-        let c = compare(&before, &now).unwrap();
-        assert_eq!(told(&c.added), [("new/deep/one.js", false, 1)]);
-        assert_eq!(told(&c.removed), [("old/deep/one.js", false, 1)]);
-        assert_eq!(told(&c.changed), [("bin/x", false, 1)]);
-    }
-
-    #[test]
-    fn the_whole_thing_added_gone_or_written_again_is_one_entry_its_own_folder() {
-        let files = list(&[("bin/x", "1"), ("lib/a.js", "1")]);
-        let c = compare(b"", &files).unwrap();
-        assert_eq!(told(&c.added), [(".", true, 2)]);
-        let c = compare(&files, b"").unwrap();
-        assert_eq!(told(&c.removed), [(".", true, 2)]);
-        let again = list(&[("bin/x", "2"), ("lib/a.js", "2")]);
-        assert_eq!(
-            told(&compare(&files, &again).unwrap().changed),
-            [(".", true, 2)]
-        );
-    }
-
-    #[test]
-    fn entries_of_a_kind_are_in_path_order_and_stop_within_their_part_of_the_cap() {
-        // Thousands of single files changed, each beside one that stayed: every one is an entry
-        // of its own, too many to keep. The counts stay exact, the entries are the first in
-        // path order, and the record as written fits the cap.
-        let mut before = Vec::new();
-        let mut now = Vec::new();
-        for i in 0..3_000 {
-            let (changed, kept) = (format!("d{i:04}/a.js"), format!("d{i:04}/kept"));
-            before.push((changed.clone(), "1"));
-            now.push((changed, "2"));
-            before.push((kept.clone(), "1"));
-            now.push((kept, "1"));
-        }
-        let as_list = |v: &[(String, &str)]| {
-            list(&v.iter().map(|(p, t)| (p.as_str(), *t)).collect::<Vec<_>>())
-        };
-        let c = compare(&as_list(&before), &as_list(&now)).unwrap();
-        assert_eq!(c.changed.count, 3_000);
-        let entries = told(&c.changed);
-        assert!(
-            entries.len() > 50 && entries.len() < 3_000,
-            "{}",
-            entries.len()
-        );
-        for (i, (path, folder, files)) in entries.iter().enumerate() {
-            assert_eq!(
-                (*path, *folder, *files),
-                (format!("d{i:04}/a.js").as_str(), false, 1)
-            );
-        }
-        // Removed and added as well, so that all three parts are full.
-        let gone: Vec<(String, &str)> = before.iter().map(|(p, t)| (format!("{p}x"), *t)).collect();
-        let mut both = as_list(&before);
-        both.extend(as_list(&gone));
-        let mut after = as_list(&now);
-        after.extend(as_list(
-            &gone
-                .iter()
-                .map(|(p, t)| (format!("{p}y"), *t))
-                .collect::<Vec<_>>(),
-        ));
-        let c = compare(&both, &after).unwrap();
-        assert_eq!(
-            (c.added.count, c.removed.count, c.changed.count),
-            (6_000, 6_000, 3_000)
-        );
-        let written = serde_json::to_vec(&c).unwrap();
-        assert!(
-            written.len() as u64 <= super::CHANGES_CAP,
-            "{}",
-            written.len()
-        );
-        assert!(
-            written.len() as u64 > super::CHANGES_CAP - 4_096,
-            "{}",
-            written.len()
-        );
-    }
-
-    #[test]
-    fn an_entry_that_fills_its_part_to_the_byte_is_kept_and_the_next_is_not() {
-        // Each entry takes its JSON and a comma: 47 bytes for `dNNNN/a.js`, and 456 of them
-        // leave 72 bytes of the part, which an entry of a 35-byte path fills exactly.
-        let mut before = vec![("kept".to_string(), "1")];
-        let mut now = before.clone();
-        let mut paths: Vec<String> = (0..456).map(|i| format!("d{i:04}/a.js")).collect();
-        paths.push(format!("d0456/{}.js", "b".repeat(26)));
-        paths.push("d0457/a.js".to_string());
-        for p in &paths {
-            before.push((p.clone(), "1"));
-            now.push((p.clone(), "2"));
-        }
-        let as_list = |v: &[(String, &str)]| {
-            list(&v.iter().map(|(p, t)| (p.as_str(), *t)).collect::<Vec<_>>())
-        };
-        let c = compare(&as_list(&before), &as_list(&now)).unwrap();
-        assert_eq!(super::PART, 21_504);
-        assert_eq!(c.changed.entries.len(), 457);
-        assert_eq!(c.changed.entries[456].path, paths[456]);
     }
 
     /// An `Info.plist` of an invented app with these three values, each an XML element.
