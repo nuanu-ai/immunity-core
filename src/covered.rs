@@ -1412,9 +1412,18 @@ pub fn not_covered(
         });
     }
 
-    // A download that failed, told with why in a person's words: the network's doing, which
-    // the owner can take up, or what passes by itself.
-    if let Some(Catalogue::Failed { reason, last, .. }) = catalogue {
+    // A download of the catalogue that failed, told with why in a person's words: the network's
+    // doing, which the owner can take up, or what passes by itself. It is told only once the
+    // catalogue read before is not current, or when it was never read, by the rule for a failed
+    // download (`vulnerabilities::read_not_current`).
+    if let Some(Catalogue::Failed { reason, last, .. }) = catalogue
+        && crate::vulnerabilities::read_not_current(
+            last.map(|(at, _)| at),
+            crate::now_secs(),
+            crate::threats::CURRENT_FOR,
+        )
+        .is_some()
+    {
         let why = crate::threats::why(reason);
         out.push(Uncovered {
             since: last.map(|(at, _)| at),

@@ -27,6 +27,9 @@ pub const RAW: &str = "cisa-kev.json";
 /// The catalogue was about 1.8 MB in 2026. Anything larger than this is not read, however
 /// it arrives: compressed or not, from the network or from a file.
 pub const MAX_BYTES: u64 = 8 * 1024 * 1024;
+/// How long the catalogue's last good reading counts as current, in seconds: it is asked for at
+/// every check, as crates.io's data is, so it is current for two checks.
+pub const CURRENT_FOR: i64 = crate::osv::CURRENT_FOR_EVERY_CHECK;
 
 /// One entry of the catalogue, its text as the catalogue gives it.
 pub struct Entry {

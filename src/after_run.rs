@@ -731,8 +731,12 @@ mod tests {
         s.not_covered = vec![failed_cause("~/.zshrc", "Permission denied")];
         states.push(("a failed reading", s));
         let mut s = calm();
-        s.threats = Some(v1::Threats {
-            outcome: v1::FeedOutcome::Failed as i32,
+        s.vulnerability_data = Some(v1::VulnerabilityData {
+            feeds: vec![v1::FeedState {
+                ecosystem: "npm".to_string(),
+                outcome: v1::FeedOutcome::Failed as i32,
+                ..Default::default()
+            }],
             ..Default::default()
         });
         states.push(("a failed download", s));

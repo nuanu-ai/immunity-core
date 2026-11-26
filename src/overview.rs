@@ -254,65 +254,47 @@ pub(crate) fn watching(s: &v1::Status, screen: &Screen) -> (String, Style) {
     (format!("{state}; {watcher}"), style)
 }
 
-/// The downloads of public threat data that failed at the last check, in two sentences: those
-/// whose data read before stays in force, and those of which nothing is known yet; none when none
-/// failed. Said even while the headline stays calm because the data kept is current. What a
-/// cause of `not_covered` already says is left out: the catalogue (`catalogue_said`), and a feed
-/// that answers rest on and that was never read (`data_said`), which is not current. An outcome
-/// this build does not know is read as failed, as the schema says.
-fn downloads_failed(s: &v1::Status, catalogue_said: bool, data_said: bool) -> Vec<String> {
+/// The downloads of OSV data that failed at the last check and are faults, in two sentences:
+/// those whose data read before is no longer current, and those of which nothing is known yet;
+/// none when none is a fault. A failed download is a fault only while its feed's data is not
+/// current now, as the status's `FeedFreshness.current` says by the rule for a failed download
+/// (`vulnerabilities::read_not_current`); a feed the status gives no freshness for is taken as
+/// not current. The catalogue is not here: its failed download is a fault only as its cause of
+/// `not_covered`, raised by the same rule. A feed that answers rest on and that was never read
+/// is left out while the cause that says their data is not current is there (`data_said`). An
+/// outcome this build does not know is read as failed, as the schema says.
+fn downloads_failed(s: &v1::Status, data_said: bool) -> Vec<String> {
     let failed = |outcome: i32| {
         !matches!(
             v1::FeedOutcome::try_from(outcome),
             Ok(v1::FeedOutcome::Read | v1::FeedOutcome::Unchanged | v1::FeedOutcome::NeverRead)
         )
     };
-    // What failed, in two groups: the catalogue, and the ecosystems of the OSV data.
-    let mut kept = (false, Vec::new());
-    let mut none = (false, Vec::new());
-    if let Some(t) = s
-        .threats
-        .as_ref()
-        .filter(|t| failed(t.outcome) && !catalogue_said)
-    {
-        let group = if t.entries.is_some() || t.read_at.is_some() {
-            &mut kept
-        } else {
-            &mut none
-        };
-        group.0 = true;
-    }
-    for f in s
+    let current = |source: &str| {
+        s.vulnerabilities
+            .iter()
+            .flat_map(|v| &v.feeds)
+            .any(|f| f.source == source && f.current)
+    };
+    let (kept, none): (Vec<&v1::FeedState>, Vec<&v1::FeedState>) = s
         .vulnerability_data
         .iter()
         .flat_map(|d| &d.feeds)
-        .filter(|f| failed(f.outcome) && !(data_said && f.matched && f.read_at.is_none()))
-    {
-        let group = if f.read_at.is_some() {
-            &mut kept
-        } else {
-            &mut none
-        };
-        group.1.push(f.ecosystem.as_str());
-    }
-    let named = |(catalogue, ecosystems): &(bool, Vec<&str>)| {
-        let mut names = Vec::new();
-        if *catalogue {
-            names.push("CISA catalogue".to_string());
-        }
-        if !ecosystems.is_empty() {
-            names.push(format!("OSV data for {}", ecosystems.join(", ")));
-        }
-        names.join(" and ")
+        .filter(|f| failed(f.outcome) && !current(&f.source))
+        .filter(|f| !(data_said && f.matched && f.read_at.is_none()))
+        .partition(|f| f.read_at.is_some());
+    let named = |feeds: &[&v1::FeedState]| {
+        let ecosystems: Vec<&str> = feeds.iter().map(|f| f.ecosystem.as_str()).collect();
+        format!("OSV data for {}", ecosystems.join(", "))
     };
     let mut said = Vec::new();
-    if kept.0 || !kept.1.is_empty() {
+    if !kept.is_empty() {
         said.push(format!(
-            "{} not downloaded at the last check, the data read before stays in force",
+            "{} not downloaded at the last check, the data read before is not current",
             named(&kept)
         ));
     }
-    if none.0 || !none.1.is_empty() {
+    if !none.is_empty() {
         said.push(format!(
             "{} not downloaded, nothing of it is known yet",
             named(&none)
@@ -326,12 +308,6 @@ const EVENT_CAUSES: [&str; 3] = [
     crate::covered::EVENTS_REFUSED.id,
     crate::covered::EVENTS_FAILING.id,
     crate::covered::EVENTS_SILENT.id,
-];
-/// The causes of `not_covered` that say a failed download of the catalogue, which the line of
-/// downloads then leaves out.
-const CATALOGUE_CAUSES: [&str; 2] = [
-    crate::covered::THREATS_UNREAD.id,
-    crate::covered::THREATS_FIXABLE.id,
 ];
 /// The causes of `not_covered` that say the vulnerability data answers rest on is not current.
 const DATA_CAUSES: [&str; 2] = [
@@ -410,7 +386,8 @@ fn times(n: u64) -> String {
 
 /// Every fault the message holds, in the order a person acts on them: a check that died, the
 /// watcher, the event level, every cause with `fault` (only `with_causes`, as `--coverage` lists
-/// them whole on their own), the downloads that failed. A limit of this version is none of them.
+/// them whole on their own), the downloads that failed while their data is not current. A limit
+/// of this version is none of them.
 fn faults(s: &v1::Status, screen: &Screen, with_causes: bool) -> Vec<Fault> {
     let now = s.answered_at;
     let mut out = Vec::new();
@@ -438,7 +415,7 @@ fn faults(s: &v1::Status, screen: &Screen, with_causes: bool) -> Vec<Fault> {
         out.extend(failed.iter().map(|u| cause_fault(u)));
     }
     out.extend(
-        downloads_failed(s, any(&CATALOGUE_CAUSES), any(&DATA_CAUSES))
+        downloads_failed(s, any(&DATA_CAUSES))
             .into_iter()
             .map(Fault::new),
     );
@@ -4107,36 +4084,53 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_download_is_a_fault_line_even_when_the_data_kept_is_current() {
+    fn a_failed_download_is_a_fault_line_only_while_its_data_is_not_current() {
         let mut s = calm_status();
         assert!(faults_in(&s).is_empty());
-        // One ecosystem's data could not be downloaded; what was read before is current, so the
-        // core raises no cause and the headline stays calm, but the failure has its line.
         let feed =
             |ecosystem: &str, outcome: v1::FeedOutcome, read_at: Option<i64>| v1::FeedState {
+                source: format!("osv-{ecosystem}"),
                 ecosystem: ecosystem.to_string(),
                 outcome: outcome as i32,
                 read_at,
                 matched: true,
                 ..Default::default()
             };
+        let fresh = |source: &str, current: bool| v1::FeedFreshness {
+            source: source.to_string(),
+            current,
+            ..Default::default()
+        };
+        // npm's data could not be downloaded and what was read before is current, as the core
+        // judges it: silent, and so is the catalogue's failed download, which the core tells
+        // only by its cause.
+        let feeds = &mut s.vulnerability_data.as_mut().unwrap().feeds;
+        feeds.push(feed("npm", v1::FeedOutcome::Failed, Some(CHECKED - 3600)));
+        let freshness = &mut s.vulnerabilities.as_mut().unwrap().feeds;
+        freshness.push(fresh("osv-npm", true));
+        s.threats.as_mut().unwrap().outcome = v1::FeedOutcome::Failed as i32;
+        assert!(faults_in(&s).is_empty(), "{:?}", faults_in(&s));
+        // A feed whose data is not current is a fault, judged by its own freshness alone.
         let feeds = &mut s.vulnerability_data.as_mut().unwrap().feeds;
         feeds.push(feed("PyPI", v1::FeedOutcome::Failed, Some(CHECKED - 3600)));
+        let freshness = &mut s.vulnerabilities.as_mut().unwrap().feeds;
+        freshness.push(fresh("osv-PyPI", false));
         assert_eq!(
             faults_in(&s),
             [
-                "! OSV data for PyPI not downloaded at the last check, the data read before stays in force"
+                "! OSV data for PyPI not downloaded at the last check, the data read before is not current"
             ]
         );
-        // The catalogue too, and an ecosystem never read whole; an outcome this build does not
-        // know is a failure.
-        s.threats.as_mut().unwrap().outcome = 99;
+        // Once npm's data is not current, its download is a fault too. So is a feed the status
+        // gives no freshness for, here one never read; an outcome this build does not know is a
+        // failure.
+        s.vulnerabilities.as_mut().unwrap().feeds[0].current = false;
         let feeds = &mut s.vulnerability_data.as_mut().unwrap().feeds;
         feeds.push(feed("crates.io", v1::FeedOutcome::Unspecified, None));
         assert_eq!(
             faults_in(&s),
             [
-                "! CISA catalogue and OSV data for PyPI not downloaded at the last check, the data read before stays in force",
+                "! OSV data for npm, PyPI not downloaded at the last check, the data read before is not current",
                 "! OSV data for crates.io not downloaded, nothing of it is known yet",
             ]
         );
@@ -4160,7 +4154,7 @@ mod tests {
             [
                 "! The list of vulnerabilities attackers are using could not be downloaded since the first check",
                 "! The list of known vulnerabilities could not be updated since the first check",
-                "! OSV data for PyPI not downloaded at the last check, the data read before stays in force",
+                "! OSV data for npm, PyPI not downloaded at the last check, the data read before is not current",
             ]
         );
         // What was read whole, or never asked for, is no failure.
