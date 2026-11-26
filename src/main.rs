@@ -3188,7 +3188,10 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
         "the checkout walk could not list some folders"
     });
     let (completeness, reason) = look.completeness_noted(None);
-    let gap = Gap::when(look.cause());
+    let gap = Gap {
+        not_read: look.not_read_rows(),
+        ..Gap::when(look.cause())
+    };
     // Every checkout the store holds is in the statements or was looked for and is gone, so
     // the reading is compared whole, whatever its coverage says.
     let applied = Applied {
@@ -4284,7 +4287,7 @@ fn read_watched(
         };
         // A place that could not be looked at failed; one that leads into a folder macOS asks
         // permission for was not given; hooks kept elsewhere have no reader.
-        let gap = if let Some((_, gap)) = tg {
+        let mut gap = if let Some((_, gap)) = tg {
             gap.clone()
         } else if let Some((_, _, cause)) = &p.coverage {
             Gap::when(*cause)
@@ -4295,6 +4298,7 @@ fn read_watched(
             }
             gap
         };
+        gap.not_read = p.look.not_read_rows();
         let with_basis: Vec<(&str, &Statement)> =
             statements.iter().map(|s| (watched::BASIS, s)).collect();
         let applied = Applied {
@@ -4788,6 +4792,7 @@ fn read_managers(run: &mut Run, args: &Args) -> rusqlite::Result<Vec<PathBuf>> {
                 .iter()
                 .map(|name| Lack::new(managers::NO_READER, Some(name)))
                 .collect(),
+            ..Gap::default()
         };
         run.apply(&reading, integrity::BASIS, "none", Some(&reason), &gap, &[])?;
     } else if !found.guarded.is_empty() {
@@ -4929,6 +4934,7 @@ fn read_other_autoruns(
         let gap = Gap {
             cause: Some(Cause::NoReader),
             lacks,
+            ..Gap::default()
         };
         ("none", Some(format!("not read: {}", named.join("; "))), gap)
     };
@@ -4949,6 +4955,7 @@ fn read_other_autoruns(
                 .iter()
                 .map(|name| Lack::new(autorun::OTHER_HOME, Some(name)))
                 .collect(),
+            ..Gap::default()
         };
         (
             "none",
@@ -5182,7 +5189,10 @@ fn read_indicators(
     // Not full while anything that could hold a match was not read. Hashes are matched
     // against every watched file whatever this run looked into, so it is partial, never none.
     let (_, reason) = look.completeness_noted(None);
-    let gap = Gap::when(look.cause());
+    let gap = Gap {
+        not_read: look.not_read_rows(),
+        ..Gap::when(look.cause())
+    };
     let completeness = if gap.cause.is_some() {
         "partial"
     } else {
@@ -5213,7 +5223,12 @@ fn read_indicators(
         let names: Vec<&str> = lacks.iter().filter_map(|l| l.name.as_deref()).collect();
         let reason = format!("not matched: {}", names.join("; "));
         let cause = Some(Cause::NoReader);
-        ("none", Some(reason), Gap { cause, lacks })
+        let gap = Gap {
+            cause,
+            lacks,
+            ..Gap::default()
+        };
+        ("none", Some(reason), gap)
     };
     run.apply(
         &on_machine(indicators::UNMATCHED_KIND),

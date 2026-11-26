@@ -13,9 +13,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// The store's format. A store of any other format is refused and left as it is: this build
-/// reads only what a build of format 9 wrote, with every table and column this build reads and
+/// reads only what a build of format 10 wrote, with every table and column this build reads and
 /// text from a source kept cut, in the store's form (see `secrets`).
-pub const FORMAT_VERSION: &str = "9";
+pub const FORMAT_VERSION: &str = "10";
 
 const SCHEMA: &str = "
 CREATE TABLE meta (
@@ -89,6 +89,23 @@ CREATE TABLE coverage_lack (
     what     TEXT NOT NULL,
     name     TEXT  -- as the source gives it, where it names one
 );
+-- How a thing was not read. Vocabulary: a new word is a seeded row.
+CREATE TABLE unread_how (
+    name TEXT PRIMARY KEY
+);
+-- What one reading did not read (`NotRead`): a row for each unit, and a row with no unit for what
+-- is no unit of the reading. A full reading has none, and the cause of any other is the worst of
+-- its rows.
+CREATE TABLE coverage_unread (
+    coverage INTEGER NOT NULL REFERENCES coverage (id) ON DELETE CASCADE,
+    path     TEXT,                      -- the unit as the reading's ids name it; NULL: no unit
+    part     TEXT NOT NULL DEFAULT '',  -- a part of the file, such as an entry's key
+    cause    TEXT NOT NULL CHECK (cause IN ('failed', 'no_reader', 'not_given')),
+    how      TEXT NOT NULL REFERENCES unread_how (name),
+    errno    INTEGER,                   -- the system's error number, when it gave one
+    said     TEXT,                      -- what the source said, cut, in the store's form
+    CHECK (path IS NOT NULL OR part = '')
+);
 
 -- Containers and checkouts that were somewhere and are no longer anywhere. What was read
 -- inside them was retracted with them, and their readings no longer count.
@@ -109,8 +126,8 @@ CREATE TABLE raw_input (
 );
 ";
 
-/// What the journal records. The list is part of the format: a new kind of entry is a new word
-/// here and a new format.
+/// What the journal records: the words `journal_entry` is seeded with. A new kind of entry is a new
+/// word here, which a store of this format learns at its next open, as it learns any vocabulary.
 const JOURNAL_ENTRIES: [&str; 26] = [
     "run_started",
     "added",
@@ -157,16 +174,17 @@ const JOURNAL_ENTRIES: [&str; 26] = [
 
 /// The journal. It cannot be rebuilt from raw input, so it only grows. Its entries are the
 /// differences a run finds, the run's own notes, the owner's word, the threat list's
-/// changes, and findings raised and answered.
-fn journal_sql() -> String {
-    let entries: Vec<String> = JOURNAL_ENTRIES.iter().map(|e| format!("'{e}'")).collect();
-    format!(
-        "
+/// changes, and findings raised and answered. Its words are vocabulary: an entry whose word is not
+/// in `journal_entry` cannot be written.
+const JOURNAL: &str = "
+CREATE TABLE journal_entry (
+    name TEXT PRIMARY KEY
+);
 CREATE TABLE journal (
     seq       INTEGER PRIMARY KEY AUTOINCREMENT,
     at        INTEGER NOT NULL,
     run_id    TEXT NOT NULL,
-    entry     TEXT NOT NULL CHECK (entry IN ({})),
+    entry     TEXT NOT NULL REFERENCES journal_entry (name),
     reader    TEXT,
     scope     TEXT,
     kind      TEXT,
@@ -180,7 +198,13 @@ CREATE TRIGGER journal_no_update BEFORE UPDATE ON journal
     BEGIN SELECT RAISE(ABORT, 'journal is append-only'); END;
 CREATE TRIGGER journal_no_delete BEFORE DELETE ON journal
     BEGIN SELECT RAISE(ABORT, 'journal is append-only'); END;
-",
+";
+
+/// The seed of `journal_entry`, applied with the rest of the vocabulary.
+fn journal_seed() -> String {
+    let entries: Vec<String> = JOURNAL_ENTRIES.iter().map(|e| format!("('{e}')")).collect();
+    format!(
+        "INSERT OR IGNORE INTO journal_entry (name) VALUES {};",
         entries.join(", ")
     )
 }
@@ -291,6 +315,11 @@ INSERT OR IGNORE INTO predicate (name, object_kind, status) VALUES
     ('has_lockfile', 'literal', 'used');
 -- Folders macOS asks the owner's permission for, see src/guarded.rs.
 INSERT OR IGNORE INTO coverage_kind (name) VALUES ('folders macOS asks permission for');
+-- How a thing a reading did not read was not read: the words of `look::Said::word` for a unit,
+-- and of `NotRead::short` for what a reading said as a whole.
+INSERT OR IGNORE INTO unread_how (name) VALUES
+    ('unreadable'), ('unparsed'), ('unlisted'), ('kept'), ('same_name'), ('past_limit'),
+    ('guarded'), ('untold'), ('no_reader'), ('source');
 ";
 
 /// Indexes what `immunity status` and the view read by. Without them the status of a store of tens of thousands of
@@ -307,7 +336,7 @@ INSERT OR IGNORE INTO coverage_kind (name) VALUES ('folders macOS asks permissio
 /// The status and the view ask for the latest reading of each reader, scope and kind, when
 /// each was last read in full, and what one run read. `LATEST` finds the first through
 /// `coverage_reading`, `coverage_full` answers the second in one look-up and `coverage_run`
-/// the third; `coverage_lack_of` finds what a latest reading names as not read. Without them `immunity status` took 8 ms after ten watcher readings and 325 ms after
+/// the third; `coverage_lack_of` and `coverage_unread_of` find what a latest reading names as not read. Without them `immunity status` took 8 ms after ten watcher readings and 325 ms after
 /// ten thousand, and `immunity view` 9 ms and 589 ms.
 const INDEXES: &str = "
 CREATE INDEX coverage_reading ON coverage (reader, scope, kind);
@@ -315,6 +344,7 @@ CREATE INDEX coverage_latest_of_kind ON coverage (reader, kind);
 CREATE INDEX coverage_full ON coverage (reader, scope, kind, completeness, observed_at);
 CREATE INDEX coverage_run ON coverage (run_id);
 CREATE INDEX coverage_lack_of ON coverage_lack (coverage);
+CREATE INDEX coverage_unread_of ON coverage_unread (coverage);
 CREATE INDEX assertion_subject ON assertion (subject, predicate);
 CREATE INDEX finding_basis_finding ON finding_basis (finding);
 ";
@@ -417,27 +447,56 @@ impl Lack {
     }
 }
 
-/// Why a reading is incomplete, and what this build has no reader for in it. Empty on a
-/// full reading.
+/// One thing a reading did not read, as `coverage_unread` keeps it: a unit, by the path and part
+/// the reading's ids name it by, or no unit for what is no unit of the reading; its cause; how it
+/// was not read, a word of `unread_how`; the system's error number; and what the source said,
+/// cut, in the store's form.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NotRead {
+    pub unit: Option<crate::baseline::Unit>,
+    pub cause: Cause,
+    pub how: &'static str,
+    pub errno: Option<i32>,
+    pub said: Option<String>,
+}
+
+impl NotRead {
+    /// What a reading said as a whole, of a unit or of none: with no reader, or else said by the
+    /// reading's source.
+    pub fn short(unit: Option<crate::baseline::Unit>, cause: Cause) -> NotRead {
+        let how = match cause {
+            Cause::NoReader => "no_reader",
+            Cause::Failed | Cause::NotGiven => "source",
+        };
+        NotRead {
+            unit,
+            cause,
+            how,
+            errno: None,
+            said: None,
+        }
+    }
+}
+
+/// Why a reading is incomplete, what this build has no reader for in it, and what it did not
+/// read. Empty on a full reading.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Gap {
     pub cause: Option<Cause>,
     pub lacks: Vec<Lack>,
+    pub not_read: Vec<NotRead>,
 }
 
 impl Gap {
     pub fn of(cause: Cause) -> Gap {
-        Gap {
-            cause: Some(cause),
-            lacks: Vec::new(),
-        }
+        Gap::when(Some(cause))
     }
 
     /// The gap of a reading with this cause, if it is incomplete at all.
     pub fn when(cause: Option<Cause>) -> Gap {
         Gap {
             cause,
-            lacks: Vec::new(),
+            ..Gap::default()
         }
     }
 }
@@ -481,7 +540,7 @@ type Res<T> = Result<T, Box<dyn std::error::Error>>;
 fn schema() -> String {
     [
         SCHEMA,
-        &journal_sql(),
+        JOURNAL,
         OWNER,
         THREATS,
         crate::osv::SCHEMA,
@@ -641,6 +700,7 @@ fn opened(path: &Path) -> Res<Connection> {
     let pages: i64 = conn.query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))?;
     conn.pragma_update(None, "journal_size_limit", page * pages)?;
     conn.execute_batch(VOCABULARY)?;
+    conn.execute_batch(&journal_seed())?;
     conn.execute_batch(crate::processes::KINDS)?;
     crate::autorun::add_kinds(&conn)?;
     crate::watched::add_kinds(&conn)?;
@@ -1113,9 +1173,12 @@ pub fn put_draft(
     Ok(())
 }
 
-/// Writes one reading's coverage, with why it is incomplete and what this build has no
-/// reader for in it. A full reading has no cause. An incomplete one without a cause is a
-/// mistake in a reader: it is written as `failed`, because unknown is never calm.
+/// Writes one reading's coverage, with why it is incomplete, what this build has no reader for
+/// in it and what it did not read. A full reading has no cause and no row of what it did not
+/// read. An incomplete one without a cause is a mistake in a reader: it is read back as `failed`,
+/// because unknown is never calm. An incomplete one has a row for each thing it did not read, and
+/// where none of them has its cause, as for a reader that names no unit, a row with no unit that
+/// has it, so that its cause is always the worst of its rows.
 pub fn put_coverage(
     tx: &Transaction,
     r: &Reading,
@@ -1152,6 +1215,23 @@ pub fn put_coverage(
         tx.execute(
             "INSERT INTO coverage_lack (coverage, what, name) VALUES (?1, ?2, ?3)",
             params![id, lack.what, lack.name],
+        )?;
+    }
+    let Some(own) = gap.cause else {
+        return Ok(());
+    };
+    let worst = Cause::worst(gap.not_read.iter().map(|n| n.cause));
+    debug_assert!(worst.is_none_or(|w| w >= own), "{} {}", r.reader, r.kind);
+    let source = (worst != Some(own)).then(|| NotRead::short(None, own));
+    for n in gap.not_read.iter().chain(&source) {
+        let (path, part) = n
+            .unit
+            .as_ref()
+            .map_or((None, ""), |u| (Some(&u.path), u.part.as_str()));
+        tx.execute(
+            "INSERT INTO coverage_unread (coverage, path, part, cause, how, errno, said)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![id, path, part, n.cause.literal(), n.how, n.errno, n.said],
         )?;
     }
     Ok(())
@@ -1798,6 +1878,7 @@ pub mod steps {
 mod tests {
     use super::*;
 
+    mod unread;
     mod wal;
 
     #[test]
@@ -2099,7 +2180,7 @@ mod tests {
                  CREATE TABLE meta (key TEXT, value TEXT NOT NULL);
                  INSERT INTO meta SELECT * FROM old_meta;
                  DROP TABLE old_meta;
-                 INSERT INTO meta VALUES ('format_version', '10');",
+                 INSERT INTO meta VALUES ('format_version', '11');",
                 (Code::UnknownFormat, "does not name exactly one format"),
             ),
             (
@@ -2123,9 +2204,9 @@ mod tests {
         // (`text::error`); a format that is no number is shown as the check words it.
         for (version, code, said, what_to_do) in [
             (
-                "8",
+                "9",
                 Code::OlderFormat,
-                "is from an older format (8)",
+                "is from an older format (9)",
                 START_OVER,
             ),
             (
@@ -2135,9 +2216,9 @@ mod tests {
                 START_OVER,
             ),
             (
-                "10",
+                "11",
                 Code::NewerFormat,
-                "is from a newer format (10)",
+                "is from a newer format (11)",
                 "Use the version of Immunity Core that made it",
             ),
             (
@@ -2295,6 +2376,7 @@ mod tests {
                         .lack
                         .map(|l| vec![Lack::new(l, None)])
                         .unwrap_or_default(),
+                    ..Gap::default()
                 };
                 put_coverage(&tx, &r, said.completeness, said.reason, &gap).unwrap();
             }

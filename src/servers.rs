@@ -371,6 +371,7 @@ pub fn readings(machine: &str, text: &str, raw_file: &str) -> Vec<Outcome> {
             Gap {
                 cause: Some(Cause::NoReader),
                 lacks: lack,
+                ..Gap::default()
             },
             "the server has none of the package managers the probe looks for".to_string(),
         ))
@@ -379,6 +380,7 @@ pub fn readings(machine: &str, text: &str, raw_file: &str) -> Vec<Outcome> {
             Gap {
                 cause: Some(Cause::NoReader),
                 lacks: lacks.clone(),
+                ..Gap::default()
             },
             format!(
                 "the program has no reader for the package manager this server uses: {}",
@@ -430,6 +432,7 @@ pub fn readings(machine: &str, text: &str, raw_file: &str) -> Vec<Outcome> {
         let no_reader = Gap {
             cause: Some(Cause::NoReader),
             lacks,
+            ..Gap::default()
         };
         let gap = if partial.is_some() {
             no_reader.clone()
@@ -547,6 +550,7 @@ pub fn readings(machine: &str, text: &str, raw_file: &str) -> Vec<Outcome> {
             gap: Gap {
                 cause: Some(Cause::NoReader),
                 lacks: vec![Lack::new(CONTAINER_CONTENTS, None)],
+                ..Gap::default()
             },
             statements: Vec::new(),
         });

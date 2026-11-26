@@ -364,15 +364,18 @@ CREATE TABLE event_file_count (
     unreadable   INTEGER NOT NULL   -- file events that could not be made out
 );
 -- The file events a finding from a published rule rests on, the first, which raised it, and
--- the latest five: the file and the program, nothing more.
+-- the latest five: the file, the program and who signed it, as the line gave them.
 CREATE TABLE rule_file_evidence (
-    finding    TEXT NOT NULL REFERENCES finding (id),
-    read_at    INTEGER NOT NULL,
-    timestamp  TEXT NOT NULL,
-    action     TEXT NOT NULL,  -- create or rename
-    path       TEXT NOT NULL,  -- the file created, or a rename's destination
-    source     TEXT,           -- a rename's source
-    executable TEXT NOT NULL   -- the program that did it
+    finding         TEXT NOT NULL REFERENCES finding (id),
+    read_at         INTEGER NOT NULL,
+    timestamp       TEXT NOT NULL,
+    action          TEXT NOT NULL,  -- create or rename
+    path            TEXT NOT NULL,  -- the file created, or a rename's destination
+    source          TEXT,           -- a rename's source
+    executable      TEXT NOT NULL,  -- the program that did it
+    signing_id      TEXT,
+    team_id         TEXT,
+    platform_binary INTEGER
 );
 -- What the lines read say of each of `KEEPS`, by kind of event (`MARKS`): a row once a line of
 -- the kind was read, none before.
@@ -2836,8 +2839,8 @@ pub fn keep<'a>(
             )?,
             Evidence::File(f) => tx.execute(
                 "INSERT INTO rule_file_evidence (finding, read_at, timestamp, action, path,
-                         source, executable)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                         source, executable, signing_id, team_id, platform_binary)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
                 params![
                     finding,
                     now,
@@ -2845,7 +2848,10 @@ pub fn keep<'a>(
                     f.action,
                     f.path,
                     f.source,
-                    f.executable
+                    f.executable,
+                    f.signing_id,
+                    f.team_id,
+                    f.platform_binary
                 ],
             )?,
         };
@@ -4540,6 +4546,7 @@ fn state_words(l: &Level) -> Said {
 mod tests {
     use super::*;
 
+    mod evidence;
     mod steps;
 
     #[test]
