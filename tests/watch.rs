@@ -515,13 +515,13 @@ fn a_watcher_already_running_never_makes_a_store_in_a_file_whose_schema_is_gone(
         .unwrap()
         .execute_batch("PRAGMA writable_schema = ON; DELETE FROM sqlite_master;")
         .unwrap();
-    let before = std::fs::read(mac.store()).unwrap();
+    let before = common::store_bytes(&mac.store());
     folder.unlock().unwrap();
     mac.put(".zshrc", "two\n");
     let problem = w.until("problem", |v| v["code"] == "read_failed");
     let said = problem["detail_text"].as_str().unwrap();
     assert!(said.contains("holds no tables, not a store"), "{said}");
-    assert_eq!(std::fs::read(mac.store()).unwrap(), before);
+    assert!(common::store_bytes(&mac.store()) == before);
     // A store that goes while it runs is not made again either.
     folder.lock().unwrap();
     std::fs::remove_file(mac.store()).unwrap();
@@ -854,9 +854,9 @@ fn a_watcher_started_while_a_full_run_holds_the_store_starts_and_reads_once_the_
 #[test]
 fn a_sample_or_a_reading_of_program_starts_that_met_a_busy_store_is_no_failure_and_the_next_reads_what_waited()
  {
-    // A reading holds the store past SQLite's five seconds while the watcher commits a sample and
-    // then its reading of program starts: nothing was read and nothing failed, and the log was
-    // fine.
+    // Another writer holds the store past SQLite's five seconds while the watcher commits a
+    // sample and then its reading of program starts: nothing was read and nothing failed, and
+    // the log was fine.
     let mac = Mac::new("events-busy");
     mac.event_level();
     mac.run();
@@ -867,9 +867,7 @@ fn a_sample_or_a_reading_of_program_starts_that_met_a_busy_store_is_no_failure_a
     mac.exec(1);
     w.until("program_starts", |v| v["starts"] == 1);
     let reader = Connection::open(mac.store()).unwrap();
-    reader
-        .execute_batch("BEGIN; SELECT COUNT(*) FROM journal;")
-        .unwrap();
+    reader.execute_batch("BEGIN IMMEDIATE").unwrap();
     mac.exec(2);
     // A sample waits out the five seconds and meets the store still held, and then a reading
     // of program starts does.
@@ -943,7 +941,7 @@ fn a_step_with_log_left_and_no_program_starts_says_nothing_of_a_state_it_did_not
 
 #[test]
 fn two_readings_in_a_row_that_met_a_busy_store_are_told_until_a_reading_reads() {
-    // A reading that never ends holds the store: the watcher reads nothing, so it is not live.
+    // A writer that never ends holds the store: the watcher reads nothing, so it is not live.
     let mac = Mac::new("events-busy-twice");
     mac.event_level();
     mac.run();
@@ -962,9 +960,7 @@ fn two_readings_in_a_row_that_met_a_busy_store_are_told_until_a_reading_reads() 
         }
     };
     let reader = Connection::open(mac.store()).unwrap();
-    reader
-        .execute_batch("BEGIN; SELECT COUNT(*) FROM journal;")
-        .unwrap();
+    reader.execute_batch("BEGIN IMMEDIATE").unwrap();
     // Two readings of program starts, five seconds each.
     says("\nunrecorded ");
     reader.execute_batch("COMMIT").unwrap();
@@ -984,9 +980,7 @@ fn a_reading_of_watched_places_that_met_a_busy_store_is_no_failure() {
     // The first sample and reading of program starts are behind it.
     w.next("alive");
     let reader = Connection::open(mac.store()).unwrap();
-    reader
-        .execute_batch("BEGIN; SELECT COUNT(*) FROM journal;")
-        .unwrap();
+    reader.execute_batch("BEGIN IMMEDIATE").unwrap();
     mac.put(".zshrc", "1\n");
     // The reading starts a second after the change and waits out the five seconds.
     std::thread::sleep(Duration::from_secs(8));
@@ -1159,22 +1153,30 @@ fn places_left_unwatched_are_the_watchers_own_word_whatever_store_is_put_in_plac
     let places = || (Value::from(false), vec![Value::from("places")]);
     assert_eq!(failing(&mac), places());
     // A copy of the store without the row, renamed over it: there is a store at every moment.
+    // Under the run lock, so no writer adds to the `-wal` the copy finds beside it, which the
+    // old store's log, copied into its file, leaves empty.
     let swap = |mac: &Mac| {
         let fresh = mac.root.join("store/fresh.db");
         let old = Connection::open(mac.store()).unwrap();
         old.execute("VACUUM INTO ?1", [fresh.to_str().unwrap()])
             .unwrap();
         let new = Connection::open(&fresh).unwrap();
+        // `VACUUM INTO` writes a file in the rollback journal's mode.
+        new.pragma_update(None, "journal_mode", "wal").unwrap();
         new.execute("DELETE FROM watcher_failed", []).unwrap();
         drop(new);
+        old.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+            .unwrap();
         std::fs::rename(&fresh, mac.store()).unwrap();
     };
+    let folder = std::fs::File::open(mac.root.join("store")).unwrap();
+    folder.lock().unwrap();
     swap(&mac);
+    folder.unlock().unwrap();
     for _ in 0..3 {
         w.next("alive");
         assert_eq!(failing(&mac), places());
     }
-    let folder = std::fs::File::open(mac.root.join("store")).unwrap();
     folder.lock().unwrap();
     swap(&mac);
     for _ in 0..3 {

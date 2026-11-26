@@ -625,7 +625,9 @@ fn a_failure_to_answer_is_never_taken_for_an_answer() {
     let said = String::from_utf8_lossy(&out.stderr);
     assert!(
         said.contains("is damaged: it lacks the table")
-            && said.contains("Move the old store aside or pass another --store"),
+            && said.contains(
+                "Move the old store aside with its -wal and -shm files or pass another --store"
+            ),
         "{said}"
     );
 }

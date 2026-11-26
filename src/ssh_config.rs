@@ -373,6 +373,7 @@ impl Parser<'_> {
         let gap = Gap {
             cause: Cause::worst(reasons.iter().map(|(c, _)| *c)),
             lacks,
+            ..Gap::default()
         };
         let reasons: Vec<String> = reasons.into_iter().map(|(_, r)| r).collect();
         Seen {

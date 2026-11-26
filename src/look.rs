@@ -31,7 +31,7 @@
 
 use crate::autorun::{self, POINTS, Point};
 use crate::baseline::{self, Unit};
-use crate::store::{Cause, Gap, Lack, Reading};
+use crate::store::{Cause, Gap, Lack, NotRead, Reading};
 use crate::watched::{self, Entry};
 use rusqlite::{Transaction, params};
 use std::collections::BTreeSet;
@@ -154,10 +154,9 @@ impl Said {
         }
     }
 
-    /// How a unit said so was not read, as one word of a seeded vocabulary: what the rows of the
-    /// units a reading did not read are to hold once the store keeps them (format 10). A finer
-    /// word can be seeded when something reads one.
-    #[allow(dead_code)]
+    /// How a unit said so was not read, as one word of the store's vocabulary `unread_how`, which
+    /// its row of what the reading did not read holds. A finer word can be seeded when something
+    /// reads one.
     pub fn word(self) -> &'static str {
         match self {
             Said::SameName => "same_name",
@@ -245,15 +244,18 @@ pub struct Look {
     pub guarded: Vec<PathBuf>,
     /// The units not read, in the order they were met.
     unread: Vec<Unread>,
-    /// What the reading did not read that is no unit of it, each with its cause and why:
+    /// What the reading did not read that is no unit of `unread`, each with its cause and why:
     /// checkouts not looked into, the folder Git's configuration names for hooks when it
     /// could not be told, hooks kept where this build does not read them.
     short: Vec<(Cause, String)>,
-    /// Units not read that are no unit of `unread`: those a `short` says together, by a count
-    /// or by the project that holds them, and those left out by design, which no reason says
-    /// and which leave the reading full. What was known of each is kept.
-    hidden: Vec<Unit>,
-    /// The units of `hidden` a `short` names: not read, and marked so with the reading
+    /// Units not read that are no unit of `unread`, those a `short` says together, by a count or
+    /// by the project that holds them, each with the place of its `short`. What was known of
+    /// each is kept.
+    of_short: Vec<(Unit, usize)>,
+    /// Units left out by design, which no reason says and which leave the reading full. What was
+    /// known of each is kept.
+    aside: Vec<Unit>,
+    /// The units of `of_short` a `short` names: not read, and marked so with the reading
     /// (`short_named`), so that a failure of the reading is of a unit (`fault.rs`).
     named: Vec<Unit>,
     /// The units read in full, by their paths as ids name them: a file looked at, found or
@@ -352,10 +354,11 @@ impl Look {
             self.met(folder);
         }
         self.unread.extend(other.unread);
-        for (cause, why) in other.short {
-            self.short(cause, why);
-        }
-        self.hidden.extend(other.hidden);
+        let at: Vec<usize> = (other.short.into_iter())
+            .map(|(cause, why)| self.short_at(cause, why))
+            .collect();
+        (self.of_short).extend(other.of_short.into_iter().map(|(u, i)| (u, at[i])));
+        self.aside.extend(other.aside);
         self.named.extend(other.named);
         self.read.extend(other.read);
         self.seen.extend(other.seen);
@@ -375,15 +378,25 @@ impl Look {
     /// Something the reading did not read that is no unit of it, with its cause and why, said
     /// once however often it was met.
     pub fn short(&mut self, cause: Cause, why: String) {
-        if !self.short.contains(&(cause, why.clone())) {
-            self.short.push((cause, why));
-        }
+        self.short_at(cause, why);
+    }
+
+    /// `short`, and the place in `short` where it is said.
+    fn short_at(&mut self, cause: Cause, why: String) -> usize {
+        let said = (cause, why);
+        self.short
+            .iter()
+            .position(|s| *s == said)
+            .unwrap_or_else(|| {
+                self.short.push(said);
+                self.short.len() - 1
+            })
     }
 
     /// Units not read, said together by `why` with its cause.
     pub fn short_of(&mut self, units: impl IntoIterator<Item = Unit>, cause: Cause, why: String) {
-        self.hidden.extend(units);
-        self.short(cause, why);
+        let at = self.short_at(cause, why);
+        self.of_short.extend(units.into_iter().map(|u| (u, at)));
     }
 
     /// Units not read, said together by `why` with its cause, each marked not read with the
@@ -407,7 +420,7 @@ impl Look {
     /// A unit the reader leaves out by design: what was known of it is kept, and the reading is
     /// not short for it.
     pub fn aside(&mut self, unit: Unit) {
-        self.hidden.push(unit);
+        self.aside.push(unit);
     }
 
     /// The reading could not tell every place its units may be, as when the folder Git's
@@ -473,7 +486,10 @@ impl Look {
     }
 
     fn hiding(&self) -> impl Iterator<Item = &Unit> {
-        self.unread.iter().map(|u| &u.unit).chain(&self.hidden)
+        let shorted = self.of_short.iter().map(|(u, _)| u);
+        (self.unread.iter().map(|u| &u.unit))
+            .chain(shorted)
+            .chain(&self.aside)
     }
 
     /// Whether this reading covers a unit it knew something of, so that it may retract that:
@@ -556,12 +572,38 @@ impl Look {
         units.chain(self.short.iter().map(|(cause, _)| *cause))
     }
 
-    /// Why the reading is not full, and what this build has no reader for in it.
+    /// Why the reading is not full, what this build has no reader for in it, and what it did not
+    /// read (`not_read_rows`).
     pub fn gap(&self) -> Gap {
         Gap {
             cause: self.cause(),
             lacks: self.lacks.clone(),
+            not_read: self.not_read_rows(),
         }
+    }
+
+    /// What the reading did not read, as the store keeps it: each unit not read, with how its
+    /// reason says it and its error number, and for one that failed why, cut as what a source
+    /// said; each unit a `short` says together; and one row with no unit for each `short` that
+    /// names none. Why a unit was not given is the core's words and names, such as the guarded
+    /// folder it leads into or the cap it is over, and is not kept as a source's.
+    pub fn not_read_rows(&self) -> Vec<NotRead> {
+        let said = |u: &Unread| {
+            (u.cause == Cause::Failed).then(|| crate::secrets::Text::source(&u.why).store())
+        };
+        let units = self.unread.iter().map(|u| NotRead {
+            unit: Some(u.unit.clone()),
+            cause: u.cause,
+            how: u.said.word(),
+            errno: u.errno,
+            said: said(u),
+        });
+        let shorted =
+            (self.of_short.iter()).map(|(u, i)| NotRead::short(Some(u.clone()), self.short[*i].0));
+        let alone = (self.short.iter().enumerate())
+            .filter(|(i, _)| !self.of_short.iter().any(|(_, at)| at == i))
+            .map(|(_, (cause, _))| NotRead::short(None, *cause));
+        units.chain(shorted).chain(alone).collect()
     }
 }
 
@@ -1215,7 +1257,62 @@ mod tests {
         }
         let not_given = format!("not looked into: {into}, {into}");
         assert_eq!(source.completeness(), ("none", Some(not_given)));
-        assert_eq!(source.gap(), Gap::of(Cause::NotGiven));
+        let gap = source.gap();
+        assert_eq!((gap.cause, gap.lacks), (Some(Cause::NotGiven), Vec::new()));
+    }
+
+    #[test]
+    fn every_unit_a_short_says_together_has_its_row_with_that_short_s_cause_and_a_short_that_names_none_has_one_with_no_unit()
+     {
+        // Also once another reading of the same kind is taken in, which says its shorts again.
+        let mut look = Look::default();
+        let units = [Unit::whole("dev/a/uv.lock"), Unit::whole("dev/b/uv.lock")];
+        look.short_of(units, Cause::NoReader, "no reader for uv.lock".into());
+        look.short(Cause::NotGiven, "only the folder given".into());
+        look.aside(Unit::whole("dev/c/node_modules"));
+        let mut other = Look::default();
+        let deeper = "deeper than 8 folders".to_string();
+        other.short_of(
+            [Unit::whole("dev/d/e/package-lock.json")],
+            Cause::NotGiven,
+            deeper,
+        );
+        other.short(Cause::Failed, "a checkout could not be looked at".into());
+        look.add(other);
+        let rows: Vec<(Option<String>, Cause, &str)> = (look.not_read_rows().into_iter())
+            .map(|n| (n.unit.map(|u| u.path), n.cause, n.how))
+            .collect();
+        let unit = |p: &str, cause, how| (Some(p.to_string()), cause, how);
+        assert_eq!(
+            rows,
+            [
+                unit("dev/a/uv.lock", Cause::NoReader, "no_reader"),
+                unit("dev/b/uv.lock", Cause::NoReader, "no_reader"),
+                unit("dev/d/e/package-lock.json", Cause::NotGiven, "source"),
+                (None, Cause::NotGiven, "source"),
+                (None, Cause::Failed, "source"),
+            ]
+        );
+    }
+
+    #[test]
+    fn every_word_a_row_of_what_a_reading_did_not_read_holds_is_in_the_store_s_vocabulary() {
+        // A word missing from `unread_how` would fail the reading that writes it.
+        let dir = crate::common::Scratch::new("look-words");
+        let conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
+        let causes = [Cause::Failed, Cause::NoReader, Cause::NotGiven];
+        let words = (Said::BEFORE.iter().chain(&Said::AFTER).map(|s| s.word()))
+            .chain(causes.map(|c| NotRead::short(None, c).how));
+        for word in words {
+            let seeded: bool = conn
+                .query_row(
+                    "SELECT COUNT(*) = 1 FROM unread_how WHERE name = ?1",
+                    [word],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(seeded, "{word}");
+        }
     }
 
     #[test]

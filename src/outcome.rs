@@ -32,7 +32,7 @@ pub enum Kind {
 /// (`Error.outcome`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Code {
-    /// `SQLITE_BUSY` and its extended codes past the busy timeout, a hot journal among them.
+    /// `SQLITE_BUSY` and its extended codes past the busy timeout, and `SQLITE_READONLY_RECOVERY`.
     StoreBusy,
     /// The run lock, still held after its wait.
     RunLockHeld,
@@ -49,8 +49,6 @@ pub enum Code {
     UnknownFormat,
     /// A store of this format whose schema or id is not as the format makes it; `SQLITE_CORRUPT`.
     Damaged,
-    /// `SQLITE_READONLY_ROLLBACK`: a journal to roll back in a folder this process cannot write.
-    HotJournal,
     /// `SQLITE_READONLY` and its other extended codes, and `SQLITE_PERM`.
     NotWritable,
     /// `SQLITE_READONLY_DBMOVED`, and a store replaced while it was read.
@@ -81,7 +79,6 @@ impl Code {
             Code::NewerFormat => "newer_format",
             Code::UnknownFormat => "unknown_format",
             Code::Damaged => "damaged",
-            Code::HotJournal => "hot_journal",
             Code::NotWritable => "not_writable",
             Code::Moved => "moved",
             Code::DiskFull => "disk_full",
@@ -103,8 +100,7 @@ impl Code {
             | Code::NewerFormat
             | Code::UnknownFormat
             | Code::Damaged => Kind::Refusal,
-            Code::HotJournal
-            | Code::NotWritable
+            Code::NotWritable
             | Code::Moved
             | Code::DiskFull
             | Code::Io
@@ -226,8 +222,10 @@ fn of_sqlite(e: &rusqlite::Error) -> Outcome {
         return Outcome::new(Code::Failed, e.to_string());
     };
     let code = match extended {
-        ffi::SQLITE_READONLY_ROLLBACK => Code::HotJournal,
         ffi::SQLITE_READONLY_DBMOVED => Code::Moved,
+        // A reader that cannot write the `-shm` came while another connection rebuilds it from
+        // the log: a moment, which a retry ends.
+        ffi::SQLITE_READONLY_RECOVERY => Code::StoreBusy,
         _ => match extended & 0xff {
             ffi::SQLITE_BUSY => Code::StoreBusy,
             ffi::SQLITE_NOTADB => Code::NotAStore,
@@ -259,11 +257,13 @@ mod tests {
     #[test]
     fn every_outcome_of_the_closed_list_has_its_kind_exit_and_code_and_none_comes_from_words() {
         let dir = crate::common::Scratch::new("outcome-table");
-        // Busy: another connection holds the store, and the reader does not wait.
+        // Busy: another connection holds the store's file itself, and the reader does not wait.
         let path = dir.join("held.db");
         drop(crate::store::open_or_make(&path).unwrap());
         let holder = Connection::open(&path).unwrap();
-        holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        holder
+            .execute_batch("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE")
+            .unwrap();
         let reader = Connection::open(&path).unwrap();
         reader.busy_timeout(std::time::Duration::ZERO).unwrap();
         let busy = || {
@@ -293,14 +293,19 @@ mod tests {
                 [],
             )
             .unwrap();
-        // A store in a folder that cannot be written, written to: its journal cannot be made.
+        // A store whose files and folder cannot be written, opened to write.
         let shut = dir.join("shut");
         std::fs::create_dir(&shut).unwrap();
-        let writer = crate::store::open_or_make(&shut.join("store.db")).unwrap();
+        let store = shut.join("store.db");
+        drop(crate::store::open_or_make(&store).unwrap());
+        for file in [store.clone()]
+            .into_iter()
+            .chain(crate::store::beside(&store))
+        {
+            std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
         std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let unwritable = writer
-            .execute_batch("BEGIN IMMEDIATE; DELETE FROM watcher; COMMIT")
-            .unwrap_err();
+        let unwritable = crate::store::open(&store).unwrap_err();
         let gone = std::fs::File::open(dir.join("no folder")).unwrap_err();
         let words: Box<dyn Error> = "database is locked".into();
         let held = Outcome::new(Code::RunLockHeld, "");
@@ -310,6 +315,18 @@ mod tests {
         let work = |o: Outcome| (o, Code::Failed, Kind::Failed, 1, "command_failed");
         let rows = [
             ("busy", skip(of(&busy()), Code::StoreBusy)),
+            (
+                "BUSY_RECOVERY",
+                skip(sqlite(ffi::SQLITE_BUSY_RECOVERY), Code::StoreBusy),
+            ),
+            (
+                "BUSY_SNAPSHOT",
+                skip(sqlite(ffi::SQLITE_BUSY_SNAPSHOT), Code::StoreBusy),
+            ),
+            (
+                "READONLY_RECOVERY",
+                skip(sqlite(ffi::SQLITE_READONLY_RECOVERY), Code::StoreBusy),
+            ),
             (
                 "busy, boxed",
                 skip(Box::<dyn Error>::from(busy()).into(), Code::StoreBusy),
@@ -370,16 +387,20 @@ mod tests {
                 refused(sqlite(ffi::SQLITE_CORRUPT_INDEX), Code::Damaged),
             ),
             (
-                "hot journal",
-                store(sqlite(ffi::SQLITE_READONLY_ROLLBACK), Code::HotJournal),
-            ),
-            (
                 "folder not writable",
                 store(of(&unwritable), Code::NotWritable),
             ),
             (
                 "READONLY",
                 store(sqlite(ffi::SQLITE_READONLY), Code::NotWritable),
+            ),
+            (
+                "READONLY_ROLLBACK",
+                store(sqlite(ffi::SQLITE_READONLY_ROLLBACK), Code::NotWritable),
+            ),
+            (
+                "READONLY_CANTINIT",
+                store(sqlite(ffi::SQLITE_READONLY_CANTINIT), Code::NotWritable),
             ),
             ("PERM", store(sqlite(ffi::SQLITE_PERM), Code::NotWritable)),
             (
@@ -398,6 +419,7 @@ mod tests {
                 store(Outcome::new(Code::Folder, "x"), Code::Folder),
             ),
             ("LOCKED", work(of(&locked))),
+            ("PROTOCOL", work(sqlite(ffi::SQLITE_PROTOCOL))),
             ("an error of the work", work(of(&missing))),
             ("the words of busy", work(words.into())),
         ];
@@ -427,7 +449,6 @@ mod tests {
             NewerFormat,
             UnknownFormat,
             Damaged,
-            HotJournal,
             NotWritable,
             Moved,
             DiskFull,

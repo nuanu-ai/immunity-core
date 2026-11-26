@@ -175,6 +175,7 @@ impl Targets {
         let gap = Gap {
             cause: look.cause(),
             lacks,
+            not_read: look.not_read_rows(),
         };
         match look.completeness() {
             ("full", _) => ("full", Some(self.said()), gap),

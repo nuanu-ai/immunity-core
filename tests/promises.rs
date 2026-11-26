@@ -352,7 +352,7 @@ fn answered_row<'a>(page: &'a str, id: &str) -> &'a str {
 
 /// Every row as its columns joined with `|`.
 fn rows(store: &Path, sql: &str) -> Vec<String> {
-    let conn = Connection::open(store).unwrap();
+    let conn = common::open_store(store);
     let mut stmt = conn.prepare(sql).unwrap();
     let n = stmt.column_count();
     stmt.query_map([], |row| {
@@ -571,10 +571,10 @@ fn view_does_not_change_or_create_the_store() {
     let dir = Dir::new("readonly");
     let store = dir.store();
     immunity(&store, &dir.input("brew.txt", SAMPLE));
-    let before = std::fs::read(&store).unwrap();
+    let before = common::store_bytes(&store);
     view(&store);
     assert!(
-        std::fs::read(&store).unwrap() == before,
+        common::store_bytes(&store) == before,
         "the store file changed"
     );
 
@@ -1480,7 +1480,7 @@ fn store_from_an_older_format_is_refused_with_a_message_and_left_untouched() {
         )
         .unwrap();
     }
-    let before = std::fs::read(&store).unwrap();
+    let before = common::store_bytes(&store);
     let brew = dir.input("brew.txt", SAMPLE);
     let absent = dir.0.join("absent");
 
@@ -1507,7 +1507,7 @@ fn store_from_an_older_format_is_refused_with_a_message_and_left_untouched() {
         assert!(stderr.contains("--store"), "{stderr}");
     }
     assert!(
-        std::fs::read(&store).unwrap() == before,
+        common::store_bytes(&store) == before,
         "the old store changed"
     );
     let mut top: Vec<String> = std::fs::read_dir(&dir.0)
@@ -4588,7 +4588,7 @@ fn of_a_session_the_store_keeps_its_working_folders_and_no_other_text() {
 
     a.run();
 
-    let store = std::fs::read(a.store()).unwrap();
+    let store = common::store_bytes(&a.store());
     let has = |s: &str| store.windows(s.len()).any(|w| w == s.as_bytes());
     assert!(!has("invented-marker-ignore-previous"));
     assert!(!has("Invented summary"));
@@ -10076,16 +10076,35 @@ fn writer_child() {
     std::process::exit(0);
 }
 
-/// The journal beside a store.
-fn journal(store: &Path) -> PathBuf {
-    store.with_file_name("store.db-journal")
+/// The store's file and the `-wal` and `-shm` SQLite keeps beside it in write-ahead mode.
+fn store_files(store: &Path) -> [PathBuf; 3] {
+    ["", "-wal", "-shm"].map(|end| PathBuf::from(format!("{}{end}", store.display())))
+}
+
+/// Whether `file` holds `text`.
+fn holds(file: &Path, text: &str) -> bool {
+    std::fs::read(file)
+        .unwrap()
+        .windows(text.len())
+        .any(|b| b == text.as_bytes())
+}
+
+/// Takes write permission from the store's folder and from its three files, as for a command
+/// run by another user or in a sandbox. The test's folder is opened again when it is removed.
+fn shut(store: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    for file in store_files(store) {
+        std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o444)).unwrap();
+    }
+    let folder = store.parent().unwrap();
+    std::fs::set_permissions(folder, std::fs::Permissions::from_mode(0o555)).unwrap();
 }
 
 #[test]
 fn a_read_only_command_answers_after_a_writer_was_killed_inside_a_transaction_with_only_what_was_committed()
  {
-    // A watcher or a run killed in the middle of a write, by a crash or a forced restart,
-    // leaves its journal hot. The next status must answer with what was committed before.
+    // A watcher or a run killed in the middle of a write, by a crash or a forced restart. The
+    // next status answers with what was committed before, and nothing of the unfinished write.
     writer_child();
     let w = Watch::new("hot-killed");
     w.run();
@@ -10096,21 +10115,9 @@ fn a_read_only_command_answers_after_a_writer_was_killed_inside_a_transaction_wi
         &store,
     );
     writer.kill();
-    // What the writer had not committed is in the store's file, and the journal is hot: a
-    // connection opened read-only is refused.
-    let file = std::fs::read(&store).unwrap();
-    assert!(
-        file.windows(UNCOMMITTED.len())
-            .any(|b| b == UNCOMMITTED.as_bytes())
-    );
-    let refused = Connection::open_with_flags(&store, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .unwrap()
-        .query_row("SELECT COUNT(*) FROM meta", [], |r| r.get::<_, i64>(0))
-        .unwrap_err();
-    assert_eq!(
-        refused.sqlite_error().map(|e| e.extended_code),
-        Some(rusqlite::ffi::SQLITE_READONLY_ROLLBACK)
-    );
+    // What the writer had not committed is in the `-wal`, never in the store's file.
+    let [file, wal, _] = store_files(&store);
+    assert!(holds(&wal, UNCOMMITTED) && !holds(&file, UNCOMMITTED));
 
     // Named as `--store store.db` from its own folder: a path with no folder in it.
     let out = immunity_cmd(w.home())
@@ -10121,102 +10128,132 @@ fn a_read_only_command_answers_after_a_writer_was_killed_inside_a_transaction_wi
     let after: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(after["store_id"], committed["store_id"]);
     assert_eq!(after["last_run"], committed["last_run"]);
-    assert!(!journal(&store).exists());
     assert_eq!(
         rows(
             &store,
-            "SELECT name FROM sqlite_master WHERE name = 'ballast'"
+            "SELECT input FROM raw_input WHERE reader = 'ballast'"
         ),
         Vec::<String>::new()
     );
 }
 
 #[test]
-fn a_read_only_command_in_a_folder_it_cannot_write_fails_on_a_hot_journal_and_changes_nothing() {
-    // The journal cannot be deleted where the folder cannot be written, so nothing is rolled
-    // back: the command fails as it did before, and the store and its journal stay as they are.
+fn a_read_only_command_in_a_folder_it_cannot_write_answers_after_a_writer_was_killed_and_changes_nothing()
+ {
+    // Nothing has to be undone after a killed writer, so a command that cannot write the store's
+    // folder nor its files reads what was committed, and leaves the store and its log as they
+    // are.
     writer_child();
     let w = Watch::new("hot-read-only");
     w.run();
     let store = w.store();
+    let committed = status_json(&store);
     Writer::start(
-        "a_read_only_command_in_a_folder_it_cannot_write_fails_on_a_hot_journal_and_changes_nothing",
+        "a_read_only_command_in_a_folder_it_cannot_write_answers_after_a_writer_was_killed_and_changes_nothing",
         &store,
     )
     .kill();
-    let file = std::fs::read(&store).unwrap();
-    let kept = std::fs::read(journal(&store)).unwrap();
-    // Only the folder: its files can still be written, so only the folder stops the rollback.
-    // The test's folder is opened again when it is removed.
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(w.home(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let [file, wal, _] = store_files(&store);
+    let before = [std::fs::read(&file).unwrap(), std::fs::read(&wal).unwrap()];
+    shut(&store);
 
-    let (code, stdout, stderr) = status_out(&store, &["--json"]);
-    assert_eq!(code, Some(3), "{stderr}");
-    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(v["errors"][0]["code"], "store_unreadable");
-    assert!(
-        v["errors"][0]["detail_text"]
-            .as_str()
-            .unwrap()
-            .contains("attempt to write a readonly database"),
-        "{v}"
-    );
-    assert!(std::fs::read(&store).unwrap() == file, "the store changed");
-    assert!(
-        std::fs::read(journal(&store)).unwrap() == kept,
-        "the journal changed"
-    );
+    let after = status_json(&store);
+    assert_eq!(after["store_id"], committed["store_id"]);
+    assert_eq!(after["last_run"], committed["last_run"]);
+    // And in a sandbox of macOS's that denies every write, as an agent's may.
+    let out = Command::new("/usr/bin/sandbox-exec")
+        .args(["-p", "(version 1) (allow default) (deny file-write*)"])
+        .arg(env!("CARGO_BIN_EXE_immunity"))
+        .args(["status", "--json", "--store"])
+        .arg(&store)
+        .env("HOME", w.home())
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let sandboxed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(sandboxed["store_id"], committed["store_id"]);
+    let now = [std::fs::read(&file).unwrap(), std::fs::read(&wal).unwrap()];
+    assert!(now == before, "the store or its -wal changed");
 }
 
 #[test]
-fn a_read_only_command_beside_a_live_writer_waits_out_the_busy_timeout_and_rolls_nothing_back() {
-    // A journal whose writer is alive is not hot. A reader waits out the busy timeout of five
-    // seconds and gives up as one to ask again; one that the writer's commit reaches within it answers with what
-    // the writer committed. Only the least it waits is pinned: SQLite counts the timeout in the
-    // sleeps it asks for, and on a loaded machine they run long. That busy is not taken for a
-    // hot journal is pinned in `store`, where no clock is read.
+fn a_read_only_command_beside_a_live_writer_answers_at_once_with_what_was_committed_even_where_it_cannot_write()
+ {
+    // A writer in the middle of a transaction that spilled pages keeps no reader waiting: the
+    // command answers while the writer still holds its transaction, from a folder and files it
+    // cannot write, and the next one answers with what the writer committed.
     writer_child();
     let w = Watch::new("hot-live");
     w.run();
     let store = w.store();
+    let committed = status_json(&store);
     let mut writer = Writer::start(
-        "a_read_only_command_beside_a_live_writer_waits_out_the_busy_timeout_and_rolls_nothing_back",
+        "a_read_only_command_beside_a_live_writer_answers_at_once_with_what_was_committed_even_where_it_cannot_write",
         &store,
     );
-    let started = std::time::Instant::now();
-    let (code, stdout, stderr) = status_out(&store, &["--json"]);
-    let waited = started.elapsed().as_secs_f64();
-    assert!(waited >= 5.0, "waited {waited} s");
-    assert_eq!(code, Some(4), "{stderr}");
-    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(v["errors"][0]["code"], "run_in_progress");
-
-    let status = immunity_cmd(w.home())
-        .args(["status", "--json", "--store"])
-        .arg(&store)
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    // Waited for and killed if the test fails before it ends.
-    struct Reaped(Option<std::process::Child>);
-    impl Drop for Reaped {
-        fn drop(&mut self) {
-            if let Some(c) = self.0.as_mut() {
-                let _ = c.kill();
-                let _ = c.wait();
-            }
-        }
-    }
-    let mut status = Reaped(Some(status));
-    std::thread::sleep(std::time::Duration::from_secs(1));
-    let running = status.0.as_mut().unwrap().try_wait().unwrap();
-    assert!(running.is_none(), "status did not wait: {running:?}");
+    shut(&store);
+    assert_eq!(status_json(&store)["store_id"], committed["store_id"]);
     writer.commit();
-    let out = status.0.take().unwrap().wait_with_output().unwrap();
-    assert_eq!(out.status.code(), Some(0));
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["store_id"], UNCOMMITTED);
+    assert_eq!(status_json(&store)["store_id"], UNCOMMITTED);
+}
+
+#[test]
+fn where_the_journal_of_a_write_left_unfinished_in_rollback_mode_stands_no_command_opens_or_makes_a_store_and_nothing_changes()
+ {
+    // A store an earlier build made in rollback mode, as SQLite makes it, whose writer was killed
+    // in a transaction that spilled: its `-journal` is left beside it, and SQLite would play it
+    // back into whatever file it opens at the path.
+    writer_child();
+    let w = Watch::new("journal-left");
+    w.run();
+    let store = w.store();
+    let rollback = Connection::open(&store).unwrap();
+    rollback
+        .pragma_update(None, "journal_mode", "delete")
+        .unwrap();
+    drop(rollback);
+    Writer::start(
+        "where_the_journal_of_a_write_left_unfinished_in_rollback_mode_stands_no_command_opens_or_makes_a_store_and_nothing_changes",
+        &store,
+    )
+    .kill();
+    let journal = PathBuf::from(format!("{}-journal", store.display()));
+    let folder = store.parent().unwrap().to_path_buf();
+    let left = || {
+        let mut names: Vec<String> = std::fs::read_dir(&folder)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        let read = |f: &Path| std::fs::read(f).ok();
+        (names, read(&store), read(&journal))
+    };
+    let refused = |(code, said): (Option<i32>, String)| {
+        assert_eq!(code, Some(3), "{said}");
+        assert!(said.contains("store.db-journal is beside"), "{said}");
+        assert!(said.contains("with its -journal, -wal and -shm"), "{said}");
+    };
+    let said = |cmd: &mut Command| {
+        let out = cmd.output().unwrap();
+        let said = String::from_utf8_lossy(&out.stderr).into_owned();
+        (out.status.code(), said)
+    };
+    let before = left();
+    assert!(before.2.as_ref().is_some_and(|j| !j.is_empty()));
+    // A command that reads, and one that opens the store to write before it reads anything.
+    let (code, _, status) = status_out(&store, &[]);
+    refused((code, status));
+    let mut sample = immunity_cmd(w.home());
+    sample.args(["sample", "--store"]).arg(&store);
+    refused(said(
+        sample.arg("--sample-input").arg(w.home().join("absent")),
+    ));
+    assert!(left() == before);
+    // One that would make a store where the store was moved aside without its journal.
+    std::fs::rename(&store, folder.join("moved-aside.db")).unwrap();
+    let before = left();
+    refused(said(&mut w.cmd()));
+    assert!(left() == before && !store.exists());
 }
 
 /// The brew answer with `n` invented formulae at one version: a run that changes them all
@@ -11174,7 +11211,7 @@ fn exit_codes_and_errors_an_agent_can_act_on() {
              INSERT INTO meta VALUES ('format_version', '2');",
         )
         .unwrap();
-    let before = std::fs::read(&store).unwrap();
+    let before = common::store_bytes(&store);
     let (code, stdout, _) = status_out(&store, &["--json"]);
     assert_eq!(code, Some(3));
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
@@ -11193,7 +11230,7 @@ fn exit_codes_and_errors_an_agent_can_act_on() {
     assert_eq!(ran.status.code(), Some(3));
     let v: serde_json::Value = serde_json::from_slice(&ran.stdout).unwrap();
     assert_eq!(v["errors"][0]["code"], "store_unreadable");
-    assert_eq!(std::fs::read(&store).unwrap(), before);
+    assert_eq!(common::store_bytes(&store), before);
 }
 
 #[test]

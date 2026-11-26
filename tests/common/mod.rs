@@ -112,6 +112,32 @@ pub fn next_second() {
     }
 }
 
+/// The store opened as the core opens it to write, so that closing it keeps the `-wal` and
+/// `-shm` beside it: a connection with SQLite's defaults that closes last copies the log into
+/// the file and removes both, and a reader that cannot write the folder can then not read.
+pub fn open_store(store: &Path) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open(store).unwrap();
+    conn.set_db_config(
+        rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+        true,
+    )
+    .unwrap();
+    conn
+}
+
+/// The bytes of the store with everything committed in its file. A store in write-ahead mode
+/// keeps commits in its `-wal` until a checkpoint copies them into the file, so the file alone
+/// says neither that nothing was written nor that a text is not kept: the log is copied in
+/// first, and its `-wal` and `-shm` go as this connection closes. A file that is not a store is
+/// read as it is.
+pub fn store_bytes(store: &Path) -> Vec<u8> {
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE;
+    let conn = rusqlite::Connection::open_with_flags(store, flags).unwrap();
+    let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
+    drop(conn);
+    std::fs::read(store).unwrap()
+}
+
 /// Changes the journal, which only grows, as time or a crash would: its two triggers are taken
 /// out for the change and put back exactly as they were, so the store keeps the schema of its
 /// format.

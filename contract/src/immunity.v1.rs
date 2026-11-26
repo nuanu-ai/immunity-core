@@ -92,10 +92,11 @@ pub struct Error {
     /// by SQLite's result codes, the store's own refusal and the locks, never by the words of a
     /// message. A skip, asked again: `store_busy`, `run_lock_held`, `check_running`,
     /// `watch_running`. A refusal of the store: `no_store`, `not_a_store`, `older_format`,
-    /// `newer_format`, `unknown_format`, `damaged`. A failure of the store: `hot_journal`,
-    /// `not_writable`, `moved`, `disk_full`, `io`, `cannot_open`, `folder`. A failure of the work:
-    /// `failed`. Absent for a failure that is no access to the store, such as `usage`. A word this
-    /// reader does not know is read as a failure of the store. Since 1.27.0.
+    /// `newer_format`, `unknown_format`, `damaged`. A failure of the store: `not_writable`, `moved`,
+    /// `disk_full`, `io`, `cannot_open`, `folder`. A failure of the work: `failed`. Absent for a
+    /// failure that is no access to the store, such as `usage`. A word this reader does not know is
+    /// read as a failure of the store. Since 1.27.0; `hot_journal` is no longer given since the
+    /// store is in write-ahead mode.
     #[prost(string, optional, tag = "6")]
     pub outcome: ::core::option::Option<::prost::alloc::string::String>,
 }

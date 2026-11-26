@@ -33,6 +33,8 @@ CREATE TABLE finding (
     last_seen_at   INTEGER NOT NULL,
     last_seen_run  TEXT NOT NULL,
     answered_at    INTEGER,  -- the owner's latest answer
+    -- 1 once it was found again after that answer, whatever the clock; an answer sets it to 0.
+    found_since_answer INTEGER NOT NULL DEFAULT 0 CHECK (found_since_answer IN (0, 1)),
     reason         TEXT,     -- given with `expected`, and with `seen` when one was given
     until_at       INTEGER,  -- when an `expected` mark ends
     via            TEXT,     -- how the answer was given: app, agent or command
@@ -746,6 +748,7 @@ pub fn hold(
                 // A package that left and is back is found as it is now.
                 tx.execute(
                     "UPDATE finding SET last_seen_at = ?2, last_seen_run = ?3,
+                            found_since_answer = 1,
                             state = CASE WHEN ?4 THEN 'open' ELSE state END,
                             change = CASE change WHEN 'gone' THEN 'new' ELSE change END
                      WHERE id = ?1",
@@ -1040,6 +1043,7 @@ pub fn occur(
             let ended = state == "expected" && until.is_some_and(|u| u <= at);
             tx.execute(
                 "UPDATE finding SET last_seen_at = ?2, last_seen_run = ?3, change = ?4,
+                        found_since_answer = 1,
                         state = CASE WHEN ?5 THEN 'open' ELSE state END
                  WHERE id = ?1",
                 params![id, at, run_id, change, ended],
@@ -1152,10 +1156,12 @@ pub struct Found {
 /// Whether a finding whose `expected` mark has ended is open again, over a row of `finding`: it
 /// was found again after the mark was given, or it is a malicious package that left, which no
 /// check finds again (`OPEN_WHEN_GONE`). Otherwise it stays closed under the ended mark until it
-/// is found again. `all` and `detect` both go by it.
+/// is found again. After is told by the order the store wrote the answer and the occurrence in,
+/// never by their times (`found_since_answer`), so one in the same second or after the clock
+/// went back is after. `all` and `detect` both go by it.
 fn again() -> String {
     format!(
-        "(last_seen_at > answered_at OR (change IS 'gone' AND rule IN ('{}')))",
+        "(found_since_answer = 1 OR (change IS 'gone' AND rule IN ('{}')))",
         OPEN_WHEN_GONE.join("', '")
     )
 }
@@ -1652,7 +1658,8 @@ pub fn answer(
         }
     };
     tx.execute(
-        "UPDATE finding SET state = ?2, answered_at = ?3, reason = ?4, until_at = ?5, via = ?6
+        "UPDATE finding SET state = ?2, answered_at = ?3, reason = ?4, until_at = ?5, via = ?6,
+                            found_since_answer = 0
          WHERE id = ?1",
         params![id, state, at, reason, until, via],
     )?;
@@ -2895,6 +2902,70 @@ mod tests {
                 "file:machine:mac/.config/other"
             ]),
             "1 project and 2 other places"
+        );
+    }
+
+    #[test]
+    fn a_finding_found_again_after_an_expected_answer_opens_when_the_mark_ends_whatever_the_clock()
+    {
+        // No false calm. Found again is told by the order the store wrote the answer and the
+        // occurrence in, never by their times: one in the same second as the answer, or after
+        // the clock went back past it, opens the finding when its mark ends. One answered in the
+        // second it was last seen, with nothing found since, stays closed under the ended mark.
+        let dir = crate::common::Scratch::new("findings-again");
+        let mut conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
+        let at = 1_791_000_000;
+        let rule = "watched.authentication";
+        // An event found, or a state a check holds, as a lockfile's finding is.
+        let held = "component:machine:mac/dev/shop#npm/left-pad";
+        let occur = |conn: &mut Connection, about: &str, at: i64| {
+            let tx = conn.transaction().unwrap();
+            crate::store::put_entity(&tx, about).unwrap();
+            if about == held {
+                let now = [(about.to_string(), Vec::new())];
+                let rule = super::EXPLOITED_VULNERABILITY;
+                super::hold(&tx, rule, &now, &|_| Ok(true), "run", at).unwrap();
+            } else {
+                super::occur(&tx, rule, about, "changed", "run", at).unwrap();
+            }
+            tx.commit().unwrap();
+        };
+        let expected = |conn: &mut Connection, about: &str| {
+            let f = super::all(conn, at).unwrap();
+            let f = f.iter().find(|f| f.about == about).unwrap();
+            let tx = conn.transaction().unwrap();
+            let a = super::Answer::Expected {
+                reason: "invented".into(),
+                days: 1,
+            };
+            super::answer(&tx, f, &a, super::Via::Command, at, "answer").unwrap();
+            tx.commit().unwrap();
+        };
+        let (same, back, none) = (
+            "file:machine:mac/.ssh/config",
+            "file:machine:mac/.zshrc",
+            "file:machine:mac/.gitconfig",
+        );
+        for about in [same, back, none, held] {
+            occur(&mut conn, about, at);
+            occur(&mut conn, about, at);
+            expected(&mut conn, about);
+        }
+        occur(&mut conn, same, at);
+        occur(&mut conn, back, at - 3_600);
+        occur(&mut conn, held, at);
+        let after = super::all(&conn, at + 2 * 86_400).unwrap();
+        let state = |about: &str| {
+            after
+                .iter()
+                .find(|f| f.about == about)
+                .unwrap()
+                .state
+                .clone()
+        };
+        assert_eq!(
+            [same, back, none, held].map(state),
+            ["open", "open", "expected", "open"]
         );
     }
 }

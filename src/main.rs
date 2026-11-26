@@ -2423,18 +2423,6 @@ fn take_store(home: &Path, wait: std::time::Duration) -> Result<std::fs::File, B
     Ok(store::lock_run_for_check(home, wait)?.ok_or(Outcome::new(Code::RunLockHeld, ""))?)
 }
 
-/// The run's commit, which waits up to `wait` for the readings that hold the store to leave,
-/// through SQLite's busy timeout on the run's connection, as long as the check waits for the run
-/// lock. The connection's own timeout is set back after it, so what follows waits as before. A
-/// transaction whose commit fails is rolled back when it is dropped.
-fn commit(tx: rusqlite::Transaction, wait: std::time::Duration) -> rusqlite::Result<()> {
-    let own: i64 = tx.query_row("PRAGMA busy_timeout", [], |r| r.get(0))?;
-    tx.busy_timeout(wait)?;
-    let committed = tx.execute_batch("COMMIT");
-    let set_back = tx.busy_timeout(std::time::Duration::from_millis(own as u64));
-    committed.and(set_back)
-}
-
 /// Runs every reader and returns the report line, and the watched places that changed or
 /// could not be read, as change, kind, path and why.
 fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
@@ -2566,7 +2554,7 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     store::journal_note(&tx, at, &run_id, "report", &line)?;
     // The time the run finished, so that its start and its end are both in the journal.
     store::journal_note(&tx, now_secs(), &run_id, "run_finished", "")?;
-    commit(tx, store::CHECK_WAIT)?;
+    tx.commit()?;
     // The readings no page or answer asks for one by one any more are folded, under the run
     // lock still held; what the run did is committed, whatever comes of that.
     store::tidy(&conn);
@@ -3200,7 +3188,10 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
         "the checkout walk could not list some folders"
     });
     let (completeness, reason) = look.completeness_noted(None);
-    let gap = Gap::when(look.cause());
+    let gap = Gap {
+        not_read: look.not_read_rows(),
+        ..Gap::when(look.cause())
+    };
     // Every checkout the store holds is in the statements or was looked for and is gone, so
     // the reading is compared whole, whatever its coverage says.
     let applied = Applied {
@@ -4296,7 +4287,7 @@ fn read_watched(
         };
         // A place that could not be looked at failed; one that leads into a folder macOS asks
         // permission for was not given; hooks kept elsewhere have no reader.
-        let gap = if let Some((_, gap)) = tg {
+        let mut gap = if let Some((_, gap)) = tg {
             gap.clone()
         } else if let Some((_, _, cause)) = &p.coverage {
             Gap::when(*cause)
@@ -4307,6 +4298,7 @@ fn read_watched(
             }
             gap
         };
+        gap.not_read = p.look.not_read_rows();
         let with_basis: Vec<(&str, &Statement)> =
             statements.iter().map(|s| (watched::BASIS, s)).collect();
         let applied = Applied {
@@ -4800,6 +4792,7 @@ fn read_managers(run: &mut Run, args: &Args) -> rusqlite::Result<Vec<PathBuf>> {
                 .iter()
                 .map(|name| Lack::new(managers::NO_READER, Some(name)))
                 .collect(),
+            ..Gap::default()
         };
         run.apply(&reading, integrity::BASIS, "none", Some(&reason), &gap, &[])?;
     } else if !found.guarded.is_empty() {
@@ -4941,6 +4934,7 @@ fn read_other_autoruns(
         let gap = Gap {
             cause: Some(Cause::NoReader),
             lacks,
+            ..Gap::default()
         };
         ("none", Some(format!("not read: {}", named.join("; "))), gap)
     };
@@ -4961,6 +4955,7 @@ fn read_other_autoruns(
                 .iter()
                 .map(|name| Lack::new(autorun::OTHER_HOME, Some(name)))
                 .collect(),
+            ..Gap::default()
         };
         (
             "none",
@@ -5194,7 +5189,10 @@ fn read_indicators(
     // Not full while anything that could hold a match was not read. Hashes are matched
     // against every watched file whatever this run looked into, so it is partial, never none.
     let (_, reason) = look.completeness_noted(None);
-    let gap = Gap::when(look.cause());
+    let gap = Gap {
+        not_read: look.not_read_rows(),
+        ..Gap::when(look.cause())
+    };
     let completeness = if gap.cause.is_some() {
         "partial"
     } else {
@@ -5225,7 +5223,12 @@ fn read_indicators(
         let names: Vec<&str> = lacks.iter().filter_map(|l| l.name.as_deref()).collect();
         let reason = format!("not matched: {}", names.join("; "));
         let cause = Some(Cause::NoReader);
-        ("none", Some(reason), Gap { cause, lacks })
+        let gap = Gap {
+            cause,
+            lacks,
+            ..Gap::default()
+        };
+        ("none", Some(reason), gap)
     };
     run.apply(
         &on_machine(indicators::UNMATCHED_KIND),
@@ -5806,57 +5809,6 @@ mod tests {
     }
 
     #[test]
-    fn a_run_whose_commit_meets_a_store_held_past_its_wait_is_a_skip_and_commits_nothing() {
-        let dir = crate::common::Scratch::new("commit-busy");
-        let path = dir.join("store.db");
-        let mut conn = store::open_or_make(&path).unwrap();
-        let tx = conn.transaction().unwrap();
-        store::journal_note(&tx, 1, "held-run", "run_finished", "").unwrap();
-        // A reading in its read transaction, as `immunity findings` holds the store.
-        let reader = rusqlite::Connection::open(&path).unwrap();
-        reader
-            .execute_batch("BEGIN; SELECT COUNT(*) FROM journal;")
-            .unwrap();
-        let busy = commit(tx, std::time::Duration::from_millis(100)).unwrap_err();
-        let (error, exit) = not_run(&busy);
-        assert_eq!((exit, error.code.as_str()), (4, "run_in_progress"));
-        assert_eq!(error.outcome.as_deref(), Some("store_busy"));
-        reader.execute_batch("COMMIT").unwrap();
-        let kept: i64 = reader
-            .query_row(
-                "SELECT COUNT(*) FROM journal WHERE run_id = 'held-run'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(kept, 0);
-    }
-
-    #[test]
-    fn what_follows_a_run_s_commit_waits_for_the_store_as_long_as_before_it() {
-        // `store::tidy` runs under the run lock after the commit: it does not keep the check's
-        // long wait, whether the commit went through or not.
-        let dir = crate::common::Scratch::new("commit-wait-back");
-        let mut conn = store::open_or_make(&dir.join("store.db")).unwrap();
-        let waits = |c: &rusqlite::Connection| -> i64 {
-            c.query_row("PRAGMA busy_timeout", [], |r| r.get(0))
-                .unwrap()
-        };
-        let before = waits(&conn);
-        commit(conn.transaction().unwrap(), store::CHECK_WAIT).unwrap();
-        assert_eq!(waits(&conn), before);
-        let reader = rusqlite::Connection::open(dir.join("store.db")).unwrap();
-        reader
-            .execute_batch("BEGIN; SELECT COUNT(*) FROM meta;")
-            .unwrap();
-        let tx = conn.transaction().unwrap();
-        store::journal_note(&tx, 1, "held-run", "run_finished", "").unwrap();
-        let wait = std::time::Duration::from_millis(100);
-        assert!(commit(tx, wait).is_err());
-        assert_eq!(waits(&conn), before);
-    }
-
-    #[test]
     fn a_run_that_fails_for_any_reason_but_a_skip_is_still_a_failed_run() {
         // `SQLITE_LOCKED` is a conflict waiting does not end; a word of the work is no outcome.
         let locked = rusqlite::Error::SqliteFailure(
@@ -5871,6 +5823,16 @@ mod tests {
         // An outcome the run made itself is said as it is, a refusal among them.
         let (error, exit) = not_run(&Outcome::new(Code::NotWritable, "x"));
         assert_eq!((exit, error.outcome.as_deref()), (3, Some("not_writable")));
+        // Another writer that held the store past the busy timeout is a skip, asked again.
+        let busy = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            None,
+        );
+        let (error, exit) = not_run(&busy);
+        assert_eq!(
+            (exit, error.code.as_str(), error.outcome.as_deref()),
+            (4, "run_in_progress", Some("store_busy"))
+        );
     }
 
     #[test]
