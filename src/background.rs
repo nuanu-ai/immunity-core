@@ -7,7 +7,8 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-const EVERY: i64 = 60 * 60;
+/// How often a full check starts, in seconds.
+pub const EVERY: i64 = 60 * 60;
 /// How soon a full check that could not get the store, another run or process holding it, is
 /// tried again: within minutes, not at the next hour.
 const RETRY: i64 = 5 * 60;

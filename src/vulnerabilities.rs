@@ -482,32 +482,20 @@ fn freshness_of(
             Some(at) => crate::view::utc(at),
             None => "at a time this version cannot read as a date".to_string(),
         };
-        let not_current = match reading.map(|(_, at)| (at, crate::store::age(at, now))) {
-            None => Some("it has never been read".to_string()),
-            Some((at, None)) => Some(format!(
-                "it was last read {}, and {}",
-                crate::view::utc(at),
+        let read = reading.map(|r| r.1);
+        let not_current = read_not_current(read, now, feed.current_for).or_else(|| match newest {
+            Some(t) if t.as_str() > ahead.as_str() => Some(format!(
+                "its newest record changed {}, and {}",
+                changed(&t),
                 crate::store::AHEAD
             )),
-            Some((at, Some(age))) if age > feed.current_for => Some(format!(
-                "it was last read {}, more than {} hours before this check",
-                crate::view::utc(at),
-                feed.current_for / 3600
+            Some(t) if t.as_str() >= crate::view::iso(now - NEWEST_CHANGE).as_str() => None,
+            Some(t) => Some(format!(
+                "its newest record changed {}, more than 7 days before this check",
+                changed(&t)
             )),
-            _ => match newest {
-                Some(t) if t.as_str() > ahead.as_str() => Some(format!(
-                    "its newest record changed {}, and {}",
-                    changed(&t),
-                    crate::store::AHEAD
-                )),
-                Some(t) if t.as_str() >= crate::view::iso(now - NEWEST_CHANGE).as_str() => None,
-                Some(t) => Some(format!(
-                    "its newest record changed {}, more than 7 days before this check",
-                    changed(&t)
-                )),
-                None => Some("it holds no record".to_string()),
-            },
-        };
+            None => Some("it holds no record".to_string()),
+        });
         out.push(Fresh {
             feed,
             reading,
@@ -515,6 +503,35 @@ fn freshness_of(
         });
     }
     Ok(out)
+}
+
+/// Why data whose latest good reading was at `read_at` is not current at `now` by its
+/// `current_for`, or `None` while it is: never read, read at a time ahead of the clock, or read
+/// longer ago than `current_for`. A feed is current when this is `None` and its newest record is
+/// recent (`freshness`); the catalogue has no records with such times and is current when this
+/// is `None` with `threats::CURRENT_FOR`.
+///
+/// It is also the one rule for a download that failed: a failed download is silent while the
+/// data it would have refreshed is current, and it is a fault from the moment that data is not
+/// current, or when nothing of it was ever read. That is the moment answers resting on it turn
+/// to "don't know" (`stale_at`). The catalogue's cause in `covered::not_covered` and the line
+/// of downloads in `overview::downloads_failed` both read it, the latter through the status's
+/// `FeedFreshness.current`.
+pub fn read_not_current(read_at: Option<i64>, now: i64, current_for: i64) -> Option<String> {
+    match read_at.map(|at| (at, crate::store::age(at, now))) {
+        None => Some("it has never been read".to_string()),
+        Some((at, None)) => Some(format!(
+            "it was last read {}, and {}",
+            crate::view::utc(at),
+            crate::store::AHEAD
+        )),
+        Some((at, Some(age))) if age > current_for => Some(format!(
+            "it was last read {}, more than {} hours before this check",
+            crate::view::utc(at),
+            current_for / 3600
+        )),
+        _ => None,
+    }
 }
 
 /// A record's time as OSV writes it (`osv::parse`), in UTC seconds; `None` when it is no date,

@@ -90,10 +90,16 @@ pub struct Feed {
     /// How often it is asked for, in words.
     pub asked: &'static str,
     /// How long its last good reading counts as current for "does not affect me, known for
-    /// certain", in seconds: two hours where it is asked for on every run, a day and two hours
-    /// where once a day.
+    /// certain", in seconds: `CURRENT_FOR_EVERY_CHECK` where it is asked for on every run, a day
+    /// and two hours where once a day.
     pub current_for: i64,
 }
+
+/// How long data asked for at every check stays current after its last good reading: two
+/// checks. One check whose download failed leaves it current until the next check asks again,
+/// and a second failure makes it not current. The OSV data of crates.io and the CISA catalogue
+/// (`threats::CURRENT_FOR`) are both asked for at every check.
+pub const CURRENT_FOR_EVERY_CHECK: i64 = 2 * crate::background::EVERY;
 
 // The time limits of one background check, which has 30 minutes in all: crates.io 120 s, npm
 // 900 s, PyPI 180 s, the catalogue 300 s and a watcher's reading waited out for up to 60 s.
@@ -108,7 +114,7 @@ pub const FEEDS: [Feed; 3] = [
         max_time: 120,
         every: 0,
         asked: "on every run",
-        current_for: 2 * 3600,
+        current_for: CURRENT_FOR_EVERY_CHECK,
     },
     // About 220 MB in 2026, 93% of it malicious-package reports: asked for once a day.
     Feed {
