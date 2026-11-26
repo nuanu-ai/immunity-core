@@ -3138,7 +3138,7 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
     for rel in &kept {
         raw.push_str(&format!("kept, not looked into\t{rel}\n"));
     }
-    for (folder, _) in &walk.unlisted {
+    for (folder, ..) in &walk.unlisted {
         raw.push_str(&format!("not listed\t{folder}\n"));
     }
     let raw_file = run.keep_raw(checkouts::READER, "checkouts.txt", raw.as_bytes())?;
@@ -3169,8 +3169,8 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
     {
         look.read(Unit::whole(rel));
     }
-    for (folder, why) in &walk.unlisted {
-        look.not_looked_at(Unit::whole(folder), why.clone());
+    for (folder, why, errno) in &walk.unlisted {
+        look.not_looked_at(Unit::whole(folder), *errno, why.clone());
     }
     if args.checkouts_root.is_some() {
         look.short(Cause::NotGiven, checkouts::ONLY_GIVEN.to_string());
@@ -3195,7 +3195,7 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
         look.short(Cause::NotGiven, why);
     }
     let failure = (!walk.unlisted.is_empty()).then(|| {
-        let folders: Vec<String> = walk.unlisted.iter().map(|(f, _)| f.clone()).collect();
+        let folders: Vec<String> = walk.unlisted.iter().map(|(f, ..)| f.clone()).collect();
         run.notes.push(unlisted_note(&folders));
         "the checkout walk could not list some folders"
     });
@@ -3212,12 +3212,12 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
     run.apply_found(&reading, checkouts::BASIS, &applied, &statements)?;
     // A folder that could not be listed is a unit not read, and one a listing shows is gone
     // is no longer one (`fault.rs`).
-    for (folder, _) in &walk.unlisted {
+    for (folder, ..) in &walk.unlisted {
         let unit = Unit::whole(folder);
         baseline::judged_unread(run.tx, checkouts::READER, checkouts::KIND, &unit, &run_id)?;
     }
     let met: BTreeSet<&str> = (walk.listed.iter().chain(&walk.seen))
-        .chain(walk.unlisted.iter().map(|(folder, _)| folder))
+        .chain(walk.unlisted.iter().map(|(folder, ..)| folder))
         .map(String::as_str)
         .collect();
     let listed: Vec<Unit> = walk.listed.iter().map(Unit::whole).collect();
@@ -3272,7 +3272,7 @@ fn read_agent_folders(
                 None => sessions = Some(*s),
                 Some(all) => agent_folders::Sessions::add(all, *s),
             },
-            agent_folders::Found::Failed(why) => look.not_looked_at(unit, why),
+            agent_folders::Found::Failed(why, errno) => look.not_looked_at(unit, errno, why),
             agent_folders::Found::Guarded(folder) => not_entered.push((unit, folder)),
         }
     }
@@ -3348,9 +3348,9 @@ fn read_agent_folders(
                 found.insert(checkouts::rel(&home, &path), path);
             }
             agent_folders::OnDisk::Nothing => {}
-            agent_folders::OnDisk::Unknown => {
+            agent_folders::OnDisk::Unknown(errno) => {
                 let why = "the disk could not say whether it is there".to_string();
-                look.unread_as(Unit::whole(folder), look::Said::WorkingFolder, why);
+                look.unread_as(Unit::whole(folder), look::Said::WorkingFolder, errno, why);
             }
             agent_folders::OnDisk::Guarded(g) => look.met(g),
         }
@@ -3380,14 +3380,15 @@ fn read_agent_folders(
             guarded::Real::Failed(_) => agent_folders::still_there(&path),
         };
         match there {
-            Some(true) => {
+            Ok(true) => {
                 found.insert(rel.to_string(), path);
             }
-            Some(false) => {}
+            Ok(false) => {}
             // Not known to be gone: the reading is partial, so it stays as it was.
-            None => {
+            Err(e) => {
                 let why = "the disk could not say whether it is there".to_string();
-                look.unread_as(Unit::whole(rel), look::Said::Checkout, why);
+                let unit = Unit::whole(rel);
+                look.unread_as(unit, look::Said::Checkout, e.raw_os_error(), why);
             }
         }
     }
@@ -5086,7 +5087,7 @@ fn read_indicators(
             Ok(real) => match std::fs::symlink_metadata(&real) {
                 Ok(_) => opened.push((autorun::TASKS.to_string(), real)),
                 Err(e) if matches!(e.kind(), NotFound | NotADirectory) => {}
-                Err(e) => look.not_looked_at(tasks, e.to_string()),
+                Err(e) => look.not_looked_at(tasks, e.raw_os_error(), e.to_string()),
             },
         }
         for (rel, path) in opened {
@@ -5100,7 +5101,7 @@ fn read_indicators(
                     }
                     read.insert(file);
                 }
-                Err(why) => look.not_looked_at(Unit::whole(shown), why.to_string()),
+                Err(why) => look.not_looked_at(Unit::whole(shown), why.errno(), why.to_string()),
             }
         }
     }

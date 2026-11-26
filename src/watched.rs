@@ -466,7 +466,7 @@ fn configured_hooks(look: &mut Look, path: &Path, unit: Unit, names: &[&str], at
         Real::Failed(e) => match Absent::on_the_way(&e) {
             // Not there: read in full, it holds no hook (`baseline.rs`).
             Some(absent) => return look.absent(unit, absent),
-            None => return look.not_looked_at(unit, reason(&e)),
+            None => return look.not_looked_at(unit, e.raw_os_error(), reason(&e)),
         },
     };
     match std::fs::metadata(&folder) {
@@ -474,7 +474,7 @@ fn configured_hooks(look: &mut Look, path: &Path, unit: Unit, names: &[&str], at
         // A non-directory cannot contain a Git hook. This does not open a FIFO,
         // socket or device configured as the hooks path.
         Ok(_) => return,
-        Err(e) => return look.not_looked_at(unit, reason(&e)),
+        Err(e) => return look.not_looked_at(unit, e.raw_os_error(), reason(&e)),
     }
     let shown = crate::checkouts::rel(at.homes[1], &folder);
     for name in names {
@@ -551,7 +551,7 @@ fn look_place(
             // A folder that is not there was listed in full: it holds nothing.
             return match Absent::of(&e) {
                 Some(absent) => look.absent(Unit::whole(shown), absent),
-                None => look.not_looked_at(Unit::whole(shown), e.to_string()),
+                None => look.not_looked_at(Unit::whole(shown), e.raw_os_error(), e.to_string()),
             };
         }
     };
@@ -597,7 +597,9 @@ fn take(
     match examined {
         // Listed and gone before it was looked at: the listing read in full holds it.
         Examined::Absent(_) => {}
-        Examined::Unknown(why) | Examined::Unread(why) => look.unread(shown, why),
+        Examined::Unknown(why, errno) | Examined::Unread(why, errno) => {
+            look.unread(shown, errno, why)
+        }
         Examined::Unreached(guarded) => look.there_not_into(shown, guarded, at.home),
         Examined::Present(content, link, bytes) => {
             look.read(shown.clone());
@@ -622,7 +624,8 @@ fn take(
                     .push(entry(unit, content, link.clone(), &bytes));
             }
             for (key, why) in failed {
-                look.not_looked_at(Unit::part(&shown.path, format!("/{key}")), why.to_string());
+                let unit = Unit::part(&shown.path, format!("/{key}"));
+                look.not_looked_at(unit, None, why.to_string());
             }
         }
     }
@@ -630,10 +633,11 @@ fn take(
 
 enum Examined {
     Absent(Absent),
-    /// Whether it is there is not known, with the reason.
-    Unknown(String),
-    /// A file whose parts count, there and not read, with the reason.
-    Unread(String),
+    /// Whether it is there is not known, with the reason and the system's error number.
+    Unknown(String, Option<i32>),
+    /// A file whose parts count, there and not read, with the reason and the system's error
+    /// number.
+    Unread(String, Option<i32>),
     /// A link into this folder macOS asks permission for, of a file whose parts count: what
     /// it holds is not known.
     Unreached(PathBuf),
@@ -670,7 +674,7 @@ fn examine(
         Err(e) => {
             return match Absent::of(&e) {
                 Some(absent) => Examined::Absent(absent),
-                None => Examined::Unknown(e.to_string()),
+                None => Examined::Unknown(e.to_string(), e.raw_os_error()),
             };
         }
     };
@@ -698,7 +702,7 @@ fn examine(
         Err(e) if Absent::of(&e).is_some() => {
             Examined::Present(Content::Dangling, Some(link), None)
         }
-        Err(e) if keys.is_some() => Examined::Unread(reason(&e)),
+        Err(e) if keys.is_some() => Examined::Unread(reason(&e), e.raw_os_error()),
         // A target that failed after its walk reached it is not told by any walk.
         Err(e) => {
             let by =
@@ -721,16 +725,16 @@ fn counted(
     let bytes = match bytes(path, meta, CAP) {
         Ok(bytes) => bytes,
         Err(not) if keys.is_none() => return Examined::Present(not, link, None),
-        Err(Content::Unread(_, why)) => return Examined::Unread(why),
-        Err(Content::Failed(f)) => return Examined::Unread(f.why()),
-        Err(other) => return Examined::Unread(other.literal().unwrap_or_default()),
+        Err(Content::Unread(_, why)) => return Examined::Unread(why, None),
+        Err(Content::Failed(f)) => return Examined::Unread(f.why(), f.errno),
+        Err(other) => return Examined::Unread(other.literal().unwrap_or_default(), None),
     };
     let Some(keys) = keys else {
         let hash = Content::Hash(format!("sha256:{}", crate::sha256::hex(&bytes)));
         return Examined::Present(hash, link, Some(bytes));
     };
     match crate::plist::values(&bytes, keys) {
-        Err(why) => Examined::Unread(why.to_string()),
+        Err(why) => Examined::Unread(why.to_string(), None),
         Ok(values) => {
             let (mut parts, mut failed) = (Vec::new(), Vec::new());
             for (key, value) in values {
@@ -847,7 +851,7 @@ mod tests {
         assert_eq!(content_coverage(&failed, true), none);
         // A file whose parts count is a unit of its kind's reading that failed, with the same.
         let keyed = counted(&path, &meta, Some(&["LoginHook"]), None);
-        assert!(matches!(keyed, Examined::Unread(w) if w == why));
+        assert!(matches!(keyed, Examined::Unread(w, Some(libc::EACCES)) if w == why));
     }
 
     #[test]

@@ -246,8 +246,9 @@ pub enum Found {
     /// The session folder is not here: nothing to read, which is not a failure.
     Absent(Absent),
     Read(Box<Sessions>),
-    /// The session folder is here and could not be listed, with why.
-    Failed(String),
+    /// The session folder is here and could not be listed, with why and the system's error
+    /// number.
+    Failed(String, Option<i32>),
     /// The session folder leads into this folder macOS asks permission for, which was not
     /// entered.
     Guarded(PathBuf),
@@ -349,11 +350,14 @@ pub fn sessions(
         crate::guarded::Real::Failed(_) => dir.to_path_buf(),
     };
     if let Err(e) = std::fs::symlink_metadata(dir) {
-        return Absent::of(&e).map_or(Found::Failed(e.to_string()), Found::Absent);
+        return Absent::of(&e).map_or(
+            Found::Failed(e.to_string(), e.raw_os_error()),
+            Found::Absent,
+        );
     }
     let entries = match std::fs::read_dir(listed) {
         Ok(entries) => entries,
-        Err(e) => return Found::Failed(e.to_string()),
+        Err(e) => return Found::Failed(e.to_string(), e.raw_os_error()),
     };
     let mut walk = Walk {
         source,
@@ -388,10 +392,13 @@ struct Walk<'a> {
 }
 
 impl Walk<'_> {
-    /// A folder of sessions that could not be listed in full, with why.
-    fn not_listed(&mut self, dir: &Path, why: String) {
+    /// A folder of sessions that could not be listed in full, with the system's error number
+    /// and why.
+    fn not_listed(&mut self, dir: &Path, errno: Option<i32>, why: String) {
         let unit = Unit::whole(dir.display().to_string());
-        self.out.look.unread_as(unit, Said::SessionFolder, why);
+        self.out
+            .look
+            .unread_as(unit, Said::SessionFolder, errno, why);
     }
 
     /// Reads the session files `depth` folders below the entries of the folder `dir`, and in
@@ -406,7 +413,7 @@ impl Walk<'_> {
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(e) => {
-                    self.not_listed(dir, e.to_string());
+                    self.not_listed(dir, e.raw_os_error(), e.to_string());
                     continue;
                 }
             };
@@ -429,11 +436,11 @@ impl Walk<'_> {
                     }
                     Ok(t) if session || !t.is_symlink() => {}
                     Ok(_) => {
-                        self.not_listed(&path, LINK.to_string());
+                        self.not_listed(&path, None, LINK.to_string());
                         continue;
                     }
                     Err(e) => {
-                        self.not_listed(&path, e.to_string());
+                        self.not_listed(&path, e.raw_os_error(), e.to_string());
                         continue;
                     }
                 }
@@ -467,7 +474,7 @@ impl Walk<'_> {
             }
             match std::fs::read_dir(&path) {
                 Ok(inner) => self.entries(&path, inner, depth.saturating_sub(1)),
-                Err(e) => self.not_listed(&path, e.to_string()),
+                Err(e) => self.not_listed(&path, e.raw_os_error(), e.to_string()),
             }
         }
     }
@@ -560,6 +567,8 @@ fn read_session(
 ) {
     let (mut whole, mut last) = (Parsed::of(source), Parsed::of(source));
     let open = crate::open::open(path, crate::open::Reach::Place, crate::open::UNCAPPED);
+    // The system's number of a refusal at the open, which the error carrying it on loses.
+    let refused = open.as_ref().err().and_then(crate::open::Refused::errno);
     let read = open.map_err(std::io::Error::other);
     let read = read.and_then(|(mut file, meta)| {
         let then = Then {
@@ -586,8 +595,9 @@ fn read_session(
         }
         Err(e) => {
             out.look.there(unit.clone());
+            let errno = refused.or(e.raw_os_error());
             out.look
-                .unread_as(unit.clone(), Said::SessionFile, e.to_string());
+                .unread_as(unit.clone(), Said::SessionFile, errno, e.to_string());
             if let Some(before) = before {
                 whole.folders.extend(before.folders.iter().cloned());
                 out.held.insert(path.to_path_buf(), before.clone());
@@ -599,7 +609,7 @@ fn read_session(
     let unparsed = whole.unparsed + last.unparsed;
     if unparsed > 0 {
         let why = "lines that name a working folder could not be parsed".to_string();
-        out.look.unread_as(unit, Said::Lines(unparsed), why);
+        out.look.unread_as(unit, Said::Lines(unparsed), None, why);
     }
 }
 
@@ -993,8 +1003,8 @@ pub enum OnDisk {
     Checkout(PathBuf),
     /// The folder is gone, or no folder above it holds `.git`.
     Nothing,
-    /// The disk could not say, for want of permission.
-    Unknown,
+    /// The disk could not say, for want of permission, with the system's error number.
+    Unknown(Option<i32>),
     /// It leads into this folder macOS asks permission for, which was not entered.
     Guarded(PathBuf),
 }
@@ -1014,7 +1024,7 @@ pub fn checkout_of(folder: &str, home: &Path, homes: &[&Path]) -> OnDisk {
         crate::guarded::Real::At(real) => real,
         crate::guarded::Real::Guarded(g) => return OnDisk::Guarded(g),
         crate::guarded::Real::Failed(e) if gone(&e) => return OnDisk::Nothing,
-        crate::guarded::Real::Failed(_) => return OnDisk::Unknown,
+        crate::guarded::Real::Failed(e) => return OnDisk::Unknown(e.raw_os_error()),
     };
     real.ancestors()
         .take_while(|dir| *dir != home)
@@ -1022,12 +1032,13 @@ pub fn checkout_of(folder: &str, home: &Path, homes: &[&Path]) -> OnDisk {
         .map_or(OnDisk::Nothing, |dir| OnDisk::Checkout(dir.to_path_buf()))
 }
 
-/// Whether a checkout this reader holds is still there. `None` when the disk cannot say.
-pub fn still_there(path: &Path) -> Option<bool> {
+/// Whether a checkout this reader holds is still there, or what the system said when the disk
+/// cannot say.
+pub fn still_there(path: &Path) -> std::io::Result<bool> {
     match std::fs::symlink_metadata(path.join(".git")) {
-        Ok(_) => Some(true),
-        Err(e) if gone(&e) => Some(false),
-        Err(_) => None,
+        Ok(_) => Ok(true),
+        Err(e) if gone(&e) => Ok(false),
+        Err(e) => Err(e),
     }
 }
 

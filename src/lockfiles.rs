@@ -340,7 +340,8 @@ fn walk(checkout: &Path, prefix: &str, limit: usize, say: Say) -> Walk {
         let entries = match std::fs::read_dir(&dir) {
             Ok(entries) => entries,
             Err(e) => {
-                out.look.unread_as(unit(&rel), say.folder, e.to_string());
+                out.look
+                    .unread_as(unit(&rel), say.folder, e.raw_os_error(), e.to_string());
                 continue;
             }
         };
@@ -352,7 +353,7 @@ fn walk(checkout: &Path, prefix: &str, limit: usize, say: Say) -> Walk {
             let (entry, file_type) = match entry.and_then(|e| e.file_type().map(|t| (e, t))) {
                 Ok(found) => found,
                 Err(e) => {
-                    missed.get_or_insert(e.to_string());
+                    missed.get_or_insert(e);
                     continue;
                 }
             };
@@ -391,7 +392,11 @@ fn walk(checkout: &Path, prefix: &str, limit: usize, say: Say) -> Walk {
             }
         }
         match missed {
-            Some(why) => out.look.unread_as(unit(&rel), say.folder, why),
+            Some(e) => {
+                let errno = e.raw_os_error();
+                out.look
+                    .unread_as(unit(&rel), say.folder, errno, e.to_string());
+            }
             None => out.look.listed(unit(&rel)),
         }
         // The look for names does not look at what a mark says is not the project's.
@@ -401,7 +406,8 @@ fn walk(checkout: &Path, prefix: &str, limit: usize, say: Say) -> Walk {
         }
         for (name, said, what) in special {
             let why = format!("{}{what}", crate::watched::NOT_A_FILE);
-            out.look.unread_as(unit(&format!("{rel}{name}")), said, why);
+            out.look
+                .unread_as(unit(&format!("{rel}{name}")), said, None, why);
         }
         out.lockfiles.extend(
             files
@@ -537,11 +543,11 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize, cap: u64) -> Option<
         // Opened as the walk found it: a regular file, a link in its place not followed,
         // without waiting, up to the cap. One refused could not be read.
         let text = crate::open::read(&path, crate::open::Reach::Place, cap)
-            .map_err(|e| e.to_string())
-            .and_then(|t| String::from_utf8(t).map_err(|_| "not UTF-8 text".to_string()));
+            .map_err(|e| (e.errno(), e.to_string()))
+            .and_then(|t| String::from_utf8(t).map_err(|_| (None, "not UTF-8 text".to_string())));
         let parsed = match text {
-            Err(why) => {
-                look.unread_as(unit, Said::Lockfile(name), why);
+            Err((errno, why)) => {
+                look.unread_as(unit, Said::Lockfile(name), errno, why);
                 continue;
             }
             Ok(t) => reader(&t, name),
@@ -555,7 +561,7 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize, cap: u64) -> Option<
                 // left out, and the reading is partial, so it never says that a package is
                 // not there.
                 for key in &unknown {
-                    look.unread_as(Unit::part(&source, key), Said::Untold, String::new());
+                    look.unread_as(Unit::part(&source, key), Said::Untold, None, String::new());
                 }
                 look.read(unit);
                 (ecosystem, found)
@@ -566,7 +572,7 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize, cap: u64) -> Option<
             }
             Parsed::Failed => {
                 let why = "it could not be parsed".to_string();
-                look.unread_as(unit, Said::Lockfile(name), why);
+                look.unread_as(unit, Said::Lockfile(name), None, why);
                 continue;
             }
         };

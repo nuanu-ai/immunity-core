@@ -388,7 +388,7 @@ fn plist_string(path: &Path, key: &str) -> Result<String, Failed> {
     let texts = match crate::plist::texts_at(path, &[key]) {
         Ok(Some(texts)) => texts,
         Ok(None) => return Err(unreadable(path, "nothing is there")),
-        Err(why) => return Err(unreadable(path, &why)),
+        Err(why) => return Err(unreadable(path, &why.to_string())),
     };
     match texts.into_iter().next() {
         Some((_, crate::plist::Text::One(s))) => Ok(s),
