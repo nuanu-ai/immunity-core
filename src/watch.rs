@@ -51,6 +51,11 @@
 //!
 //! Program starts. Every `EVENTS_EVERY` (`--events-every`) the watcher reads the event level's
 //! log (`events.rs`) one log file a step, each step under the run lock in its own transaction.
+//! Between steps, every `LOOK`, it evaluates the lines written since it last looked, without
+//! opening the store (`events::Pass::raising`), and reads at once when one matches a rule that
+//! raises a finding, so that the finding comes within about a second of its line. Each rule
+//! does that once between two steps at the period: a rule that keeps matching waits for the
+//! period after its first early step, and another rule is still read at once.
 //! While log is left after a step, the next is read at the next turn of the loop, at once. A
 //! step that took program starts or changed the level's state prints a `program_starts` line,
 //! so that the app shows it without asking for the status; a reading that failed is a
@@ -144,9 +149,17 @@ const PARENT: Duration = Duration::from_secs(1);
 /// How often the watcher takes a sample of running programs. The rule over them wants two
 /// samples a minute apart, so three samples at this cadence; a sample costs 10 to 20 ms.
 pub const SAMPLE: Duration = Duration::from_secs(30);
-/// How often the watcher reads the event level's log. A reading that took nothing costs a
-/// look at the log's files and one row of `event_count`, see `--events-every`.
+/// How often the watcher reads the event level's log, see `--events-every`. A reading that took
+/// nothing still writes the level's rows and one row of `event_count`, and what reads those
+/// (the level's state, whether the collector fell silent, the freshness of the reading) goes by
+/// this period.
 pub const EVENTS_EVERY: Duration = Duration::from_secs(10);
+/// How often the watcher's early look evaluates the lines written since it last looked
+/// (`events::Pass::raising`), and so about the longest a line that raises a finding waits to be
+/// read. A look at a log that did not grow is a listing of its folder, tens of microseconds;
+/// each new line costs its evaluation, as in a reading. It opens no store and writes nothing;
+/// the loop turns this often anyway (`PARENT`).
+const LOOK: Duration = Duration::from_secs(1);
 /// Another watcher holds the store.
 pub const EXIT_WATCHING: u8 = 5;
 /// How the run id of a watcher's reading begins; it writes no `run_started` or `run_finished`.
@@ -876,13 +889,18 @@ impl Watcher<'_> {
         // reading of program starts after it.
         let mut sample = Instant::now();
         let mut starts = Instant::now();
+        let mut look = Instant::now();
         let mut pass = crate::events::Pass::default();
+        // The rules that brought a step forward since the last step at the period
+        // (`events::Pass::raising`), and whether the step due now goes on with a pass.
+        let mut held = BTreeSet::new();
+        let mut reading_on = false;
         loop {
             if !self.progress() {
                 return;
             }
             let next = due.as_ref().map_or(alive, |d| d.at.min(alive)).min(sample);
-            let next = next.min(starts);
+            let next = next.min(starts).min(look);
             let next = next.min(Instant::now() + PARENT);
             match rx.recv_timeout(next.saturating_duration_since(Instant::now())) {
                 Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => return,
@@ -955,13 +973,25 @@ impl Watcher<'_> {
                     }
                 }
             }
-            if starts <= Instant::now() {
+            // A line of a rule that raises a finding, and has not brought a step forward since
+            // the last step at the period, is read at once; any other waits for `events_every`.
+            let period = starts <= Instant::now();
+            let mut news = false;
+            if !period && look <= Instant::now() {
+                look = Instant::now() + LOOK;
+                news = pass.raising(&self.args.system_root, crate::now_secs(), &mut held);
+            }
+            if news || period {
+                if period && !reading_on {
+                    held.clear();
+                }
                 starts = Instant::now() + self.args.events_every;
                 let read = self.events(&mut pass);
                 // Log left unread is read on at the next turn, at once: a full check waiting for
                 // the run lock takes it between steps, and the turn says the watcher is alive. A
                 // step that did not commit is tried again at the next reading.
-                if matches!(read, Ok(Some(_))) && pass.more() {
+                reading_on = matches!(read, Ok(Some(_))) && pass.more();
+                if reading_on {
                     starts = Instant::now();
                 }
                 match read {

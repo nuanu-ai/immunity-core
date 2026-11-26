@@ -201,6 +201,33 @@ impl Mac {
 
     /// The same program start, appended to the log file `name`.
     fn exec_in(&self, name: &str, seq: u64) {
+        self.start_in(
+            name,
+            seq,
+            "/bin/dd",
+            r#""dd","if=/dev/zero","bs=1","count=1""#,
+        );
+    }
+
+    /// Appends to the log file `name` a program start that only the low rule "Split A File Into
+    /// Pieces" matches, with invented content.
+    fn split_in(&self, name: &str, seq: u64) {
+        self.start_in(
+            name,
+            seq,
+            "/usr/bin/split",
+            r#""split","-b","1","notes.txt""#,
+        );
+    }
+
+    /// Appends to the log file `name` a program start that the high rule "Credentials In Files"
+    /// matches, a rule other than the one `exec_in` meets, with invented content.
+    fn password_search_in(&self, name: &str, seq: u64) {
+        self.start_in(name, seq, "/usr/bin/grep", r#""grep","-r","password",".""#);
+    }
+
+    /// Appends to the log file `name` a program start of `program` with the JSON strings `args`.
+    fn start_in(&self, name: &str, seq: u64, program: &str, args: &str) {
         use std::io::Write;
         let out = Command::new("/bin/date")
             .args(["-u", "+%Y-%m-%dT%H:%M:%S.000001Z"])
@@ -208,7 +235,7 @@ impl Mac {
             .unwrap();
         let time = String::from_utf8(out.stdout).unwrap().trim().to_string();
         let line = format!(
-            r#"{{"schema_version":1,"version":10,"seq_num":{seq},"global_seq_num":{seq},"time":"{time}","process":{{"executable":{{"path":"/bin/sh"}}}},"event":{{"exec":{{"args":["dd","if=/dev/zero","bs=1","count=1"],"cwd":{{"path":"/Users/example/dev/site"}},"target":{{"executable":{{"path":"/bin/dd"}},"audit_token":{{"pid":402,"euid":501}},"ppid":401,"signing_id":"com.example.tool","team_id":null,"is_platform_binary":false}}}}}}}}"#
+            r#"{{"schema_version":1,"version":10,"seq_num":{seq},"global_seq_num":{seq},"time":"{time}","process":{{"executable":{{"path":"/bin/sh"}}}},"event":{{"exec":{{"args":[{args}],"cwd":{{"path":"/Users/example/dev/site"}},"target":{{"executable":{{"path":"{program}"}},"audit_token":{{"pid":402,"euid":501}},"ppid":401,"signing_id":"com.example.tool","team_id":null,"is_platform_binary":false}}}}}}}}"#
         ) + "\n";
         std::fs::OpenOptions::new()
             .create(true)
@@ -935,6 +962,192 @@ fn a_step_with_log_left_and_no_program_starts_says_nothing_of_a_state_it_did_not
     assert_eq!(
         (&first["state"], &first["starts"]),
         (&"failing".into(), &0.into())
+    );
+    assert!(w.stop().success());
+}
+
+/// How long a line written to the event level's log may wait to be read, and its finding raised,
+/// by a watcher whose reading at its own period is an hour away: a look every second, a step,
+/// and a loaded test machine.
+const LINE_READ_WITHIN: Duration = Duration::from_secs(5);
+
+/// A watcher on `mac` whose readings of program starts at their own period, and samples, are an
+/// hour apart, so that only its looks at the log read it; past its first sample and reading.
+fn reading_by_looks(mac: &Mac) -> Watcher {
+    let hourly = ["--events-every", "3600", "--sample-every", "3600"];
+    let mut w = mac
+        .watch_with(&[&hourly[..], &["--alive-every", "1"]].concat())
+        .started();
+    w.next("alive");
+    w
+}
+
+/// Writes to the log with `write` and waits for the step that reads the one start written: how
+/// long that took.
+fn read_after(w: &mut Watcher, write: impl FnOnce()) -> Duration {
+    let t = Instant::now();
+    write();
+    w.until("program_starts", |v| v["starts"] == 1);
+    t.elapsed()
+}
+
+#[test]
+fn a_line_that_matches_a_rule_that_raises_is_read_and_its_finding_raised_within_seconds_without_waiting_for_the_reading_period()
+ {
+    let mac = Mac::new("events-look");
+    mac.event_level();
+    mac.run();
+    let mut w = reading_by_looks(&mac);
+    let took = read_after(&mut w, || mac.exec(1));
+    assert!(took < LINE_READ_WITHIN, "read after {took:?}");
+    let found = "SELECT id FROM finding WHERE rule LIKE 'sigma:%'";
+    assert_eq!(mac.rows(found).len(), 1);
+    assert!(w.stop().success());
+}
+
+#[test]
+fn a_line_that_matches_no_rule_that_raises_is_left_for_the_reading_period() {
+    // A rule below high matches it: it is counted with the reading that takes it, and no
+    // reading is made for it alone.
+    let mac = Mac::new("events-look-low");
+    mac.event_level();
+    mac.run();
+    let mut w = reading_by_looks(&mac);
+    let readings = "SELECT CAST(COUNT(*) AS TEXT) FROM event_count";
+    let before = mac.rows(readings);
+    let name = "exec-20261004T000013-20261004T000000.jsonl";
+    mac.split_in(name, 1);
+    // Several looks, one a second.
+    for _ in 0..4 {
+        w.next("alive");
+    }
+    assert_eq!(mac.rows(readings), before);
+    assert!(w.lines("program_starts").is_empty(), "{:?}", w.seen);
+    // A line that raises is read at once, and the reading takes both.
+    mac.exec_in(name, 2);
+    w.until("program_starts", |v| v["starts"] == 2);
+    assert!(w.stop().success());
+}
+
+#[test]
+fn a_rule_that_brought_a_reading_forward_brings_no_other_before_the_reading_at_the_period() {
+    // A rule that keeps matching, as on a build tool it takes for something else, does not
+    // make the watcher read every second.
+    let mac = Mac::new("events-look-held");
+    mac.event_level();
+    mac.run();
+    let mut w = reading_by_looks(&mac);
+    let took = read_after(&mut w, || mac.exec(1));
+    assert!(took < LINE_READ_WITHIN, "read after {took:?}");
+    let readings = "SELECT CAST(COUNT(*) AS TEXT) FROM event_count";
+    let before = mac.rows(readings);
+    mac.exec(2);
+    // Several looks, one a second.
+    for _ in 0..4 {
+        w.next("alive");
+    }
+    assert_eq!(mac.rows(readings), before);
+    assert_eq!(w.lines("program_starts").len(), 1, "{:?}", w.seen);
+    assert!(w.stop().success());
+}
+
+#[test]
+fn after_the_reading_at_the_period_a_rule_brings_a_reading_forward_again() {
+    let mac = Mac::new("events-look-again");
+    mac.event_level();
+    mac.run();
+    let period: u64 = 10;
+    let every = period.to_string();
+    let args = [
+        "--events-every",
+        &every,
+        "--sample-every",
+        "3600",
+        "--alive-every",
+        "1",
+    ];
+    let mut w = mac.watch_with(&args).started();
+    w.next("alive");
+    let took = read_after(&mut w, || mac.exec(1));
+    assert!(took < LINE_READ_WITHIN, "read after {took:?}");
+    let readings = || mac.rows("SELECT CAST(COUNT(*) AS TEXT) FROM event_count")[0].clone();
+    let early: u64 = readings().parse().unwrap();
+    // The reading at the period, which takes nothing.
+    until_row(
+        &mac,
+        &format!("SELECT 'read' WHERE (SELECT COUNT(*) FROM event_count) > {early}"),
+    );
+    // The next reading at the period is a whole period away.
+    let took = read_after(&mut w, || mac.exec(2));
+    assert!(took < LINE_READ_WITHIN, "read after {took:?}");
+    assert!(w.stop().success());
+}
+
+#[test]
+fn a_log_file_that_appears_is_read_as_soon_as_a_log_file_that_grew() {
+    // The collector starts a new file at the hour and at its size. The line in the new file is
+    // of another rule that raises, so it is read at once while the first rule waits for the
+    // reading at the period.
+    let mac = Mac::new("events-look-turn");
+    mac.event_level();
+    mac.run();
+    let first = "exec-20261004T000013-20261004T000000.jsonl";
+    mac.exec_in(first, 1);
+    let mut w = reading_by_looks(&mac);
+    let grew = read_after(&mut w, || mac.exec_in(first, 2));
+    let next = "exec-20261004T000013-20261004T010000.jsonl";
+    let appeared = read_after(&mut w, || mac.password_search_in(next, 3));
+    assert!(
+        grew < LINE_READ_WITHIN && appeared < LINE_READ_WITHIN,
+        "grew {grew:?}, appeared {appeared:?}"
+    );
+    assert!(w.stop().success());
+}
+
+#[test]
+fn while_the_log_is_quiet_the_watcher_reads_it_once_a_reading_period_and_no_more() {
+    // What reads the reading's rows, as whether the collector fell silent, sees them come as
+    // before there were looks. A line left unfinished, as by a collector stopped while it
+    // wrote, stays as it is and is no news.
+    let mac = Mac::new("events-quiet");
+    mac.event_level();
+    mac.run();
+    // A file read to its end, and the file being written, read to its unfinished line.
+    mac.exec_in("exec-20261004T000013-20261004T000000.jsonl", 1);
+    let name = "exec-20261004T000013-20261004T010000.jsonl";
+    mac.exec_in(name, 2);
+    let log = mac.sys().join(EVENT_LOG).join(name);
+    let mut held = std::fs::OpenOptions::new().append(true).open(log).unwrap();
+    std::io::Write::write_all(&mut held, br#"{"schema_version":1,"seq_num":3"#).unwrap();
+    let period: u64 = 3;
+    let every = period.to_string();
+    let args = [
+        "--events-every",
+        &every,
+        "--sample-every",
+        "3600",
+        "--alive-every",
+        "1",
+    ];
+    let mut w = mac.watch_with(&args).started();
+    // A step for each file, the second at once.
+    for _ in 0..2 {
+        w.until("program_starts", |v| v["starts"] == 1);
+    }
+    let readings = || mac.rows("SELECT CAST(COUNT(*) AS TEXT) FROM event_count")[0].clone();
+    let before: u64 = readings().parse().unwrap();
+    let t = Instant::now();
+    // Nine alive lines, one a second.
+    for _ in 0..9 {
+        w.next("alive");
+    }
+    let after: u64 = readings().parse().unwrap();
+    let periods = t.elapsed().as_secs() / period;
+    assert!(
+        (periods - 1..=periods + 1).contains(&(after - before)),
+        "{} readings in {:?}, {periods} periods",
+        after - before,
+        t.elapsed()
     );
     assert!(w.stop().success());
 }
