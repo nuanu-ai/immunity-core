@@ -1191,6 +1191,28 @@ fn a_folder_that_could_not_be_listed_is_named_with_what_the_system_said_and_leav
 }
 
 #[test]
+fn a_folder_the_walk_could_not_list_carries_the_systems_number_and_a_lockfile_no_file_none() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = Dir::new("errno", &[("web/package-lock.json", NPM)]);
+    let fifo = std::ffi::CString::new(dir.0.join("package-lock.json").to_str().unwrap()).unwrap();
+    // SAFETY: `fifo` is a valid NUL-terminated path.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let web = dir.0.join("web");
+    std::fs::set_permissions(&web, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let texts = read_as_text(&dir.checkout());
+    std::fs::set_permissions(&web, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut errno: Vec<(String, Option<i32>)> = (texts.look.not_read())
+        .map(|u| (u.unit.to_string(), u.errno))
+        .collect();
+    errno.sort();
+    let said = [
+        ("dev/shop/package-lock.json".to_string(), None),
+        ("dev/shop/web".to_string(), Some(libc::EACCES)),
+    ];
+    assert_eq!(errno, said);
+}
+
+#[test]
 fn what_a_reading_did_not_open_is_decided_from_its_lacks_and_never_from_its_words() {
     // The words of a reason are for a person: a clause about a lockfile not opened or a
     // kind with no reader decides nothing, its lack does.

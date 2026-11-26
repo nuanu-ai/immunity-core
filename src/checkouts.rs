@@ -144,9 +144,9 @@ fn through_link(start: &Start, path: &Path) -> Again {
     match guarded::real(path, &homes) {
         guarded::Real::Guarded(g) => Again::Guarded(g),
         guarded::Real::At(real) => match still_there(&real) {
-            Some(true) => Again::Linked,
-            Some(false) => Again::Gone,
-            None => Again::NotTold,
+            Ok(true) => Again::Linked,
+            Ok(false) => Again::Gone,
+            Err(_) => Again::NotTold,
         },
         guarded::Real::Failed(e) if Absent::on_the_way(&e).is_some() => Again::Gone,
         guarded::Real::Failed(_) => Again::NotTold,
@@ -188,8 +188,9 @@ pub struct Checkout {
 /// What a walk found.
 pub struct Walk {
     pub checkouts: Vec<Checkout>,
-    /// Folders that could not be listed, named as checkouts are, each with why.
-    pub unlisted: Vec<(String, String)>,
+    /// Folders that could not be listed, named as checkouts are, each with why and the
+    /// system's error number.
+    pub unlisted: Vec<(String, String, Option<i32>)>,
     /// Folders macOS asks permission for that the walk did not enter (`guarded.rs`).
     pub guarded: Vec<PathBuf>,
     /// Folders on another file system than the walk's root, not gone down into, named as
@@ -215,9 +216,9 @@ impl Walk {
         }
         let path = start.root.join(under);
         match still_there(&path) {
-            Some(true) => {}
-            Some(false) => return Again::Gone,
-            None => return Again::NotTold,
+            Ok(true) => {}
+            Ok(false) => return Again::Gone,
+            Err(_) => return Again::NotTold,
         }
         match std::fs::canonicalize(&path).map(|real| rel(&start.real_home, &real)) {
             Ok(named) if self.checkouts.iter().any(|c| c.rel == named) => Again::Gone,
@@ -254,20 +255,20 @@ pub fn rel(home: &Path, path: &Path) -> String {
 struct Listed {
     descend: Vec<PathBuf>,
     folders: Vec<PathBuf>,
-    missed: Option<String>,
+    missed: Option<std::io::Error>,
 }
 
 /// The folders inside `dir`, or what the system said when the folder could not be listed.
-fn subfolders(dir: &Path, in_home: bool) -> Result<Listed, String> {
+fn subfolders(dir: &Path, in_home: bool) -> std::io::Result<Listed> {
     let mut out = Vec::new();
     let mut folders = Vec::new();
     let mut missed = None;
-    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+    for entry in std::fs::read_dir(dir)? {
         // Symbolic links are not followed: they lead out of the tree or into a loop.
         let (entry, file_type) = match entry.and_then(|e| e.file_type().map(|t| (e, t))) {
             Ok(found) => found,
             Err(e) => {
-                missed.get_or_insert(e.to_string());
+                missed.get_or_insert(e);
                 continue;
             }
         };
@@ -310,7 +311,7 @@ pub fn walk(root: &Path, home: &Path) -> Walk {
     let mut stack = Vec::new();
     match base {
         Some(_) => stack.push((root.to_path_buf(), 0)),
-        None => unlisted.push((rel(home, root), NO_DEVICE.to_string())),
+        None => unlisted.push((rel(home, root), NO_DEVICE.to_string(), None)),
     }
     while let Some((dir, depth)) = stack.pop() {
         let top = dir == home;
@@ -324,16 +325,17 @@ pub fn walk(root: &Path, home: &Path) -> Walk {
         if depth == MAX_DEPTH {
             continue;
         }
+        let said = |e: std::io::Error| (rel(home, &dir), e.to_string(), e.raw_os_error());
         let found = match subfolders(&dir, top) {
             Ok(found) => found,
-            Err(why) => {
-                unlisted.push((rel(home, &dir), why));
+            Err(e) => {
+                unlisted.push(said(e));
                 continue;
             }
         };
         match found.missed {
             None => listed.push(rel(home, &dir)),
-            Some(why) => unlisted.push((rel(home, &dir), why)),
+            Some(e) => unlisted.push(said(e)),
         }
         seen.extend(found.folders.iter().map(|f| rel(home, f)));
         for path in found.descend.into_iter().rev() {
@@ -343,7 +345,7 @@ pub fn walk(root: &Path, home: &Path) -> Walk {
                 continue;
             }
             match device(&path, false) {
-                None => unlisted.push((rel(home, &path), NO_DEVICE.to_string())),
+                None => unlisted.push((rel(home, &path), NO_DEVICE.to_string(), None)),
                 Some(d) if Some(d) != base => mounted.push(rel(home, &path)),
                 Some(_) => stack.push((path, depth + 1)),
             }
@@ -448,7 +450,7 @@ pub mod tests {
         file_systems(vec![(home.join("OrbStack"), None)]);
         let whole = walk(&home, &home);
         assert_eq!(found(&whole), ["dev/api"]);
-        let unlisted = |at: &str| [(at.to_string(), NO_DEVICE.to_string())];
+        let unlisted = |at: &str| [(at.to_string(), NO_DEVICE.to_string(), None)];
         assert_eq!(whole.unlisted, unlisted("OrbStack"));
         assert!(whole.mounted.is_empty());
         // The root's: nothing is walked blind.
@@ -456,6 +458,20 @@ pub mod tests {
         let whole = walk(&home, &home);
         assert!(found(&whole).is_empty());
         assert_eq!(whole.unlisted, unlisted("."));
+    }
+
+    #[test]
+    fn a_folder_the_walk_could_not_list_carries_the_systems_number() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = crate::common::Scratch::new("walk-shut");
+        let shut = base.join("dev/shut");
+        std::fs::create_dir_all(&shut).unwrap();
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let whole = walk(&base, &base);
+        std::fs::set_permissions(&shut, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let why = std::io::Error::from_raw_os_error(libc::EACCES).to_string();
+        let said = [("dev/shut".to_string(), why, Some(libc::EACCES))];
+        assert_eq!(whole.unlisted, said);
     }
 
     #[test]
