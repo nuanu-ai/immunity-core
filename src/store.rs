@@ -13,9 +13,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// The store's format. A store of any other format is refused and left as it is: this build
-/// reads only what a build of format 10 wrote, with every table and column this build reads and
+/// reads only what a build of format 11 wrote, with every table and column this build reads and
 /// text from a source kept cut, in the store's form (see `secrets`).
-pub const FORMAT_VERSION: &str = "10";
+pub const FORMAT_VERSION: &str = "11";
 
 const SCHEMA: &str = "
 CREATE TABLE meta (
@@ -2304,7 +2304,7 @@ mod tests {
                  CREATE TABLE meta (key TEXT, value TEXT NOT NULL);
                  INSERT INTO meta SELECT * FROM old_meta;
                  DROP TABLE old_meta;
-                 INSERT INTO meta VALUES ('format_version', '11');",
+                 INSERT INTO meta VALUES ('format_version', '12');",
                 (Code::UnknownFormat, "does not name exactly one format"),
             ),
             (
@@ -2328,9 +2328,9 @@ mod tests {
         // (`text::error`); a format that is no number is shown as the check words it.
         for (version, code, said, what_to_do) in [
             (
-                "9",
+                "10",
                 Code::OlderFormat,
-                "is from an older format (9)",
+                "is from an older format (10)",
                 START_OVER,
             ),
             (
@@ -2340,9 +2340,9 @@ mod tests {
                 START_OVER,
             ),
             (
-                "11",
+                "12",
                 Code::NewerFormat,
-                "is from a newer format (11)",
+                "is from a newer format (12)",
                 "Use the version of Immunity Core that made it",
             ),
             (
