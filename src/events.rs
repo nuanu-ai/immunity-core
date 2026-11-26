@@ -290,8 +290,10 @@ CREATE TABLE event_file (
     inode  INTEGER NOT NULL,
     offset INTEGER NOT NULL
 );
--- What one reading of a log read, kept for two days.
+-- What one reading of a log read, kept for two days, and from the latest finished full check
+-- on whatever its time.
 CREATE TABLE event_count (
+    journal_seq  INTEGER NOT NULL,  -- the journal's largest seq when the reading was written
     at           INTEGER NOT NULL,
     starts       INTEGER NOT NULL,  -- program starts read
     lost         INTEGER NOT NULL,  -- program starts missing from the numbering
@@ -355,8 +357,9 @@ CREATE TABLE rule_line (
     finding TEXT NOT NULL REFERENCES finding (id),
     PRIMARY KEY (file, inode, offset, rule)
 ) WITHOUT ROWID;
--- What one reading read of file events, kept for two days beside event_count.
+-- What one reading read of file events, kept as event_count is, beside it.
 CREATE TABLE event_file_count (
+    journal_seq  INTEGER NOT NULL,  -- the journal's largest seq when the reading was written
     at           INTEGER NOT NULL,
     files        INTEGER NOT NULL,  -- file events read
     lost         INTEGER NOT NULL,  -- file events missing from the numbering
@@ -2569,11 +2572,14 @@ pub fn read(
                     params![name, *inode as i64, *offset as i64],
                 )?;
             }
+            // Each count carries where the journal stood, so a full check's start orders it
+            // whatever the clock (`Since::Check`).
             let t = &log.tally;
             tx.execute(
-                "INSERT INTO event_count (at, starts, lost, unknown_gaps, unreadable, other,
-                                          removed_cap, removed_unread)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                "INSERT INTO event_count (journal_seq, at, starts, lost, unknown_gaps, unreadable,
+                                          other, removed_cap, removed_unread)
+                 VALUES ((SELECT COALESCE(MAX(seq), 0) FROM journal),
+                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![
                     now,
                     t.starts,
@@ -2587,8 +2593,9 @@ pub fn read(
             )?;
             let f = &log.file_tally;
             tx.execute(
-                "INSERT INTO event_file_count (at, files, lost, unknown_gaps, unreadable)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO event_file_count (journal_seq, at, files, lost, unknown_gaps,
+                                               unreadable)
+                 VALUES ((SELECT COALESCE(MAX(seq), 0) FROM journal), ?1, ?2, ?3, ?4, ?5)",
                 params![now, f.files, f.lost, f.unknown_gaps, f.unreadable],
             )?;
             let seq = |k: usize| log.file_seq[k].map(|s| s as i64);
@@ -2653,8 +2660,15 @@ pub fn read(
             }
         }
     }
-    tx.execute("DELETE FROM event_count WHERE at < ?1", [now - KEEP])?;
-    tx.execute("DELETE FROM event_file_count WHERE at < ?1", [now - KEEP])?;
+    // A count since the latest finished full check stays, so a clock stepped forward never
+    // takes a loss out of `lost_since_check`; with no check finished, two days are kept.
+    let spared = check_seq(tx)?.unwrap_or(i64::MAX);
+    for table in ["event_count", "event_file_count"] {
+        tx.execute(
+            &format!("DELETE FROM {table} WHERE at < ?1 AND journal_seq < ?2"),
+            [now - KEEP, spared],
+        )?;
+    }
     tx.execute(
         "DELETE FROM rule_match WHERE hour < ?1",
         [(now - KEEP_MATCHES) / HOUR],
@@ -4038,8 +4052,9 @@ pub fn level(conn: &Connection, now: i64) -> rusqlite::Result<Option<Level>> {
     let Some(((state, read_at), written, said_by, said, reason, version)) = row else {
         return Ok(None);
     };
-    // The latest full check's own reading counts as since it, and every one after it.
-    let check = crate::status::latest_finished(conn)?.map_or(0, |r| r.started_at);
+    // Every reading written after the latest finished full check began counts as since it, its
+    // own included; every one when none has finished.
+    let check = check_seq(conn)?.unwrap_or(0);
     let (collected, why) = collected(conn)?;
     let files = Files {
         collected,
@@ -4164,31 +4179,39 @@ fn matches_since(conn: &Connection, from: i64) -> rusqlite::Result<BTreeMap<Stri
 enum Since {
     /// Those stamped at or after a time: the last day.
     At(i64),
-    /// Those the store received from a full check's own reading on, which is stamped with the
-    /// check's start, the time given. They are told by the order of the rows, which a clock set
-    /// back cannot rewind: a reading stamped before the check's start that came after it counts.
-    /// The earliest row with that stamp is taken, so one stamped alike earlier only counts more.
-    /// Every row kept when none has it: no full check has finished, it did not read the log, or
-    /// its row was deleted. The rows' order survives `VACUUM`, which copies them in order.
+    /// Those written at or after a journal sequence number, a full check's `run_started`
+    /// (`check_seq`): the check writes it before it reads the log and every write holds the run
+    /// lock, so its own reading and every later one carry a `journal_seq` at or above it and
+    /// every earlier one less, whatever their stamps say.
     Check(i64),
 }
 
 impl Since {
-    /// The condition on the rows of `table`, with its one parameter.
-    fn rows(self, table: &str) -> (String, i64) {
+    /// The condition on the rows, with its one parameter.
+    fn rows(self) -> (&'static str, i64) {
         match self {
-            Since::At(from) => ("at >= ?1".to_string(), from),
-            Since::Check(start) => (
-                format!("rowid >= COALESCE((SELECT MIN(rowid) FROM {table} WHERE at = ?1), 0)"),
-                start,
-            ),
+            Since::At(from) => ("at >= ?1", from),
+            Since::Check(seq) => ("journal_seq >= ?1", seq),
         }
     }
 }
 
+/// The journal sequence number of the `run_started` of the latest finished full check, `None`
+/// when none has finished. One that left no start is 0, so every reading counts as since it.
+fn check_seq(conn: &Connection) -> rusqlite::Result<Option<i64>> {
+    conn.query_row(
+        "SELECT COALESCE((SELECT MIN(s.seq) FROM journal s
+                          WHERE s.entry = 'run_started' AND s.run_id = f.run_id), 0)
+         FROM journal f WHERE f.entry = 'run_finished' ORDER BY f.seq DESC LIMIT 1",
+        [],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
 /// The counts of every reading `since` counts.
 fn tally_since(conn: &Connection, since: Since) -> rusqlite::Result<Tally> {
-    let (rows, at) = since.rows("event_count");
+    let (rows, at) = since.rows();
     conn.query_row(
         &format!(
             "SELECT COALESCE(SUM(starts), 0), COALESCE(SUM(lost), 0),
@@ -4214,7 +4237,7 @@ fn tally_since(conn: &Connection, since: Since) -> rusqlite::Result<Tally> {
 
 /// The counts of file events of every reading `since` counts.
 fn file_tally_since(conn: &Connection, since: Since) -> rusqlite::Result<FileTally> {
-    let (rows, at) = since.rows("event_file_count");
+    let (rows, at) = since.rows();
     conn.query_row(
         &format!(
             "SELECT COALESCE(SUM(files), 0), COALESCE(SUM(lost), 0),
@@ -5582,7 +5605,7 @@ mod tests {
         // No false calm, and no state a person cannot wait out. A loss stands while the store
         // received it from the latest finished full check's own reading on, or at any time when
         // none has finished: a check whose reading came after the loss read again what the
-        // unseen moment could have left. The order of the rows decides, never their stamps, so a
+        // unseen moment could have left. The journal's sequence decides, never the stamps, so a
         // clock set back cannot put a later loss before the check. A check that runs, failed or
         // was killed clears nothing. The day still says the loss: `rules.judged` and the caveats
         // keep their span. A check's own reading is stamped with its start, as a run writes it.
@@ -5599,17 +5622,20 @@ mod tests {
         sql("INSERT INTO event_files (id, collected) VALUES (1, 0)", &[]);
         let restart = |at: i64| {
             sql(
-                "INSERT INTO event_count VALUES (?1, 1, 0, ?2, 0, 0, 0, 0)",
+                "INSERT INTO event_count VALUES ((SELECT COALESCE(MAX(seq), 0) FROM journal),
+                     ?1, 1, 0, ?2, 0, 0, 0, 0)",
                 &[at, 1],
             )
         };
         let read = |at: i64, files_lost: i64| {
             sql(
-                "INSERT INTO event_count VALUES (?1, 1, 0, 0, 0, 0, 0, 0)",
+                "INSERT INTO event_count VALUES ((SELECT COALESCE(MAX(seq), 0) FROM journal),
+                     ?1, 1, 0, 0, 0, 0, 0, 0)",
                 &[at],
             );
             sql(
-                "INSERT INTO event_file_count VALUES (?1, 1, ?2, 0, 0)",
+                "INSERT INTO event_file_count VALUES ((SELECT COALESCE(MAX(seq), 0) FROM journal),
+                     ?1, 1, ?2, 0, 0)",
                 &[at, files_lost],
             );
         };
@@ -5641,11 +5667,9 @@ mod tests {
         read(now - 90 * 60, 0);
         note(now - 90 * 60 + 60, "within", "run_finished");
         assert_eq!(state(), (true, true, 1));
-        // A finished check whose reading came after the restarts clears this Mac's state, one
-        // a watcher read while that check downloaded included; the day's judgement and its
-        // caveat stay.
+        // A finished check begun after the restarts clears this Mac's state; the day's judgement
+        // and its caveat stay.
         note(now - HOUR, "after", "run_started");
-        restart(now - HOUR + 10);
         read(now - HOUR, 0);
         note(now - HOUR + 60, "after", "run_finished");
         assert_eq!(state(), (false, true, 1));
@@ -5673,6 +5697,61 @@ mod tests {
         assert_eq!(state(), (false, true, 1));
         read(now - HOUR + 250, 1);
         assert_eq!(state(), (true, true, 1));
+    }
+
+    #[test]
+    fn a_loss_read_after_a_check_began_counts_since_it_and_one_read_before_does_not_whatever_the_clock()
+     {
+        // No false calm. A reading carries where the journal stood when it was written, so a
+        // loss the store received after the latest finished full check began holds this Mac in
+        // part whatever its stamp: of program starts or of file events, one followed by a
+        // reading a clock set back stamped with the check's start, and one kept past two days by
+        // a clock stepped forward. A loss received before the check is behind it, though a clock
+        // ahead stamped it after the check's start. These checks' own readings of the log failed,
+        // so no reading carries a check's stamp but the one a clock set back gave.
+        let dir = crate::common::Scratch::new("events-since-seq");
+        let root = dir.join("root");
+        std::fs::create_dir_all(root.join(LOG)).unwrap();
+        std::fs::create_dir_all(root.join(PLIST).parent().unwrap()).unwrap();
+        std::fs::write(root.join(PLIST), "<plist/>").unwrap();
+        let collects = r#"["/usr/bin/eslogger","exec","create","rename"]"#;
+        std::fs::write(root.join(COLLECTS), collects).unwrap();
+        let log = root.join(LOG).join("exec-20261004T00.jsonl");
+        let mut conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
+        let start = crate::now_secs();
+        let mut lines = String::new();
+        // Program starts by their numbers, and file events by theirs, negative.
+        let mut read = |conn: &mut Connection, at: i64, seqs: &[i64]| {
+            for &seq in seqs {
+                let line = match seq {
+                    s if s > 0 => exec(s as u64, OBJECT),
+                    s => created(-s as u64, "/Users/example/a"),
+                };
+                lines.push_str(&(line + "\n"));
+            }
+            std::fs::write(&log, &lines).unwrap();
+            let tx = conn.transaction().unwrap();
+            crate::store::put_entity(&tx, "machine:mac").unwrap();
+            read(&tx, "events-1", "machine:mac", &root, at, None).unwrap();
+            tx.commit().unwrap();
+        };
+        let lost = |conn: &Connection| level(conn, start).unwrap().unwrap().lost_since_check();
+        let check = |conn: &Connection, run: &str, at: i64| {
+            crate::store::journal_note(conn, at, run, "run_started", "").unwrap();
+            crate::store::journal_note(conn, at + 60, run, "run_finished", "").unwrap();
+        };
+        read(&mut conn, start + 500, &[1, 3]);
+        check(&conn, "check", start);
+        assert!(!lost(&conn));
+        read(&mut conn, start + 100, &[4, -1, -3]);
+        assert!(lost(&conn));
+        check(&conn, "next", start + 200);
+        assert!(!lost(&conn));
+        read(&mut conn, start + 300, &[6]);
+        read(&mut conn, start + 200, &[7]);
+        assert!(lost(&conn));
+        read(&mut conn, start + 3 * DAY, &[8]);
+        assert!(lost(&conn));
     }
 
     #[test]

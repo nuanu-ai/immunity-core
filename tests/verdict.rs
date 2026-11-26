@@ -4228,7 +4228,8 @@ fn an_open_finding_of_a_rule_this_build_does_not_have_is_counted_shown_read_and_
     // Marked expected, its mark ended after it was found again: open, counted and answered.
     db.execute(
         "UPDATE finding SET state = 'expected', answered_at = ?1, until_at = ?2,
-                            last_seen_at = ?3, reason = 'invented', via = 'command'
+                            last_seen_at = ?3, reason = 'invented', via = 'command',
+                            found_since_answer = 1
          WHERE id = ?4",
         rusqlite::params![t - 50, now() - 1, t, id],
     )
