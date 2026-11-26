@@ -2248,8 +2248,8 @@ fn open(root: &Path) -> Result<Opened, Option<(String, Option<i32>)>> {
     };
     let collects = collects(root, &daemon);
     let dir = root.join(LOG);
-    let (mut files, foreign) = list(&dir)
-        .map_err(|e| Some((format!("the event level's log: {e}"), e.raw_os_error())))?;
+    let (mut files, foreign) =
+        list(&dir).map_err(|e| Some((format!("the event level's log: {e}"), e.raw_os_error())))?;
     for i in 0..files.len() {
         files[i].over = files[i + 1..].iter().any(|g| g.mtime >= files[i].mtime);
     }
