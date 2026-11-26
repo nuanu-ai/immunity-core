@@ -383,7 +383,7 @@ pub fn read(
         let (content, link) = if let Some(read) = theirs {
             let why = if read { ELSEWHERE } else { NOT_THERE };
             t.count(why);
-            (Content::Unread(Cause::NoReader, why.into()), None)
+            (Content::Unread(Cause::NoReader, why.into(), None), None)
         } else {
             let before = previous(tx, &id)?;
             let mut resolve = || guarded::real_to(&on_disk(roots, &unit.path), &homes);
@@ -480,7 +480,7 @@ fn read_target(
                 let into = guarded::leads_into(&g, roots.home);
                 look.met(g);
                 let why = format!("{}{into}", guarded::NOT_LOOKED_INTO);
-                return not(Content::Unread(Cause::NotGiven, why), Some(GUARDED));
+                return not(Content::Unread(Cause::NotGiven, why, None), Some(GUARDED));
             }
             // A link that leads nowhere is that; a name with nothing at it is named so.
             Real::Failed(e) if Absent::on_the_way(&e).is_some() => {
@@ -503,12 +503,12 @@ fn read_target(
         let shown = from_root(roots.system, &real);
         let link = (shown != path).then_some(shown);
         let read = std::fs::metadata(&real)
-            .map_err(|e| Content::Unread(Cause::Failed, e.to_string()))
+            .map_err(|e| Content::Unread(Cause::Failed, e.to_string(), e.raw_os_error()))
             .and_then(|meta| Ok((watched::bytes(&real, &meta, CAP)?, meta)));
         let (bytes, meta) = match read {
             Ok(read) => read,
             Err(content @ Content::Special(_)) => return not(content, Some(NOT_FILE)),
-            Err(content @ Content::Unread(Cause::NoReader, _)) => {
+            Err(content @ Content::Unread(Cause::NoReader, ..)) => {
                 return not(content, Some(watched::OVER_CAP));
             }
             Err(Content::Failed(mut f)) => {
@@ -540,7 +540,7 @@ fn read_target(
         }
     }
     not(
-        Content::Unread(Cause::Failed, MOVED.to_string()),
+        Content::Unread(Cause::Failed, MOVED.to_string(), None),
         Some(FAILED),
     )
 }
@@ -874,7 +874,10 @@ mod tests {
         let why = "Permission denied (os error 13)".to_string();
         // Neither keeps a link, so its row is `none` whatever its cause (`closed::Read::of`).
         for e in &look.entries {
-            assert_eq!(e.content, Content::Unread(Cause::Failed, why.clone()));
+            assert_eq!(
+                e.content,
+                Content::Unread(Cause::Failed, why.clone(), Some(libc::EACCES))
+            );
             assert_eq!(e.link, None);
         }
         let failed = format!("not read in full: {FAILED}: 2; {AT_CHECKS}");
@@ -1061,7 +1064,7 @@ mod tests {
         };
         let program = home.join(crate::closed::real_folder::NOT_THERE);
         let (read, reason) = read_named("in-roots-home", &[&program], None);
-        let limit = Content::Unread(Cause::NotGiven, watched::CLOSED_ON_THE_WAY.into());
+        let limit = Content::Unread(Cause::NotGiven, watched::CLOSED_ON_THE_WAY.into(), None);
         assert_eq!(read, vec![limit]);
         assert_eq!(
             reason,
@@ -1076,7 +1079,7 @@ mod tests {
         };
         let program = home.join(crate::closed::real_folder::NOT_THERE);
         let (read, reason) = read_named("in-roots-home-read", &[&program], Some(&home.join("x")));
-        let failed = Content::Unread(Cause::Failed, watched::CLOSED_ON_THE_WAY.into());
+        let failed = Content::Unread(Cause::Failed, watched::CLOSED_ON_THE_WAY.into(), None);
         assert_eq!(read, vec![failed]);
         assert_eq!(
             reason,
@@ -1095,7 +1098,11 @@ mod tests {
         std::os::unix::fs::symlink(home.join(crate::closed::real_folder::NOT_THERE), &link)
             .unwrap();
         let (read, _) = read_named("through-own-link-store", &[&link], None);
-        let failed = Content::Unread(Cause::Failed, "Permission denied (os error 13)".into());
+        let failed = Content::Unread(
+            Cause::Failed,
+            "Permission denied (os error 13)".into(),
+            Some(libc::EACCES),
+        );
         assert_eq!(read, vec![failed]);
     }
 
@@ -1207,7 +1214,10 @@ mod tests {
             Real::At(program.clone())
         };
         let (content, _) = read_at(&dir, &mut always, &Signature::default());
-        assert_eq!(content, Content::Unread(Cause::Failed, MOVED.to_string()));
+        assert_eq!(
+            content,
+            Content::Unread(Cause::Failed, MOVED.to_string(), None)
+        );
     }
 
     #[test]

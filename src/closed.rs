@@ -168,6 +168,13 @@ impl Failure {
             }
     }
 
+    /// The system's error number where `why` gives what the system said; none for another
+    /// account's closed file, whose reason is the core's and which is not the person's to fix
+    /// (`covered::not_permitted`).
+    pub fn errno(&self) -> Option<i32> {
+        self.errno.filter(|_| !self.closed())
+    }
+
     /// Why it was not read: a fixed reason for another account's closed file, which is not the
     /// person's to fix (`covered::not_permitted`), else what the system said.
     pub fn why(&self) -> String {
@@ -303,7 +310,7 @@ pub fn settle(
             _ => Vec::new(),
         };
         let cause = cause(f, &names, &folders, &read);
-        e.content = Content::Unread(cause, f.why());
+        e.content = Content::Unread(cause, f.why(), f.errno());
         out.push(cause);
     }
     Ok(out)
@@ -462,7 +469,7 @@ mod tests {
         let decided = h.decided("mac", MET, refused(libc::EACCES, file(0), real), &[]);
         assert_eq!(
             decided,
-            Content::Unread(Cause::NotGiven, CLOSED.to_string())
+            Content::Unread(Cause::NotGiven, CLOSED.to_string(), None)
         );
         // The stored form is the one `covered` lists under `other-accounts-files`.
         let not_given = |c| (c, Some(CLOSED), Gap::of(Cause::NotGiven));
@@ -508,7 +515,7 @@ mod tests {
             h.content(machine, read, "run-1", how, link);
             let refusal = refused(libc::EACCES, file(0), real.clone());
             let decided = h.decided(machine, MET, refusal, &[]);
-            let failed = Content::Unread(Cause::Failed, CLOSED.to_string());
+            let failed = Content::Unread(Cause::Failed, CLOSED.to_string(), None);
             assert_eq!(decided, failed, "{machine}");
         }
     }
@@ -523,7 +530,7 @@ mod tests {
         let mut pass = Look::default();
         pass.entries
             .push(entry(MET, Content::Hash("sha256:00".into()), None));
-        let failed = Content::Unread(Cause::Failed, CLOSED.to_string());
+        let failed = Content::Unread(Cause::Failed, CLOSED.to_string(), None);
         for (machine, others) in [("stored", vec![]), ("in-the-pass", vec![&pass])] {
             let refusal = refused(libc::EACCES, file(0), real.clone());
             assert_eq!(
@@ -547,7 +554,7 @@ mod tests {
             let why = "Operation not permitted (os error 1)";
             assert_eq!(
                 decided,
-                Content::Unread(Cause::Failed, why.into()),
+                Content::Unread(Cause::Failed, why.into(), Some(libc::EPERM)),
                 "{said}"
             );
         }
@@ -560,7 +567,10 @@ mod tests {
         let own = By::Folder(folder(h.system.join("Library/Example"), 501));
         for by in [file(501), own] {
             let decided = h.decided("mac", MET, refused(libc::EACCES, by, real.clone()), &[]);
-            assert_eq!(decided, Content::Unread(Cause::Failed, DENIED.into()));
+            assert_eq!(
+                decided,
+                Content::Unread(Cause::Failed, DENIED.into(), Some(libc::EACCES))
+            );
         }
     }
 
@@ -569,7 +579,10 @@ mod tests {
         let h = here("closed-untold");
         let real = h.system.join("opt/closed/helper");
         let decided = h.decided("mac", MET, refused(libc::EACCES, By::Untold, real), &[]);
-        assert_eq!(decided, Content::Unread(Cause::Failed, DENIED.into()));
+        assert_eq!(
+            decided,
+            Content::Unread(Cause::Failed, DENIED.into(), Some(libc::EACCES))
+        );
     }
 
     const BEHIND: &str = "/opt/closed/helper";
@@ -587,7 +600,7 @@ mod tests {
         let failed = refused(libc::EACCES, shut, h.system.join(BEHIND));
         let decided = h.decided("mac", BEHIND, failed, &[]);
         let why = CLOSED_ON_THE_WAY.to_string();
-        assert_eq!(decided, Content::Unread(Cause::NotGiven, why));
+        assert_eq!(decided, Content::Unread(Cause::NotGiven, why, None));
         // Stored with the second reason, and listed under `other-accounts-files`.
         let not_given = |c| (c, Some(CLOSED_ON_THE_WAY), Gap::of(Cause::NotGiven));
         assert_eq!(
@@ -607,6 +620,7 @@ mod tests {
             cause: Some(Cause::NotGiven.literal().to_string()),
             at: 1,
             last_full: None,
+            ..Default::default()
         };
         let latest = [latest];
         let p = crate::status::problems(&h.conn, &latest).unwrap();
@@ -634,7 +648,7 @@ mod tests {
             ("relative", "/opt/x", Some("closed/other")),
             ("itself", BEHIND, None),
         ];
-        let failed = Content::Unread(Cause::Failed, CLOSED_ON_THE_WAY.to_string());
+        let failed = Content::Unread(Cause::Failed, CLOSED_ON_THE_WAY.to_string(), None);
         for (machine, read, link) in cases {
             let how = if machine == "partial" {
                 "partial"
@@ -675,7 +689,10 @@ mod tests {
         };
         let refusal = refused(libc::EACCES, By::Folder(via), h.system.join(BEHIND));
         let decided = h.decided("mac", BEHIND, refusal, &[]);
-        assert_eq!(decided, Content::Unread(Cause::Failed, DENIED.into()));
+        assert_eq!(
+            decided,
+            Content::Unread(Cause::Failed, DENIED.into(), Some(libc::EACCES))
+        );
         // The walk says so of a folder of this account's on the way, and of a link of its
         // own; a path that lies in objects of root's, as macOS's own `/etc` to
         // `/private/etc`, passes nothing of this account's, its link included.
@@ -717,7 +734,7 @@ mod tests {
             let decided = h.decided("mac", BEHIND, refusal, &[]);
             assert_eq!(
                 decided,
-                Content::Unread(Cause::Failed, DENIED.into()),
+                Content::Unread(Cause::Failed, DENIED.into(), Some(libc::EACCES)),
                 "{said}"
             );
         }
@@ -783,7 +800,7 @@ mod tests {
             let decided = h.decided("mac", MET, refused(libc::EACCES, by, real.clone()), &[]);
             assert_eq!(
                 decided,
-                Content::Unread(Cause::Failed, DENIED.into()),
+                Content::Unread(Cause::Failed, DENIED.into(), Some(libc::EACCES)),
                 "{said}"
             );
         }
@@ -808,11 +825,11 @@ mod tests {
         // `partial`, read the link, and counts as a reading that read the name.
         let h = here("closed-own-row");
         let real = h.system.join("opt/example/helper.plist");
-        let limit = Content::Unread(Cause::NotGiven, CLOSED.into());
+        let limit = Content::Unread(Cause::NotGiven, CLOSED.into(), None);
         let row = watched::content_coverage(&limit, true);
         h.row("mac", MET, "run-1", row, Some("/opt/example/helper.plist"));
         let decided = h.decided("mac", MET, refused(libc::EACCES, file(0), real), &[]);
-        assert_eq!(decided, Content::Unread(Cause::Failed, CLOSED.into()));
+        assert_eq!(decided, Content::Unread(Cause::Failed, CLOSED.into(), None));
     }
 
     /// A folder of this account's own, closed to it, in `dir`, with a file inside, made real.

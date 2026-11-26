@@ -215,6 +215,11 @@ mod tests {
         let (completeness, reason, gap) = match not {
             None => ("full", None, Gap::default()),
             Some((why, Cause::NotGiven)) => ("partial", Some(why), Gap::of(Cause::NotGiven)),
+            // What the system said, with its number, as a reader writes it.
+            Some((why, Cause::Failed)) => {
+                let errno = (why == DENIED).then_some(libc::EACCES);
+                ("none", Some(why), Gap::failed(errno))
+            }
             Some((why, cause)) => ("none", Some(why), Gap::of(cause)),
         };
         crate::store::put_coverage(&tx, &r, completeness, reason, &gap).unwrap();

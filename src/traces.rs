@@ -21,9 +21,10 @@ pub fn source(home: &Path, rel: &str, absent: &'static str) -> Result<PathBuf, B
         crate::guarded::Real::Failed(e) if e.kind() == std::io::ErrorKind::NotFound => {
             Err(Box::new(Found::Absent(absent)))
         }
-        crate::guarded::Real::Failed(e) => {
-            Err(Box::new(Found::Failed(format!("cannot read ~/{rel}: {e}"))))
-        }
+        crate::guarded::Real::Failed(e) => Err(Box::new(Found::Failed(
+            format!("cannot read ~/{rel}: {e}"),
+            e.raw_os_error(),
+        ))),
     }
 }
 
@@ -64,8 +65,9 @@ pub enum Found {
     /// The source is not on this machine: nothing to read, which is not a failure.
     Absent(&'static str),
     Read(Seen),
-    /// The source is here and could not be read, with the reason.
-    Failed(String),
+    /// The source is here and could not be read, with the reason and the system's error number
+    /// when it gave one.
+    Failed(String, Option<i32>),
     /// The source is here and says it is not connected, in the program's fixed words for its
     /// state: not a failure, and not a reading that found nothing.
     Off(String),

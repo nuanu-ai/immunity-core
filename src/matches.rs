@@ -1319,6 +1319,7 @@ mod tests {
             cause: None,
             at: 1,
             last_full: Some(1),
+            ..Default::default()
         };
         let this = Some("machine:mac");
         // Each row as (scope, completeness, at).

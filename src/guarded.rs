@@ -16,6 +16,8 @@
 //! A volume is anything under `/Volumes`: removable and network volumes are mounted there.
 //! Nothing there is looked at to tell them apart, since looking could itself ask.
 
+use crate::baseline::Unit;
+use crate::store::{Cause, Gap, NotRead};
 use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::path::{Component, Components, Path, PathBuf};
@@ -23,8 +25,27 @@ use std::path::{Component, Components, Path, PathBuf};
 /// The coverage kind of what the readers did not look into.
 pub const KIND: &str = "folders macOS asks permission for";
 
-/// How the reason of that reading begins; the folders follow, as `shown` gives them.
+/// How the reason of that reading begins; the folders follow, as `shown` gives them, for a
+/// person. Each is also a row of what the reading did not read (`gap`).
 pub const NOT_LOOKED_INTO: &str = "not looked into: ";
+
+/// The word of `unread_how` for what was not looked into because macOS asks permission for it.
+pub const HOW: &str = "guarded";
+
+/// The gap of a reading that did not look into `folders` because macOS asks permission for
+/// them: not given, with a row for each folder, its path as ids name it under `home`. What is
+/// decided of those folders is decided from these rows (`covered.rs`, `known.rs`), so that a
+/// name from the Mac holding a comma is one folder.
+pub fn gap(folders: &[PathBuf], home: &Path) -> Gap {
+    let row = |g: &PathBuf| {
+        let unit = Unit::whole(crate::checkouts::rel(home, g));
+        NotRead::said(Some(unit), Cause::NotGiven, HOW)
+    };
+    Gap {
+        not_read: folders.iter().map(row).collect(),
+        ..Gap::of(Cause::NotGiven)
+    }
+}
 
 /// The guarded folders in the home folder, relative to it.
 pub const IN_HOME: [&str; 7] = [

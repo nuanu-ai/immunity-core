@@ -60,7 +60,7 @@ pub fn read(home: &Path) -> Found {
         Err(Refused::Look(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             return Found::Absent(NOT_PRESENT);
         }
-        Err(e) => return Found::Failed(format!("cannot read ~/.ssh/config: {e}")),
+        Err(e) => return Found::Failed(format!("cannot read ~/.ssh/config: {e}"), e.errno()),
     };
     let real_home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
     let mut p = Parser {
@@ -874,7 +874,35 @@ mod tests {
                 let h = home.to_path_buf();
                 let found = crate::open::tests::within(move || read(&h));
                 let found = found.expect("the reading waited");
-                assert!(matches!(found, Found::Failed(_)), "{rel} {which}");
+                assert!(matches!(found, Found::Failed(..)), "{rel} {which}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_ssh_file_closed_by_its_permissions_fails_with_the_system_s_number() {
+        // The person can open what their own permissions keep closed: the number is what tells
+        // it from another failure (`covered::not_permitted`), a closed file or a closed folder.
+        use std::os::unix::fs::PermissionsExt;
+        type Reader = fn(&Path) -> Found;
+        let readers: [(&str, Reader); 2] = [
+            (".ssh/config", read),
+            (".ssh/known_hosts", crate::known_hosts::read),
+        ];
+        let mode = |p: &Path, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m));
+        for (rel, read) in readers {
+            for closed in [rel, ".ssh"] {
+                let home = crate::common::Scratch::new("ssh-closed");
+                std::fs::create_dir(home.join(".ssh")).unwrap();
+                std::fs::write(home.join(rel), "Host example\n").unwrap();
+                mode(&home.join(closed), 0o000).unwrap();
+                let found = read(&home);
+                mode(&home.join(closed), 0o700).unwrap();
+                let errno = match found {
+                    Found::Failed(_, errno) => errno,
+                    _ => None,
+                };
+                assert_eq!(errno, Some(libc::EACCES), "{rel} {closed}");
             }
         }
     }

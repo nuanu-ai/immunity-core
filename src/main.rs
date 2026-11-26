@@ -1810,7 +1810,7 @@ fn survey(args: &ServersArgs) -> Result<Survey, Box<dyn Error>> {
     for (reader, kind, basis, found) in &traces {
         match found {
             traces::Found::Absent(note) => said.push(format!("{kind}: nothing to read, {note}")),
-            traces::Found::Failed(reason) => said.push(trace_failed(kind, reason)),
+            traces::Found::Failed(reason, _) => said.push(trace_failed(kind, reason)),
             traces::Found::Off(why) => said.push(format!("{kind}: not read, {why}")),
             traces::Found::Guarded(folder) => said.push(format!(
                 "{kind}: not read, it leads into {}, which macOS asks permission for",
@@ -2824,9 +2824,9 @@ fn read_brew(run: &mut Run, args: &Args) -> Result<(), Box<dyn Error>> {
                     .push("Homebrew is not installed, nothing to read.".to_string());
             }
         }
-        brew::Found::Failed(reason) => {
+        brew::Found::Failed(reason, errno) => {
             run.readers += 1;
-            let gap = Gap::of(Cause::Failed);
+            let gap = Gap::failed(errno);
             run.apply(&reading, brew::BASIS, "none", Some(&reason), &gap, &[])?;
             run.notes.push(not_read_note("Homebrew", &reason));
         }
@@ -2862,8 +2862,14 @@ fn tool_not_found(
         return Ok(false);
     }
     let reason = format!("{name}{}{}", tools::READ_BEFORE, places.join(", "));
-    let gap = Gap::of(Cause::NotGiven);
-    run.apply(reading, basis, "none", Some(&reason), &gap, &[])?;
+    run.apply(
+        reading,
+        basis,
+        "none",
+        Some(&reason),
+        &tools::lost(places),
+        &[],
+    )?;
     // The places are names of places, never cut: written as the contract writes a name, so no
     // backslash in one reads as a mark in the run's line (`known::whole`).
     let shown: Vec<String> = places.iter().map(|p| known::whole(p)).collect();
@@ -3161,7 +3167,8 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
         look.not_looked_at(Unit::whole(folder), *errno, why.clone());
     }
     if args.checkouts_root.is_some() {
-        look.short(Cause::NotGiven, checkouts::ONLY_GIVEN.to_string());
+        let given = checkouts::ONLY_GIVEN.to_string();
+        look.short_as(Cause::NotGiven, checkouts::GIVEN, given);
     }
     if !walk.mounted.is_empty() {
         let why = format!(
@@ -3471,14 +3478,8 @@ fn not_looked_into(
     }
     let shown: Vec<String> = folders.iter().map(|g| guarded::shown(g, home)).collect();
     let reason = format!("{}{}", guarded::NOT_LOOKED_INTO, shown.join(", "));
-    run.apply(
-        &reading,
-        "observed",
-        "none",
-        Some(&reason),
-        &Gap::of(Cause::NotGiven),
-        &[],
-    )
+    let gap = guarded::gap(folders, home);
+    run.apply(&reading, "observed", "none", Some(&reason), &gap, &[])
 }
 
 /// The three local traces of servers, each its own reading of this machine.
@@ -3550,9 +3551,9 @@ fn read_traces(run: &mut Run, args: &Args) -> Result<(), Box<dyn Error>> {
                     &statements,
                 )?;
             }
-            traces::Found::Failed(reason) => {
+            traces::Found::Failed(reason, errno) => {
                 run.readers += 1;
-                let gap = Gap::of(Cause::Failed);
+                let gap = Gap::failed(errno);
                 run.apply(&reading, basis, "none", Some(&reason), &gap, &[])?;
                 run.notes
                     .push(not_read_note(&format!("The {kind}"), &reason));
@@ -3572,7 +3573,7 @@ fn read_traces(run: &mut Run, args: &Args) -> Result<(), Box<dyn Error>> {
                     guarded::NOT_LOOKED_INTO,
                     guarded::shown(&folder, &args.home)
                 );
-                let gap = Gap::of(Cause::NotGiven);
+                let gap = guarded::gap(std::slice::from_ref(&folder), &args.home);
                 run.apply(&reading, basis, "none", Some(&reason), &gap, &[])?;
                 not_looked_into(run, reader, &[folder], &args.home)?;
                 continue;
@@ -4128,7 +4129,7 @@ fn read_watched(
         let mut mine = Vec::new();
         for e in &p.look.entries {
             let content = match &e.content {
-                watched::Content::Unread(_, why) => format!("not read: {why}"),
+                watched::Content::Unread(_, why, _) => format!("not read: {why}"),
                 other => other.literal().unwrap_or_default(),
             };
             let link = e.link.as_deref().unwrap_or_default();
@@ -4802,7 +4803,7 @@ fn read_managers(run: &mut Run, args: &Args) -> rusqlite::Result<Vec<PathBuf>> {
             .map(|g| guarded::shown(g, &args.home))
             .collect();
         let reason = format!("{}{}", guarded::NOT_LOOKED_INTO, shown.join(", "));
-        let gap = Gap::of(Cause::NotGiven);
+        let gap = guarded::gap(&found.guarded, &args.home);
         run.apply(&reading, integrity::BASIS, "none", Some(&reason), &gap, &[])?;
     } else {
         run.apply(

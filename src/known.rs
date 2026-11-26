@@ -284,6 +284,7 @@ pub fn known_of(
         Some(id) => type_of(conn, id)?.map(|ty| (id, ty)),
         None => None,
     };
+    let latest = latest(conn)?;
     // The thing under each of its ids, and its parts, by id: whose facts are given and whose
     // readings speak. Findings are those about these, and about anything ever inside the thing.
     let mut subjects: BTreeMap<String, String> = BTreeMap::new();
@@ -304,7 +305,7 @@ pub fn known_of(
             all.extend(in_folder);
         }
         own_ids.extend(own.keys().cloned());
-        let (presence, readings) = presence(conn, own.keys(), with_parts)?;
+        let (presence, readings) = presence(conn, own.keys(), with_parts, &latest, q.found_by)?;
         known.presence = presence as i32;
         owners = readings;
         known.thing = Some(entity(id, ty));
@@ -324,7 +325,7 @@ pub fn known_of(
         .map(|(_, rel)| rel)
         .or(q.place)
         .and_then(|rel| guarded_folder(rel, home));
-    known.coverage = latest(conn)?
+    known.coverage = latest
         .into_iter()
         .filter(|r| {
             let this = Some(r.scope.as_str()) == q.machine;
@@ -389,7 +390,10 @@ type ReadingKey = (String, String, String);
 /// reading full: after a partial reading, what it did not read again is kept as it was, so a
 /// unit no longer held may only not have been read. Then the thing is `unknown`. A held thing
 /// whose owning reading was partial is held, and that reading comes with the answer, so it reads
-/// as not read now. A thing the store has no entity of is `unknown`. So is a unit an owning
+/// as not read now. A thing the store has no entity of is `unknown`. So is a thing whose place a
+/// row of what a latest reading on its Mac did not read hides (`store::Unread::hides`), by one of
+/// its owners' readers or by one of `found_by`, their readings of folders macOS asks permission
+/// for among them: it may be there, not looked at. So is a unit an owning
 /// reading's latest retraction of it, in the order of runs, set aside with a journal entry
 /// `retired` without looking at it (`lifecycle::retire`, `look::retire_facts`): that says nothing
 /// of whether it is there, whatever the latest reading of its kind was.
@@ -397,7 +401,10 @@ fn presence<'a>(
     conn: &Connection,
     units: impl Iterator<Item = &'a String>,
     with_parts: bool,
+    latest: &[Reading],
+    found_by: &[(&str, &str)],
 ) -> rusqlite::Result<(v1::Presence, BTreeSet<ReadingKey>)> {
+    let units: Vec<&String> = units.collect();
     let mut held = with_parts;
     let mut owners: BTreeSet<ReadingKey> = BTreeSet::new();
     let mut live = conn
@@ -419,7 +426,7 @@ fn presence<'a>(
          LIMIT 1",
     )?;
     let mut aside = false;
-    for unit in units {
+    for &unit in &units {
         held = held || live.query_row([unit], |r| r.get::<_, bool>(0))?;
         for row in owning.query_map([unit], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))? {
             let (reader, scope, kind): ReadingKey = row?;
@@ -432,13 +439,29 @@ fn presence<'a>(
     if held {
         return Ok((v1::Presence::Held, owners));
     }
-    let mut latest = conn.prepare(
+    let mut last = conn.prepare(
         "SELECT completeness FROM coverage WHERE reader = ?1 AND scope = ?2 AND kind = ?3
          ORDER BY id DESC LIMIT 1",
     )?;
-    let mut all_full = !owners.is_empty() && !aside;
+    // A row with no unit hides no place: only a reading not full, which an owner's says below.
+    let readers: BTreeSet<&str> = (owners.iter().map(|(reader, ..)| reader.as_str()))
+        .chain(found_by.iter().map(|(reader, _)| *reader))
+        .collect();
+    let hidden = units
+        .iter()
+        .filter_map(|u| place_of(u))
+        .any(|(machine, path)| {
+            latest.iter().any(|r| {
+                let on_its_mac =
+                    r.scope == machine || place_of(&r.scope).is_some_and(|(m, _)| m == machine);
+                on_its_mac
+                    && readers.contains(r.reader.as_str())
+                    && r.unread.iter().any(|u| u.hides(path))
+            })
+        });
+    let mut all_full = !owners.is_empty() && !aside && !hidden;
     for (reader, scope, kind) in &owners {
-        let completeness: Option<String> = latest
+        let completeness: Option<String> = last
             .query_row([reader, scope, kind], |r| r.get(0))
             .optional()?;
         all_full = all_full && completeness.as_deref() == Some("full");
@@ -659,20 +682,17 @@ pub fn place_of(id: &str) -> Option<(&str, &str)> {
         .and_then(|rest| rest.split_once('/'))
 }
 
-/// The folder macOS asks permission for that holds a path as ids name it, as the readers name
-/// it in their reasons, such as `~/Documents`.
+/// The folder macOS asks permission for that holds a path as ids name it, by its path as ids
+/// name it, as the readers' rows name it (`guarded::gap`), such as `Documents`.
 fn guarded_folder(rel: &str, home: &Path) -> Option<String> {
     // A full path, outside the home folder, replaces it in the join.
-    guarded::folder_of(&home.join(rel), home).map(|g| guarded::shown(&g, home))
+    guarded::folder_of(&home.join(rel), home).map(|g| checkouts::rel(home, &g))
 }
 
-/// Whether a reading says that it did not look into `folder`, as the reading of folders macOS asks
-/// permission for words it.
+/// Whether a reading did not look into `folder` because macOS asks permission for it: a row of
+/// it names that folder whole.
 fn not_looked_into(r: &Reading, folder: &str) -> bool {
-    r.reason
-        .as_deref()
-        .and_then(|s| s.strip_prefix(guarded::NOT_LOOKED_INTO))
-        .is_some_and(|named| named.split(", ").any(|f| f == folder))
+    (r.unread.iter()).any(|u| u.how == guarded::HOW && u.path.as_deref() == Some(folder))
 }
 
 /// The facts in force about these subjects, each with the assertions it rests on.
@@ -747,29 +767,41 @@ struct Reading {
     reason: Option<String>,
     cause: Option<String>,
     at: i64,
+    /// What it did not read (`store::unread_of`); none on a full reading.
+    unread: Vec<store::Unread>,
 }
 
-/// The latest reading of every reader, scope and kind.
+/// The latest reading of every reader, scope and kind, with what each did not read.
 fn latest(conn: &Connection) -> rusqlite::Result<Vec<Reading>> {
-    conn.prepare(&format!(
-        "{latest}
+    let mut latest: Vec<Reading> = conn
+        .prepare(&format!(
+            "{latest}
          SELECT id, reader, scope, kind, completeness, reason, cause, observed_at FROM latest
          ORDER BY scope, reader, kind",
-        latest = store::LATEST
-    ))?
-    .query_map([], |r| {
-        Ok(Reading {
-            id: r.get(0)?,
-            reader: r.get(1)?,
-            scope: r.get(2)?,
-            kind: r.get(3)?,
-            completeness: r.get(4)?,
-            reason: r.get(5)?,
-            cause: r.get(6)?,
-            at: r.get(7)?,
-        })
-    })?
-    .collect()
+            latest = store::LATEST
+        ))?
+        .query_map([], |r| {
+            Ok(Reading {
+                id: r.get(0)?,
+                reader: r.get(1)?,
+                scope: r.get(2)?,
+                kind: r.get(3)?,
+                completeness: r.get(4)?,
+                reason: r.get(5)?,
+                cause: r.get(6)?,
+                at: r.get(7)?,
+                unread: Vec::new(),
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut not_full: Vec<&mut Reading> = (latest.iter_mut())
+        .filter(|r| r.completeness != "full")
+        .collect();
+    let ids: Vec<i64> = not_full.iter().map(|r| r.id).collect();
+    for (r, rows) in not_full.iter_mut().zip(store::unread_of(conn, &ids)?) {
+        r.unread = rows;
+    }
+    Ok(latest)
 }
 
 /// A reading as the contract gives it, with what it names as having no reader. A reading that
@@ -833,6 +865,8 @@ pub fn finding_ref(i: &findings::Item) -> v1::FindingRef {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn a_thing_is_inside_another_only_when_its_id_names_that_whole_id_as_where_it_is() {
         // What lies on a machine, or in a project, at any depth, is its; what lies on another
@@ -910,7 +944,7 @@ mod tests {
         };
         let presence = |thing: &str| {
             let unit = format!("file:machine:mac/{thing}");
-            super::presence(&conn, std::iter::once(&unit), false)
+            super::presence(&conn, std::iter::once(&unit), false, &[], &[])
                 .unwrap()
                 .0
         };
@@ -985,5 +1019,93 @@ mod tests {
         assert_eq!(presence("d"), Gone);
         drop(conn);
         std::fs::remove_file(&path).unwrap();
+    }
+
+    /// A store with the Mac `machine:mac` and, by the reader of checkouts, its reading of the
+    /// folders macOS asks permission for that it did not look into, `folders`, as it writes it.
+    fn not_looked_into(tag: &str, folders: &[&str]) -> (crate::common::Scratch, Connection) {
+        let dir = crate::common::Scratch::new(tag);
+        let mut conn = store::open_or_make(&dir.join("store.db")).unwrap();
+        let tx = conn.transaction().unwrap();
+        store::put_entity(&tx, "machine:mac").unwrap();
+        let home = Path::new("/Users/example");
+        let folders: Vec<PathBuf> = folders.iter().map(|f| home.join(f)).collect();
+        let shown: Vec<String> = folders.iter().map(|g| guarded::shown(g, home)).collect();
+        let reason = format!("{}{}", guarded::NOT_LOOKED_INTO, shown.join(", "));
+        let r = store::Reading {
+            reader: checkouts::READER,
+            scope: "machine:mac",
+            kind: guarded::KIND,
+            run_id: "run-1",
+            at: 1,
+            observed_at: 1,
+        };
+        let gap = guarded::gap(&folders, home);
+        store::put_coverage(&tx, &r, "none", Some(&reason), &gap).unwrap();
+        tx.commit().unwrap();
+        (dir, conn)
+    }
+
+    #[test]
+    fn a_disk_whose_name_holds_a_comma_speaks_whole_for_a_place_on_it() {
+        // No false calm. An answer about a place on a disk the readers did not look into comes
+        // with the reading that says so, whatever the disk is named.
+        let (_dir, conn) = not_looked_into("known-disk", &["/Volumes/Backup, old"]);
+        let home = Path::new("/Users/example");
+        let place = "/Volumes/Backup, old/dev/shop";
+        let q = Question {
+            question: v1::Question::Project,
+            asked: place,
+            id: None,
+            also: &[],
+            folder: None,
+            place: Some(place),
+            places: &[],
+            unread: None,
+            machine: Some("machine:mac"),
+            found_by: &[],
+            inside: &[],
+        };
+        let known = known_of(&conn, &q, home, 1).unwrap();
+        let kinds: Vec<&str> = known.coverage.iter().map(|c| c.kind.as_str()).collect();
+        assert_eq!(kinds, [guarded::KIND]);
+    }
+
+    #[test]
+    fn a_thing_in_a_folder_a_latest_reading_on_its_mac_did_not_look_into_is_never_gone() {
+        // No false calm. A project the walk found and found no longer, in a folder that a later
+        // reading of the walk's reader did not look into, may be there: unknown, never gone,
+        // whatever the walk's own reading says. A row with no unit, as of a folder on another
+        // file system, names no place and hides none: its reading is not full, which says it.
+        let (_dir, conn) = not_looked_into("known-hidden", &["Documents"]);
+        let shop = "checkout:machine:mac/Documents/shop";
+        conn.execute_batch(&format!(
+            "INSERT INTO entity (id, type) VALUES ('{shop}', 'checkout');
+             INSERT INTO assertion (layer, subject, predicate, object, reader, scope, kind,
+                 source_ref, basis, observed_at, run_id, retracted_at, retracted_by)
+             VALUES ('retracted', '{shop}', 'located_on', 'machine:mac', '{reader}',
+                     'machine:mac', '{kind}', 'raw', 'observed', 0, 'run-0', 1, 'run-1');
+             INSERT INTO coverage (reader, run_id, observed_at, scope, kind, completeness)
+             VALUES ('{reader}', 'run-1', 1, 'machine:mac', '{kind}', 'full');",
+            reader = checkouts::READER,
+            kind = checkouts::KIND,
+        ))
+        .unwrap();
+        let presence = |found_by: &[(&str, &str)]| {
+            let latest = super::latest(&conn).unwrap();
+            let unit = shop.to_string();
+            (super::presence(&conn, std::iter::once(&unit), false, &latest, found_by))
+                .unwrap()
+                .0
+        };
+        assert_eq!(presence(&[]), v1::Presence::Unknown);
+        assert_eq!(presence(&crate::project::FOUND_BY), v1::Presence::Unknown);
+        // Elsewhere, the folder hides nothing of it.
+        conn.execute(
+            "UPDATE coverage_unread SET path = 'Desktop' WHERE path = 'Documents'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(presence(&[]), v1::Presence::Gone);
     }
 }

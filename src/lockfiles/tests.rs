@@ -8,8 +8,18 @@ fn file_name(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 use crate::baseline::Unit;
-use crate::store::Cause;
+use crate::store::{Cause, Unread};
 use std::path::PathBuf;
+
+/// The rows a reading writes of what it did not read, as they are read back.
+pub(super) fn rows(o: &super::Outcome) -> Vec<Unread> {
+    o.gap.not_read.iter().map(Unread::of).collect()
+}
+
+/// The names of what a reading names it has no reader for.
+pub(super) fn names(o: &super::Outcome) -> Vec<Option<String>> {
+    o.gap.lacks.iter().map(|l| l.name.clone()).collect()
+}
 
 /// A `package-lock.json` of version 3 as npm 10 writes it, with every source an entry can
 /// come from. Names and addresses other than the public registry's are invented.
@@ -431,8 +441,7 @@ fn a_lockfile_of_a_kind_with_no_reader_is_never_opened_and_is_listed_with_its_si
     let size = text.len() as u64;
     assert!(o.lockfiles.contains(&(format!("dev/shop/{file}"), size)));
     assert_eq!(unknown_for(&o), [true, false]);
-    let names: Vec<Option<String>> = o.gap.lacks.iter().map(|l| l.name.clone()).collect();
-    assert!(!partial_for(&reason, &names, "PyPI"));
+    assert!(!partial_for(&rows(&o), &names(&o), "PyPI"));
     assert_eq!(texts.opened, ["Cargo.lock"]);
     assert!(texts.not_opened.is_empty());
 }
@@ -456,16 +465,16 @@ fn an_entry_not_told_leaves_the_ecosystem_of_its_kind_unknown_and_no_other() {
     assert_eq!(o.gap.cause, Some(Cause::NotGiven));
     assert_eq!(lacks(&o), [format!("{NOT_TOLD} package-lock.json")]);
     assert_eq!(unknown_for(&o), [true, false]);
-    // The lack beside a reason whose only clause decides nothing.
-    let (uv, words) = (
-        [Some("uv.lock".to_string())],
-        "not supported yet: flake.lock",
-    );
-    assert!(partial_for(words, &uv, "PyPI"));
-    assert!(!partial_for(words, &uv, "npm") && !partial_for(words, &uv, "crates.io"));
-    // A reading written before the lack was recorded still leaves npm unknown by its words.
-    let said = one_not_told(at).unwrap();
-    assert!(partial_for(&said, &[], "npm") && !partial_for(&said, &[], "crates.io"));
+    // The lack beside a row with no reader, which decides nothing.
+    let uv = [Some("uv.lock".to_string())];
+    let no_reader = [Unread {
+        path: Some("dev/shop/flake.lock".into()),
+        cause: Cause::NoReader.literal().into(),
+        how: "no_reader".into(),
+        ..Unread::default()
+    }];
+    assert!(partial_for(&no_reader, &uv, "PyPI"));
+    assert!(!partial_for(&no_reader, &uv, "npm") && !partial_for(&no_reader, &uv, "crates.io"));
 }
 
 #[test]
@@ -826,9 +835,7 @@ pub(super) fn lacks(o: &super::Outcome) -> Vec<String> {
 
 /// Whether the reading leaves each of npm and crates.io in part unknown.
 pub(super) fn unknown_for(o: &super::Outcome) -> [bool; 2] {
-    let names: Vec<Option<String>> = o.gap.lacks.iter().map(|l| l.name.clone()).collect();
-    let reason = o.reason.as_deref().unwrap_or_default();
-    ["npm", "crates.io"].map(|e| o.completeness == "partial" && partial_for(reason, &names, e))
+    ["npm", "crates.io"].map(|e| o.completeness == "partial" && partial_for(&rows(o), &names(o), e))
 }
 
 #[test]
@@ -919,12 +926,8 @@ fn a_lockfile_of_an_ecosystem_with_no_reader_is_named_as_a_kind_wherever_it_is()
         assert_eq!(ecosystem_of(kind), eco, "{tag}");
         assert_eq!(o.completeness, "partial", "{tag}");
         assert_eq!(unknown_for(&o), [false, false], "{tag}");
-        let names: Vec<Option<String>> = o.gap.lacks.iter().map(|l| l.name.clone()).collect();
         if let Some(eco) = eco {
-            assert!(
-                partial_for(o.reason.as_deref().unwrap(), &names, eco),
-                "{tag}"
-            );
+            assert!(partial_for(&rows(&o), &names(&o), eco), "{tag}");
         }
     }
 }
@@ -1213,21 +1216,29 @@ fn a_folder_the_walk_could_not_list_carries_the_systems_number_and_a_lockfile_no
 }
 
 #[test]
-fn what_a_reading_did_not_open_is_decided_from_its_lacks_and_never_from_its_words() {
-    // The words of a reason are for a person: a clause about a lockfile not opened or a
-    // kind with no reader decides nothing, its lack does.
-    let said = "not opened: 1 lockfile deeper than 4 folders: a/b/c/d/e/Cargo.lock; \
-                    not supported yet: yarn.lock";
+fn what_a_reading_did_not_open_is_decided_from_its_lacks_and_never_from_its_rows_with_no_reader() {
+    // A lockfile not opened or of a kind with no reader is a row with no reader, which decides
+    // nothing: its lack does.
+    let no_reader = |path: &str| Unread {
+        path: Some(path.into()),
+        cause: Cause::NoReader.literal().into(),
+        how: "no_reader".into(),
+        ..Unread::default()
+    };
+    let rows = [
+        no_reader("dev/shop/a/b/c/d/e/Cargo.lock"),
+        no_reader("dev/shop/yarn.lock"),
+    ];
     for eco in ["npm", "crates.io"] {
-        assert!(!partial_for(said, &[], eco), "{eco}");
+        assert!(!partial_for(&rows, &[], eco), "{eco}");
     }
     let npm = [Some("package-lock.json".to_string())];
-    assert!(partial_for(said, &npm, "npm"));
-    assert!(!partial_for(said, &npm, "crates.io"));
+    assert!(partial_for(&rows, &npm, "npm"));
+    assert!(!partial_for(&rows, &npm, "crates.io"));
     for eco in ["npm", "crates.io"] {
-        assert!(partial_for(said, &[None], eco), "{eco}");
+        assert!(partial_for(&rows, &[None], eco), "{eco}");
         assert!(
-            !partial_for(said, &[Some("flake.lock".to_string())], eco),
+            !partial_for(&rows, &[Some("flake.lock".to_string())], eco),
             "{eco}"
         );
     }

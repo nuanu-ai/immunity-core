@@ -34,7 +34,7 @@ pub fn read(home: &Path) -> Found {
         Err(Refused::Look(e)) if e.kind() == std::io::ErrorKind::NotFound => {
             Found::Absent(NOT_PRESENT)
         }
-        Err(e) => Found::Failed(format!("cannot read ~/.ssh/known_hosts: {e}")),
+        Err(e) => Found::Failed(format!("cannot read ~/.ssh/known_hosts: {e}"), e.errno()),
     }
 }
 
