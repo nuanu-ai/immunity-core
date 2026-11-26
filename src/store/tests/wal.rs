@@ -99,23 +99,85 @@ fn a_writer_s_transaction_that_spills_its_cache_shuts_no_reader_out_and_is_read_
     assert_eq!(read(&path, |c| Ok(id(c)?)).unwrap(), uncommitted);
 }
 
+/// One commit as every command and every step of a watcher makes it: on a connection of its own,
+/// opened and closed.
+fn commit_alone(path: &Path, n: usize) {
+    journal_note(
+        &open(path).unwrap(),
+        1,
+        &format!("run-{n}"),
+        "run_started",
+        "",
+    )
+    .unwrap();
+}
+
 #[test]
-fn what_was_committed_is_read_after_every_connection_closed_without_a_checkpoint_and_where_nothing_can_be_written()
+fn each_commit_on_a_connection_of_its_own_leaves_an_empty_wal_and_both_files_so_the_next_first_open_has_no_log_to_read_through()
  {
-    let dir = crate::common::Scratch::new("closed");
+    // No connection lives longer than a command or a step of a watcher, so nearly every open is
+    // the first one, which reads the whole log through to rebuild the `-shm`, holding the others
+    // out meanwhile; a log every close kept would grow with every commit.
+    let dir = crate::common::Scratch::new("alone");
     let path = dir.join("store.db");
     drop(open_or_make(&path).unwrap());
     let [wal, shm] = beside(&path);
-    let before = notes(&open_read_only(&path).unwrap()).unwrap();
-    journal_note(&open(&path).unwrap(), 1, "run-1", "run_started", "").unwrap();
-    // Every connection is closed, a reader the last of them: the commit is still only in the
-    // `-wal`, which is kept with the `-shm`.
-    assert_eq!(read(&path, |c| Ok(notes(c)?)).unwrap(), before + 1);
-    assert!(len(&wal) > 0 && shm.exists());
-    shut(&path);
-    // Twice: the reader that cannot write leaves the store as readable as it found it.
-    assert_eq!(read(&path, |c| Ok(notes(c)?)).unwrap(), before + 1);
-    assert_eq!(read(&path, |c| Ok(notes(c)?)).unwrap(), before + 1);
+    let before = read(&path, |c| Ok(notes(c)?)).unwrap();
+    for n in 1..=30 {
+        commit_alone(&path, n);
+        assert_eq!(
+            (len(&wal), wal.exists(), shm.exists()),
+            (0, true, true),
+            "{n}"
+        );
+        assert_eq!(read(&path, |c| Ok(notes(c)?)).unwrap(), before + n as i64);
+    }
+}
+
+#[test]
+fn the_log_a_held_read_made_grow_is_cut_to_nothing_once_the_reader_left_and_a_writer_closed_alone()
+{
+    let dir = crate::common::Scratch::new("alone-beside");
+    let path = dir.join("store.db");
+    drop(open_or_make(&path).unwrap());
+    let [wal, shm] = beside(&path);
+    let (held, grown) = read(&path, |long| {
+        let held = notes(long)?;
+        let mut sizes = vec![];
+        for n in 1..=5 {
+            commit_alone(&path, n);
+            sizes.push(len(&wal));
+        }
+        assert!(sizes.windows(2).all(|s| s[0] < s[1]), "{sizes:?}");
+        Ok((held, notes(long)?))
+    })
+    .unwrap();
+    assert_eq!(grown, held);
+    assert!(len(&wal) > 0);
+    commit_alone(&path, 6);
+    assert_eq!((len(&wal), shm.exists()), (0, true));
+    assert_eq!(read(&path, |c| Ok(notes(c)?)).unwrap(), held + 6);
+}
+
+#[test]
+fn what_was_committed_is_read_after_every_connection_closed_and_where_nothing_can_be_written() {
+    // The last to close a writer alone, which leaves an empty `-wal`; or a reader, after a
+    // writer closed beside it, which leaves the log as it was.
+    for reader_last in [false, true] {
+        let dir = crate::common::Scratch::new("closed");
+        let path = dir.join("store.db");
+        drop(open_or_make(&path).unwrap());
+        let [wal, shm] = beside(&path);
+        let before = read(&path, |c| Ok(notes(c)?)).unwrap();
+        let reader = reader_last.then(|| open_read_only(&path).unwrap());
+        commit_alone(&path, 1);
+        drop(reader);
+        assert_eq!((len(&wal) > 0, shm.exists()), (reader_last, true));
+        shut(&path);
+        // Twice: the reader that cannot write leaves the store as readable as it found it.
+        assert_eq!(read(&path, |c| Ok(notes(c)?)).unwrap(), before + 1);
+        assert_eq!(read(&path, |c| Ok(notes(c)?)).unwrap(), before + 1);
+    }
 }
 
 #[test]
