@@ -1331,47 +1331,28 @@ fn watched_message(st: &State, s: &Summary, w: &Watched) -> crate::contract::v1:
         .iter()
         .filter(|r| r.reader == watched::READER)
         .collect();
-    let kinds = covered::watched_files()
+    let kinds = covered::watched_readings(&st.coverage, st.this_mac.machine.as_deref())
         .into_iter()
-        .map(|(watched_as, kinds)| {
-            let rows: Vec<&&Latest> = mine.iter().filter(|r| kinds.contains(&r.kind)).collect();
+        .map(|k| {
+            let watched_as = k.watched_as;
             let presence = st
                 .presence_only
                 .get(watched_as)
                 .copied()
                 .unwrap_or_default();
-            let count = |c: &str| rows.iter().filter(|r| r.completeness == c).count();
-            let (full, partial, none) = (count("full"), count("partial"), count("none"));
-            let coverage = match (full, partial, none) {
-                (0, 0, 0) => None,
-                (_, 0, 0) => Some("full"),
-                (0, 0, _) => Some("none"),
-                _ => Some("partial"),
-            };
-            let mut reasons: Vec<&str> = Vec::new();
-            for r in rows.iter().filter(|r| r.completeness != "full") {
-                if let Some(reason) = r.reason.as_deref().filter(|x| !reasons.contains(x)) {
-                    reasons.push(reason);
-                }
-            }
-            let reason = match (reasons.is_empty(), rows.as_slice()) {
-                (false, _) => Some(reasons.join("; ")),
-                (true, [only]) => only.reason.clone(),
-                _ => None,
-            };
             v1::WatchedKind {
                 kind: watched_as.to_string(),
                 files: n(st.files.get(watched_as).copied().unwrap_or_default()),
                 presence_only: n(presence),
                 presence_only_note: (presence > 0).then(|| watched::PRESENCE_ONLY.to_string()),
-                coverage: coverage.map(value_of::<v1::Completeness>),
+                coverage: k.coverage.map(value_of::<v1::Completeness>),
                 readings: Some(v1::CompletenessCounts {
-                    full: n(full),
-                    partial: n(partial),
-                    none: n(none),
+                    full: n(k.full),
+                    partial: n(k.partial),
+                    none: n(k.none),
                 }),
                 // The readers' reasons, prose from their sources: cut, as every such text.
-                reason_text: reason.as_deref().map(crate::secrets::said),
+                reason_text: k.reason.as_deref().map(crate::secrets::said),
             }
         })
         .collect();

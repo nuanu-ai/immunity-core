@@ -3408,7 +3408,7 @@ fn an_autorun_row_s_kind_not_read_in_full_is_named_in_the_run_line_and_in_the_wa
     let husky = (kinds.iter())
         .find(|k| k["kind"] == "file in the home folder that git runs code from")
         .unwrap_or_else(|| panic!("{kinds:#?}"));
-    assert_ne!(husky["coverage"], "full", "{husky}");
+    assert_eq!(husky["coverage"], "none", "{husky}");
 }
 
 #[test]
@@ -8948,4 +8948,24 @@ fn a_narrower_check_that_does_not_look_at_a_unit_read_before_leaves_its_fault_st
         text.contains("! Can no longer be read: \"~/dev/shop/.mcp.json\""),
         "{text}"
     );
+}
+
+#[test]
+fn a_full_check_of_a_mac_with_nothing_to_watch_and_no_checkout_reads_every_kind_of_watched_files_in_full()
+ {
+    // No kind of watched files is held at partial on a clean Mac: a finished full check writes
+    // a reading for every coverage kind of each, and each is full. The hooks of checkouts have
+    // no reading where there is no checkout, and say nothing.
+    let e = Estate::new("clean-mac-kinds");
+    e.full();
+    let status = e.status();
+    let kinds = status["watched"]["kinds"].as_array().unwrap();
+    assert!(kinds.len() > 8, "{kinds:#?}");
+    for k in kinds {
+        let none = &k["readings"]["none"];
+        match k["kind"].as_str().unwrap() {
+            "git hook" => assert!(k["coverage"].is_null() && none == 0, "{k}"),
+            _ => assert!(k["coverage"] == "full" && none == 0, "{k}"),
+        }
+    }
 }

@@ -2377,10 +2377,9 @@ mod tests {
         };
         let w = AGENT_START.0;
         assert!(!live_in(&[of(Watch::Hourly(REWRITTEN))], w));
-        assert!(!live_in(
-            &[of(Watch::Hourly(REWRITTEN)), of(Watch::Live)],
-            w
-        ));
+        let hourly = || of(Watch::Hourly(REWRITTEN));
+        assert!(!live_in(&[hourly(), of(Watch::Live)], w));
+        assert!(!live_in(&[of(Watch::Live), hourly()], w));
         assert!(live_in(&[of(Watch::Live), of(Watch::Live)], w));
         assert!(!live_in(&[of(Watch::Live)], AGENT_SETTINGS.0));
     }

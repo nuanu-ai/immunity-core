@@ -65,6 +65,77 @@ pub fn kinds_of(watched_as: &str) -> Vec<String> {
     kinds
 }
 
+/// How the latest readings of one kind of watched files on this Mac went together, as
+/// `watched.kinds` tells it.
+pub struct WatchedReadings {
+    pub watched_as: &'static str,
+    /// Its readings by completeness. A kind of its list with no reading here was not read, and
+    /// counts as a reading of nothing.
+    pub full: usize,
+    pub partial: usize,
+    pub none: usize,
+    /// `None` when it has no reading here at all.
+    pub coverage: Option<&'static str>,
+    /// Why they were not full, each reason once; on one full reading that is all, its note.
+    pub reason: Option<String>,
+}
+
+/// The kinds of watched files with their latest readings on this Mac (`this`), its checkouts'
+/// among them. No false calm: a kind is `full` only when every coverage kind of its list has a
+/// reading here and each is full, and a reading of another machine stands for none of them.
+pub fn watched_readings(latest: &[Latest], this: Option<&str>) -> Vec<WatchedReadings> {
+    let here = |scope: &str| {
+        this.is_some_and(|t| {
+            let checkout = scope
+                .strip_prefix("checkout:")
+                .and_then(|s| s.strip_prefix(t));
+            on_this_mac(scope, t) || checkout.is_some_and(|rest| rest.starts_with('/'))
+        })
+    };
+    let mine: Vec<&Latest> = (latest.iter())
+        .filter(|r| r.reader == watched::READER && here(&r.scope))
+        .collect();
+    let group = |(watched_as, kinds): (&'static str, Vec<String>)| {
+        let rows: Vec<&Latest> = mine
+            .iter()
+            .copied()
+            .filter(|r| kinds.contains(&r.kind))
+            .collect();
+        let count = |c: &str| rows.iter().filter(|r| r.completeness == c).count();
+        let unread = (kinds.iter())
+            .filter(|k| !rows.iter().any(|r| &r.kind == *k))
+            .count();
+        let unread = if rows.is_empty() { 0 } else { unread };
+        let (full, partial, none) = (count("full"), count("partial"), count("none") + unread);
+        let coverage = match (full, partial, none) {
+            (0, 0, 0) => None,
+            (_, 0, 0) => Some("full"),
+            (0, 0, _) => Some("none"),
+            _ => Some("partial"),
+        };
+        let mut reasons: Vec<&str> = Vec::new();
+        for r in rows.iter().filter(|r| r.completeness != "full") {
+            if let Some(reason) = r.reason.as_deref().filter(|x| !reasons.contains(x)) {
+                reasons.push(reason);
+            }
+        }
+        let reason = match (reasons.is_empty(), rows.as_slice()) {
+            (false, _) => Some(reasons.join("; ")),
+            (true, [only]) if unread == 0 => only.reason.clone(),
+            _ => None,
+        };
+        WatchedReadings {
+            watched_as,
+            full,
+            partial,
+            none,
+            coverage,
+            reason,
+        }
+    };
+    watched_files().into_iter().map(group).collect()
+}
+
 /// Scripts the login window runs at every login and logout, in the words for a person.
 pub const LOGIN_HOOKS: &str = "login and logout hooks";
 /// What decides how the owner logs in and how a password is checked, in the same words.
@@ -162,6 +233,8 @@ pub struct ThisMac {
     pub watched: Vec<(&'static str, i64, &'static str)>,
     /// What has failed in the watcher running now and not succeeded since.
     pub failed: Vec<crate::watch::Failure>,
+    /// The machine its readings are scoped to (`this_machine`); `None` before any.
+    pub machine: Option<String>,
 }
 
 impl ThisMac {
@@ -174,6 +247,7 @@ impl ThisMac {
             live_read_at: None,
             watched: Vec::new(),
             failed: Vec::new(),
+            machine: None,
         }
     }
 }
@@ -302,6 +376,7 @@ pub fn this_mac(conn: &Connection, latest: &[Latest], live: bool) -> rusqlite::R
         live_read_at,
         watched,
         failed: Vec::new(),
+        machine: Some(this),
     })
 }
 
