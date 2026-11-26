@@ -1869,7 +1869,7 @@ fn a_mark_the_collector_printed_is_text_and_never_hides_the_secret_beside_it() {
     dir.run();
     let status = dir.report(&["status"]);
     assert_eq!(status["event_level"]["said_text"], cut, "{status:#}");
-    assert!(!holds(&std::fs::read(dir.store()).unwrap(), &pw));
+    assert!(!holds(&common::store_bytes(&dir.store()), &pw));
 }
 
 #[test]
@@ -1914,7 +1914,7 @@ fn a_value_with_spaces_in_its_own_argument_is_cut_whole_wherever_it_is_shown_or_
         .command(&["finding", &id, "--json"], &[])
         .output()
         .unwrap();
-    let file = std::fs::read(dir.store()).unwrap();
+    let file = common::store_bytes(&dir.store());
     for secret in [tail.as_str(), literal.as_str()] {
         assert!(!holds(&shown, secret), "{secret}");
         assert!(!holds(&finding.stdout, secret), "{secret}");

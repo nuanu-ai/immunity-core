@@ -3,10 +3,13 @@
 
 use crate::outcome::{Code, Outcome};
 use crate::resolver;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
+use rusqlite::config::DbConfig;
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+};
 use std::collections::BTreeSet;
 use std::fs::{File, TryLockError};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// The store's format. A store of any other format is refused and left as it is: this build
@@ -523,13 +526,42 @@ fn exists(path: &Path) -> Res<bool> {
     }
 }
 
+/// The two files SQLite keeps beside a store in write-ahead mode: the log of what was committed
+/// since the last checkpoint (`-wal`) and its index (`-shm`). They are part of the store.
+pub fn beside(path: &Path) -> [PathBuf; 2] {
+    ["-wal", "-shm"].map(|end| {
+        let mut name = path.as_os_str().to_owned();
+        name.push(end);
+        PathBuf::from(name)
+    })
+}
+
 /// Makes a whole store where there was no file. It is made under a name of its own in the same
 /// folder, committed and closed, and then linked to the path with link(2), which fails if
 /// anything is at the path: so the path holds no file or a whole store, never a half-made one,
 /// whether the process dies part way or two commands make a store at once. The one that links
 /// second finds the other's store, keeps it and removes its own. A process killed before the
-/// link leaves only a file named `.<store>.making-…` beside the store, which no command reads.
+/// link leaves only files named `.<store>.making-…` beside the store, which no command reads.
+///
+/// The store is in write-ahead mode from its making. The making connection keeps none of its
+/// own `-wal` and `-shm`: it checkpoints and removes them as it closes, so the file linked holds
+/// everything. The store is then opened once to write, which makes its `-wal` and `-shm` and
+/// keeps them (`writer`). A `-wal` or `-shm` already beside a path that holds no store was left
+/// by a store moved or deleted without it, and SQLite would read it as part of the new store,
+/// so nothing is made there.
 fn make(path: &Path) -> Res<()> {
+    for left in beside(path) {
+        if exists(&left)? && !exists(path)? {
+            let said = format!(
+                "there is no store at {}, but {} is beside it, left by a store moved or deleted \
+                 without it, and SQLite would read it as part of a new store. Nothing was made. \
+                 Move it aside with the other files of the old store or pass another --store.",
+                path.display(),
+                left.display()
+            );
+            return Err(Outcome::new(Code::NotAStore, said).into());
+        }
+    }
     let folder = path.parent().filter(|p| !p.as_os_str().is_empty());
     let folder = folder.unwrap_or(Path::new("."));
     let name = path
@@ -547,6 +579,13 @@ fn make(path: &Path) -> Res<()> {
             &making,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )?;
+        let mode: String =
+            conn.pragma_update_and_check(None, "journal_mode", "wal", |r| r.get(0))?;
+        if mode != "wal" {
+            return Err(
+                format!("SQLite did not put the new store in write-ahead mode: {mode}").into(),
+            );
+        }
         let tx = conn.transaction()?;
         tx.execute_batch(&schema())?;
         tx.execute(
@@ -557,11 +596,18 @@ fn make(path: &Path) -> Res<()> {
         tx.commit()?;
         conn.close().map_err(|(_, e)| e)?;
         match std::fs::hard_link(&making, path) {
-            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => Err(e.into()),
-            _ => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+            Err(e) => Err(e.into()),
+            // Its first read makes the `-wal` and `-shm`, which its close keeps.
+            Ok(()) => {
+                writer(path)?.query_row("PRAGMA journal_mode", [], |_| Ok(()))?;
+                Ok(())
+            }
         }
     })();
-    let _ = std::fs::remove_file(&making);
+    for file in [making.clone()].into_iter().chain(beside(&making)) {
+        let _ = std::fs::remove_file(file);
+    }
     made
 }
 
@@ -570,15 +616,14 @@ fn make(path: &Path) -> Res<()> {
 /// this format and its id, is refused before anything is written and is left as it is. Old
 /// stores are not converted and a damaged one is not repaired.
 ///
-/// A run writes in one transaction that lasts the whole run. Readers such as `immunity status`
-/// must be able to read the last committed state all that time, so the run never takes the
-/// exclusive lock before it commits: a cache that grew past its size would otherwise be
-/// spilled to the file, which takes the exclusive lock in the middle of the transaction and
-/// shuts every reader out until the commit. The rollback journal is kept, rather than
-/// write-ahead logging, because a reader in a folder it cannot write must open the store
-/// without creating files next to it. Waiting on a lock is rusqlite's busy timeout of five
-/// seconds on every connection: a reader waits out the commit, and the commit waits out a
-/// reader.
+/// The store is in write-ahead mode, SQLite's design for one writer beside readers in other
+/// processes: a reader reads the last committed state from the file and its `-wal`, and never
+/// waits for a writer, and a writer never waits for a reader, however long either holds its
+/// transaction. A run writes in one transaction that lasts the whole run, and `immunity status`
+/// reads what was committed before it all that time. Two writers still meet: a writer begins
+/// every transaction by taking the write lock (`writer`), and waits for it up to rusqlite's
+/// busy timeout of five seconds, as a reader does in the moment SQLite recovers the log of a
+/// writer that died.
 pub fn open(path: &Path) -> Result<Connection, Outcome> {
     opened(path).map_err(Outcome::from)
 }
@@ -587,14 +632,33 @@ fn opened(path: &Path) -> Res<Connection> {
     if !exists(path)? {
         return Err(absent(path).into());
     }
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-    conn.pragma_update(None, "cache_spill", false)?;
+    let conn = writer(path)?;
     conn.pragma_update(None, "foreign_keys", true)?;
     check(&conn, path)?;
+    // The `-wal` is cut back to the size the automatic checkpoint lets it reach, once a
+    // checkpoint has copied it all, so the space a long reader made it take is given back.
+    let page: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
+    let pages: i64 = conn.query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))?;
+    conn.pragma_update(None, "journal_size_limit", page * pages)?;
     conn.execute_batch(VOCABULARY)?;
     conn.execute_batch(crate::processes::KINDS)?;
     crate::autorun::add_kinds(&conn)?;
     crate::watched::add_kinds(&conn)?;
+    Ok(conn)
+}
+
+/// A connection that may write the store, opened without making it. Its close does not
+/// checkpoint (`SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`), and SQLite removes the `-wal` and `-shm` only
+/// after that checkpoint, so they stay for a reader that cannot write the store's folder, which
+/// SQLite lets read a store in write-ahead mode only while both exist; and a refused store's
+/// file is left as it was. `SQLITE_FCNTL_PERSIST_WAL` is not set: in the bundled SQLite it is
+/// read only by that checkpoint at close. Every transaction takes the write lock as it begins
+/// (`BEGIN IMMEDIATE`): one that read first and wrote after another writer's commit would fail
+/// on a snapshot that is no longer the latest, and waiting does not end that.
+fn writer(path: &Path) -> rusqlite::Result<Connection> {
+    let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
+    conn.set_transaction_behavior(TransactionBehavior::Immediate);
     Ok(conn)
 }
 
@@ -645,68 +709,38 @@ pub fn read<T>(path: &Path, f: impl FnOnce(&Connection) -> Res<T>) -> Result<T, 
     f(&tx).map_err(Outcome::from)
 }
 
-/// Opens an existing store so that nothing can be written to it. Creates nothing. A command
-/// that only reads the store reads it through `read`.
+/// Opens an existing store so that nothing can be written to it. A command that only reads the
+/// store reads it through `read`.
 ///
-/// A writer killed inside its transaction, a run or a watcher stopped by a crash or a forced
-/// restart, leaves its rollback journal hot, and a connection opened read-only cannot roll it
-/// back: SQLite refuses every read with `SQLITE_READONLY_ROLLBACK` until something opens the
-/// store to write. On that one refusal the store is opened for writing, without creating it,
-/// and read once, which makes SQLite roll the journal back under its exclusive lock; then it is
-/// opened read-only again, once. Rolling back restores the last committed state: nothing the
-/// store held as committed changes, and what the killed writer had not committed was never
-/// part of it. A journal is hot only while no live process holds the store's lock, so a writer
-/// that is alive is never rolled back: beside one, a reader waits out the busy timeout as
-/// before. Where the store's folder cannot be written, SQLite could restore the store's file
-/// and then fail to delete the journal, so nothing is tried; a store file that cannot be
-/// written is opened read-only by SQLite itself, which refuses the rollback the same way. In
-/// both the first refusal is returned as SQLite gave it.
+/// It reads the last committed state, from the store's file and its `-wal`. A writer killed
+/// inside its transaction, a run or a watcher stopped by a crash or a forced restart, may have
+/// left pages of it in the `-wal`, but no commit names them, so no reader reads them and
+/// nothing has to be undone first. In a folder this process cannot write, SQLite reads the
+/// store as long as its `-wal` and `-shm` are beside it, which every writer keeps (`writer`).
+/// Without one, SQLite says only that it cannot write or open, so the refusal names the file.
 pub fn open_read_only(path: &Path) -> Result<Connection, Outcome> {
-    let opened = match read_only(path) {
-        // Told by the one mapping, by SQLite's extended code (`outcome::of`).
-        Err(e) if crate::outcome::of(e.as_ref()).code == Code::HotJournal => {
-            match roll_back(path) {
-                Ok(true) => read_only(path),
-                // Nothing was tried, or the read that rolls back failed: the first refusal stands.
-                _ => Err(e),
-            }
+    let read = || -> Res<Connection> {
+        let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        check(&conn, path)?;
+        Ok(conn)
+    };
+    read().map_err(|e| {
+        let refused = Outcome::from(e);
+        let gone = beside(path).into_iter().find(|f| !f.exists());
+        match gone.filter(|_| matches!(refused.code, Code::NotWritable | Code::CannotOpen)) {
+            Some(gone) => Outcome::new(
+                refused.code,
+                format!(
+                    "SQLite reads the store at {} only with {} beside it, which is not there, and \
+                     this process cannot make it in that folder. Nothing was changed. A command \
+                     that may write the folder makes it, such as `immunity run`.",
+                    path.display(),
+                    gone.display()
+                ),
+            ),
+            None => refused,
         }
-        opened => opened,
-    };
-    opened.map_err(Outcome::from)
-}
-
-fn read_only(path: &Path) -> Res<Connection> {
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-    check(&conn, path)?;
-    Ok(conn)
-}
-
-/// Lets SQLite roll a hot journal back through a connection that may write, opened without
-/// `SQLITE_OPEN_CREATE` so that a store that is not there is not made. `false` when the folder
-/// cannot be written, so nothing was tried; an error when the read that rolls back failed, as
-/// beside another connection rolling the same journal back.
-fn roll_back(path: &Path) -> rusqlite::Result<bool> {
-    let folder = path.parent().filter(|p| !p.as_os_str().is_empty());
-    if !writable(folder.unwrap_or(Path::new("."))) {
-        return Ok(false);
-    }
-    let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-    conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| {
-        r.get::<_, i64>(0)
-    })?;
-    Ok(true)
-}
-
-/// Whether this process may write in the folder, by access(2), as SQLite will need to delete
-/// the journal there.
-fn writable(folder: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(c) = std::ffi::CString::new(folder.as_os_str().as_bytes()) else {
-        return false;
-    };
-    // SAFETY: `c` is a NUL-terminated path that outlives the call; access(2) only reads it.
-    unsafe { libc::access(c.as_ptr(), libc::W_OK) == 0 }
+    })
 }
 
 /// The refusal of a path that holds no store, as every command gives it: the same words wherever
@@ -731,26 +765,24 @@ pub const NO_STORE_FIX: &str =
 
 /// What every command tells a person about a store another build made, in one wording.
 pub const OTHER_FORMAT: &str = "this store was made by another build of Immunity Core";
-pub const OTHER_FORMAT_FIX: &str = "It was left unchanged. Move it aside or pass another --store; \
-                                    the next check starts one from the beginning.";
+pub const OTHER_FORMAT_FIX: &str = "It was left unchanged. Move it aside with its -wal and -shm \
+                                    files or pass another --store; the next check starts one from \
+                                    the beginning.";
 
 /// What every refusal of a store ends with: what was done to it and what to do.
-const START_OVER: &str = "Nothing was changed. Move the old store aside or pass another --store; \
-                          the next run starts a store from the beginning.";
+const START_OVER: &str = "Nothing was changed. Move the old store aside with its -wal and -shm \
+                          files or pass another --store; the next run starts a store from the \
+                          beginning.";
 
 /// What the refusal of a file that holds no store says to do.
 const NOT_A_STORE: &str = "Nothing was changed. Move it aside or pass another --store; the next \
                            run makes a store where there is no file.";
 
 /// Checks a store before anything else is done with it: that the file is a store at all, its
-/// format, that it holds exactly the schema of this format, and its id. A store that fails is
-/// refused with what to do and is not touched. So no answer ever rests on a table that is not
-/// there, and no command makes again, empty, a table or a store that was lost with what it held.
-///
-/// Before the check, SQLite rolls back a journal a writer that died left beside the file
-/// (`open_read_only`, and the first read of a connection that may write). That cannot change
-/// what the check judges: it takes out only what that writer never committed, which no reader
-/// of the file would ever see.
+/// format, that it is in write-ahead mode, that it holds exactly the schema of this format, and
+/// its id. A store that fails is refused with what to do and is not touched. So no answer ever
+/// rests on a table that is not there, and no command makes again, empty, a table or a store
+/// that was lost with what it held.
 fn check(conn: &Connection, path: &Path) -> Res<()> {
     let at = path.display();
     let refused =
@@ -779,7 +811,7 @@ fn check(conn: &Connection, path: &Path) -> Res<()> {
     }
     let one = |key: &str| -> rusqlite::Result<Option<String>> {
         // A table `meta` without the columns `key` and `value` holds no value; any other
-        // failure, such as a journal to roll back first, is returned as it is.
+        // failure is returned as it is.
         let readable: bool = conn.query_row(
             "SELECT COUNT(*) = 2 FROM pragma_table_info('meta') WHERE name IN ('key', 'value')",
             [],
@@ -842,6 +874,13 @@ fn check(conn: &Connection, path: &Path) -> Res<()> {
         }
         Some(_) => {}
     }
+    // The journal mode is written in the file and is part of the format: a store in another
+    // was changed by something else, and converting it would be a write at open.
+    let mode: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
+    if mode != "wal" {
+        let why = format!("it is in the journal mode {mode:?}, not in write-ahead mode");
+        return Err(refused(Code::Damaged, damaged(path, &why)));
+    }
     if let Some(why) = differs(expected(), &shape(conn)?) {
         return Err(refused(Code::Damaged, damaged(path, &why)));
     }
@@ -859,8 +898,8 @@ fn is_id(id: &str) -> bool {
 
 fn damaged(path: &Path, why: &str) -> String {
     format!(
-        "the store at {} is damaged: {why}. A store of format {FORMAT_VERSION} holds exactly the \
-         schema this version makes, so something other than Immunity Core changed it. {START_OVER}",
+        "the store at {} is damaged: {why}. A store of format {FORMAT_VERSION} is exactly as \
+         this version makes it, so something other than Immunity Core changed it. {START_OVER}",
         path.display()
     )
 }
@@ -1003,8 +1042,7 @@ pub fn watch_in_progress(folder: &Path) -> std::io::Result<bool> {
     held(&folder.join(WATCH_LOCK))
 }
 
-/// How long a full run waits for whoever holds the store: for the run lock, and at its commit for
-/// the readings that hold the store to leave. Measured on a store of 30,000 things: a watcher's
+/// How long a full run waits for the run lock, held by a watcher's reading or a command. Measured on a store of 30,000 things: a watcher's
 /// reading holds the lock 0.03 s when one of 40 watched files changed, 0.3 s when all 40 did,
 /// and about 1 s and 8 s with 1,000 watched files. It leaves at least a second between
 /// readings, so a run waiting gets the lock. A reading under a heavy load of the Mac has held
@@ -1239,10 +1277,9 @@ fn free_pages(conn: &Connection) -> rusqlite::Result<(i64, i64)> {
     Ok((free, pages))
 }
 
-/// How many readings one transaction of `fold` takes out. A store is opened so that a writer
-/// never shuts readers out before it commits, which keeps what it changes in memory. On a
-/// store of 543,182 readings, a year of them: taken out in one transaction, the run that did
-/// it held 235 MB at most; in transactions of this many, 92 MB, and it took 6 s.
+/// How many readings one transaction of `fold` takes out. Each commit lets the automatic
+/// checkpoint copy into the file what the fold wrote so far, so the `-wal` grows by one such
+/// transaction and not by the whole fold.
 const FOLD_AT_ONCE: i64 = 10_000;
 
 /// Folds the history of readings older than the runs kept whole (`FOLDED`), outside any
@@ -1295,14 +1332,18 @@ pub fn give_back(conn: &Connection) -> rusqlite::Result<()> {
 
 /// What follows a full run's commit, still under the run lock: the fold, and where a quarter of
 /// the file or more is free pages, the space given back. It is housekeeping and never changes
-/// what the run did, so it returns nothing: a fold or a vacuum that fails, as when a reader
-/// holds the store, is left as it is. The next run folds what is left, and gives back the space
-/// still free, whichever run freed it.
+/// what the run did, so it returns nothing: a fold or a vacuum that fails is left as it is. The
+/// next run folds what is left, and gives back the space still free, whichever run freed it.
+///
+/// What a vacuum wrote is in the `-wal` until a checkpoint copies it into the file, and only
+/// then is the file cut to its new size. So a passive checkpoint ends it, which never waits: a
+/// reader that holds an older state keeps it from going all the way, and the next run's goes on.
 pub fn tidy(conn: &Connection) {
     let _ = fold(conn);
     if free_pages(conn).is_ok_and(|(free, pages)| worth_giving_back(free, pages)) {
         let _ = give_back(conn);
     }
+    let _ = conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
 }
 
 // --- End of folding. ---
@@ -1757,6 +1798,8 @@ pub mod steps {
 mod tests {
     use super::*;
 
+    mod wal;
+
     #[test]
     fn the_schema_holds_no_quoted_text_that_the_comparison_would_change() {
         // `normal` takes out `--` comments and makes blank space one. A quoted string or name
@@ -1812,13 +1855,10 @@ mod tests {
             id(&conn).unwrap()
         );
         assert_eq!(std::fs::read(&path).unwrap().len(), first.len());
-        // Nothing of the making is left beside it.
-        let beside: Vec<_> = std::fs::read_dir(&*dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name())
-            .collect();
-        assert_eq!(beside, [std::ffi::OsString::from("store.db")]);
+        // Nothing of the making is left beside it, and its `-wal` and `-shm` are there.
+        let (names, _) = as_left(&path);
+        let names: Vec<_> = names.iter().map(|n| n.to_str().unwrap()).collect();
+        assert_eq!(names, ["store.db", "store.db-shm", "store.db-wal"]);
     }
 
     #[test]
@@ -1883,24 +1923,35 @@ mod tests {
     }
 
     /// A store made from empty and then changed by `sql`, as something other than Immunity Core
-    /// would change it.
+    /// would change it, with its `-wal` and `-shm` beside it as a writer leaves them.
     fn changed(sql: &str) -> (crate::common::Scratch, std::path::PathBuf) {
         let dir = crate::common::Scratch::new("changed");
         let path = dir.join("store.db");
         drop(open_or_make(&path).unwrap());
-        Connection::open(&path)
+        writer(&path)
             .unwrap()
             .execute_batch(&format!("PRAGMA foreign_keys = OFF; {sql}"))
             .unwrap();
         (dir, path)
     }
 
+    /// The names in the folder of `path`, and the bytes of the store's file and of its `-wal`.
+    fn as_left(path: &Path) -> (BTreeSet<std::ffi::OsString>, [Option<Vec<u8>>; 2]) {
+        let names = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        let [wal, _] = beside(path);
+        (names, [path, &wal].map(|f| std::fs::read(f).ok()))
+    }
+
     /// Every way a command opens a store, to write, to read, in one read access and to make one
     /// where no file is, refuses the file at `path` in the same words, saying each of `said`, and
-    /// leaves it byte for byte as it was with nothing beside it, under the outcome `code`. The
-    /// words.
+    /// leaves it and its `-wal` byte for byte as they were, with nothing made or taken away
+    /// beside them, under the outcome `code`. The words.
     fn refused(path: &Path, code: Code, said: &[&str]) -> String {
-        let before = std::fs::read(path).ok();
+        let before = as_left(path);
         type Opens = fn(&Path) -> Result<(), Outcome>;
         let ways: [(&str, Opens); 4] = [
             ("open", |p| open(p).map(drop)),
@@ -1917,13 +1968,10 @@ mod tests {
                 for s in said {
                     assert!(words.contains(s), "{way}: {words}");
                 }
-                assert_eq!(std::fs::read(path).ok(), before, "{way}");
-                let beside: Vec<_> = std::fs::read_dir(path.parent().unwrap())
-                    .unwrap()
-                    .flatten()
-                    .map(|e| e.file_name())
-                    .collect();
-                assert_eq!(beside, [std::ffi::OsString::from("store.db")], "{way}");
+                assert!(
+                    as_left(path) == before,
+                    "{way}: the store or its files changed"
+                );
                 words
             })
             .collect();
@@ -2120,6 +2168,10 @@ mod tests {
                 NOT_A_STORE,
             ],
         );
+        // The store's files go with it.
+        for file in beside(&path) {
+            std::fs::remove_file(file).unwrap();
+        }
         std::fs::write(&path, b"").unwrap();
         refused(
             &path,
@@ -2641,24 +2693,21 @@ mod tests {
     }
 
     #[test]
-    fn a_fold_beside_a_reader_that_holds_the_store_does_not_fail_the_run_and_the_next_run_folds() {
-        // What follows a full run's commit is housekeeping, and returns nothing: a fold that
-        // cannot commit while a reader holds the store, here for the five seconds a writer
-        // waits, leaves the readings as they were, and the next run folds them.
+    fn a_fold_beside_a_reader_that_holds_the_store_folds_and_the_reader_keeps_what_it_read() {
         let mut k = Kept::new("busy");
         for _ in 0..(RUNS_KEPT + 5) {
             k.run(true, &[("brew", MAC, BREW, FULL)]);
         }
         let rows = k.rows();
         let reader = Connection::open(k.dir.join("store.db")).unwrap();
-        reader
-            .execute_batch("BEGIN; SELECT COUNT(*) FROM coverage;")
-            .unwrap();
+        let held = reader.unchecked_transaction().unwrap();
+        let count = |c: &Connection| -> i64 {
+            c.query_row("SELECT COUNT(*) FROM coverage", [], |r| r.get(0))
+                .unwrap()
+        };
+        assert_eq!(count(&held), rows);
         tidy(&k.conn);
-        assert_eq!(k.rows(), rows);
-        reader.execute_batch("COMMIT").unwrap();
-        tidy(&k.conn);
-        assert_eq!(k.rows(), rows - 3);
+        assert_eq!((k.rows(), count(&held)), (rows - 3, rows));
     }
 
     #[test]
@@ -2702,9 +2751,10 @@ mod tests {
     }
 
     #[test]
-    fn space_a_fold_freed_and_could_not_give_back_is_given_back_by_a_later_run() {
-        // The vacuum after a fold met a reader and failed; the next run folds almost nothing,
-        // and still gives back the space the file holds free.
+    fn space_given_back_beside_a_reader_reaches_the_file_by_a_later_run() {
+        // The vacuum after a fold goes through beside a reader, and the reader's older state
+        // keeps the checkpoint from copying it into the file. The next run folds almost
+        // nothing, and its checkpoint cuts the file.
         let mut k = Kept::new("free-later");
         let scopes: Vec<String> = (0..40).map(|i| format!("machine:m{i}")).collect();
         let readings: Vec<(&str, &str, &str, Said)> = scopes
@@ -2722,10 +2772,10 @@ mod tests {
         reader
             .execute_batch("BEGIN; SELECT COUNT(*) FROM coverage;")
             .unwrap();
-        assert!(give_back(&k.conn).is_err(), "the vacuum met the reader");
+        tidy(&k.conn);
+        assert_eq!(size(), before);
         reader.execute_batch("COMMIT").unwrap();
         drop(reader);
-        assert_eq!(size(), before);
         k.run(true, &readings);
         tidy(&k.conn);
         assert!(size() * 3 < before, "{} bytes of {before}", size());
@@ -2880,103 +2930,24 @@ mod tests {
         assert_eq!(k.rows(), 40 * (RUNS_KEPT + 2));
     }
 
-    // --- Opening to read after a writer was killed. ---
-
-    /// A store and the hot journal a writer killed inside its transaction leaves beside it: the
-    /// store's file and its journal copied while a writer holds its transaction, with enough
-    /// written that SQLite has spilled pages into the file. The copy holds no lock, as a killed
-    /// process holds none. Returns the copy and the store's committed id.
-    fn hot(dir: &Path) -> (std::path::PathBuf, String) {
-        let live = dir.join("live.db");
-        let committed = id(&open_or_make(&live).unwrap()).unwrap();
-        let writer = Connection::open(&live).unwrap();
-        writer
-            .execute_batch(
-                "BEGIN;
-                 UPDATE meta SET value = 'uncommitted' WHERE key = 'store_id';
-                 CREATE TABLE ballast (b BLOB);
-                 INSERT INTO ballast VALUES (zeroblob(8000000));",
-            )
-            .unwrap();
-        let path = dir.join("store.db");
-        std::fs::copy(&live, &path).unwrap();
-        std::fs::copy(dir.join("live.db-journal"), dir.join("store.db-journal")).unwrap();
-        (path, committed)
-    }
-
-    #[test]
-    fn a_store_opened_to_read_after_its_journal_was_rolled_back_holds_what_was_committed_and_cannot_be_written()
-     {
-        let dir = crate::common::Scratch::new("hot-unit");
-        let (path, committed) = hot(&dir);
-        let conn = open_read_only(&path).unwrap();
-        assert_eq!(id(&conn).unwrap(), committed);
-        assert!(!dir.join("store.db-journal").exists());
-        assert!(conn.execute_batch("CREATE TABLE t (a)").is_err());
-    }
-
-    #[test]
-    fn a_hot_journal_in_a_folder_that_cannot_be_written_is_its_own_outcome_and_is_left_as_it_is() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = crate::common::Scratch::new("hot-shut");
-        let (path, _) = hot(&dir);
-        std::fs::set_permissions(&*dir, std::fs::Permissions::from_mode(0o555)).unwrap();
-        let refused = open_read_only(&path).unwrap_err();
-        assert_eq!(refused.code, Code::HotJournal, "{refused}");
-        assert!(dir.join("store.db-journal").exists());
-    }
-
-    // --- One read access. ---
-
-    #[test]
-    fn what_one_read_access_reads_is_of_one_state_and_no_write_commits_between_its_reads() {
-        let dir = crate::common::Scratch::new("one-read");
-        let path = dir.join("store.db");
-        drop(open_or_make(&path).unwrap());
-        let notes = |c: &Connection| -> rusqlite::Result<i64> {
-            c.query_row("SELECT COUNT(*) FROM journal", [], |r| r.get(0))
-        };
-        // A check that commits between two reads, without waiting for the reader.
-        let writer = Connection::open(&path).unwrap();
-        writer.busy_timeout(Duration::ZERO).unwrap();
-        let check = || journal_note(&writer, 1, "run-1", "run_started", "").is_ok();
-        let (first, committed, second) = read(&path, |c| {
-            let first = notes(c)?;
-            Ok((first, check(), notes(c)?))
-        })
-        .unwrap();
-        assert_eq!((committed, first), (false, second));
-        // Once the read is over the same write commits, and the next read sees it.
-        assert!(check());
-        assert_eq!(read(&path, |c| Ok(notes(c)?)).unwrap(), first + 1);
-    }
-
     #[test]
     fn a_store_held_by_another_process_when_a_read_access_reads_is_store_busy_exit_4() {
-        // Held after the store was opened and checked, at the first read of the transaction:
-        // the error is the read's own, and it is told by the one mapping.
+        // In write-ahead mode only a connection that holds the file itself, as SQLite's
+        // exclusive locking mode does, keeps a reader out; whichever read meets it, the error
+        // is told by the one mapping.
         let dir = crate::common::Scratch::new("read-busy");
         let path = dir.join("store.db");
         drop(open_or_make(&path).unwrap());
         let holder = Connection::open(&path).unwrap();
-        let refused = read(&path, |c| {
-            holder.execute_batch("BEGIN EXCLUSIVE").unwrap();
-            Ok(id(c)?)
-        })
-        .unwrap_err();
+        holder
+            .execute_batch("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE")
+            .unwrap();
+        let refused = read(&path, |c| Ok(id(c)?)).unwrap_err();
         assert_eq!(
             (refused.code, refused.exit()),
             (Code::StoreBusy, 4),
             "{refused}"
         );
-    }
-
-    #[test]
-    fn a_rollback_makes_no_store_where_there_is_none() {
-        let dir = crate::common::Scratch::new("hot-none");
-        let missing = dir.join("store.db");
-        assert!(roll_back(&missing).is_err());
-        assert!(!missing.exists());
     }
 
     #[test]

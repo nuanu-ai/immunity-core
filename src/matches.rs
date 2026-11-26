@@ -1388,7 +1388,11 @@ mod tests {
         let (dir, args) = one_line("replaced");
         let (other, replacing) = one_line("replacing");
         let answered = read_through(Rules::shipped(), &args, 1_791_090_000, |awake| {
-            std::fs::rename(&replacing.store, &args.store).unwrap();
+            // The store's file with its `-wal` and `-shm`, as a store is moved.
+            let files = |s: &std::path::Path| [s.to_path_buf()].into_iter().chain(store::beside(s));
+            for (from, to) in files(&replacing.store).zip(files(&args.store)) {
+                std::fs::rename(from, to).unwrap();
+            }
             events::queue(&args.system_root, None, LIMIT, 1_791_090_000, awake)
         });
         let _ = std::fs::remove_dir_all(&dir);

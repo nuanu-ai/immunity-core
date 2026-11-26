@@ -546,8 +546,9 @@ mod tests {
                 assert_eq!(
                     said,
                     "error: this store was made by another build of Immunity Core\n  It was left \
-                     unchanged. Move it aside or pass another --store; the next check starts one \
-                     from the beginning.\n  Store   the store at /x/store.db is from …\n",
+                     unchanged. Move it aside with its -wal and -shm files or pass another \
+                     --store; the next check starts one from the beginning.\n  Store   the store \
+                     at /x/store.db is from …\n",
                     "{op}"
                 );
             }

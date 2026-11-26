@@ -2133,7 +2133,7 @@ fn the_text_of_a_script_or_a_command_is_never_kept_printed_or_returned() {
         cjs
     );
     assert!(!shop.join(".pnpmfile.cjs.ran").exists());
-    let mut kept = std::fs::read(e.store()).unwrap();
+    let mut kept = common::store_bytes(&e.store());
     for file in walk(&e.0.join("raw")) {
         kept.extend(std::fs::read(file).unwrap());
     }

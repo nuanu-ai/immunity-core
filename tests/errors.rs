@@ -195,7 +195,7 @@ fn a_failure_has_the_documented_json_and_protobuf_fields() {
         (
             &["status"],
             &older,
-            r#"{"operation":"status","ok":false,"errors":[{"code":"store_unreadable","message":"the store cannot be read; nothing was changed","example":"immunity status --json --store <file>","detail_text":"the store at <dir>/older.db is from an older format (5); this version uses format 9 and does not convert old stores. Nothing was changed. Move the old store aside or pass another --store; the next run starts a store from the beginning.","ids_text":[],"outcome":"older_format"}]}"#,
+            r#"{"operation":"status","ok":false,"errors":[{"code":"store_unreadable","message":"the store cannot be read; nothing was changed","example":"immunity status --json --store <file>","detail_text":"the store at <dir>/older.db is from an older format (5); this version uses format 9 and does not convert old stores. Nothing was changed. Move the old store aside with its -wal and -shm files or pass another --store; the next run starts a store from the beginning.","ids_text":[],"outcome":"older_format"}]}"#,
         ),
         (
             &["findings", "--frob"],
@@ -264,11 +264,14 @@ fn a_store_another_process_holds_is_one_to_ask_again_in_every_form_and_never_unr
     // A sample of a reading that is not one makes the store and records nothing.
     std::fs::write(e.dir().join("bad.json"), "not a reading").unwrap();
     e.on(&store, &["sample", "--sample-input", "bad.json"]);
-    // Opened without making it: the store held is the one the sample made.
+    // Opened without making it: the store held is the one the sample made. In write-ahead mode
+    // only a connection that holds the file itself, in SQLite's exclusive locking mode, keeps a
+    // reader out.
     let db =
         rusqlite::Connection::open_with_flags(&store, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
             .unwrap();
-    db.execute_batch("BEGIN EXCLUSIVE").unwrap();
+    db.execute_batch("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE")
+        .unwrap();
     // Each command waits out SQLite's busy timeout of five seconds, so they wait side by side.
     let asked: [&[&str]; 10] = [
         &["status", "--json"],
@@ -321,8 +324,9 @@ fn a_store_another_process_holds_is_one_to_ask_again_in_every_form_and_never_unr
 const NO_STORE: &str = "there is no store here yet";
 const NO_STORE_FIX: &str = "immunity run makes one, or immunity on, which also keeps it checked.";
 const OTHER_FORMAT: &str = "error: this store was made by another build of Immunity Core";
-const OTHER_FORMAT_FIX: &str = "  It was left unchanged. Move it aside or pass another --store; \
-                                the next check starts one from the beginning.";
+const OTHER_FORMAT_FIX: &str = "  It was left unchanged. Move it aside with its -wal and -shm \
+                                files or pass another --store; the next check starts one from \
+                                the beginning.";
 
 #[test]
 fn no_store_and_a_store_of_another_format_are_worded_once_across_every_command() {

@@ -1663,7 +1663,7 @@ fn a_verdict_sent_again_under_its_id_gets_its_first_answer_and_writes_and_raises
     let own = mac.verdict_findings();
     assert_eq!(own.len(), 2);
     let again = |state: &str| {
-        let before = std::fs::read(mac.store()).unwrap();
+        let before = common::store_bytes(&mac.store());
         for (v, first) in sent.iter().zip(&first) {
             let answer = mac.send(v);
             assert_eq!(answer["already_recorded"], true, "{state}: {answer:#}");
@@ -1683,7 +1683,7 @@ fn a_verdict_sent_again_under_its_id_gets_its_first_answer_and_writes_and_raises
             }
         }
         assert_eq!(
-            std::fs::read(mac.store()).unwrap(),
+            common::store_bytes(&mac.store()),
             before,
             "{state}: nothing is written"
         );
@@ -1759,7 +1759,7 @@ fn an_id_names_one_verdict_and_the_same_id_on_any_other_message_is_refused_with_
     ];
     let check = |state: &str| {
         for (other, differs) in &cases {
-            let before = std::fs::read(mac.store()).unwrap();
+            let before = common::store_bytes(&mac.store());
             let out = mac.refused(other.to_string().as_bytes(), "verdict_id_reused", 2);
             let failure: Value = serde_json::from_slice(&out.stdout).unwrap();
             // What differs, and the earlier verdict's kind and time: the core's values alone.
@@ -1778,7 +1778,7 @@ fn an_id_names_one_verdict_and_the_same_id_on_any_other_message_is_refused_with_
             let failure = v1::Failure::decode(out.stdout.as_slice()).unwrap();
             assert_eq!(failure.errors[0].code, "verdict_id_reused", "{state}");
             assert_eq!(
-                std::fs::read(mac.store()).unwrap(),
+                common::store_bytes(&mac.store()),
                 before,
                 "{state}: {differs}"
             );
@@ -3100,7 +3100,7 @@ fn every_command_tells_a_person_of_a_store_of_another_format_in_one_wording_and_
         &["is from an older format (8)", START_OVER],
         Some(&[
             "error: this store was made by another build of Immunity Core",
-            "It was left unchanged. Move it aside or pass another --store;",
+            "It was left unchanged. Move it aside with its -wal and -shm files or pass another --store;",
         ]),
     );
 }
@@ -3151,10 +3151,10 @@ fn two_first_commands_at_once_and_one_killed_part_way_leave_no_store_or_a_whole_
         for entry in std::fs::read_dir(&fresh).into_iter().flatten().flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             assert!(
-                // A journal beside a whole store is the killed command's own transaction after
-                // the store was in place, which the next open rolls back.
+                // The `-wal` and `-shm` are the whole store's own, from when it was in place.
                 name == "store.db"
-                    || name == "store.db-journal"
+                    || name == "store.db-wal"
+                    || name == "store.db-shm"
                     || name.starts_with(".store.db.making-")
                     || !name.starts_with("store.db"),
                 "{ms} ms: {name}"
@@ -3211,14 +3211,15 @@ fn a_command_that_only_reads_changes_not_a_byte_of_a_store_of_its_format() {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
-        assert_eq!(std::fs::read(r.mac.store()).unwrap(), r.before, "{args:?}");
         r.nothing_beside(&format!("{args:?}"));
+        assert_eq!(common::store_bytes(&r.mac.store()), r.before, "{args:?}");
     }
 }
 
 /// What every refusal of a store ends with, older and damaged alike.
-const START_OVER: &str = "Nothing was changed. Move the old store aside or pass another --store; \
-                          the next run starts a store from the beginning.";
+const START_OVER: &str = "Nothing was changed. Move the old store aside with its -wal and -shm \
+                          files or pass another --store; the next run starts a store from the \
+                          beginning.";
 
 /// A store with a finding of the response layer open and a finding the person saw, kept as it
 /// was so that each damage starts from it.
@@ -3257,7 +3258,7 @@ impl Refusable {
         )
         .unwrap();
         let sample = sample.to_str().unwrap().to_string();
-        let before = std::fs::read(mac.store()).unwrap();
+        let before = common::store_bytes(&mac.store());
         let r = Refusable {
             mac,
             id,
@@ -3279,6 +3280,9 @@ impl Refusable {
     }
 
     fn restore(&self) {
+        for end in ["-wal", "-shm"] {
+            let _ = std::fs::remove_file(self.mac.0.join("store").join(format!("store.db{end}")));
+        }
         std::fs::write(self.mac.store(), &self.before).unwrap();
     }
 
@@ -3295,13 +3299,13 @@ impl Refusable {
             .unwrap()
     }
 
+    /// No journal beside the store, and nothing written into its `-wal`: SQLite makes the `-wal`
+    /// and `-shm` empty to read a store in write-ahead mode that has none.
     fn nothing_beside(&self, what: &str) {
-        for beside in ["store.db-journal", "store.db-wal", "store.db-shm"] {
-            assert!(
-                !self.mac.0.join("store").join(beside).exists(),
-                "{what}: {beside}"
-            );
-        }
+        let folder = self.mac.0.join("store");
+        assert!(!folder.join("store.db-journal").exists(), "{what}");
+        let wal = std::fs::metadata(folder.join("store.db-wal"));
+        assert!(wal.map_or(true, |m| m.len() == 0), "{what}: store.db-wal");
     }
 
     /// Every command, reading or writing, refuses the store as it is now, saying each of `said`,
@@ -3345,7 +3349,7 @@ impl Refusable {
     }
 
     fn refused_by(&self, commands: &[Vec<&str>], said: &[&str], told: Option<&[&str]>) {
-        let before = std::fs::read(self.mac.store()).unwrap();
+        let before = common::store_bytes(&self.mac.store());
         for args in commands {
             let mut cmd = if args[0] == "run" {
                 let mut c = self.mac.run_cmd();
@@ -3376,8 +3380,8 @@ impl Refusable {
             for s in said {
                 assert!(all.contains(s), "{args:?}: {all}");
             }
-            assert_eq!(std::fs::read(self.mac.store()).unwrap(), before, "{args:?}");
             self.nothing_beside(&format!("{args:?}"));
+            assert_eq!(common::store_bytes(&self.mac.store()), before, "{args:?}");
         }
     }
 }
@@ -3421,7 +3425,7 @@ fn a_verdict_about_a_match_keeps_the_event_it_read_again_cut() {
         json!([{ "argument": 2, "kind": "gitleaks:github-pat", "length": 40 }])
     );
     assert_eq!(event["args_text"][2], "\\cut{gitleaks:github-pat 40}");
-    let db = std::fs::read(mac.store()).unwrap();
+    let db = common::store_bytes(&mac.store());
     assert!(!db.windows(token.len()).any(|w| w == token.as_bytes()));
 }
 
@@ -3430,10 +3434,10 @@ fn a_refused_verdict_changes_not_a_byte_of_the_store_and_makes_no_store_of_a_fil
     let mac = Mac::new("refusal-writes-nothing");
     let at = mac.append(&sw_vers(1));
     mac.run();
-    let bytes = std::fs::read(mac.store()).unwrap();
+    let bytes = common::store_bytes(&mac.store());
     let v = about_finding(&"0".repeat(32), "f0", "harmless", "case-1");
     mac.refused(v.to_string().as_bytes(), "another_store", 2);
-    assert_eq!(std::fs::read(mac.store()).unwrap(), bytes);
+    assert_eq!(common::store_bytes(&mac.store()), bytes);
     // Not vacuous: a verdict that is taken changes the store.
     mac.send(&about_match(
         &mac.store_id(),
@@ -3441,7 +3445,7 @@ fn a_refused_verdict_changes_not_a_byte_of_the_store_and_makes_no_store_of_a_fil
         SW_VERS,
         "harmless",
     ));
-    assert_ne!(std::fs::read(mac.store()).unwrap(), bytes);
+    assert_ne!(common::store_bytes(&mac.store()), bytes);
     std::fs::write(mac.store(), b"").unwrap();
     assert_eq!(mac.send_output(&v).status.code(), Some(3));
     assert_eq!(std::fs::metadata(mac.store()).unwrap().len(), 0);
@@ -3759,7 +3763,7 @@ fn given(mac: &Mac, id: &str, answer: &[&str]) -> Value {
 /// An answer that must be refused with this code and exit code 2, in the core's words and quoting
 /// `detail` or nothing, with the store's bytes as they were.
 fn refused_answer(mac: &Mac, id: &str, answer: &[&str], code: &str, detail: Option<&str>) {
-    let bytes = std::fs::read(mac.store()).unwrap();
+    let bytes = common::store_bytes(&mac.store());
     let out = mac.answer(id, answer);
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(out.status.code(), Some(2), "{answer:?}: {v:#}");
@@ -3794,7 +3798,7 @@ fn refused_answer(mac: &Mac, id: &str, answer: &[&str], code: &str, detail: Opti
         _ => {}
     }
     assert!(
-        std::fs::read(mac.store()).unwrap() == bytes,
+        common::store_bytes(&mac.store()) == bytes,
         "{answer:?}: the store changed"
     );
 }
@@ -3976,7 +3980,7 @@ fn an_answer_whose_other_finding_is_not_its_pair_is_refused_and_the_store_is_as_
 fn with_with_an_answer_names_what_it_read_journal_seq_once_and_each_finding_once() {
     let (mac, core, verdict, _, _) = paired("pair-usage");
     let seq = read(&mac);
-    let bytes = std::fs::read(mac.store()).unwrap();
+    let bytes = common::store_bytes(&mac.store());
     // --with may be given more than once, each time naming another finding: the same one twice
     // is refused by the store, not the usage.
     refused_answer(
@@ -4021,7 +4025,7 @@ fn with_with_an_answer_names_what_it_read_journal_seq_once_and_each_finding_once
         let v: Value = serde_json::from_slice(&out.stdout).unwrap();
         assert_eq!(v["errors"][0]["code"], "usage", "{args:?}");
     }
-    assert!(std::fs::read(mac.store()).unwrap() == bytes);
+    assert!(common::store_bytes(&mac.store()) == bytes);
 }
 
 #[test]
@@ -4029,7 +4033,7 @@ fn who_gave_an_answer_or_a_statement_is_said_once() {
     // A second --via would win silently: an agent's answer recorded as the app's, which needs
     // no read. It is misuse, and nothing is recorded.
     let (mac, core, _, _, _) = paired("via-once");
-    let bytes = std::fs::read(mac.store()).unwrap();
+    let bytes = common::store_bytes(&mac.store());
     for (first, second) in [("agent", "app"), ("app", "agent"), ("app", "app")] {
         let out = mac.answer(
             &core,
@@ -4059,7 +4063,7 @@ fn who_gave_an_answer_or_a_statement_is_said_once() {
             .unwrap();
         assert_eq!(out.status.code(), Some(2), "owner {first} {second}");
     }
-    assert!(std::fs::read(mac.store()).unwrap() == bytes);
+    assert!(common::store_bytes(&mac.store()) == bytes);
 }
 
 /// A rule no build of Immunity Core ships: what a store is left with when a later build drops a rule.
@@ -4497,7 +4501,7 @@ fn an_answer_through_an_agent_names_the_read_it_rests_on_and_is_refused_when_it_
     let (mac, core, verdict, _, _) = paired("agent-read");
     let agent = ["--via", "agent", "--reason", "invented: they agreed"];
     for answer in ["seen", "expected"] {
-        let bytes = std::fs::read(mac.store()).unwrap();
+        let bytes = common::store_bytes(&mac.store());
         let out = mac.answer(&verdict, &[&[answer][..], &agent].concat());
         assert_eq!(out.status.code(), Some(2), "{answer}");
         let v: Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -4509,7 +4513,7 @@ fn an_answer_through_an_agent_names_the_read_it_rests_on_and_is_refused_when_it_
                 && why.contains("immunity finding <id> --json"),
             "{why}"
         );
-        assert!(std::fs::read(mac.store()).unwrap() == bytes);
+        assert!(common::store_bytes(&mac.store()) == bytes);
     }
     // Taking an answer back needs none.
     let seq = read(&mac);
@@ -4543,7 +4547,7 @@ fn an_answer_from_the_app_names_the_read_it_rests_on_and_without_one_records_not
         &["seen"][..],
         &["expected", "--reason", "invented: my own build"][..],
     ] {
-        let bytes = std::fs::read(mac.store()).unwrap();
+        let bytes = common::store_bytes(&mac.store());
         let out = mac.answer(&verdict, &[answer, &["--via", "app"][..]].concat());
         assert_eq!(out.status.code(), Some(2), "{answer:?}");
         let v: Value = serde_json::from_slice(&out.stdout).unwrap();
@@ -4553,7 +4557,7 @@ fn an_answer_from_the_app_names_the_read_it_rests_on_and_without_one_records_not
             why.contains("an answer from the app needs --journal-seq <n>"),
             "{why}"
         );
-        assert!(std::fs::read(mac.store()).unwrap() == bytes);
+        assert!(common::store_bytes(&mac.store()) == bytes);
     }
     // With the read named, an old one refuses and a fresh one is taken.
     let seq = read(&mac);
