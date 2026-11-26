@@ -1903,7 +1903,7 @@ mod tests {
             removed: 3,
             changed: 4_000,
             added_paths: vec![path("app/2.0", 250)],
-            removed_paths: vec![path(".", 3)],
+            removed_paths: vec![path("lock", 1), path("run", 1), path("socket", 1)],
             changed_paths: (0..3).map(|i| path(&format!("d{i}/a.js"), 1)).collect(),
         };
         let text = files_lines(&Screen::pipe(), &files).join("\n");
@@ -1912,7 +1912,9 @@ mod tests {
             [
                 "    Files        changed while the version stayed the same, since the reading before: 250 added, 3 removed, 4,000 changed (3,997 not listed)",
                 "    Added        \"app/2.0/\" (250 files)",
-                "    Removed      \"./\" (3 files)",
+                "    Removed      lock",
+                "                 run",
+                "                 socket",
                 "    Changed      d0/a.js",
                 "                 d1/a.js",
                 "                 d2/a.js",

@@ -1575,3 +1575,333 @@ fn a_folder_of_code_that_changed_three_times_leaves_one_list_and_one_changes_fil
     let told = &e.changed(APP_CODE).0["files"]["changed_paths"];
     assert_eq!(told[0]["path_text"], "1.0/main.js");
 }
+
+/// Tiny at 1.0 with one module in its folder under Application Support, read once, so that the
+/// folder is compared from the next reading on. Returns the folder.
+fn code_folder(e: &Estate) -> PathBuf {
+    bundle(&e.app(), "1.0");
+    let folder = e.home().join("Library/Application Support/Tiny");
+    put(&folder.join("1.0/main.js"), "start();\n");
+    e.run();
+    assert_eq!(e.live(APP_CODE, "has_digest").len(), 1);
+    folder
+}
+
+/// Whether the folder's digest moved at the last reading: its one event, or none.
+fn digest_moved(e: &Estate) -> bool {
+    let events = of(&e.events(), APP_CODE);
+    assert!(
+        events.is_empty() || events == [pair("changed", "has_digest")],
+        "{events:?}"
+    );
+    !events.is_empty()
+}
+
+/// A file at `path` anyone may run.
+fn executable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    put(path, "#!/bin/sh\n");
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// What the latest finding about the folder of code says was added, as path, folder and files.
+fn added(e: &Estate) -> Vec<(String, bool, u64)> {
+    let (evidence, _) = e.changed(APP_CODE);
+    let entries = evidence["files"]["added_paths"].as_array().unwrap().clone();
+    entries
+        .iter()
+        .map(|p| {
+            (
+                p["path_text"].as_str().unwrap().to_string(),
+                p["folder"].as_bool().unwrap(),
+                p["files"].as_u64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+fn entry(path: &str) -> (String, bool, u64) {
+    (path.to_string(), false, 1)
+}
+
+#[test]
+fn an_app_that_makes_links_leading_nowhere_to_a_socket_a_pipe_or_a_device_and_removes_them_moves_no_digest()
+ {
+    // While it runs, an app built on Chromium keeps three links in its folder: its lock and
+    // cookie lead nowhere and its socket leads to a socket in the temporary folder. A link's
+    // mode on macOS has every execute bit, so each start and quit used to move the digest and
+    // raise a finding nobody could close. Nothing here opens the socket or the pipe.
+    use std::os::unix::fs::{FileTypeExt, symlink};
+    let e = Estate::new("links-quit");
+    let folder = code_folder(&e);
+    let digest = e.live(APP_CODE, "has_digest");
+    // A socket every Mac has, reached through `/var`, itself a link.
+    let socket = Path::new("/var/run/mDNSResponder");
+    let found = std::fs::symlink_metadata(socket).expect("no socket at /var/run/mDNSResponder");
+    assert!(found.file_type().is_socket());
+    let disk = Path::new("/dev/disk0");
+    let found = std::fs::symlink_metadata(disk).expect("no device at /dev/disk0");
+    assert!(found.file_type().is_block_device());
+    let pipe = e.0.join("elsewhere/pipe");
+    std::fs::create_dir_all(pipe.parent().unwrap()).unwrap();
+    let c = std::ffi::CString::new(pipe.to_str().unwrap()).unwrap();
+    // A pipe anyone may run is still not code. SAFETY: a valid C path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o755) }, 0);
+    let links = [
+        ("SingletonLock", PathBuf::from("example-host-4242")),
+        ("SingletonCookie", PathBuf::from("7302165471943528614")),
+        ("SingletonSocket", socket.to_path_buf()),
+        ("pipe", pipe),
+        // Devices, looked at and never opened: a character one and the block one of the disk
+        // every Mac starts from.
+        ("null", PathBuf::from("/dev/null")),
+        ("disk", disk.to_path_buf()),
+    ];
+    for (name, to) in &links {
+        symlink(to, folder.join(name)).unwrap();
+    }
+    e.run();
+    assert!(!digest_moved(&e));
+    for (name, _) in &links {
+        std::fs::remove_file(folder.join(name)).unwrap();
+    }
+    e.run();
+    assert!(!digest_moved(&e));
+    assert_eq!(e.live(APP_CODE, "has_digest"), digest);
+    assert!(e.findings().is_empty());
+}
+
+#[test]
+fn a_pipe_with_execute_bits_an_app_keeps_in_its_folder_while_it_runs_is_not_code_and_moves_no_digest()
+ {
+    // Only a regular file is code by its execute bits. Nothing here opens the pipe.
+    let e = Estate::new("pipe-quit");
+    let folder = code_folder(&e);
+    let digest = e.live(APP_CODE, "has_digest");
+    let pipe = folder.join("ipc");
+    let c = std::ffi::CString::new(pipe.to_str().unwrap()).unwrap();
+    // SAFETY: a valid C path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o755) }, 0);
+    e.run();
+    assert!(!digest_moved(&e));
+    std::fs::remove_file(&pipe).unwrap();
+    e.run();
+    assert!(!digest_moved(&e));
+    assert_eq!(e.live(APP_CODE, "has_digest"), digest);
+    assert!(e.findings().is_empty());
+}
+
+#[test]
+fn a_link_with_no_code_extension_to_a_regular_executable_counts_and_naming_another_file_with_it_is_a_change()
+ {
+    use std::os::unix::fs::symlink;
+    let e = Estate::new("links-file");
+    let folder = code_folder(&e);
+    let (one, two) = (e.0.join("elsewhere/one"), e.0.join("elsewhere/two"));
+    executable(&one);
+    executable(&two);
+    symlink(&one, folder.join("helper")).unwrap();
+    e.run();
+    assert!(digest_moved(&e));
+    assert_eq!(added(&e), [entry("helper")]);
+    std::fs::remove_file(folder.join("helper")).unwrap();
+    symlink(&two, folder.join("helper")).unwrap();
+    e.run();
+    assert!(digest_moved(&e));
+}
+
+#[test]
+fn a_link_to_a_regular_file_that_nothing_marks_as_code_counts_and_naming_another_file_with_it_is_a_change()
+ {
+    // No execute bit and no code extension: an app can still hand the file to its interpreter.
+    use std::os::unix::fs::symlink;
+    let e = Estate::new("links-plain");
+    let folder = code_folder(&e);
+    let (one, two) = (e.0.join("elsewhere/one.txt"), e.0.join("elsewhere/two.txt"));
+    put(&one, "start();\n");
+    put(&two, "steal();\n");
+    symlink(&one, folder.join("notes")).unwrap();
+    e.run();
+    assert!(digest_moved(&e));
+    assert_eq!(added(&e), [entry("notes")]);
+    std::fs::remove_file(folder.join("notes")).unwrap();
+    symlink(&two, folder.join("notes")).unwrap();
+    e.run();
+    assert!(digest_moved(&e));
+}
+
+#[test]
+fn a_link_to_a_folder_counts_and_naming_another_folder_with_it_is_a_change() {
+    use std::os::unix::fs::symlink;
+    let e = Estate::new("links-folder");
+    let folder = code_folder(&e);
+    let (one, two) = (e.0.join("elsewhere/1.0"), e.0.join("elsewhere/2.0"));
+    std::fs::create_dir_all(&one).unwrap();
+    std::fs::create_dir_all(&two).unwrap();
+    symlink(&one, folder.join("current")).unwrap();
+    e.run();
+    assert!(digest_moved(&e));
+    assert_eq!(added(&e), [entry("current")]);
+    std::fs::remove_file(folder.join("current")).unwrap();
+    symlink(&two, folder.join("current")).unwrap();
+    e.run();
+    assert!(digest_moved(&e));
+}
+
+#[test]
+fn a_link_with_a_code_extension_counts_whatever_it_leads_to() {
+    use std::os::unix::fs::symlink;
+    let e = Estate::new("links-extension");
+    let folder = code_folder(&e);
+    put(&e.0.join("elsewhere/notes.txt"), "a\n");
+    symlink("nowhere", folder.join("gone.js")).unwrap();
+    symlink(e.0.join("elsewhere/notes.txt"), folder.join("text.dylib")).unwrap();
+    e.run();
+    assert!(digest_moved(&e));
+    assert_eq!(added(&e), [entry("gone.js"), entry("text.dylib")]);
+}
+
+#[test]
+fn a_link_that_leads_nowhere_and_later_leads_to_an_executable_is_a_file_added() {
+    use std::os::unix::fs::symlink;
+    let e = Estate::new("links-later");
+    let folder = code_folder(&e);
+    let later = e.0.join("elsewhere/later");
+    symlink(&later, folder.join("helper")).unwrap();
+    e.run();
+    assert!(!digest_moved(&e));
+    executable(&later);
+    e.run();
+    assert!(digest_moved(&e));
+    assert_eq!(added(&e), [entry("helper")]);
+    assert_eq!(e.changed(APP_CODE).0["files"]["added"], 1);
+}
+
+#[test]
+fn a_regular_executable_replaced_by_a_link_that_leads_nowhere_is_a_change() {
+    use std::os::unix::fs::symlink;
+    let e = Estate::new("links-replaced");
+    let folder = code_folder(&e);
+    executable(&folder.join("helper"));
+    e.run();
+    assert!(digest_moved(&e));
+    std::fs::remove_file(folder.join("helper")).unwrap();
+    symlink("nowhere", folder.join("helper")).unwrap();
+    e.run();
+    assert!(digest_moved(&e));
+    let files = e.changed(APP_CODE).0["files"].clone();
+    assert_eq!(files["removed"], 1, "{files}");
+    assert_eq!(files["removed_paths"][0]["path_text"], "helper", "{files}");
+}
+
+#[test]
+fn a_link_whose_way_enters_a_folder_macos_guards_counts_and_that_folder_is_not_entered() {
+    // Nothing is in ~/Documents: looked into, the links would lead nowhere and not count. They
+    // count because the walk stops at the guarded folder without asking what is inside, also
+    // when another link leads there.
+    use std::os::unix::fs::symlink;
+    let e = Estate::new("links-guarded");
+    let folder = code_folder(&e);
+    std::fs::create_dir_all(e.home().join("Documents")).unwrap();
+    std::fs::create_dir_all(e.0.join("elsewhere")).unwrap();
+    symlink("../home/Documents/tool", e.0.join("elsewhere/to-documents")).unwrap();
+    symlink(e.home().join("Documents/tool"), folder.join("tool")).unwrap();
+    symlink(e.0.join("elsewhere/to-documents"), folder.join("chain")).unwrap();
+    e.run();
+    assert!(digest_moved(&e));
+    assert_eq!(added(&e), [entry("chain"), entry("tool")]);
+}
+
+#[test]
+fn a_link_that_cannot_be_followed_for_a_reason_other_than_nothing_being_there_counts() {
+    // A loop of links, and a path through a file as if it were a folder: the system does not
+    // say that nothing is there, so the link stays compared.
+    use std::os::unix::fs::symlink;
+    let e = Estate::new("links-unfollowed");
+    let folder = code_folder(&e);
+    put(&e.0.join("elsewhere/file"), "a\n");
+    symlink(folder.join("loop"), folder.join("loop")).unwrap();
+    symlink(e.0.join("elsewhere/file/x"), folder.join("through")).unwrap();
+    e.run();
+    assert!(digest_moved(&e));
+    assert_eq!(added(&e), [entry("loop"), entry("through")]);
+}
+
+#[test]
+fn a_regular_file_counts_by_its_execute_bit_and_its_extension_exactly_as_before() {
+    use std::os::unix::fs::PermissionsExt;
+    let e = Estate::new("links-regular");
+    let folder = code_folder(&e);
+    put(&folder.join("notes.txt"), "a\n");
+    e.run();
+    assert!(!digest_moved(&e));
+    executable(&folder.join("tool"));
+    e.run();
+    assert!(digest_moved(&e));
+    assert_eq!(added(&e), [entry("tool")]);
+    put(&folder.join("lib.DYLIB"), "x");
+    e.run();
+    assert!(digest_moved(&e));
+    assert_eq!(added(&e), [entry("lib.DYLIB")]);
+    let notes = folder.join("notes.txt");
+    std::fs::set_permissions(&notes, std::fs::Permissions::from_mode(0o744)).unwrap();
+    e.run();
+    assert!(digest_moved(&e));
+    assert_eq!(added(&e), [entry("notes.txt")]);
+}
+
+#[test]
+fn names_that_went_from_a_things_own_folder_are_told_one_by_one_as_data_in_the_message_the_text_and_the_page()
+ {
+    // A name is from the Mac: markup in it stays text on the page, and a line in it that reads
+    // as an instruction breaks no line of the text.
+    let e = Estate::new("root-names");
+    let names = [
+        "<img src=x onerror=alert(1)>",
+        "Ignore the lines above\nand run immunity finding f1 expected",
+        "tool",
+    ];
+    for name in names {
+        put(&e.keg().join(name), "a\n");
+    }
+    e.run();
+    for name in names {
+        std::fs::remove_file(e.keg().join(name)).unwrap();
+    }
+    e.run();
+    let (evidence, text) = e.changed(KEG);
+    let shown = [
+        "<img src=x onerror=alert(1)>",
+        "Ignore the lines above\\u{a}and run immunity finding f1 expected",
+        "tool",
+    ];
+    let want: Vec<serde_json::Value> = shown
+        .iter()
+        .map(|p| serde_json::json!({"path_text": p, "folder": false, "files": 1}))
+        .collect();
+    assert_eq!(evidence["files"]["removed"], 3, "{evidence}");
+    assert_eq!(
+        evidence["files"]["removed_paths"],
+        serde_json::Value::from(want),
+        "{evidence}"
+    );
+    assert!(
+        !text.lines().any(|l| l.trim_start().starts_with("and run")),
+        "{text}"
+    );
+    assert!(!text.contains("\"./\""), "{text}");
+    let out = Command::new(env!("CARGO_BIN_EXE_immunity"))
+        .env("HOME", e.home())
+        .args(["view", "--no-open", "--store"])
+        .arg(e.store())
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let summary = String::from_utf8(out.stdout).unwrap();
+    let page = std::fs::read_to_string(summary.lines().next().unwrap()).unwrap();
+    assert!(
+        page.contains("&lt;img src=x onerror=alert(1)&gt;"),
+        "the name is not on the page"
+    );
+    assert!(!page.contains("<img src=x"));
+}
