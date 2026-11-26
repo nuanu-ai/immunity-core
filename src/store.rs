@@ -5,7 +5,7 @@ use crate::outcome::{Code, Outcome};
 use crate::resolver;
 use rusqlite::config::DbConfig;
 use rusqlite::{
-    Connection, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
+    Connection, FileControl, OpenFlags, OptionalExtension, Transaction, TransactionBehavior, params,
 };
 use std::collections::BTreeSet;
 use std::fs::{File, TryLockError};
@@ -529,11 +529,34 @@ fn exists(path: &Path) -> Res<bool> {
 /// The two files SQLite keeps beside a store in write-ahead mode: the log of what was committed
 /// since the last checkpoint (`-wal`) and its index (`-shm`). They are part of the store.
 pub fn beside(path: &Path) -> [PathBuf; 2] {
-    ["-wal", "-shm"].map(|end| {
-        let mut name = path.as_os_str().to_owned();
-        name.push(end);
-        PathBuf::from(name)
-    })
+    ["-wal", "-shm"].map(|end| ended(path, end))
+}
+
+fn ended(path: &Path, end: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(end);
+    PathBuf::from(name)
+}
+
+/// A store of this format never has a rollback journal beside it. One that is there is the
+/// unfinished write of a store an earlier build made in rollback mode, or of something else, and
+/// SQLite plays it back into the file it opens at the path before anything can be checked, a
+/// store just made included. So where one stands nothing is opened or made, by any command.
+fn no_journal(path: &Path) -> Res<()> {
+    let journal = ended(path, "-journal");
+    if !exists(&journal)? {
+        return Ok(());
+    }
+    let said = format!(
+        "{} is beside {}: the unfinished write of a store an earlier build of Immunity Core \
+         made, or of something else, which SQLite would play back into the store. A store of \
+         this build never has one. Nothing was opened, made or changed. Move the store aside \
+         with its -journal, -wal and -shm files or pass another --store; the next run starts a \
+         store from the beginning.",
+        journal.display(),
+        path.display()
+    );
+    Err(Outcome::new(Code::UnknownFormat, said).into())
 }
 
 /// Makes a whole store where there was no file. It is made under a name of its own in the same
@@ -548,8 +571,9 @@ pub fn beside(path: &Path) -> [PathBuf; 2] {
 /// everything. The store is then opened once to write, which makes its `-wal` and `-shm` and
 /// keeps them (`writer`). A `-wal` or `-shm` already beside a path that holds no store was left
 /// by a store moved or deleted without it, and SQLite would read it as part of the new store,
-/// so nothing is made there.
+/// so nothing is made there, nor where a rollback journal stands (`no_journal`).
 fn make(path: &Path) -> Res<()> {
+    no_journal(path)?;
     for left in beside(path) {
         if exists(&left)? && !exists(path)? {
             let said = format!(
@@ -622,8 +646,14 @@ fn make(path: &Path) -> Res<()> {
 /// transaction. A run writes in one transaction that lasts the whole run, and `immunity status`
 /// reads what was committed before it all that time. Two writers still meet: a writer begins
 /// every transaction by taking the write lock (`writer`), and waits for it up to rusqlite's
-/// busy timeout of five seconds, as a reader does in the moment SQLite recovers the log of a
-/// writer that died.
+/// busy timeout of five seconds.
+///
+/// Every command and every step of a watcher opens the store and closes it again. A writer that
+/// closes while no other connection is open copies the log into the file, as SQLite does by
+/// default, and keeps the `-wal`, cut to nothing, and the `-shm` (`opened`). So the next open
+/// finds no log to read through before it answers, unless a writer died or another connection
+/// was open when the last writer closed; then the first open reads the log through to rebuild
+/// its index, and a reader or writer that comes in that moment waits for it, as for a writer.
 pub fn open(path: &Path) -> Result<Connection, Outcome> {
     opened(path).map_err(Outcome::from)
 }
@@ -632,14 +662,19 @@ fn opened(path: &Path) -> Res<Connection> {
     if !exists(path)? {
         return Err(absent(path).into());
     }
+    no_journal(path)?;
     let conn = writer(path)?;
     conn.pragma_update(None, "foreign_keys", true)?;
     check(&conn, path)?;
-    // The `-wal` is cut back to the size the automatic checkpoint lets it reach, once a
-    // checkpoint has copied it all, so the space a long reader made it take is given back.
+    // Only now that the store is this build's does the close copy the log into the file. The
+    // `-wal` and `-shm` are kept, for a reader that cannot make them, and the `-wal` is cut to
+    // nothing at that close (`journal_size_limit`, which also cuts it back to the size the
+    // automatic checkpoint lets it reach while the connection is open).
     let page: i64 = conn.query_row("PRAGMA page_size", [], |r| r.get(0))?;
     let pages: i64 = conn.query_row("PRAGMA wal_autocheckpoint", [], |r| r.get(0))?;
     conn.pragma_update(None, "journal_size_limit", page * pages)?;
+    conn.file_control(Some(rusqlite::MAIN_DB), FileControl::PersistWal(&mut 1))?;
+    conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, false)?;
     conn.execute_batch(VOCABULARY)?;
     conn.execute_batch(crate::processes::KINDS)?;
     crate::autorun::add_kinds(&conn)?;
@@ -647,14 +682,12 @@ fn opened(path: &Path) -> Res<Connection> {
     Ok(conn)
 }
 
-/// A connection that may write the store, opened without making it. Its close does not
-/// checkpoint (`SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`), and SQLite removes the `-wal` and `-shm` only
-/// after that checkpoint, so they stay for a reader that cannot write the store's folder, which
-/// SQLite lets read a store in write-ahead mode only while both exist; and a refused store's
-/// file is left as it was. `SQLITE_FCNTL_PERSIST_WAL` is not set: in the bundled SQLite it is
-/// read only by that checkpoint at close. Every transaction takes the write lock as it begins
-/// (`BEGIN IMMEDIATE`): one that read first and wrote after another writer's commit would fail
-/// on a snapshot that is no longer the latest, and waiting does not end that.
+/// A connection that may write the store, opened without making it. Its close copies nothing
+/// into the file (`SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`) until `opened` has found the store this
+/// build's, so a refused store's file is left as it was, and SQLite removes no `-wal` or `-shm`
+/// it did not copy. Every transaction takes the write lock as it begins (`BEGIN IMMEDIATE`): one
+/// that read first and wrote after another writer's commit would fail on a snapshot that is no
+/// longer the latest, and waiting does not end that.
 fn writer(path: &Path) -> rusqlite::Result<Connection> {
     let mut conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
@@ -716,9 +749,10 @@ pub fn read<T>(path: &Path, f: impl FnOnce(&Connection) -> Res<T>) -> Result<T, 
 /// inside its transaction, a run or a watcher stopped by a crash or a forced restart, may have
 /// left pages of it in the `-wal`, but no commit names them, so no reader reads them and
 /// nothing has to be undone first. In a folder this process cannot write, SQLite reads the
-/// store as long as its `-wal` and `-shm` are beside it, which every writer keeps (`writer`).
+/// store as long as its `-wal` and `-shm` are beside it, which every writer keeps (`opened`).
 /// Without one, SQLite says only that it cannot write or open, so the refusal names the file.
 pub fn open_read_only(path: &Path) -> Result<Connection, Outcome> {
+    no_journal(path).map_err(Outcome::from)?;
     let read = || -> Res<Connection> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
         check(&conn, path)?;
@@ -775,8 +809,9 @@ const START_OVER: &str = "Nothing was changed. Move the old store aside with its
                           beginning.";
 
 /// What the refusal of a file that holds no store says to do.
-const NOT_A_STORE: &str = "Nothing was changed. Move it aside or pass another --store; the next \
-                           run makes a store where there is no file.";
+const NOT_A_STORE: &str = "Nothing was changed. Move it aside with any -wal and -shm files beside \
+                           it or pass another --store; the next run makes a store where there is \
+                           no file.";
 
 /// Checks a store before anything else is done with it: that the file is a store at all, its
 /// format, that it is in write-ahead mode, that it holds exactly the schema of this format, and

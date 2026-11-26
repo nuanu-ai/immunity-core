@@ -10197,6 +10197,65 @@ fn a_read_only_command_beside_a_live_writer_answers_at_once_with_what_was_commit
     assert_eq!(status_json(&store)["store_id"], UNCOMMITTED);
 }
 
+#[test]
+fn where_the_journal_of_a_write_left_unfinished_in_rollback_mode_stands_no_command_opens_or_makes_a_store_and_nothing_changes()
+ {
+    // A store an earlier build made in rollback mode, as SQLite makes it, whose writer was killed
+    // in a transaction that spilled: its `-journal` is left beside it, and SQLite would play it
+    // back into whatever file it opens at the path.
+    writer_child();
+    let w = Watch::new("journal-left");
+    w.run();
+    let store = w.store();
+    let rollback = Connection::open(&store).unwrap();
+    rollback
+        .pragma_update(None, "journal_mode", "delete")
+        .unwrap();
+    drop(rollback);
+    Writer::start(
+        "where_the_journal_of_a_write_left_unfinished_in_rollback_mode_stands_no_command_opens_or_makes_a_store_and_nothing_changes",
+        &store,
+    )
+    .kill();
+    let journal = PathBuf::from(format!("{}-journal", store.display()));
+    let folder = store.parent().unwrap().to_path_buf();
+    let left = || {
+        let mut names: Vec<String> = std::fs::read_dir(&folder)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        let read = |f: &Path| std::fs::read(f).ok();
+        (names, read(&store), read(&journal))
+    };
+    let refused = |(code, said): (Option<i32>, String)| {
+        assert_eq!(code, Some(3), "{said}");
+        assert!(said.contains("store.db-journal is beside"), "{said}");
+        assert!(said.contains("with its -journal, -wal and -shm"), "{said}");
+    };
+    let said = |cmd: &mut Command| {
+        let out = cmd.output().unwrap();
+        let said = String::from_utf8_lossy(&out.stderr).into_owned();
+        (out.status.code(), said)
+    };
+    let before = left();
+    assert!(before.2.as_ref().is_some_and(|j| !j.is_empty()));
+    // A command that reads, and one that opens the store to write before it reads anything.
+    let (code, _, status) = status_out(&store, &[]);
+    refused((code, status));
+    let mut sample = immunity_cmd(w.home());
+    sample.args(["sample", "--store"]).arg(&store);
+    refused(said(
+        sample.arg("--sample-input").arg(w.home().join("absent")),
+    ));
+    assert!(left() == before);
+    // One that would make a store where the store was moved aside without its journal.
+    std::fs::rename(&store, folder.join("moved-aside.db")).unwrap();
+    let before = left();
+    refused(said(&mut w.cmd()));
+    assert!(left() == before && !store.exists());
+}
+
 /// The brew answer with `n` invented formulae at one version: a run that changes them all
 /// writes more than SQLite's page cache holds.
 fn many_formulae(n: usize, version: &str) -> String {

@@ -515,13 +515,13 @@ fn a_watcher_already_running_never_makes_a_store_in_a_file_whose_schema_is_gone(
         .unwrap()
         .execute_batch("PRAGMA writable_schema = ON; DELETE FROM sqlite_master;")
         .unwrap();
-    let before = std::fs::read(mac.store()).unwrap();
+    let before = common::store_bytes(&mac.store());
     folder.unlock().unwrap();
     mac.put(".zshrc", "two\n");
     let problem = w.until("problem", |v| v["code"] == "read_failed");
     let said = problem["detail_text"].as_str().unwrap();
     assert!(said.contains("holds no tables, not a store"), "{said}");
-    assert_eq!(std::fs::read(mac.store()).unwrap(), before);
+    assert!(common::store_bytes(&mac.store()) == before);
     // A store that goes while it runs is not made again either.
     folder.lock().unwrap();
     std::fs::remove_file(mac.store()).unwrap();

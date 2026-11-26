@@ -32,7 +32,7 @@ pub enum Kind {
 /// (`Error.outcome`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Code {
-    /// `SQLITE_BUSY` and its extended codes past the busy timeout.
+    /// `SQLITE_BUSY` and its extended codes past the busy timeout, and `SQLITE_READONLY_RECOVERY`.
     StoreBusy,
     /// The run lock, still held after its wait.
     RunLockHeld,
@@ -223,6 +223,9 @@ fn of_sqlite(e: &rusqlite::Error) -> Outcome {
     };
     let code = match extended {
         ffi::SQLITE_READONLY_DBMOVED => Code::Moved,
+        // A reader that cannot write the `-shm` came while another connection rebuilds it from
+        // the log: a moment, which a retry ends.
+        ffi::SQLITE_READONLY_RECOVERY => Code::StoreBusy,
         _ => match extended & 0xff {
             ffi::SQLITE_BUSY => Code::StoreBusy,
             ffi::SQLITE_NOTADB => Code::NotAStore,
@@ -313,6 +316,18 @@ mod tests {
         let rows = [
             ("busy", skip(of(&busy()), Code::StoreBusy)),
             (
+                "BUSY_RECOVERY",
+                skip(sqlite(ffi::SQLITE_BUSY_RECOVERY), Code::StoreBusy),
+            ),
+            (
+                "BUSY_SNAPSHOT",
+                skip(sqlite(ffi::SQLITE_BUSY_SNAPSHOT), Code::StoreBusy),
+            ),
+            (
+                "READONLY_RECOVERY",
+                skip(sqlite(ffi::SQLITE_READONLY_RECOVERY), Code::StoreBusy),
+            ),
+            (
                 "busy, boxed",
                 skip(Box::<dyn Error>::from(busy()).into(), Code::StoreBusy),
             ),
@@ -379,6 +394,14 @@ mod tests {
                 "READONLY",
                 store(sqlite(ffi::SQLITE_READONLY), Code::NotWritable),
             ),
+            (
+                "READONLY_ROLLBACK",
+                store(sqlite(ffi::SQLITE_READONLY_ROLLBACK), Code::NotWritable),
+            ),
+            (
+                "READONLY_CANTINIT",
+                store(sqlite(ffi::SQLITE_READONLY_CANTINIT), Code::NotWritable),
+            ),
             ("PERM", store(sqlite(ffi::SQLITE_PERM), Code::NotWritable)),
             (
                 "moved",
@@ -396,6 +419,7 @@ mod tests {
                 store(Outcome::new(Code::Folder, "x"), Code::Folder),
             ),
             ("LOCKED", work(of(&locked))),
+            ("PROTOCOL", work(sqlite(ffi::SQLITE_PROTOCOL))),
             ("an error of the work", work(of(&missing))),
             ("the words of busy", work(words.into())),
         ];
