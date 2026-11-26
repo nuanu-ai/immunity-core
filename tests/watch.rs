@@ -2517,6 +2517,37 @@ fn a_place_the_watcher_read_first_after_the_first_check_is_told_once_and_what_ap
 }
 
 #[test]
+fn in_a_store_only_a_watcher_wrote_what_a_later_reading_of_a_kind_meets_first_is_told_and_never_silent()
+ {
+    // No full check has run. The watcher's first reading could not list the home folder's
+    // autostart items; an item put there after that reading is no part of the baseline, so the
+    // reading that first lists the folder tells what it holds once, as read for the first time.
+    let mac = Mac::new("watcher-only-store");
+    let agents = mac.home().join("Library/LaunchAgents");
+    mac.put(
+        "Library/LaunchAgents/com.invented.sync.plist",
+        "<plist><dict/></plist>\n",
+    );
+    {
+        std::fs::set_permissions(&agents, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let _open = Mode(agents.clone(), 0o755);
+        assert!(mac.watch().started().stop().success());
+    }
+    mac.put(
+        "Library/LaunchAgents/com.invented.other.plist",
+        "<plist><dict/></plist>\n",
+    );
+    assert!(mac.watch().started().stop().success());
+    assert!(
+        mac.rows("SELECT run_id FROM journal WHERE entry = 'run_started'")
+            .is_empty()
+    );
+    // A watcher names the machine by this Mac's own name, so only the rule is compared.
+    let rules: Vec<String> = found(&mac).into_iter().map(|f| f.0).collect();
+    assert_eq!(rules, ["watched.first-read"]);
+}
+
+#[test]
 fn a_worktree_that_appears_while_the_watcher_runs_raises_nothing_in_the_run_or_the_watcher_and_its_later_change_is_found_live()
  {
     // The full run finds the worktree and the watcher then watches it: both judge it by one

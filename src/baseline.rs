@@ -7,8 +7,9 @@
 //!   holds it was read in full by an earlier run; or the unit is new to a listing an earlier
 //!   run made in full; or it is in a checkout new to a listing an earlier walk made in full,
 //!   and was in reach since that checkout was first seen;
-//! - the baseline, recorded and silent, during the store's first check, for a unit nothing met
-//!   before: nobody could have known what was there;
+//! - the baseline, recorded and silent, in the first reading of its reader and kind while the
+//!   store has had no full check, for a unit nothing met before: nobody could have known what
+//!   was there;
 //! - read for the first time, recorded and told once, in every other case: a project reached
 //!   later by a run pointed at its folder, a folder that could not be read before, or a place
 //!   a later version reads that an earlier one did not.
@@ -461,7 +462,8 @@ pub struct Facts {
     pub in_new_checkout: bool,
     /// An earlier run read the unit or saw it present.
     pub met_before: bool,
-    /// The store has had no full check before this run.
+    /// The store has had no full check before this run, and no earlier run read this reader
+    /// and kind: this reading is the first of its kind.
     pub first_check: bool,
 }
 
@@ -677,8 +679,21 @@ impl Judge<'_> {
             new_to_listing: newer(listing.as_ref(), seen.as_ref(), self.run_id),
             in_new_checkout,
             met_before: first.is_some(),
-            first_check: self.first_check,
+            first_check: self.first_check && !self.kind_read_before()?,
         })
+    }
+
+    /// Whether an earlier run wrote coverage of this reader and kind, whether it read all of it,
+    /// part or nothing. A reading after it is not the first of its kind, so what nothing met
+    /// before is read for the first time and told, though the store has had no full check: a
+    /// watcher reads before the first check, and what is put in a place after its first reading
+    /// is no part of the baseline.
+    fn kind_read_before(&self) -> rusqlite::Result<bool> {
+        self.tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM coverage WHERE reader = ?1 AND kind = ?2 AND run_id != ?3)",
+            params![self.reader, self.kind, self.run_id],
+            |r| r.get(0),
+        )
     }
 
     pub fn verdict(&self, unit: &Unit) -> rusqlite::Result<Verdict> {
@@ -714,6 +729,54 @@ mod tests {
             };
             assert_eq!(verdict(f), expected, "{f:?}");
         }
+    }
+
+    #[test]
+    fn only_the_first_reading_of_its_reader_and_kind_is_the_silent_baseline_whatever_else_was_read()
+    {
+        // A store with no full check, where another reader read this kind and this reader read
+        // another kind: the first reading of this reader and kind is still the baseline. A later
+        // one is not, though the earlier one read nothing and the store still has no full check.
+        let dir = crate::common::Scratch::new("first-of-kind");
+        let conn = store::open_or_make(&dir.join("store.db")).unwrap();
+        let (mac, agents) = ("machine:example-mac", "launch agents and daemons");
+        let cover = |reader: &str, kind: &str, run: &str| {
+            let tx = conn.unchecked_transaction().unwrap();
+            store::put_entity(&tx, mac).unwrap();
+            tx.execute(
+                "INSERT OR IGNORE INTO coverage_kind (name) VALUES (?1)",
+                [kind],
+            )
+            .unwrap();
+            let r = store::Reading {
+                reader,
+                scope: mac,
+                kind,
+                run_id: run,
+                at: 1,
+                observed_at: 1,
+            };
+            let gap = store::Gap::of(store::Cause::Failed);
+            store::put_coverage(&tx, &r, "none", Some("invented"), &gap).unwrap();
+            tx.commit().unwrap();
+        };
+        let reader = crate::watched::READER;
+        cover("another-reader", agents, "run-1");
+        cover(reader, "shell files", "run-1");
+        let judge = |run| Judge {
+            tx: &conn,
+            reader,
+            kind: agents,
+            run_id: run,
+            first_check: true,
+            checkouts: &[],
+        };
+        let thing = Unit::whole("Library/LaunchAgents/com.invented.sync.plist");
+        assert_eq!(judge("run-2").verdict(&thing).unwrap(), Verdict::Baseline);
+        // What this reading writes of itself is no earlier reading.
+        cover(reader, agents, "run-2");
+        assert_eq!(judge("run-2").verdict(&thing).unwrap(), Verdict::Baseline);
+        assert_eq!(judge("run-3").verdict(&thing).unwrap(), Verdict::FirstRead);
     }
 
     #[test]
