@@ -1625,7 +1625,7 @@ fn entry(path: &str) -> (String, bool, u64) {
 }
 
 #[test]
-fn an_app_that_makes_links_leading_nowhere_to_a_socket_and_to_a_pipe_and_removes_them_moves_no_digest()
+fn an_app_that_makes_links_leading_nowhere_to_a_socket_a_pipe_or_a_device_and_removes_them_moves_no_digest()
  {
     // While it runs, an app built on Chromium keeps three links in its folder: its lock and
     // cookie lead nowhere and its socket leads to a socket in the temporary folder. A link's
@@ -1639,6 +1639,9 @@ fn an_app_that_makes_links_leading_nowhere_to_a_socket_and_to_a_pipe_and_removes
     let socket = Path::new("/var/run/mDNSResponder");
     let found = std::fs::symlink_metadata(socket).expect("no socket at /var/run/mDNSResponder");
     assert!(found.file_type().is_socket());
+    let disk = Path::new("/dev/disk0");
+    let found = std::fs::symlink_metadata(disk).expect("no device at /dev/disk0");
+    assert!(found.file_type().is_block_device());
     let pipe = e.0.join("elsewhere/pipe");
     std::fs::create_dir_all(pipe.parent().unwrap()).unwrap();
     let c = std::ffi::CString::new(pipe.to_str().unwrap()).unwrap();
@@ -1649,6 +1652,10 @@ fn an_app_that_makes_links_leading_nowhere_to_a_socket_and_to_a_pipe_and_removes
         ("SingletonCookie", PathBuf::from("7302165471943528614")),
         ("SingletonSocket", socket.to_path_buf()),
         ("pipe", pipe),
+        // Devices, looked at and never opened: a character one and the block one of the disk
+        // every Mac starts from.
+        ("null", PathBuf::from("/dev/null")),
+        ("disk", disk.to_path_buf()),
     ];
     for (name, to) in &links {
         symlink(to, folder.join(name)).unwrap();
@@ -1665,27 +1672,60 @@ fn an_app_that_makes_links_leading_nowhere_to_a_socket_and_to_a_pipe_and_removes
 }
 
 #[test]
+fn a_pipe_with_execute_bits_an_app_keeps_in_its_folder_while_it_runs_is_not_code_and_moves_no_digest()
+ {
+    // Only a regular file is code by its execute bits. Nothing here opens the pipe.
+    let e = Estate::new("pipe-quit");
+    let folder = code_folder(&e);
+    let digest = e.live(APP_CODE, "has_digest");
+    let pipe = folder.join("ipc");
+    let c = std::ffi::CString::new(pipe.to_str().unwrap()).unwrap();
+    // SAFETY: a valid C path.
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o755) }, 0);
+    e.run();
+    assert!(!digest_moved(&e));
+    std::fs::remove_file(&pipe).unwrap();
+    e.run();
+    assert!(!digest_moved(&e));
+    assert_eq!(e.live(APP_CODE, "has_digest"), digest);
+    assert!(e.findings().is_empty());
+}
+
+#[test]
 fn a_link_with_no_code_extension_to_a_regular_executable_counts_and_naming_another_file_with_it_is_a_change()
  {
-    // A link to a file that is not executable and has no code extension does not count; one to
-    // a file with a code extension does, whatever its mode.
     use std::os::unix::fs::symlink;
     let e = Estate::new("links-file");
     let folder = code_folder(&e);
-    let elsewhere = e.0.join("elsewhere");
-    let (one, two) = (elsewhere.join("one"), elsewhere.join("two"));
+    let (one, two) = (e.0.join("elsewhere/one"), e.0.join("elsewhere/two"));
     executable(&one);
     executable(&two);
-    put(&elsewhere.join("notes.txt"), "a\n");
-    put(&elsewhere.join("Module.JS"), "start();\n");
     symlink(&one, folder.join("helper")).unwrap();
-    symlink(elsewhere.join("notes.txt"), folder.join("notes")).unwrap();
-    symlink(elsewhere.join("Module.JS"), folder.join("module")).unwrap();
     e.run();
     assert!(digest_moved(&e));
-    assert_eq!(added(&e), [entry("helper"), entry("module")]);
+    assert_eq!(added(&e), [entry("helper")]);
     std::fs::remove_file(folder.join("helper")).unwrap();
     symlink(&two, folder.join("helper")).unwrap();
+    e.run();
+    assert!(digest_moved(&e));
+}
+
+#[test]
+fn a_link_to_a_regular_file_that_nothing_marks_as_code_counts_and_naming_another_file_with_it_is_a_change()
+ {
+    // No execute bit and no code extension: an app can still hand the file to its interpreter.
+    use std::os::unix::fs::symlink;
+    let e = Estate::new("links-plain");
+    let folder = code_folder(&e);
+    let (one, two) = (e.0.join("elsewhere/one.txt"), e.0.join("elsewhere/two.txt"));
+    put(&one, "start();\n");
+    put(&two, "steal();\n");
+    symlink(&one, folder.join("notes")).unwrap();
+    e.run();
+    assert!(digest_moved(&e));
+    assert_eq!(added(&e), [entry("notes")]);
+    std::fs::remove_file(folder.join("notes")).unwrap();
+    symlink(&two, folder.join("notes")).unwrap();
     e.run();
     assert!(digest_moved(&e));
 }

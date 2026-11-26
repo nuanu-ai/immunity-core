@@ -1,7 +1,7 @@
 {
   "advice": "The program named here reached an address on the list you gave. Look at what is shown here of the process that did. Until you know why it reached that address, treat this Mac as affected; if nobody knows, ask your agent to look into it.",
   "answer": null,
-  "answered_at": 1795677039,
+  "answered_at": 1795677918,
   "answered_together": [],
   "answered_with": null,
   "answers_note": "Answer a finding only after the owner has agreed in this conversation, having been told what it is and what the options are. Pass --via agent and the reason the owner agreed to. The app shows every answer given this way.",
@@ -24,7 +24,7 @@
         "pid": 4300,
         "process_group_leader": null,
         "session_leader": null,
-        "start_micros": 1795673439123456,
+        "start_micros": 1795674318123456,
         "working_directory_text": null
       },
       "transport": "tcp"
@@ -39,14 +39,14 @@
     "state": "open",
     "urgent": true
   },
-  "first_seen_at": 1795676909,
+  "first_seen_at": 1795677788,
   "folder_text": null,
   "format": 1,
   "group": null,
   "journal_seq": 47,
   "kind": "match of an indicator from the list",
   "kind_title": "Indicator match",
-  "last_seen_at": 1795676909,
+  "last_seen_at": 1795677788,
   "meaning": "The list names files, sites and addresses that the attack is known to use, so a match is rarely chance; it is wrong only when the list itself is wrong.",
   "rests_on": [
     {
@@ -56,14 +56,14 @@
       "old_value_text": null,
       "predicate": "matches_indicator",
       "reader": "processes",
-      "recorded_at": 1795676909,
-      "run_id": "sample-1795677039-131871000",
+      "recorded_at": 1795677788,
+      "run_id": "sample-1795677918-012806000",
       "seq": 41,
       "subject_text": "file:machine:mac//opt/tools/bin/node"
     }
   ],
   "short_title": "Matches a sign of attack from your list",
-  "store_id": "5889e92ab5971b47a109ffa038040a7f",
+  "store_id": "0376983a01c0170402e064cc20277ef6",
   "technique_text": null,
   "thing": null,
   "title": "Something on this Mac matches a sign of a known attack from the list you gave.",

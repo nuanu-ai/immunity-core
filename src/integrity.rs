@@ -69,9 +69,9 @@ const NODE_MODULES: &str = "lib/node_modules";
 const SKIPPED: [&str; 1] = ["__pycache__"];
 
 /// Kinds of file that are code, by extension: scripts, native modules and libraries, and
-/// archives of code. A file anyone may run is code too, whatever its name, and a symbolic link
-/// by what it leads to (`is_code`). Python's compiled files are left out: Python writes them by
-/// itself.
+/// archives of code. A file anyone may run is code too, whatever its name, and so is a symbolic
+/// link unless it leads nowhere or to a socket, a pipe or a device (`is_code`). Python's compiled
+/// files are left out: Python writes them by itself.
 const CODE: [&str; 13] = [
     "js", "mjs", "cjs", "node", "dylib", "so", "py", "asar", "jar", "wasm", "sh", "rb", "lua",
 ];
@@ -94,7 +94,7 @@ const MAX_FILES: usize = 20_000;
 /// What a reading's note says the reader cannot judge, kind by kind.
 const BUNDLES_CANNOT: &str = "not covered: extended attributes, which no seal covers; a bundle changed and signed again shows only as another signer at the same version; an application that updates itself in place shows as a change of its digest";
 const KEGS_CANNOT: &str = "compared by files' metadata between readings, since Homebrew keeps no record of a keg's files to verify against; __pycache__ folders are not compared";
-const APP_SUPPORT_CANNOT: &str = "compared by the metadata of code files between readings, a symbolic link among them unless what it leads to cannot be run; only a folder named like an application read here that Apple did not sign is looked into, and one an earlier reading held for as long as it is there, so code kept under another name is not compared; caches, web storage, crash reports and logs are not compared";
+const APP_SUPPORT_CANNOT: &str = "compared by the metadata of code files between readings, a symbolic link among them unless it leads nowhere or to a socket, a pipe or a device; only a folder named like an application read here that Apple did not sign is looked into, and one an earlier reading held for as long as it is there, so code kept under another name is not compared; caches, web storage, crash reports and logs are not compared";
 const NPM_CANNOT: &str = "compared by files' metadata between readings, since npm keeps no record of a global package's files to verify against; a global folder set in npm's configuration or by a version manager is not looked for, and a linked package is not read";
 
 /// Where places are resolved: the home folder, and the root of the system, `/` unless a test
@@ -255,43 +255,39 @@ fn walk_code(
 /// Whether an entry under a folder of code that is not a folder is code: by a code extension,
 /// whatever it is; a regular file by its execute bit; a symbolic link by what it leads to.
 fn is_code(path: &Path, m: &std::fs::Metadata, name: &str, homes: &[&Path]) -> bool {
-    if CODE.contains(&extension(name)) {
+    if CODE.contains(&name.rsplit_once('.').map_or("", |(_, e)| e)) {
         return true;
     }
-    if !m.file_type().is_symlink() {
-        return m.mode() & 0o111 != 0;
+    if m.file_type().is_symlink() {
+        return leads_to_code(path, homes);
     }
-    leads_to_code(path, homes)
+    // A socket or a pipe an app keeps while it runs has execute bits too, and cannot be run.
+    m.is_file() && m.mode() & 0o111 != 0
 }
 
-/// Whether a symbolic link with no code extension leads to what may be code. It may, unless
-/// what it leads to cannot be run: nothing is there, it is neither a regular file nor a folder
-/// (a socket, a pipe, a device), or it is a regular file with no execute bit and no code
-/// extension. An app that runs keeps such links beside its code and removes them as it quits,
-/// as Chromium does with its single-instance lock, cookie and socket. A link to a folder may
-/// be: which folder it names decides which code runs. The link is followed one part at a time
-/// by `guarded::real`, which never looks into a folder macOS asks permission for and counts the
-/// links it passes; a link that leads into one, or that cannot be followed for any reason but
-/// nothing being there, may be code. Nothing it leads to is opened.
+/// Whether a symbolic link with no code extension may lead to code. It may, unless nothing is
+/// there, or what it leads to is a socket, a pipe or a device, which cannot be run. An app that
+/// runs keeps such links beside its code and removes them as it quits, as Chromium does with its
+/// single-instance lock, cookie and socket. A link to a regular file counts whatever the file's
+/// mode and name, since an app can hand any file to its interpreter, and a link to a folder
+/// counts, since which folder it names decides which code runs. The link is followed one part
+/// at a time by `guarded::real`, which never looks into a folder macOS asks permission for and
+/// counts the links it passes; a link that leads into one, or that cannot be followed for any
+/// reason but nothing being there, counts. Anything the second look does not name, or cannot
+/// make, stays compared: a link swapped in after `real` answered among them. Nothing it leads to
+/// is opened.
 fn leads_to_code(link: &Path, homes: &[&Path]) -> bool {
+    use std::os::unix::fs::FileTypeExt;
     let to = match crate::guarded::real(link, homes) {
         crate::guarded::Real::At(to) => to,
         crate::guarded::Real::Guarded(_) => return true,
         crate::guarded::Real::Failed(e) => return e.kind() != ErrorKind::NotFound,
     };
-    // What the walk looked at a moment ago: if it cannot be looked at again, it is still compared.
     let Ok(m) = std::fs::symlink_metadata(&to) else {
         return true;
     };
-    let name = to.file_name().map(|n| n.to_string_lossy().to_lowercase());
-    m.is_dir()
-        || m.is_file()
-            && (m.mode() & 0o111 != 0 || name.is_some_and(|n| CODE.contains(&extension(&n))))
-}
-
-/// What follows the last `.` of a name, or nothing.
-fn extension(name: &str) -> &str {
-    name.rsplit_once('.').map_or("", |(_, e)| e)
+    let t = m.file_type();
+    !(t.is_socket() || t.is_fifo() || t.is_block_device() || t.is_char_device())
 }
 
 /// Code that applications keep outside their bundle, in `~/Library/Application Support`.
