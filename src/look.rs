@@ -575,8 +575,13 @@ pub fn kinds_written() -> BTreeSet<String> {
 /// more, by `lifecycle::retire`, and a thing of a kind still read that no row of the kind
 /// names, such as a file a row no longer lists. Each is retracted with a journal entry
 /// `retired` that says why, never told as removed, and the content read of it goes with it.
-/// `r` gives the run; its scope and kind are ignored. Returns how many things were closed.
-pub fn retire_unread(tx: &Transaction, r: &Reading) -> rusqlite::Result<usize> {
+/// `r` gives the run; its scope and kind are ignored; `checkouts` are those the store ever knew
+/// (`baseline::past_checkouts`). Returns how many things were closed.
+pub fn retire_unread(
+    tx: &Transaction,
+    r: &Reading,
+    checkouts: &BTreeSet<String>,
+) -> rusqlite::Result<usize> {
     let written = kinds_written();
     let reader = watched::READER;
     // Kind by kind through the index of readings by reader and kind, never through every
@@ -594,7 +599,6 @@ pub fn retire_unread(tx: &Transaction, r: &Reading) -> rusqlite::Result<usize> {
         )?
         .query_map([reader], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
-    let checkouts = baseline::past_checkouts(tx)?;
     let rows: Vec<(String, String, String)> = tx
         .prepare(
             "SELECT scope, kind, subject FROM assertion
@@ -1340,9 +1344,10 @@ mod tests {
             observed_at: at,
         };
         crate::store::put_coverage(&tx, &r(gone_kind), "full", None, &Default::default()).unwrap();
-        let closed = retire_unread(&tx, &r("")).unwrap();
+        let checkouts = baseline::past_checkouts(&tx).unwrap();
+        let closed = retire_unread(&tx, &r(""), &checkouts).unwrap();
         // Done once: the next reading closes nothing.
-        let again = retire_unread(&tx, &r("")).unwrap();
+        let again = retire_unread(&tx, &r(""), &checkouts).unwrap();
         let live = |subject: &str| -> i64 {
             tx.query_row(
                 "SELECT COUNT(*) FROM assertion WHERE layer = 'live' AND subject = ?1",

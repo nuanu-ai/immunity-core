@@ -2198,6 +2198,38 @@ fn git_hooks_watch_rebinds_to_a_new_folder_on_a_config_event() {
 }
 
 #[test]
+fn a_watchers_reading_of_hooks_git_told_keeps_the_marks_of_a_checkout_inside() {
+    // The walk does not look into a checkout inside another, so only a check pointed at it
+    // reads its hooks; a watcher's reading of the outer one's hooks leaves its marks alone.
+    let mac = Mac::new("nested-marks");
+    for rel in ["dev/tree", "dev/tree/sub"] {
+        mac.put(&format!("{rel}/.git/HEAD"), "ref: refs/heads/main\n");
+        mac.put(
+            &format!("{rel}/.git/config"),
+            "[core]\n hooksPath = tools/hooks\n",
+        );
+        mac.put(&format!("{rel}/tools/hooks/pre-push"), "# hook\n");
+    }
+    let sub = mac.home().join("dev/tree/sub");
+    let run_in_sub = || {
+        let out = mac.run_cmd().arg("--checkouts-root").arg(&sub).output();
+        assert!(out.unwrap().status.success());
+    };
+    run_in_sub();
+    std::fs::set_permissions(sub.join("tools"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    let _open = Mode(sub.join("tools"), 0o755);
+    run_in_sub();
+    mac.run();
+    let marks = || mac.rows("SELECT unit FROM unit_unread UNION ALL SELECT part FROM part_unread");
+    assert_eq!(marks(), ["dev/tree/sub/tools/hooks"]);
+    let mut watcher = mac.watch_with(&["--alive-every", "60"]).started();
+    mac.put("dev/tree/tools/hooks/pre-push", "# changed\n");
+    watcher.next("read");
+    assert_eq!(marks(), ["dev/tree/sub/tools/hooks"]);
+    assert!(watcher.stop().success());
+}
+
+#[test]
 fn what_changes_between_the_watchers_first_reading_and_the_first_check_where_the_watcher_read_is_found()
  {
     // The watcher's first reading of the home folder is that folder's baseline, though no
