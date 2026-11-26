@@ -99,7 +99,7 @@ use crate::sigma::{Match, Meta, Rules, Subject};
 use crate::store::{Cause, Gap, Reading};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -1234,12 +1234,105 @@ struct Left {
 pub struct Pass {
     after: Option<Key>,
     writing: Option<Key>,
+    /// How far the watcher's early look (`raising`) has looked in each file since the latest
+    /// step that read the log.
+    seen: Option<Seen>,
+}
+
+/// How far the early look has looked in each log file: its inode, the offset after the last
+/// whole line looked at, and the file's length then. It starts at each step that reads the log
+/// from where that step left each file, the rows it wrote into `event_file`, with the length the
+/// step listed for the files it read. It lives in memory only and is never written: the store's
+/// places stay the one record of what was read.
+#[derive(Debug, Default)]
+struct Seen {
+    looked: BTreeMap<String, (u64, u64, u64)>,
 }
 
 impl Pass {
     /// Log is left after the latest step: the next step reads on.
     pub fn more(&self) -> bool {
         self.after.is_some()
+    }
+
+    /// The watcher's early look: whether lines written since it last looked match a rule that
+    /// raises a finding (`Meta::raises`, a level stated and high or critical) and is not in
+    /// `held`, or more is waiting than one look takes (`BYTES`), so that the step should run now
+    /// rather than at its period. Every rule that raised in those lines then goes into `held`,
+    /// by the id the evaluator keys its matches by (`Matched::rules`). The caller empties `held`
+    /// at each step at its period, so a rule brings a step forward once in each period, and a
+    /// rule that matches all the time costs one early step and the step at the period. It
+    /// opens no store and writes nothing. First a listing of the log's folder and each file's
+    /// size: a file as it was at the last look, or holding nothing past where the look got to,
+    /// is passed over, so a quiet log costs that listing alone, and a line left unfinished is
+    /// looked at again only once the file grows. Then the new whole lines are read and
+    /// evaluated by the reading's own parser and the one evaluator (`read_file`,
+    /// `Into::judge`), counted into nothing that is kept, and where the look got to moves past
+    /// them, so a line is looked at once. False until a step read the log, after a step that
+    /// failed or found no collector, and when the folder cannot be listed; a file that cannot
+    /// be read ends the look, which answers by what matched before it. The step at its period
+    /// reads and tells such a failure. Whatever this says, what the step
+    /// reads is decided by the store's places alone, so a wrong answer here, or a wrong `held`,
+    /// costs an early step or a wait of at most one period, and never a line.
+    pub fn raising(&mut self, root: &Path, now: i64, held: &mut BTreeSet<&'static str>) -> bool {
+        let Some(seen) = &mut self.seen else {
+            return false;
+        };
+        let dir = root.join(LOG);
+        let Ok((files, _)) = list(&dir) else {
+            return false;
+        };
+        let from = |f: &LogFile| match seen.looked.get(&f.name) {
+            Some(&(inode, to, len)) if inode == f.inode && to <= f.len => (to, len == f.len),
+            _ => (0, f.len == 0),
+        };
+        let grown: Vec<(&LogFile, u64)> = files
+            .iter()
+            .filter_map(|f| match from(f) {
+                (_, true) => None,
+                (to, false) => Some((f, to)),
+            })
+            .collect();
+        let waiting: u64 = grown.iter().map(|(f, to)| f.len - to).sum();
+        if waiting > BYTES as u64 {
+            return true;
+        }
+        let (mut tally, mut file_tally) = (Tally::default(), FileTally::default());
+        let (mut last_seq, mut file_seq, mut version, mut pending) = (None, [None; 2], None, 0);
+        let mut matched = Matched::default();
+        for (f, to) in grown {
+            let mut into = Into {
+                tally: &mut tally,
+                file_tally: &mut file_tally,
+                last_seq: &mut last_seq,
+                file_seq: &mut file_seq,
+                version: &mut version,
+                arrivals: None,
+                lacked: None,
+                pending: &mut pending,
+                now,
+                rules: Rules::shipped(),
+                matched: &mut matched,
+                file: String::new(),
+                inode: 0,
+                queue: None,
+            };
+            let at = |m: &std::fs::Metadata| if m.ino() == f.inode { to } else { 0 };
+            match read_file(&dir, &f.name, at, false, &mut into) {
+                Ok(Some(read)) => {
+                    let place = (read.inode, read.to, read.len);
+                    seen.looked.insert(f.name.clone(), place);
+                }
+                Ok(None) => {}
+                // The look ends here; what matched before the file that failed still counts,
+                // since where the look got to has moved past it.
+                Err(_) => break,
+            }
+        }
+        let raised = matched.rules.into_iter().filter(|(_, h)| h.meta.raises());
+        let before = held.len();
+        held.extend(raised.map(|(id, _)| id));
+        held.len() > before
     }
 }
 
@@ -1279,6 +1372,7 @@ fn look(
     let mut pending = left.pending;
     let mut version = None;
     let mut files = Vec::new();
+    let mut listed_read = BTreeMap::new();
     let mut times = Vec::new();
     let place = |f: &LogFile| left.files.get(&f.name).copied();
     let now_written = writing(&listed, place, was.and_then(|p| p.writing));
@@ -1323,22 +1417,33 @@ fn look(
             _ => 0,
         };
         match read_file(&dir, name, from, f.over, &mut into) {
-            Ok(Some(f)) => {
-                times.push(f.mtime);
-                files.push((name.clone(), f.inode, f.to));
+            Ok(Some(read)) => {
+                times.push(read.mtime);
+                files.push((name.clone(), read.inode, read.to));
+                listed_read.insert(name.clone(), (f.inode, f.len));
             }
             // Deleted by the root side between the listing and now.
             Ok(None) => {}
             Err((why, errno)) => return Found::Failed(why, errno),
         }
     }
-    let pass = match step {
+    let mut pass = match step {
         Some(Some(k)) if left_after(k) => Pass {
             after: Some(listed[k].key),
             writing: now_written.map(|i| listed[i].key),
+            seen: None,
         },
         _ => Pass::default(),
     };
+    // The early look starts from what this step read: a file it read as long as it was
+    // listed, any other as far as it was read.
+    let looked = files.iter().map(|(n, i, to)| {
+        let len = listed_read.get(n).filter(|(inode, _)| inode == i);
+        (n.clone(), (*i, *to, len.map_or(*to, |&(_, len)| len)))
+    });
+    pass.seen = Some(Seen {
+        looked: looked.collect(),
+    });
     let written = times.iter().copied().max();
     let (state, said, kept) = judge(&dir, installed_at, &times, now, awake);
     Found::Read(Box::new(Log {
@@ -2143,12 +2248,27 @@ fn open(root: &Path) -> Result<Opened, Option<(String, Option<i32>)>> {
     };
     let collects = collects(root, &daemon);
     let dir = root.join(LOG);
-    let failed =
-        |e: std::io::Error| Some((format!("the event level's log: {e}"), e.raw_os_error()));
+    let (mut files, foreign) =
+        list(&dir).map_err(|e| Some((format!("the event level's log: {e}"), e.raw_os_error())))?;
+    for i in 0..files.len() {
+        files[i].over = files[i + 1..].iter().any(|g| g.mtime >= files[i].mtime);
+    }
+    Ok(Opened {
+        installed_at: daemon.mtime(),
+        collects,
+        dir,
+        files,
+        foreign,
+    })
+}
+
+/// The collector's log files in the log folder `dir`, in the order of their names, none yet
+/// told over, and how many files there are not the collector's.
+fn list(dir: &Path) -> std::io::Result<(Vec<LogFile>, u64)> {
     let mut files: Vec<LogFile> = Vec::new();
     let mut foreign = 0;
-    for entry in std::fs::read_dir(&dir).map_err(failed)? {
-        let name = entry.map_err(failed)?.file_name();
+    for entry in std::fs::read_dir(dir)? {
+        let name = entry?.file_name();
         // A log file's name is ASCII, so a name that is not text is another file.
         let name = name.to_string_lossy();
         let Some(key) = key_of(&name) else {
@@ -2161,7 +2281,7 @@ fn open(root: &Path) -> Result<Opened, Option<(String, Option<i32>)>> {
         let meta = match std::fs::metadata(dir.join(&*name)) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(failed(e)),
+            Err(e) => return Err(e),
         };
         files.push(LogFile {
             name: name.to_string(),
@@ -2173,16 +2293,7 @@ fn open(root: &Path) -> Result<Opened, Option<(String, Option<i32>)>> {
         });
     }
     files.sort_by_key(|f| f.key);
-    for i in 0..files.len() {
-        files[i].over = files[i + 1..].iter().any(|g| g.mtime >= files[i].mtime);
-    }
-    Ok(Opened {
-        installed_at: daemon.mtime(),
-        collects,
-        dir,
-        files,
-        foreign,
-    })
+    Ok((files, foreign))
 }
 
 /// Counts what the sequence number says was lost since the last one of its kind: into `lost`
