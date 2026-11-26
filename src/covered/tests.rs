@@ -387,3 +387,66 @@ fn a_walk_limited_to_the_folder_given_is_told_by_its_row_and_never_by_its_reason
     let why = format!("the reading of {} was not full", crate::checkouts::KIND);
     assert_eq!(found.why, Some(why));
 }
+
+#[test]
+fn every_kind_of_place_and_every_kind_of_the_rows_read_here_is_in_the_one_list_of_watched_files() {
+    // No kind of watched files is left out of what an answer goes over: each kind of place,
+    // in the order of the table of places, then each kind of the rows of the table of autorun
+    // points read here, and every coverage kind of each has its kind of files.
+    let files = watched_files();
+    let places: Vec<&str> = watched::kinds().into_iter().map(|k| k.0).collect();
+    let named: Vec<&str> = files.iter().map(|k| k.0).collect();
+    assert_eq!(named[..places.len()], places[..]);
+    for (as_, kind) in watched::kinds() {
+        let kinds = &files.iter().find(|k| k.0 == as_).expect(as_).1;
+        assert!(kinds.iter().any(|k| k == kind), "{as_}");
+    }
+    for (as_, ..) in autorun::watched() {
+        let kinds = &files.iter().find(|k| k.0 == as_).expect(as_).1;
+        assert_eq!(*kinds, autorun::kinds_of(as_), "{as_}");
+        assert!(!kinds.is_empty(), "{as_}");
+    }
+}
+
+#[test]
+fn a_kind_of_watched_files_is_full_only_when_every_kind_of_its_list_was_read_in_full_on_this_mac() {
+    // No false calm. A coding agent's own settings read in full and the other files of that
+    // kind never read is not that kind read in full, and neither is a full reading of the rest
+    // on another machine, which stands for nothing here. The rest not read count as readings
+    // of nothing. A kind with no reading here says nothing.
+    let (_dir, conn) = store_of("covered-watched-readings");
+    let as_ = autorun::AGENT_SETTINGS.0;
+    let kinds = autorun::kinds_of(as_);
+    let full = |scope: &str, kind: &str, note: Option<&str>| {
+        stored(
+            &conn,
+            scope,
+            (watched::READER, kind),
+            ("full", note, Gap::default()),
+        )
+    };
+    let of = |latest: &[Latest], as_: &str| {
+        let all = watched_readings(latest, Some(MAC));
+        let k = all.into_iter().find(|k| k.watched_as == as_).unwrap();
+        (k.coverage, k.full, k.partial, k.none, k.reason)
+    };
+    let mut latest = vec![full(MAC, &kinds[0], Some("none of the keys read is in it"))];
+    let rest = kinds.len() - 1;
+    assert_eq!(of(&latest, as_), (Some("partial"), 1, 0, rest, None));
+    for kind in &kinds[1..] {
+        latest.push(full("machine:example-other", kind, None));
+    }
+    assert_eq!(of(&latest, as_), (Some("partial"), 1, 0, rest, None));
+    for kind in &kinds[1..] {
+        latest.push(full(MAC, kind, None));
+    }
+    assert_eq!(of(&latest, as_).0, Some("full"));
+    assert_eq!(of(&latest[1..=rest], as_), (None, 0, 0, 0, None));
+    // The hooks of a checkout are this Mac's when the checkout is on it, and not on a machine
+    // whose id only begins with this one's.
+    let hooks = |scope: &str| [full(scope, watched::HOOK_KIND, None)];
+    let mine = hooks(&format!("checkout:{MAC}/dev/app"));
+    assert_eq!(of(&mine, watched::HOOK).0, Some("full"));
+    let other = hooks(&format!("checkout:{MAC}-2/dev/app"));
+    assert_eq!(of(&other, watched::HOOK).0, None);
+}

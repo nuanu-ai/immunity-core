@@ -13,7 +13,7 @@
 
 use crate::store::{self, Totals};
 use crate::view::{self, Latest};
-use crate::{ServerCounts, findings, resolver, servers, threats, watched};
+use crate::{ServerCounts, covered, findings, resolver, servers, threats, watched};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -164,9 +164,9 @@ pub struct Watched {
     pub new: usize,
     pub changed: usize,
     pub gone: usize,
-    /// Kinds of place on the machine whose reading in this run was not full, as their
-    /// coverage kind and completeness, in the order of the table of places.
-    pub kinds_not_full: Vec<(&'static str, String)>,
+    /// Kinds of watched files on the machine whose reading in this run was not full, as their
+    /// coverage kind and completeness, in the order of `covered::watched`.
+    pub kinds_not_full: Vec<(String, String)>,
     /// Readings of checkouts' hooks in this run that were not full, by completeness.
     pub hooks_not_full: BTreeMap<String, usize>,
     /// Files whose content could not be read in this run.
@@ -604,8 +604,8 @@ fn watched_summary(
             places.insert(kind, completeness);
         }
     }
-    for (_, kind) in watched::kinds() {
-        if let Some(completeness) = places.remove(kind) {
+    for kind in covered::watched_files().into_iter().flat_map(|k| k.1) {
+        if let Some(completeness) = places.remove(&kind) {
             w.kinds_not_full.push((kind, completeness));
         }
     }
@@ -1331,47 +1331,28 @@ fn watched_message(st: &State, s: &Summary, w: &Watched) -> crate::contract::v1:
         .iter()
         .filter(|r| r.reader == watched::READER)
         .collect();
-    let kinds = watched::kinds()
+    let kinds = covered::watched_readings(&st.coverage, st.this_mac.machine.as_deref())
         .into_iter()
-        .map(|(watched_as, kind)| {
-            let rows: Vec<&&Latest> = mine.iter().filter(|r| r.kind == kind).collect();
+        .map(|k| {
+            let watched_as = k.watched_as;
             let presence = st
                 .presence_only
                 .get(watched_as)
                 .copied()
                 .unwrap_or_default();
-            let count = |c: &str| rows.iter().filter(|r| r.completeness == c).count();
-            let (full, partial, none) = (count("full"), count("partial"), count("none"));
-            let coverage = match (full, partial, none) {
-                (0, 0, 0) => None,
-                (_, 0, 0) => Some("full"),
-                (0, 0, _) => Some("none"),
-                _ => Some("partial"),
-            };
-            let mut reasons: Vec<&str> = Vec::new();
-            for r in rows.iter().filter(|r| r.completeness != "full") {
-                if let Some(reason) = r.reason.as_deref().filter(|x| !reasons.contains(x)) {
-                    reasons.push(reason);
-                }
-            }
-            let reason = match (reasons.is_empty(), rows.as_slice()) {
-                (false, _) => Some(reasons.join("; ")),
-                (true, [only]) => only.reason.clone(),
-                _ => None,
-            };
             v1::WatchedKind {
                 kind: watched_as.to_string(),
                 files: n(st.files.get(watched_as).copied().unwrap_or_default()),
                 presence_only: n(presence),
                 presence_only_note: (presence > 0).then(|| watched::PRESENCE_ONLY.to_string()),
-                coverage: coverage.map(value_of::<v1::Completeness>),
+                coverage: k.coverage.map(value_of::<v1::Completeness>),
                 readings: Some(v1::CompletenessCounts {
-                    full: n(full),
-                    partial: n(partial),
-                    none: n(none),
+                    full: n(k.full),
+                    partial: n(k.partial),
+                    none: n(k.none),
                 }),
                 // The readers' reasons, prose from their sources: cut, as every such text.
-                reason_text: reason.as_deref().map(crate::secrets::said),
+                reason_text: k.reason.as_deref().map(crate::secrets::said),
             }
         })
         .collect();

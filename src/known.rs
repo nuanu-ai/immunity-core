@@ -805,12 +805,12 @@ fn latest(conn: &Connection) -> rusqlite::Result<Vec<Reading>> {
 }
 
 /// A reading as the contract gives it, with what it names as having no reader. A reading that
-/// is not full and was written before causes were kept failed, as the status reads it. Its
-/// reason is given whole: what was cut off could be what the reading did not cover.
+/// is not full has the cause the status classes it by (`status::class`). Its reason is given
+/// whole: what was cut off could be what the reading did not cover.
 fn coverage(conn: &Connection, r: Reading) -> rusqlite::Result<v1::Coverage> {
-    let cause = match (r.completeness.as_str(), r.cause.as_deref()) {
-        ("full", c) => c,
-        (_, c) => Some(c.unwrap_or(store::Cause::Failed.literal())),
+    let cause = match r.completeness.as_str() {
+        "full" => r.cause.as_deref(),
+        c => status::class(c, r.reason.as_deref(), r.cause.as_deref()),
     };
     let lacks = conn
         .prepare("SELECT what, name FROM coverage_lack WHERE coverage = ?1 ORDER BY what, name")?

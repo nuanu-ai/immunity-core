@@ -1138,13 +1138,17 @@ pub fn home_places() -> Vec<(&'static str, bool, String)> {
 }
 
 /// Whether a change to things watched as `watched_as` shows within seconds while a watcher
-/// runs: whether any row read here whose findings are such is watched live.
+/// runs: whether every row read here whose findings are such is watched live, and there is one.
+/// A row read only at checks leaves its kind told as read at checks.
 pub fn live(watched_as: &str) -> bool {
     live_in(&POINTS, watched_as)
 }
 
 fn live_in(points: &[Point], watched_as: &str) -> bool {
-    points.iter().any(|p| p.live() && p.finds(watched_as))
+    let mut rows = (points.iter())
+        .filter(|p| p.read_here() && p.finds(watched_as))
+        .peekable();
+    rows.peek().is_some() && rows.all(Point::live)
 }
 
 /// What the rows read here are watched as, each once, in the order of the table.
@@ -2355,9 +2359,10 @@ mod tests {
     }
 
     #[test]
-    fn a_kind_shows_within_seconds_only_while_one_of_its_rows_is_watched_live() {
-        // What the page says of how fast a change shows: a kind whose every row is read only
-        // at the hourly check is hourly; one live row makes it live.
+    fn a_kind_shows_within_seconds_only_while_every_one_of_its_rows_is_watched_live() {
+        // No false calm. What the page says of how fast a change shows: a kind with a row read
+        // only at the hourly check is hourly, whatever its other rows; every row live makes it
+        // live.
         let of = |watch| Point {
             watch,
             ..row(
@@ -2372,7 +2377,10 @@ mod tests {
         };
         let w = AGENT_START.0;
         assert!(!live_in(&[of(Watch::Hourly(REWRITTEN))], w));
-        assert!(live_in(&[of(Watch::Hourly(REWRITTEN)), of(Watch::Live)], w));
+        let hourly = || of(Watch::Hourly(REWRITTEN));
+        assert!(!live_in(&[hourly(), of(Watch::Live)], w));
+        assert!(!live_in(&[of(Watch::Live), hourly()], w));
+        assert!(live_in(&[of(Watch::Live), of(Watch::Live)], w));
         assert!(!live_in(&[of(Watch::Live)], AGENT_SETTINGS.0));
     }
 
