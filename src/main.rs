@@ -3791,6 +3791,15 @@ struct Placed {
     checkouts: Vec<String>,
 }
 
+impl Placed {
+    /// The checkout whose hooks Git's configuration told, when this reading read what it told,
+    /// as only a reading of a checkout's hooks does (`watched::look_checkout`).
+    fn told(&self) -> Option<&String> {
+        (self.checkouts.first())
+            .filter(|c| self.look.read_units().contains(&watched::hooks_told(c)))
+    }
+}
+
 /// The reading of a checkout's hooks that were not looked at where they are, and why: it read
 /// nothing, and covers nothing.
 fn elsewhere(cause: Cause, why: String) -> (look::Look, Option<String>) {
@@ -3928,23 +3937,25 @@ fn read_watched(
         system: &args.system_root,
     };
     let rels: Vec<String> = checkouts.iter().map(|c| c.rel.clone()).collect();
+    // The checkouts the store ever knew, read at most once for the whole reading: only the walk
+    // and the reading of agents' sessions place one, and what this reading retracts stays known.
+    let mut known = None;
     // What an earlier run read and this build has no row for is closed as retired before any
     // reading compares with it: not shown as watched, never told as removed, and said once in
     // the run's line (`run`), the watcher's included. Only a reading of every place does it: a
     // build's rows change between runs, never between two looks of a watcher, which would pay
     // for it at every change.
     if only.is_none() {
-        look::retire_unread(
-            run.tx,
-            &Reading {
-                reader: watched::READER,
-                scope: &machine,
-                kind: "",
-                run_id: &run_id,
-                at: run.at,
-                observed_at: run.at,
-            },
-        )?;
+        let known = known.insert(baseline::past_checkouts(run.tx)?);
+        let r = Reading {
+            reader: watched::READER,
+            scope: &machine,
+            kind: "",
+            run_id: &run_id,
+            at: run.at,
+            observed_at: run.at,
+        };
+        look::retire_unread(run.tx, &r, known)?;
     }
     // Whether a thing is new where a reading of its kind in another scope placed it is told by
     // what was placed when the run began, whatever order the readings come in.
@@ -4160,6 +4171,11 @@ fn read_watched(
     let first_check = !baseline::checked_before(run.tx, &run_id)?;
     // What was read for the first time, by the place that holds it and what it is watched as.
     let mut first_reads: BTreeMap<(String, &'static str), usize> = BTreeMap::new();
+    let known = match known {
+        Some(known) => known,
+        None if placed.iter().any(|p| p.told().is_some()) => baseline::past_checkouts(run.tx)?,
+        None => BTreeSet::new(),
+    };
 
     for (p, mine) in placed.iter().zip(&lines) {
         let reading = Reading {
@@ -4404,10 +4420,9 @@ fn read_watched(
         }
         // Told where Git runs the checkout's hooks from, the reading found absent what it did
         // not reach in the checkout, as a folder no longer configured.
-        if let Some(c) = (p.checkouts.first()).filter(|c| {
-            p.kind == watched::HOOK_KIND && p.look.read_units().contains(&watched::hooks_told(c))
-        }) {
-            baseline::found_absent_within(tx, watched::READER, &p.kind, &machine, c, &run_id)?;
+        if let Some(c) = p.told() {
+            let (reader, kind) = (watched::READER, &p.kind);
+            baseline::found_absent_within(tx, reader, kind, &machine, &known, c, &run_id)?;
         }
         for u in p.look.not_read() {
             let how = match u.cause {

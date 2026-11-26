@@ -1310,6 +1310,38 @@ fn a_checkout_inside_one_whose_hooks_git_told_keeps_the_marks_of_its_own_reading
 }
 
 #[test]
+fn checkouts_inside_two_whose_hooks_git_told_in_one_reading_each_keep_the_marks_of_their_own() {
+    // Every checkout of a reading is judged by what the store knew of checkouts: the second
+    // judged as the first, not by what judging the first left.
+    let e = Estate::new("mark-nested-two");
+    let config = "[core]\n hooksPath = tools/hooks\n";
+    let mut subs = Vec::new();
+    for rel in ["dev/one", "dev/two"] {
+        for tree in [e.checkout(rel), e.checkout(&format!("{rel}/sub"))] {
+            put(&tree.join(".git/config"), config);
+            put(&tree.join("tools/hooks/pre-push"), "# hook\n");
+        }
+        subs.push(e.home().join(rel).join("sub"));
+    }
+    for sub in &subs {
+        e.run_in(sub);
+        mode(&sub.join("tools"), 0o000);
+        e.run_in(sub);
+    }
+    let marked = marks(&e);
+    e.run();
+    let kept = marks(&e);
+    for sub in &subs {
+        mode(&sub.join("tools"), 0o755);
+    }
+    assert_eq!(
+        marked,
+        ["dev/one/sub/tools/hooks", "dev/two/sub/tools/hooks"]
+    );
+    assert_eq!(kept, marked);
+}
+
+#[test]
 fn a_mark_ends_when_it_or_a_folder_holding_it_is_found_absent() {
     let e = Estate::new("mark-absent");
     // A folder the walk could not list, then the folder above it removed with all it held.
