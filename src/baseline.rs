@@ -373,16 +373,17 @@ pub fn found_absent(
 /// did not make in its run, `run_id`, as when Git's configuration told where the checkout's
 /// hooks are and a folder marked before is no longer among them: what that reading did not
 /// reach there is no place of its kind now. A checkout inside it that the store ever knew on
-/// `machine` has a reading of its own, which the walk does not look into, so its marks stay.
+/// `machine`, among `known` (`past_checkouts`), has a reading of its own, which the walk does not
+/// look into, so its marks stay.
 pub fn found_absent_within(
     tx: &Transaction,
     reader: &str,
     kind: &str,
     machine: &str,
+    known: &BTreeSet<String>,
     within: &str,
     run_id: &str,
 ) -> rusqlite::Result<()> {
-    let known = past_checkouts(tx)?;
     let nested: Vec<&str> = (known.iter())
         .filter_map(|k| k.strip_prefix(machine)?.strip_prefix('/'))
         .filter(|k| *k != within && under(k, within))
