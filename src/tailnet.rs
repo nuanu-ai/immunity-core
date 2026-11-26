@@ -258,9 +258,9 @@ fn read_from(cli: Option<&Path>, processes: impl Fn() -> String) -> Found {
             Ok((true, stdout, _)) => {
                 return match parse(&stdout) {
                     Ok(Answer::Peers(seen)) => Found::Read(seen),
-                    Ok(Answer::State(t)) if t.retry => Found::Failed(t.reason.to_string()),
+                    Ok(Answer::State(t)) if t.retry => Found::Failed(t.reason.to_string(), None),
                     Ok(Answer::State(t)) => Found::Off(t.reason.to_string()),
-                    Err(e) => Found::Failed(e),
+                    Err(e) => Found::Failed(e, None),
                 };
             }
             Ok((false, _, stderr)) => tried.push((socket, short(&stderr))),
@@ -278,10 +278,11 @@ fn read_from(cli: Option<&Path>, processes: impl Fn() -> String) -> Found {
             Some(socket) => format!("on the socket {socket} of a running tailscaled ({why})"),
         })
         .collect();
-    Found::Failed(format!(
+    let why = format!(
         "tailscale could not reach its daemon {}",
         ways.join("; nor ")
-    ))
+    );
+    Found::Failed(why, None)
 }
 
 /// The gist of a tool's error: the last part of its first line, cut short.
@@ -538,7 +539,7 @@ exit 1";
                   /usr/bin/invented-tool --socket=/invented/not-tailscale.sock\n\
                   tailscaled --socket=/invented/b.sock\n\
                   tailscaled --socket=/invented/b.sock\n";
-        let Found::Failed(reason) = read_from(Some(&cli), || ps.to_string()) else {
+        let Found::Failed(reason, _) = read_from(Some(&cli), || ps.to_string()) else {
             panic!("an unreachable daemon was not a failed reading");
         };
         assert_eq!(
@@ -579,7 +580,7 @@ exit 1";
             _ => panic!("{state}: not told as not connected"),
         };
         let failed = |state: &str| match at(state) {
-            Found::Failed(said) => said,
+            Found::Failed(said, _) => said,
             _ => panic!("{state}: not told as a reading that failed"),
         };
         assert_eq!(off("Stopped"), "Tailscale is switched off on this Mac");
@@ -614,7 +615,7 @@ exit 1";
         }
         // An answer that names no state at all is one this reader cannot read.
         let cli = command(&dir, "echo '{ \"Peer\": {} }'");
-        let Found::Failed(reason) = read_from(Some(&cli), String::new) else {
+        let Found::Failed(reason, _) = read_from(Some(&cli), String::new) else {
             panic!("an answer without a state was taken as one");
         };
         assert_eq!(reason, "tailscale status gave no state");

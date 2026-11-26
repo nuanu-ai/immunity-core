@@ -1171,8 +1171,9 @@ impl Matched {
 #[derive(Debug)]
 enum Found {
     NotInstalled,
-    /// The source is there and could not be read; nothing is taken as read.
-    Failed(String),
+    /// The source is there and could not be read, with why and the system's error number when it
+    /// gave one; nothing is taken as read.
+    Failed(String, Option<i32>),
     Read(Box<Log>),
 }
 
@@ -1256,7 +1257,7 @@ fn look(
     let opened = match open(root) {
         Ok(opened) => opened,
         Err(None) => return Found::NotInstalled,
-        Err(Some(why)) => return Found::Failed(why),
+        Err(Some((why, errno))) => return Found::Failed(why, errno),
     };
     let Opened {
         installed_at,
@@ -1269,7 +1270,8 @@ fn look(
     let mut file_tally = FileTally::default();
     let mut matched = Matched::default();
     if let Err(e) = removed(&dir, left, &mut tally) {
-        return Found::Failed(format!("{REMOVED} in the event level's log: {e}"));
+        let why = format!("{REMOVED} in the event level's log: {e}");
+        return Found::Failed(why, e.raw_os_error());
     }
     let mut last_seq = left.last_seq;
     let mut file_seq = left.file_seq;
@@ -1327,7 +1329,7 @@ fn look(
             }
             // Deleted by the root side between the listing and now.
             Ok(None) => {}
-            Err(why) => return Found::Failed(why),
+            Err((why, errno)) => return Found::Failed(why, errno),
         }
     }
     let pass = match step {
@@ -1401,8 +1403,16 @@ fn bytes_of(text: &str) -> Option<u64> {
 /// cannot be read, a failed reading with what failed.
 fn collects(root: &Path, daemon: &std::fs::Metadata) -> Result<(), NotCollected> {
     let path = root.join(COLLECTS);
-    let not = |cause, why, said| NotCollected { cause, why, said };
-    let unread = |e: std::io::Error| not(Cause::Failed, UNREAD_RECORD, Some(e.to_string()));
+    let not = |cause, why, said| NotCollected {
+        cause,
+        why,
+        said,
+        errno: None,
+    };
+    let unread = |e: std::io::Error| NotCollected {
+        errno: e.raw_os_error(),
+        ..not(Cause::Failed, UNREAD_RECORD, Some(e.to_string()))
+    };
     let meta = match std::fs::metadata(&path) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -1435,6 +1445,8 @@ pub struct NotCollected {
     pub cause: Cause,
     pub why: &'static str,
     pub said: Option<String>,
+    /// The system's error number, when it said why.
+    pub errno: Option<i32>,
 }
 
 impl NotCollected {
@@ -1931,8 +1943,11 @@ fn read_file(
     from: impl FnOnce(&std::fs::Metadata) -> u64,
     over: bool,
     into: &mut Into,
-) -> Result<Option<FileRead>, String> {
-    let failed = |e: &dyn std::fmt::Display| format!("{name} in the event level's log: {e}");
+) -> Result<Option<FileRead>, (String, Option<i32>)> {
+    let failed = |e: &std::io::Error| {
+        let why = format!("{name} in the event level's log: {e}");
+        (why, e.raw_os_error())
+    };
     let file = match std::fs::File::open(dir.join(name)) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1945,7 +1960,7 @@ fn read_file(
     let upto = match read_from(file, from, into) {
         Ok(upto) => upto,
         Err(Stop::Io(e)) => return Err(failed(&e)),
-        Err(Stop::Schema(why)) => return Err(why),
+        Err(Stop::Schema(why)) => return Err((why, None)),
     };
     let mut read = FileRead {
         inode: meta.ino(),
@@ -2116,16 +2131,20 @@ fn unread(f: &LogFile, read: Option<(u64, u64)>) -> bool {
 
 /// Looks at the source without reading a line. `Err(None)` is a level not installed, `Err` with
 /// a reason one that is there and cannot be read.
-fn open(root: &Path) -> Result<Opened, Option<String>> {
+fn open(root: &Path) -> Result<Opened, Option<(String, Option<i32>)>> {
     let plist = root.join(PLIST);
     let daemon = match std::fs::metadata(&plist) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(None),
-        Err(e) => return Err(Some(format!("the event level's launch daemon: {e}"))),
+        Err(e) => {
+            let why = format!("the event level's launch daemon: {e}");
+            return Err(Some((why, e.raw_os_error())));
+        }
     };
     let collects = collects(root, &daemon);
     let dir = root.join(LOG);
-    let failed = |e: std::io::Error| Some(format!("the event level's log: {e}"));
+    let failed =
+        |e: std::io::Error| Some((format!("the event level's log: {e}"), e.raw_os_error()));
     let mut files: Vec<LogFile> = Vec::new();
     let mut foreign = 0;
     for entry in std::fs::read_dir(&dir).map_err(failed)? {
@@ -2536,12 +2555,12 @@ pub fn read(
     match &found {
         Found::Read(log) => put_awake(tx, log.kept.as_ref())?,
         Found::NotInstalled => put_awake(tx, None)?,
-        Found::Failed(_) => {}
+        Found::Failed(..) => {}
     }
     let mut opened = 0;
     let state = match &found {
         Found::NotInstalled => NOT_INSTALLED,
-        Found::Failed(_) => FAILED,
+        Found::Failed(..) => FAILED,
         Found::Read(log) => log.state,
     };
     match &found {
@@ -2554,7 +2573,7 @@ pub fn read(
             tx.execute("DELETE FROM event_cap", [])?;
         }
         // Nothing is taken as read.
-        Found::Failed(why) => {
+        Found::Failed(why, _) => {
             tx.execute(
                 "INSERT INTO event_level (id, read_at, state, reason) VALUES (1, ?1, ?2, ?3)
                  ON CONFLICT (id) DO UPDATE SET read_at = excluded.read_at,
@@ -2681,8 +2700,12 @@ pub fn read(
                 Some("the event level is not installed".to_string()),
                 Some(Cause::NotGiven),
             ),
-            Found::Failed(why) => ("none", Some(why.clone()), Some(Cause::Failed)),
+            Found::Failed(why, _) => ("none", Some(why.clone()), Some(Cause::Failed)),
             Found::Read(log) => covered(log.state, &tally_since(tx, Since::At(now - DAY))?),
+        };
+        let gap = match &found {
+            Found::Failed(_, errno) => Gap::failed(*errno),
+            _ => Gap::when(cause),
         };
         tx.execute(
             "DELETE FROM coverage WHERE reader = ?1 AND scope = ?2 AND kind = ?3",
@@ -2696,13 +2719,7 @@ pub fn read(
             at: now,
             observed_at: now,
         };
-        crate::store::put_coverage(
-            tx,
-            &reading,
-            completeness,
-            reason.as_deref(),
-            &Gap::when(cause),
-        )?;
+        crate::store::put_coverage(tx, &reading, completeness, reason.as_deref(), &gap)?;
         // File events have coverage of their own while the level runs; otherwise the level's
         // state, above, says why nothing is recorded, once.
         tx.execute(
@@ -2717,6 +2734,11 @@ pub fn read(
                 &tally_since(tx, Since::At(now - DAY))?,
                 &file_tally_since(tx, Since::At(now - DAY))?,
             );
+            // What the collector records could not be read: as the system said, with its number.
+            let gap = match &log.collects {
+                Err(n) if n.cause == Cause::Failed => Gap::failed(n.errno),
+                _ => Gap::when(cause),
+            };
             crate::store::put_coverage(
                 tx,
                 &Reading {
@@ -2725,13 +2747,13 @@ pub fn read(
                 },
                 completeness,
                 reason.as_deref(),
-                &Gap::when(cause),
+                &gap,
             )?;
         }
     }
     let (starts, failed, pass) = match found {
         Found::Read(log) => (log.tally.starts, None, log.pass),
-        Found::Failed(why) => (0, Some(why), Pass::default()),
+        Found::Failed(why, _) => (0, Some(why), Pass::default()),
         Found::NotInstalled => (0, None, Pass::default()),
     };
     Ok(Outcome {
@@ -3018,7 +3040,7 @@ pub fn replay(root: &Path, now: i64) -> Replay {
         None,
     ) {
         Found::NotInstalled => Replay::NotInstalled,
-        Found::Failed(why) => Replay::Failed(why),
+        Found::Failed(why, _) => Replay::Failed(why),
         Found::Read(log) => Replay::Read {
             tally: log.tally,
             file_tally: log.file_tally,
@@ -3440,7 +3462,7 @@ pub fn queue(root: &Path, after: Option<&Place>, limit: usize, now: i64, awake: 
                 gone: after.is_some_and(|p| p.files.iter().any(|k| !k.finished)),
             };
         }
-        Err(Some(why)) => return Queue::Failed(why),
+        Err(Some((why, _))) => return Queue::Failed(why),
     };
     if files.len() > MAX_FILES {
         return Queue::Failed(format!(
@@ -3530,7 +3552,7 @@ pub fn queue(root: &Path, after: Option<&Place>, limit: usize, now: i64, awake: 
                 gone.extend(was.filter(|k| unread(k)).map(|k| k.key));
                 continue;
             }
-            Err(why) => return Queue::Failed(why),
+            Err((why, _)) => return Queue::Failed(why),
         };
         if replaced {
             gone.extend(was.filter(|k| unread(k)).map(|k| k.key));
@@ -4140,6 +4162,7 @@ pub fn served_readings<'a>(
         cause: Some(failed.into()),
         at: l.read_at,
         last_full: stored.and_then(|r| r.last_full),
+        ..Default::default()
     };
     let others = latest.iter().filter(|r| !mine(r)).cloned();
     std::borrow::Cow::Owned(others.chain([said]).collect())

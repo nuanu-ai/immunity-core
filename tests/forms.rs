@@ -977,8 +977,8 @@ fn fits(words: &str, said: &str) -> bool {
 fn words_taken_from_the_mac_never_enter_a_field_that_is_not_text_nor_a_sentence() {
     // An invented Mac where every name a reader takes from it holds words written for an agent:
     // a folder macOS protects, a package manager no reader reads, a file of a kind no reader
-    // understands, and a project. The reasons the readers stored are written as a source would
-    // write them.
+    // understands, and a project. The reasons and rows the readers stored are written as a
+    // source would write them.
     let e = Estate::new("marker");
     e.put(&format!("dev/{MARKER}/.git/HEAD"), "ref: refs/heads/main\n");
     e.put("Documents/notes.txt", "invented\n");
@@ -991,6 +991,13 @@ fn words_taken_from_the_mac_never_enter_a_field_that_is_not_text_nor_a_sentence(
             [MARKER],
         )
         .unwrap();
+    // The folder as its row names it, which is what is told.
+    db.execute(
+        "UPDATE coverage_unread SET path = ?1 WHERE how = 'guarded' AND coverage IN
+             (SELECT id FROM coverage WHERE kind = 'folders macOS asks permission for')",
+        [MARKER],
+    )
+    .unwrap();
     let managers = db
         .execute(
             "UPDATE coverage SET completeness = 'none', reason = 'not read: ' || ?1,

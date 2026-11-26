@@ -210,30 +210,31 @@ pub fn ecosystem_of_file(path: &str) -> Option<&'static str> {
 }
 
 /// Whether a partial reading leaves the dependencies of one ecosystem in part unknown. What the
-/// reading names it did not read, `lacks` by their names (a kind with no reader, a lockfile not
-/// opened, a kind with entries not told), leaves the ecosystem of each name unknown and no
+/// reading names it has no reader for, `lacks` by their names (a kind with no reader, a lockfile
+/// not opened, a kind with entries not told), leaves the ecosystem of each name unknown and no
 /// other: a name of no ecosystem a record can be about, such as `flake.lock`, leaves none. A
-/// lack with no name, folders not looked through, counts for every ecosystem. The reason's
-/// clauses for the lacks are only words for a person. The reason decides the rest: a lockfile
-/// of that ecosystem that could not be read, by its kind, a folder not listed. A clause this
-/// does not recognise counts for every ecosystem, so that nothing reads as fully known that is
-/// not.
-pub fn partial_for(reason: &str, lacks: &[Option<String>], ecosystem: &str) -> bool {
+/// lack with no name, folders not looked through, counts for every ecosystem. The rows of what
+/// it did not read (`store::unread_of`) decide the rest, those with no reader aside, which their
+/// lacks say: a lockfile that could not be read or has entries not told counts for the
+/// ecosystem its file's name gives; anything else, a folder not listed or what is no unit,
+/// counts for every ecosystem, so that nothing reads as fully known that is not. The reason is
+/// words for a person and decides nothing.
+pub fn partial_for(
+    rows: &[crate::store::Unread],
+    lacks: &[Option<String>],
+    ecosystem: &str,
+) -> bool {
     let of_it = |name: &str| ecosystem_of(name) == Some(ecosystem);
+    let lockfile = [Said::Lockfile("").word(), Said::Untold.word()];
     lacks.iter().any(|name| name.as_deref().is_none_or(of_it))
-        || reason.split("; ").any(|clause| {
-            if clause.starts_with(NOT_SUPPORTED_SAID) || clause.starts_with(NOT_OPENED_SAID) {
-                false
-            } else if let Some(names) = clause.strip_prefix("could not be read: ") {
-                names.split(", ").any(of_it)
-            } else if clause.starts_with("the package of ") {
-                // Entries not told are decided by their lack (`NOT_TOLD`). The clause counts for
-                // npm only for a reading written before that lack was recorded.
-                ecosystem == "npm"
-            } else {
-                true
-            }
-        })
+        || (rows.iter())
+            .filter(|u| u.cause != Cause::NoReader.literal())
+            .any(|u| match &u.path {
+                Some(path) if lockfile.contains(&u.how.as_str()) => {
+                    ecosystem_of_file(path).is_none_or(|e| e == ecosystem)
+                }
+                _ => true,
+            })
 }
 
 /// What reading one checkout found.
@@ -619,8 +620,7 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize, cap: u64) -> Option<
     }
 
     // Kinds with no reader and lockfiles not opened where they are are said together, each with
-    // its lack by name, so that what it leaves unknown is decided from the lacks and never from
-    // the reason's words (`partial_for`).
+    // its lack by name, so that what it leaves unknown is decided from the lacks (`partial_for`).
     if !not_supported.is_empty() {
         let names: Vec<&str> = not_supported.keys().map(String::as_str).collect();
         let why = format!("{NOT_SUPPORTED_SAID}{}", names.join(", "));
@@ -660,8 +660,8 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize, cap: u64) -> Option<
 
 /// The clause of the units of one kind a reading of lockfiles did not read (`look::Said`):
 /// lockfiles that could not be read, by their kinds; entries whose package cannot be told; and
-/// folders that could not be listed in full, each with what the system said, so that a
-/// permission is told from another failure. `partial_for` takes the last for every ecosystem.
+/// folders that could not be listed in full, each with what the system said. Words for a person:
+/// `partial_for` decides by the rows.
 pub fn said(units: &[&Unread]) -> String {
     let n = units.len();
     let some = |each: fn(&Unread) -> String| {

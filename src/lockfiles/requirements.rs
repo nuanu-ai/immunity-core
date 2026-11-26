@@ -997,7 +997,7 @@ mod tests {
         let dir = Dir::new("requirements-part", &[("requirements.txt", &text)]);
         let (o, said) = dir.read();
         assert_eq!(said.len(), 4, "{said:?}");
-        let reason = o.reason.unwrap();
+        let reason = o.reason.clone().unwrap();
         assert_eq!(
             reason,
             format!(
@@ -1009,7 +1009,8 @@ mod tests {
         let names: Vec<Option<String>> = o.gap.lacks.iter().map(|l| l.name.clone()).collect();
         assert_eq!(names, [Some("requirements.txt".to_string())]);
         assert_eq!(o.gap.lacks[0].what, NOT_TOLD);
-        assert!(partial_for(&reason, &names, "PyPI"));
-        assert!(!partial_for(&reason, &names, "crates.io"));
+        let rows = super::super::tests::rows(&o);
+        assert!(partial_for(&rows, &names, "PyPI"));
+        assert!(!partial_for(&rows, &names, "crates.io"));
     }
 }

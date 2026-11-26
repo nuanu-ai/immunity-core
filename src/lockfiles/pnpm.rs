@@ -1046,11 +1046,14 @@ packages:
             assert_eq!(o.gap.cause, Some(Cause::NoReader));
             let name = format!("pnpm-lock.yaml version {version}");
             assert_eq!(o.gap.lacks[0].name.as_deref(), Some(name.as_str()));
-            let reason = o.reason.unwrap();
+            let reason = o.reason.clone().unwrap();
             assert_eq!(reason, format!("not supported yet: {name}"));
-            let lacks: Vec<Option<String>> = o.gap.lacks.iter().map(|l| l.name.clone()).collect();
-            assert!(super::super::partial_for(&reason, &lacks, "npm"));
-            assert!(!super::super::partial_for(&reason, &lacks, "crates.io"));
+            let (rows, lacks) = (
+                super::super::tests::rows(&o),
+                super::super::tests::names(&o),
+            );
+            assert!(super::super::partial_for(&rows, &lacks, "npm"));
+            assert!(!super::super::partial_for(&rows, &lacks, "crates.io"));
         }
     }
 

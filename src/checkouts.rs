@@ -29,6 +29,8 @@ pub const BASIS: &str = "observed";
 pub const TYPE: &str = "checkout";
 /// Why a walk of a folder given instead of the home folder is partial.
 pub const ONLY_GIVEN: &str = "only the given folder was walked";
+/// The word of `unread_how` its row is said by (`covered::projects_found`).
+pub const GIVEN: &str = "only_given";
 /// What is said of a checkout the store holds that is still there in another form.
 pub const MOVED: &str = "is no longer a folder there, as when a link to a folder elsewhere took its place: it was not looked into, and what was known of it is kept";
 /// How the reading says which folders the walk did not go down into because they are on another

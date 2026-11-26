@@ -76,7 +76,7 @@ pub struct Unread {
 /// How a reading's reason says the units of one kind it did not read, and so their cause. Each
 /// kind is one clause, and the clauses come in the order of this list, with the reader's note
 /// and what is no unit of the reading (`Look::short`) between `SourceInto` and `Lockfile`. The
-/// words are those the store holds, and some are parsed back (`covered.rs`, `known.rs`).
+/// words are for a person: what reads a reading back decides by its rows (`Said::word`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Said {
     /// It could not be read: `could not be read: a (why); b (why)`.
@@ -101,15 +101,13 @@ pub enum Said {
     Into,
     /// The same, said of a source whose reading read nothing at all: the folders alone.
     SourceInto,
-    /// A lockfile of this kind that could not be read, said by its kind alone, which is what
-    /// `lockfiles::partial_for` parses back.
+    /// A lockfile of this kind that could not be read, said by its kind alone.
     Lockfile(&'static str),
     /// An entry of a lockfile whose package cannot be told, counted.
     Untold,
     /// A folder the walk for lockfiles could not list in full, counted, with why.
     Unlisted,
-    /// The same as `Into`, said of session files after everything else, so that what comes
-    /// before names no folder (`covered::projects_found`).
+    /// The same as `Into`, said of session files after everything else.
     FilesInto,
 }
 
@@ -161,7 +159,7 @@ impl Said {
         match self {
             Said::SameName => "same_name",
             Said::OverCap => "past_limit",
-            Said::Into | Said::SourceInto | Said::FilesInto => "guarded",
+            Said::Into | Said::SourceInto | Said::FilesInto => crate::guarded::HOW,
             Said::Untold => "untold",
             Said::SessionFolder | Said::Unlisted => "unlisted",
             Said::Checkout => "kept",
@@ -244,10 +242,10 @@ pub struct Look {
     pub guarded: Vec<PathBuf>,
     /// The units not read, in the order they were met.
     unread: Vec<Unread>,
-    /// What the reading did not read that is no unit of `unread`, each with its cause and why:
-    /// checkouts not looked into, the folder Git's configuration names for hooks when it
-    /// could not be told, hooks kept where this build does not read them.
-    short: Vec<(Cause, String)>,
+    /// What the reading did not read that is no unit of `unread`, each with its cause, the word
+    /// its rows are said by and why: checkouts not looked into, the folder Git's configuration
+    /// names for hooks when it could not be told, hooks kept where this build does not read them.
+    short: Vec<(Cause, &'static str, String)>,
     /// Units not read that are no unit of `unread`, those a `short` says together, by a count or
     /// by the project that holds them, each with the place of its `short`. What was known of
     /// each is kept.
@@ -355,7 +353,7 @@ impl Look {
         }
         self.unread.extend(other.unread);
         let at: Vec<usize> = (other.short.into_iter())
-            .map(|(cause, why)| self.short_at(cause, why))
+            .map(|(cause, how, why)| self.short_at(cause, how, why))
             .collect();
         (self.of_short).extend(other.of_short.into_iter().map(|(u, i)| (u, at[i])));
         self.aside.extend(other.aside);
@@ -378,12 +376,18 @@ impl Look {
     /// Something the reading did not read that is no unit of it, with its cause and why, said
     /// once however often it was met.
     pub fn short(&mut self, cause: Cause, why: String) {
-        self.short_at(cause, why);
+        self.short_as(cause, NotRead::word(cause), why);
     }
 
-    /// `short`, and the place in `short` where it is said.
-    fn short_at(&mut self, cause: Cause, why: String) -> usize {
-        let said = (cause, why);
+    /// The same, its row said by `how`, a word of `unread_how` of its own that what reads the
+    /// rows back decides by.
+    pub fn short_as(&mut self, cause: Cause, how: &'static str, why: String) {
+        self.short_at(cause, how, why);
+    }
+
+    /// `short_as`, and the place in `short` where it is said.
+    fn short_at(&mut self, cause: Cause, how: &'static str, why: String) -> usize {
+        let said = (cause, how, why);
         self.short
             .iter()
             .position(|s| *s == said)
@@ -395,7 +399,7 @@ impl Look {
 
     /// Units not read, said together by `why` with its cause.
     pub fn short_of(&mut self, units: impl IntoIterator<Item = Unit>, cause: Cause, why: String) {
-        let at = self.short_at(cause, why);
+        let at = self.short_at(cause, NotRead::word(cause), why);
         self.of_short.extend(units.into_iter().map(|u| (u, at)));
     }
 
@@ -540,7 +544,7 @@ impl Look {
         };
         let reasons: Vec<String> = (Said::BEFORE.iter().filter_map(clause))
             .chain(note)
-            .chain(self.short.iter().map(|(_, why)| why.clone()))
+            .chain(self.short.iter().map(|(.., why)| why.clone()))
             .chain(Said::AFTER.iter().filter_map(clause))
             .collect();
         let reason = (!reasons.is_empty()).then(|| reasons.join("; "));
@@ -569,7 +573,7 @@ impl Look {
 
     fn causes(&self) -> impl Iterator<Item = Cause> + '_ {
         let units = self.unread.iter().map(|u| u.cause);
-        units.chain(self.short.iter().map(|(cause, _)| *cause))
+        units.chain(self.short.iter().map(|(cause, ..)| *cause))
     }
 
     /// Why the reading is not full, what this build has no reader for in it, and what it did not
@@ -598,11 +602,11 @@ impl Look {
             errno: u.errno,
             said: said(u),
         });
-        let shorted =
-            (self.of_short.iter()).map(|(u, i)| NotRead::short(Some(u.clone()), self.short[*i].0));
-        let alone = (self.short.iter().enumerate())
-            .filter(|(i, _)| !self.of_short.iter().any(|(_, at)| at == i))
-            .map(|(_, (cause, _))| NotRead::short(None, *cause));
+        let row = |unit, i: usize| NotRead::said(unit, self.short[i].0, self.short[i].1);
+        let shorted = (self.of_short.iter()).map(|(u, i)| row(Some(u.clone()), *i));
+        let alone = (0..self.short.len())
+            .filter(|i| !self.of_short.iter().any(|(_, at)| at == i))
+            .map(|i| row(None, i));
         units.chain(shorted).chain(alone).collect()
     }
 }
