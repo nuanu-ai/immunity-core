@@ -55,7 +55,9 @@
 //! opening the store (`events::Pass::raising`), and reads at once when one matches a rule that
 //! raises a finding, so that the finding comes within about a second of its line. Each rule
 //! does that once between two steps at the period: a rule that keeps matching waits for the
-//! period after its first early step, and another rule is still read at once.
+//! period after its first early step, and another rule is still read at once. An early step
+//! leaves the time of the step at the period where it was, so a line read at the period is
+//! read no later than with no early step.
 //! While log is left after a step, the next is read at the next turn of the loop, at once. A
 //! step that took program starts or changed the level's state prints a `program_starts` line,
 //! so that the app shows it without asking for the status; a reading that failed is a
@@ -900,7 +902,11 @@ impl Watcher<'_> {
                 return;
             }
             let next = due.as_ref().map_or(alive, |d| d.at.min(alive)).min(sample);
-            let next = next.min(starts).min(look);
+            // Log left unread after a step is read at the next turn, at once.
+            let next = match reading_on {
+                true => Instant::now(),
+                false => next.min(starts).min(look),
+            };
             let next = next.min(Instant::now() + PARENT);
             match rx.recv_timeout(next.saturating_duration_since(Instant::now())) {
                 Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => return,
@@ -975,25 +981,26 @@ impl Watcher<'_> {
             }
             // A line of a rule that raises a finding, and has not brought a step forward since
             // the last step at the period, is read at once; any other waits for `events_every`.
-            let period = starts <= Instant::now();
+            // `starts` is the time of the step at the period, and only that step moves it: an
+            // early step, and the steps that go on with a pass, leave it where it was, so no line
+            // waits longer for the period than it would with no early step. A period that comes
+            // while a pass goes on is taken by the first step after the pass.
+            let period = starts <= Instant::now() && !reading_on;
             let mut news = false;
-            if !period && look <= Instant::now() {
+            if !period && !reading_on && look <= Instant::now() {
                 look = Instant::now() + LOOK;
                 news = pass.raising(&self.args.system_root, crate::now_secs(), &mut held);
             }
-            if news || period {
-                if period && !reading_on {
+            if news || period || reading_on {
+                if period {
                     held.clear();
+                    starts = Instant::now() + self.args.events_every;
                 }
-                starts = Instant::now() + self.args.events_every;
                 let read = self.events(&mut pass);
                 // Log left unread is read on at the next turn, at once: a full check waiting for
                 // the run lock takes it between steps, and the turn says the watcher is alive. A
-                // step that did not commit is tried again at the next reading.
+                // step that did not commit ends the pass here and is read again by the next step.
                 reading_on = matches!(read, Ok(Some(_))) && pass.more();
-                if reading_on {
-                    starts = Instant::now();
-                }
                 match read {
                     // A reading that took program starts or changed the level's state is said,
                     // so that the app shows it without asking for the status.

@@ -1268,8 +1268,9 @@ impl Pass {
     /// evaluated by the reading's own parser and the one evaluator (`read_file`,
     /// `Into::judge`), counted into nothing that is kept, and where the look got to moves past
     /// them, so a line is looked at once. False until a step read the log, after a step that
-    /// failed or found no collector, when the folder cannot be listed and when a file cannot be
-    /// read: the step at its period reads and tells that. Whatever this says, what the step
+    /// failed or found no collector, and when the folder cannot be listed; a file that cannot
+    /// be read ends the look, which answers by what matched before it. The step at its period
+    /// reads and tells such a failure. Whatever this says, what the step
     /// reads is decided by the store's places alone, so a wrong answer here, or a wrong `held`,
     /// costs an early step or a wait of at most one period, and never a line.
     pub fn raising(&mut self, root: &Path, now: i64, held: &mut BTreeSet<&'static str>) -> bool {
@@ -1322,7 +1323,9 @@ impl Pass {
                     seen.looked.insert(f.name.clone(), place);
                 }
                 Ok(None) => {}
-                Err(_) => return false,
+                // The look ends here; what matched before the file that failed still counts,
+                // since where the look got to has moved past it.
+                Err(_) => break,
             }
         }
         let raised = matched.rules.into_iter().filter(|(_, h)| h.meta.raises());

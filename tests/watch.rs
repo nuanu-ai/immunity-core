@@ -1084,6 +1084,72 @@ fn after_the_reading_at_the_period_a_rule_brings_a_reading_forward_again() {
 }
 
 #[test]
+fn an_early_reading_does_not_put_off_the_reading_at_the_period() {
+    // A line no rule raises on, written after an early reading, is read at the period counted
+    // from the watcher's reading before, as it would be with no early reading. Times are the
+    // readings' own, in the store.
+    let mac = Mac::new("events-look-period");
+    mac.event_level();
+    mac.run();
+    let period: i64 = 8;
+    let every = period.to_string();
+    let args = [
+        "--events-every",
+        &every,
+        "--sample-every",
+        "3600",
+        "--alive-every",
+        "1",
+    ];
+    let mut w = mac.watch_with(&args).started();
+    let last = || {
+        mac.rows("SELECT CAST(MAX(at) AS TEXT) FROM event_count")[0]
+            .parse::<i64>()
+            .unwrap()
+    };
+    // The watcher's first reading is behind this line, and is the last at the period.
+    w.next("alive");
+    let at_period = last();
+    // Late in the period, so that an early reading that moved the period would move it far.
+    for _ in 0..3 {
+        w.next("alive");
+    }
+    let name = "exec-20261004T000013-20261004T000000.jsonl";
+    read_after(&mut w, || mac.exec_in(name, 1));
+    mac.split_in(name, 2);
+    w.until("program_starts", |v| v["starts"] == 1);
+    // The readings' times are whole seconds; two more allow for a loaded machine. An early
+    // reading that moved the period would read the line about five seconds later still.
+    let read = last();
+    assert!(
+        read <= at_period + period + 2,
+        "read at {read}, the period came at {}",
+        at_period + period
+    );
+    assert!(w.stop().success());
+}
+
+#[test]
+fn a_log_file_that_cannot_be_read_does_not_hide_a_match_the_look_found_before_it() {
+    // A line of a format this version does not know, in a later file, fails the reading. The
+    // look reads the earlier file first, and its line that raises is read at once.
+    let mac = Mac::new("events-look-error");
+    mac.event_level();
+    mac.run();
+    let mut w = reading_by_looks(&mac);
+    let later = mac
+        .sys()
+        .join(EVENT_LOG)
+        .join("exec-20261004T000013-20261004T010000.jsonl");
+    std::fs::write(&later, "{\"schema_version\":2,\"seq_num\":9}\n").unwrap();
+    let took = read_after(&mut w, || {
+        mac.exec_in("exec-20261004T000013-20261004T000000.jsonl", 1)
+    });
+    assert!(took < LINE_READ_WITHIN, "read after {took:?}");
+    assert!(w.stop().success());
+}
+
+#[test]
 fn a_log_file_that_appears_is_read_as_soon_as_a_log_file_that_grew() {
     // The collector starts a new file at the hour and at its size. The line in the new file is
     // of another rule that raises, so it is read at once while the first rule waits for the
