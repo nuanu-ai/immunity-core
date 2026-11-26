@@ -66,6 +66,16 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
+impl Refused {
+    /// The system's error number, when the system refused.
+    pub fn errno(&self) -> Option<i32> {
+        match self {
+            Refused::Look(e) | Refused::Failed(e) => e.raw_os_error(),
+            _ => None,
+        }
+    }
+}
+
 /// The regular file at `path`, opened to read, with its metadata as opened.
 pub fn open(path: &Path, reach: Reach, cap: u64) -> Result<(File, Metadata), Refused> {
     let given;

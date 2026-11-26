@@ -1446,10 +1446,10 @@ fn what_each_agents_sessions_gave_is_told_together_within_the_bound_over_all_fil
         for i in 0..n {
             let unit = |what: &str| Unit::whole(format!("/invented/{n}/{what}{i}"));
             look.there(unit("s"));
-            look.unread_as(unit("s"), Said::SessionFile, "denied".into());
-            look.unread_as(unit("f"), Said::SessionFolder, "denied".into());
+            look.unread_as(unit("s"), Said::SessionFile, None, "denied".into());
+            look.unread_as(unit("f"), Said::SessionFolder, None, "denied".into());
         }
-        look.unread_as(Unit::whole("x.jsonl"), Said::Lines(n), String::new());
+        look.unread_as(Unit::whole("x.jsonl"), Said::Lines(n), None, String::new());
         // Only the second walk stopped.
         if n == 2 {
             look.short(Cause::NoReader, "past the budget".into());
@@ -1510,4 +1510,24 @@ fn another_agents_session_store_is_named_without_reading_inside_it() {
     std::fs::create_dir_all(home.join("Documents/kept/sessions")).unwrap();
     std::os::unix::fs::symlink(home.join("Documents/kept"), home.join(".continue")).unwrap();
     assert_eq!(unread_here(&home, &homes), ["Gemini CLI"]);
+}
+
+#[test]
+fn a_session_file_shut_carries_the_systems_number_and_a_folder_that_is_a_link_none() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = Trial::new("errno");
+    let file = t.file("-invented-a/s1.jsonl");
+    std::fs::write(&file, turn("/invented/w0", 1)).unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let link = t.file("-invented-c");
+    std::os::unix::fs::symlink(t.file("-invented-b"), &link).unwrap();
+    let read = t.read(&BTreeMap::new(), later(10));
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let mut errno: Vec<(String, Option<i32>)> = (read.look.not_read())
+        .map(|u| (u.unit.to_string(), u.errno))
+        .collect();
+    errno.sort();
+    let shown = |p: &Path| p.display().to_string();
+    let said = [(shown(&file), Some(libc::EACCES)), (shown(&link), None)];
+    assert_eq!(errno, said);
 }

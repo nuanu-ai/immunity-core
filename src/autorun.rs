@@ -1334,7 +1334,9 @@ fn matching(dir: &Path, rel: &str, pattern: &str, out: &mut Looked) -> Vec<Strin
         Err(e) => {
             match Absent::on_the_way(&e) {
                 Some(absent) => out.look.absent(listing, absent),
-                None => out.look.not_looked_at(listing, e.to_string()),
+                None => out
+                    .look
+                    .not_looked_at(listing, e.raw_os_error(), e.to_string()),
             }
             return Vec::new();
         }
@@ -1379,7 +1381,9 @@ fn look(p: &Point, path: &Path, shown: &str, out: &mut Looked, homes: &[&Path], 
             // Not there: read in full, it holds nothing.
             return match Absent::on_the_way(&e) {
                 Some(absent) => out.look.absent(shown, absent),
-                None => out.look.not_looked_at(shown, e.to_string()),
+                None => out
+                    .look
+                    .not_looked_at(shown, e.raw_os_error(), e.to_string()),
             };
         }
         Ok(m) if m.file_type().is_symlink() => std::fs::read_link(path)
@@ -1395,7 +1399,7 @@ fn look(p: &Point, path: &Path, shown: &str, out: &mut Looked, homes: &[&Path], 
     let mut found: Vec<(Unit, Content)> = Vec::new();
     if let Folders(ident) = p.part {
         match folders(&path, ident, &shown.path, out, homes, home) {
-            Err(why) => return out.look.unread(shown, why),
+            Err(e) => return out.look.unread(shown, e.raw_os_error(), e.to_string()),
             Ok(names) => {
                 for name in names {
                     let entry = Unit::whole(format!("{shown}/{name}"));
@@ -1409,14 +1413,14 @@ fn look(p: &Point, path: &Path, shown: &str, out: &mut Looked, homes: &[&Path], 
     }
     let bytes = match crate::open::read(&path, crate::open::Reach::Place, p.cap()) {
         Ok(bytes) => bytes,
-        Err(why) => return out.look.unread(shown, why.to_string()),
+        Err(why) => return out.look.unread(shown, why.errno(), why.to_string()),
     };
     let whole = |bytes: &[u8]| Content::Hash(format!("sha256:{}", crate::sha256::hex(bytes)));
     let unit = shown.clone();
     let mut lists = Vec::new();
     match p.part {
         WholeWhen(format, key, holds) => match whole_when(&bytes, format, key, holds) {
-            Err(why) => return out.look.unread(shown, why),
+            Err(why) => return out.look.unread(shown, None, why),
             Ok(true) => found.push((shown, whole(&bytes))),
             Ok(false) => {}
         },
@@ -1484,10 +1488,10 @@ fn folders(
     looked: &mut Looked,
     homes: &[&Path],
     home: &Path,
-) -> Result<Vec<String>, String> {
+) -> std::io::Result<Vec<String>> {
     let mut out = Vec::new();
-    for entry in std::fs::read_dir(path).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
         let name = entry.file_name().to_string_lossy().into_owned();
         if name.starts_with('.') {
             continue;
@@ -1505,7 +1509,7 @@ fn folders(
             Ok(m) if m.is_dir() => {}
             Ok(_) => continue,
             Err(e) => {
-                looked.look.unread(unit, e.to_string());
+                looked.look.unread(unit, e.raw_os_error(), e.to_string());
                 continue;
             }
         }

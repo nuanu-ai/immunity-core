@@ -158,14 +158,19 @@ impl Kind {
         self.look.listed(Unit::whole(shown));
     }
 
-    /// A place or thing there that could not be read, with why.
-    fn failed(&mut self, shown: String, why: String) {
-        self.look.not_looked_at(Unit::whole(shown), why);
+    /// A place or thing there that could not be read, with the system's error number and why.
+    fn failed(&mut self, shown: String, errno: Option<i32>, why: String) {
+        self.look.not_looked_at(Unit::whole(shown), errno, why);
+    }
+
+    /// A place or thing there that the system kept from being read, as it said.
+    fn refused(&mut self, shown: String, e: &std::io::Error) {
+        self.failed(shown, e.raw_os_error(), e.to_string());
     }
 
     /// A thing seen and not recorded, as `said` says, with why.
     fn not_recorded(&mut self, shown: String, said: Said, why: String) {
-        self.look.unread_as(Unit::whole(shown), said, why);
+        self.look.unread_as(Unit::whole(shown), said, None, why);
     }
 
     /// The statements of this reading, each pointing at its line of the raw copy.
@@ -339,6 +344,7 @@ fn app_support(
     for u in bundles.look.not_read().filter(|u| u.said == Said::Failed) {
         kind.failed(
             u.unit.to_string(),
+            u.errno,
             "applications there could not be read, so their folders were not looked for"
                 .to_string(),
         );
@@ -350,7 +356,7 @@ fn app_support(
     let entries = match list(&base) {
         None => return kind,
         Some(Err(e)) => {
-            kind.failed(APP_SUPPORT_PLACE.to_string(), e.to_string());
+            kind.refused(APP_SUPPORT_PLACE.to_string(), &e);
             return kind;
         }
         Some(Ok(entries)) => entries,
@@ -375,6 +381,7 @@ fn app_support(
             if before.is_some() {
                 kind.failed(
                     format!("{APP_SUPPORT_PLACE}/{text}"),
+                    None,
                     NOT_A_FOLDER.to_string(),
                 );
             }
@@ -394,7 +401,7 @@ fn app_support(
         let (mut records, mut count) = (Vec::new(), 0);
         let homes: [&Path; 2] = [&home, &real_home];
         match walk_code(&path, b"", 0, &mut records, &mut count, &homes) {
-            Err(e) => kind.failed(shown, e.to_string()),
+            Err(e) => kind.refused(shown, &e),
             Ok(Walked::Capped(cap)) => kind.not_recorded(shown, Said::OverCap, cap),
             // No application read now matches it and no code is left in it: nothing to hold.
             Ok(Walked::Done) if unmatched && count == 0 => {}
@@ -518,15 +525,15 @@ pub fn raw(kinds: &[Kind]) -> (String, Vec<Vec<usize>>) {
 }
 
 /// The digest of a tree: every entry but folders, in order of path, by metadata alone.
-fn digest(root: &Path) -> Result<String, String> {
+fn digest(root: &Path) -> std::io::Result<String> {
     listing(root).map(|records| stat(&records))
 }
 
 /// The list a tree's digest is made over: for each entry but folders, in order of path, its path
 /// from the tree, a NUL, its change time and a newline.
-fn listing(root: &Path) -> Result<Vec<u8>, String> {
+fn listing(root: &Path) -> std::io::Result<Vec<u8>> {
     let mut records = Vec::new();
-    walk(root, b"", &mut records).map_err(|e| e.to_string())?;
+    walk(root, b"", &mut records)?;
     Ok(records)
 }
 
@@ -614,14 +621,24 @@ const INFO_KEYS: [&str; 3] = [
 /// is not a string, and any of the three that cannot be told: a fallback to the folder's name
 /// would move the app to another subject with no failure said, and a number could be another
 /// app's identifier. A version or build of another type than a string or a number is none.
-fn info(bundle: &Path) -> Result<[Option<String>; 3], String> {
-    use crate::plist::Text;
+/// The error carries the system's error number when the system refused.
+fn info(bundle: &Path) -> Result<[Option<String>; 3], (Option<i32>, String)> {
+    use crate::plist::{NotRead, Text};
     let contents = bundle.join("Contents");
     if std::fs::symlink_metadata(&contents).is_ok_and(|m| m.file_type().is_symlink()) {
-        return Err("its Contents is a symbolic link, which is not followed".to_string());
+        return Err((
+            None,
+            "its Contents is a symbolic link, which is not followed".into(),
+        ));
     }
-    let texts = crate::plist::texts_at(&contents.join("Info.plist"), &INFO_KEYS)
-        .map_err(|why| format!("its Info.plist: {why}"))?;
+    let texts =
+        crate::plist::texts_at(&contents.join("Info.plist"), &INFO_KEYS).map_err(|not| {
+            let errno = match &not {
+                NotRead::Refused(r) => r.errno(),
+                NotRead::Texts(_) => None,
+            };
+            (errno, format!("its Info.plist: {not}"))
+        })?;
     let mut out = [None, None, None];
     for (slot, key) in out.iter_mut().zip(INFO_KEYS) {
         let identifier = key == INFO_KEYS[0];
@@ -629,8 +646,8 @@ fn info(bundle: &Path) -> Result<[Option<String>; 3], String> {
             None => None,
             Some((_, Text::One(s))) => Some(s.clone()),
             Some((_, Text::Number(s))) if !identifier => Some(s.clone()),
-            Some((_, Text::Untold)) => return Err(format!("its {key} cannot be told")),
-            Some(_) if identifier => return Err(format!("its {key} is not a string")),
+            Some((_, Text::Untold)) => return Err((None, format!("its {key} cannot be told"))),
+            Some(_) if identifier => return Err((None, format!("its {key} is not a string"))),
             Some(_) => None,
         };
     }
@@ -714,7 +731,7 @@ fn find_bundles(roots: &Roots, kind: &mut Kind) -> Vec<Found> {
         let names = match list(&dir) {
             None => continue,
             Some(Err(e)) => {
-                kind.failed(shown, e.to_string());
+                kind.refused(shown, &e);
                 continue;
             }
             Some(Ok(names)) => names,
@@ -734,7 +751,7 @@ fn find_bundles(roots: &Roots, kind: &mut Kind) -> Vec<Found> {
             // One folder down, where installers put suites.
             match list(&path) {
                 None => {}
-                Some(Err(e)) => kind.failed(here, e.to_string()),
+                Some(Err(e)) => kind.refused(here, &e),
                 Some(Ok(inner)) => {
                     for name in inner {
                         let text = name.to_string_lossy();
@@ -833,15 +850,15 @@ fn bundles(conn: &Connection, roots: &Roots, machine: &str) -> rusqlite::Result<
     for f in found {
         let digest = match digest(&f.path) {
             Ok(d) => d,
-            Err(why) => {
-                kind.failed(f.shown, why);
+            Err(e) => {
+                kind.refused(f.shown, &e);
                 continue;
             }
         };
         let [identifier, short, build] = match info(&f.path) {
             Ok(info) => info,
-            Err(why) => {
-                kind.failed(f.shown, why);
+            Err((errno, why)) => {
+                kind.failed(f.shown, errno, why);
                 continue;
             }
         };
@@ -886,7 +903,7 @@ fn bundles(conn: &Connection, roots: &Roots, machine: &str) -> rusqlite::Result<
             }
             // A thread that could not record its answer: never taken for a bundle gone.
             (None, None) => {
-                kind.failed(p.found.shown, "not examined".to_string());
+                kind.failed(p.found.shown, None, "not examined".to_string());
                 continue;
             }
         };
@@ -936,7 +953,7 @@ fn kegs(roots: &Roots, machine: &str) -> Kind {
         let names = match list(&cellar) {
             None => continue,
             Some(Err(e)) => {
-                kind.failed(shown, e.to_string());
+                kind.refused(shown, &e);
                 continue;
             }
             Some(Ok(names)) => names,
@@ -951,7 +968,7 @@ fn kegs(roots: &Roots, machine: &str) -> Kind {
             let versions = match list(&formula) {
                 None => continue,
                 Some(Err(e)) => {
-                    kind.failed(here, e.to_string());
+                    kind.refused(here, &e);
                     continue;
                 }
                 Some(Ok(versions)) => versions,
@@ -963,7 +980,7 @@ fn kegs(roots: &Roots, machine: &str) -> Kind {
                     continue;
                 }
                 match listing(&keg) {
-                    Err(why) => kind.failed(shown, why),
+                    Err(e) => kind.refused(shown, &e),
                     Ok(list) => kind.things.push(Thing {
                         subject: format!("file:{machine}/{shown}"),
                         facts: vec![
@@ -999,7 +1016,7 @@ fn npm(roots: &Roots, machine: &str) -> Kind {
         let entries = match list(&root) {
             None => continue,
             Some(Err(e)) => {
-                kind.failed(shown, e.to_string());
+                kind.refused(shown, &e);
                 continue;
             }
             Some(Ok(entries)) => entries,
@@ -1018,7 +1035,7 @@ fn npm(roots: &Roots, machine: &str) -> Kind {
             }
             match list(&path) {
                 None => {}
-                Some(Err(e)) => kind.failed(format!("{shown}/{text}"), e.to_string()),
+                Some(Err(e)) => kind.refused(format!("{shown}/{text}"), &e),
                 Some(Ok(scoped)) => {
                     for name in scoped {
                         let inside = path.join(&name);
@@ -1033,8 +1050,8 @@ fn npm(roots: &Roots, machine: &str) -> Kind {
             let here = format!("{shown}/{name}");
             let list = match listing(&path) {
                 Ok(list) => list,
-                Err(why) => {
-                    kind.failed(here, why);
+                Err(e) => {
+                    kind.refused(here, &e);
                     continue;
                 }
             };
@@ -1367,7 +1384,7 @@ mod tests {
                 0 => kind.not_recorded(tool(), Said::OverCap, "cap".into()),
                 1 => kind.not_recorded(tool(), Said::SameName, String::new()),
                 2 => (kind.look).not_into(Unit::whole(tool()), home.join("Documents"), home),
-                _ => kind.failed(tool(), "denied".into()),
+                _ => kind.failed(tool(), None, "denied".into()),
             }
             let (completeness, reason, gap) = kind.coverage();
             assert_eq!((completeness, gap.cause), ("partial", Some(cause)));
@@ -1377,6 +1394,46 @@ mod tests {
         let mut whole = Kind::new(NPM, NPM_CANNOT);
         whole.listed("/l");
         assert_eq!(whole.coverage().0, "full");
+    }
+
+    #[test]
+    fn a_place_or_an_app_shut_to_this_account_carries_the_systems_number_and_a_link_none() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::common::Scratch::new("integrity-errno");
+        let (home, system) = (dir.join("home"), dir.join("system"));
+        let places = system.join("Applications");
+        let info = home.join("Applications/X.app/Contents/Info.plist");
+        std::fs::create_dir_all(&places).unwrap();
+        std::fs::create_dir_all(info.parent().unwrap()).unwrap();
+        std::fs::write(&info, "<plist/>\n").unwrap();
+        std::fs::create_dir_all(home.join("Applications/Y.app")).unwrap();
+        let contents = home.join("Applications/Y.app/Contents");
+        std::os::unix::fs::symlink(info.parent().unwrap(), contents).unwrap();
+        let mode = |path: &Path, m| {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        mode(&places, 0o000);
+        mode(&info, 0o000);
+        let store = dir.join("store.db");
+        let conn = crate::store::open_or_make(&store).unwrap();
+        let roots = super::Roots {
+            home: &home,
+            system: &system,
+            store: &store,
+        };
+        let kind = super::bundles(&conn, &roots, "machine:mac").unwrap();
+        mode(&places, 0o755);
+        mode(&info, 0o644);
+        let errno: Vec<(String, Option<i32>)> = (kind.look.not_read())
+            .map(|u| (u.unit.to_string(), u.errno))
+            .collect();
+        let denied = Some(libc::EACCES);
+        let said = [
+            ("/Applications".to_string(), denied),
+            ("Applications/X.app".to_string(), denied),
+            ("Applications/Y.app".to_string(), None),
+        ];
+        assert_eq!(errno, said);
     }
 
     /// An `Info.plist` of an invented app with these three values, each an XML element.

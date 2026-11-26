@@ -68,6 +68,9 @@ pub struct Unread {
     pub cause: Cause,
     pub why: String,
     pub said: Said,
+    /// The system's error number, from the error in hand where the unit was not read; none
+    /// when the system gave none.
+    pub errno: Option<i32>,
 }
 
 /// How a reading's reason says the units of one kind it did not read, and so their cause. Each
@@ -148,6 +151,25 @@ impl Said {
             | Said::SourceInto
             | Said::Untold
             | Said::FilesInto => Cause::NotGiven,
+        }
+    }
+
+    /// How a unit said so was not read, as one word of a seeded vocabulary: what the rows of the
+    /// units a reading did not read are to hold once the store keeps them (format 10). A finer
+    /// word can be seeded when something reads one.
+    #[allow(dead_code)]
+    pub fn word(self) -> &'static str {
+        match self {
+            Said::SameName => "same_name",
+            Said::OverCap => "past_limit",
+            Said::Into | Said::SourceInto | Said::FilesInto => "guarded",
+            Said::Untold => "untold",
+            Said::SessionFolder | Said::Unlisted => "unlisted",
+            Said::Checkout => "kept",
+            Said::Lines(_) => "unparsed",
+            Said::Failed | Said::SessionFile | Said::WorkingFolder | Said::Lockfile(_) => {
+                "unreadable"
+            }
         }
     }
 
@@ -277,26 +299,28 @@ impl Look {
         self.seen.push(unit);
     }
 
-    /// A unit there that could not be read, with why.
-    pub fn unread(&mut self, unit: Unit, why: String) {
+    /// A unit there that could not be read, with the system's error number and why.
+    pub fn unread(&mut self, unit: Unit, errno: Option<i32>, why: String) {
         self.seen.push(unit.clone());
-        self.not_looked_at(unit, why);
+        self.not_looked_at(unit, errno, why);
     }
 
-    /// A unit that could not be looked at, with why: whether it is there is not known. A part
-    /// of a file that could not be read is one too: only it is not known.
-    pub fn not_looked_at(&mut self, unit: Unit, why: String) {
-        self.unread_as(unit, Said::Failed, why);
+    /// A unit that could not be looked at, with the system's error number and why: whether it
+    /// is there is not known. A part of a file that could not be read is one too: only it is
+    /// not known.
+    pub fn not_looked_at(&mut self, unit: Unit, errno: Option<i32>, why: String) {
+        self.unread_as(unit, Said::Failed, errno, why);
     }
 
-    /// A unit not read, said as `said` says it, with why.
-    pub fn unread_as(&mut self, unit: Unit, said: Said, why: String) {
+    /// A unit not read, said as `said` says it, with the system's error number and why.
+    pub fn unread_as(&mut self, unit: Unit, said: Said, errno: Option<i32>, why: String) {
         let cause = said.cause();
         self.unread.push(Unread {
             unit,
             cause,
             why,
             said,
+            errno,
         });
     }
 
@@ -307,7 +331,7 @@ impl Look {
 
     /// The same, said as `said` says it.
     pub fn not_into_as(&mut self, unit: Unit, folder: PathBuf, home: &Path, said: Said) {
-        self.unread_as(unit, said, crate::guarded::leads_into(&folder, home));
+        self.unread_as(unit, said, None, crate::guarded::leads_into(&folder, home));
         self.met(folder);
     }
 
@@ -880,7 +904,7 @@ mod tests {
         look.read(Unit::whole("tools/pre-push"));
         look.read(Unit::whole("tools/pre-commit"));
         look.read_part(&Unit::whole("conf.json"), "/a");
-        look.not_looked_at(Unit::whole("shut"), "denied".to_string());
+        look.not_looked_at(Unit::whole("shut"), None, "denied".to_string());
         let covers = |look: &Look, path: &str| look.covers(Some(&Unit::whole(path)));
         assert!(covers(&look, "old/pre-commit") && !covers(&look, "shut/pre-commit"));
         look.unplaced();
@@ -916,7 +940,11 @@ mod tests {
         assert!(!covers("dev/a/b/tools/run") && !covers("dev/a/c/.mcp.json"));
         assert!(!covers("dev/a/b/hooks/deeper/pre-commit"));
         // A unit not read inside a folder listed is hidden by itself.
-        look.unread(Unit::whole("dev/a/b/hooks/shut"), "denied".to_string());
+        look.unread(
+            Unit::whole("dev/a/b/hooks/shut"),
+            None,
+            "denied".to_string(),
+        );
         assert!(!look.covers(Some(&Unit::whole("dev/a/b/hooks/shut"))));
     }
 
@@ -927,7 +955,7 @@ mod tests {
             look.absent(Unit::whole("dev/a/.git/hooks"), gone);
         }
         fn shut(look: &mut Look) {
-            look.not_looked_at(Unit::whole("dev/a/.git/hooks"), "denied".to_string());
+            look.not_looked_at(Unit::whole("dev/a/.git/hooks"), None, "denied".to_string());
         }
         let orders: [[fn(&mut Look); 2]; 2] = [[absent, shut], [shut, absent]];
         for [first, then] in orders {
@@ -991,6 +1019,57 @@ mod tests {
     }
 
     #[test]
+    fn each_kind_of_unit_not_read_says_how_by_one_word_of_the_vocabulary() {
+        let words: Vec<&str> = (Said::BEFORE.iter().chain(&Said::AFTER))
+            .map(|s| s.word())
+            .collect();
+        let said = [
+            "unreadable", // Failed
+            "unreadable", // SessionFile
+            "unlisted",   // SessionFolder
+            "unparsed",   // Lines
+            "unreadable", // WorkingFolder
+            "kept",       // Checkout
+            "same_name",  // SameName
+            "past_limit", // OverCap
+            "guarded",    // Into
+            "guarded",    // SourceInto
+            "unreadable", // Lockfile
+            "untold",     // Untold
+            "unlisted",   // Unlisted
+            "guarded",    // FilesInto
+        ];
+        assert_eq!(words, said);
+    }
+
+    #[test]
+    fn a_unit_a_place_or_a_row_could_not_read_carries_the_systems_number_and_only_then() {
+        // A folder and a file shut to this account carry EACCES; a link into a folder macOS
+        // asks permission for was not refused by the system and carries none.
+        let mac = Mac::new("errno");
+        mac.put("Library/LaunchAgents/org.example.sync.plist", "<plist/>\n");
+        mac.shut("Library/LaunchAgents");
+        mac.put("dev/a/.mcp.json", "{}");
+        mac.shut("dev/a/.mcp.json");
+        mac.put("Documents/hooks.json", "{}");
+        let link = mac.home().join(".cursor/hooks.json");
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(mac.home().join("Documents/hooks.json"), &link).unwrap();
+        let errno = |look: &Look| -> Vec<(String, Option<i32>)> {
+            look.not_read()
+                .map(|u| (u.unit.to_string(), u.errno))
+                .collect()
+        };
+        let place = mac.place(watched::AUTOSTART_KIND);
+        let shut = mac.way(".mcp.json", Scope::Checkout).look;
+        let guarded = mac.way(".cursor/hooks.json", Scope::Home).look;
+        let denied = Some(libc::EACCES);
+        assert_eq!(errno(&place), [("Library/LaunchAgents".into(), denied)]);
+        assert_eq!(errno(&shut), [("dev/a/.mcp.json".into(), denied)]);
+        assert_eq!(errno(&guarded), [(".cursor/hooks.json".into(), None)]);
+    }
+
+    #[test]
     fn a_place_not_on_this_mac_is_not_applicable_and_one_there_and_unreadable_failed() {
         let mac = Mac::new("here");
         // Nothing of either kind here: full, with the note that says so, and each place read.
@@ -1033,9 +1112,9 @@ mod tests {
         let home = Path::new("/Users/example");
         let mut look = Look::default();
         look.not_into(Unit::whole("Documents/b"), home.join("Documents"), home);
-        look.not_looked_at(Unit::whole("a"), "denied".to_string());
+        look.not_looked_at(Unit::whole("a"), None, "denied".to_string());
         look.there_not_into(Unit::whole("d"), PathBuf::from("/Volumes/Backup"), home);
-        look.unread(Unit::part("c.json", "/x"), "not JSON".to_string());
+        look.unread(Unit::part("c.json", "/x"), None, "not JSON".to_string());
         look.read(Unit::whole("e"));
         look.present = 1;
         let failed = "could not be read: a (denied); c.json#/x (not JSON)";
@@ -1096,10 +1175,10 @@ mod tests {
             ("Applications/B.app", Said::SameName),
             ("Library/Application Support/T", Said::OverCap),
         ] {
-            look.unread_as(Unit::whole(unit), said, "cap".into());
+            look.unread_as(Unit::whole(unit), said, None, "cap".into());
         }
         look.there(Unit::whole("sessions/b.jsonl"));
-        look.not_looked_at(Unit::whole("/codex"), "denied".into());
+        look.not_looked_at(Unit::whole("/codex"), None, "denied".into());
         look.not_into(Unit::whole("Applications"), docs(), home);
         let into = "it leads into ~/Documents, which macOS asks permission for";
         let said = [

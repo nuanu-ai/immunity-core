@@ -183,13 +183,32 @@ pub enum Text {
 pub fn texts_at<'k>(
     path: &std::path::Path,
     keys: &[&'k str],
-) -> Result<Option<Vec<(&'k str, Text)>>, String> {
+) -> Result<Option<Vec<(&'k str, Text)>>, NotRead> {
     use crate::open::Refused;
     match crate::open::read(path, crate::open::Reach::Own, crate::watched::CAP) {
         Err(Refused::Look(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(Refused::Kind("symbolic link")) => Err("a symbolic link, which is not followed".into()),
-        Err(refused) => Err(refused.to_string()),
-        Ok(bytes) => texts(&bytes, keys).map(Some).map_err(str::to_string),
+        Err(refused) => Err(NotRead::Refused(refused)),
+        Ok(bytes) => texts(&bytes, keys).map(Some).map_err(NotRead::Texts),
+    }
+}
+
+/// Why `texts_at` took nothing from a file: what `open::read` refused, with the system's error
+/// number, or why its bytes are not texts. Its words are the error's text.
+#[derive(Debug)]
+pub enum NotRead {
+    Refused(crate::open::Refused),
+    Texts(&'static str),
+}
+
+impl std::fmt::Display for NotRead {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            NotRead::Refused(crate::open::Refused::Kind("symbolic link")) => {
+                f.write_str("a symbolic link, which is not followed")
+            }
+            NotRead::Refused(r) => write!(f, "{r}"),
+            NotRead::Texts(why) => f.write_str(why),
+        }
     }
 }
 

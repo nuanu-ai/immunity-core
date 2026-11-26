@@ -1364,7 +1364,7 @@ fn log_cap(root: &Path) -> Result<u64, String> {
     let failed = |e: &str| format!("the cap of the event level's log could not be read: {e}");
     let arguments = match crate::plist::texts_at(&root.join(TIDY_PLIST), &["ProgramArguments"]) {
         Ok(None) => return Err(NO_TIDY.to_string()),
-        Err(why) => return Err(failed(&why)),
+        Err(why) => return Err(failed(&why.to_string())),
         Ok(Some(texts)) => texts,
     };
     match arguments.first() {
