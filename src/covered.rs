@@ -40,6 +40,31 @@ pub fn watched() -> Vec<(Count, &'static str, bool)> {
     out
 }
 
+/// The kinds of watched files, each once, in the order of `watched`, with the coverage kinds of
+/// the readings of each (`kinds_of`).
+pub fn watched_files() -> Vec<(&'static str, Vec<String>)> {
+    let mut out: Vec<(&'static str, Vec<String>)> = Vec::new();
+    for (count, ..) in watched() {
+        if let Count::Files(as_) = count
+            && !out.iter().any(|k| k.0 == as_)
+        {
+            out.push((as_, kinds_of(as_)));
+        }
+    }
+    out
+}
+
+/// The coverage kinds of the readings of files watched as `watched_as`: every kind of place
+/// watched as it, the programs startup items run among them, and every row of the table of
+/// autorun points read here whose findings are such. Every answer that says how completely a
+/// kind of watched files was read goes over this one list.
+pub fn kinds_of(watched_as: &str) -> Vec<String> {
+    let mut kinds = autorun::kinds_of(watched_as);
+    let places = watched::kinds().into_iter().filter(|k| k.0 == watched_as);
+    kinds.extend(places.map(|k| k.1.to_string()));
+    kinds
+}
+
 /// Scripts the login window runs at every login and logout, in the words for a person.
 pub const LOGIN_HOOKS: &str = "login and logout hooks";
 /// What decides how the owner logs in and how a password is checked, in the same words.

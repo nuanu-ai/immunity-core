@@ -3391,6 +3391,27 @@ fn husky_s_startup_file_in_the_home_folder_raises_a_finding_when_it_changes_or_a
 }
 
 #[test]
+fn an_autorun_row_s_kind_not_read_in_full_is_named_in_the_run_line_and_in_the_watched_kinds() {
+    // No false calm. The run line and `WatchedPlaces.kinds` go over every kind of watched
+    // files, the rows of the table of autorun points among them: Husky's startup file, closed
+    // by its permissions, is named as not read in both.
+    use std::os::unix::fs::PermissionsExt;
+    let e = Estate::new("autorun-kind-unread");
+    let rc = e.home().join(".huskyrc");
+    put(&rc, "export NVM_DIR=\"$HOME/.nvm\"\n");
+    std::fs::set_permissions(&rc, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let line = e.full();
+    let status = e.status();
+    std::fs::set_permissions(&rc, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(line.contains(&format!("{HUSKY_HOME_KIND} (")), "{line}");
+    let kinds = status["watched"]["kinds"].as_array().unwrap();
+    let husky = (kinds.iter())
+        .find(|k| k["kind"] == "file in the home folder that git runs code from")
+        .unwrap_or_else(|| panic!("{kinds:#?}"));
+    assert_ne!(husky["coverage"], "full", "{husky}");
+}
+
+#[test]
 fn a_hook_managers_files_read_for_the_first_time_on_a_store_that_exists_are_told_once_and_raise_nothing()
  {
     let e = Estate::new("hook-managers-upgrade");

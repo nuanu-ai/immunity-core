@@ -2313,16 +2313,7 @@ const NONE_IN_FOUND: &str = "None in the projects found.";
 /// depend on, finding the projects and reading their lockfiles.
 fn readings_of(count: Count, coverage: &[Latest]) -> Vec<&Latest> {
     let kinds: Vec<String> = match count {
-        Count::Files(as_) => {
-            // The kinds of place watched as it, the programs startup items run among them.
-            let mut kinds = crate::autorun::kinds_of(as_);
-            kinds.extend(
-                (watched::kinds().into_iter())
-                    .filter(|k| k.0 == as_)
-                    .map(|k| k.1.to_string()),
-            );
-            kinds
-        }
+        Count::Files(as_) => covered::kinds_of(as_),
         Count::Installed(kind) => vec![kind.to_string()],
         Count::Dependencies => vec![
             crate::checkouts::KIND.to_string(),

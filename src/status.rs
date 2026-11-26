@@ -13,7 +13,7 @@
 
 use crate::store::{self, Totals};
 use crate::view::{self, Latest};
-use crate::{ServerCounts, findings, resolver, servers, threats, watched};
+use crate::{ServerCounts, covered, findings, resolver, servers, threats, watched};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -164,9 +164,9 @@ pub struct Watched {
     pub new: usize,
     pub changed: usize,
     pub gone: usize,
-    /// Kinds of place on the machine whose reading in this run was not full, as their
-    /// coverage kind and completeness, in the order of the table of places.
-    pub kinds_not_full: Vec<(&'static str, String)>,
+    /// Kinds of watched files on the machine whose reading in this run was not full, as their
+    /// coverage kind and completeness, in the order of `covered::watched`.
+    pub kinds_not_full: Vec<(String, String)>,
     /// Readings of checkouts' hooks in this run that were not full, by completeness.
     pub hooks_not_full: BTreeMap<String, usize>,
     /// Files whose content could not be read in this run.
@@ -604,8 +604,8 @@ fn watched_summary(
             places.insert(kind, completeness);
         }
     }
-    for (_, kind) in watched::kinds() {
-        if let Some(completeness) = places.remove(kind) {
+    for kind in covered::watched_files().into_iter().flat_map(|k| k.1) {
+        if let Some(completeness) = places.remove(&kind) {
             w.kinds_not_full.push((kind, completeness));
         }
     }
@@ -1331,10 +1331,10 @@ fn watched_message(st: &State, s: &Summary, w: &Watched) -> crate::contract::v1:
         .iter()
         .filter(|r| r.reader == watched::READER)
         .collect();
-    let kinds = watched::kinds()
+    let kinds = covered::watched_files()
         .into_iter()
-        .map(|(watched_as, kind)| {
-            let rows: Vec<&&Latest> = mine.iter().filter(|r| r.kind == kind).collect();
+        .map(|(watched_as, kinds)| {
+            let rows: Vec<&&Latest> = mine.iter().filter(|r| kinds.contains(&r.kind)).collect();
             let presence = st
                 .presence_only
                 .get(watched_as)

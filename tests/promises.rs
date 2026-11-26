@@ -8535,7 +8535,9 @@ fn a_watched_folder_that_cannot_be_listed_retracts_nothing_and_reports_no_change
         )]
     );
     assert!(
-        printed.contains("0 new, 0 changed, 0 gone since the last reading; not read in full: launch agents and daemons (partial), programs that launch agents, daemons and login hooks run (nothing read)."),
+        // The kinds of the rows read here follow, each named: with no checkout, those of each
+        // checkout read nothing.
+        printed.contains("0 new, 0 changed, 0 gone since the last reading; not read in full: launch agents and daemons (partial), programs that launch agents, daemons and login hooks run (nothing read), editor tasks set to run when a checkout's folder is opened (nothing read), "),
         "{printed}"
     );
     // Each place not read is named with why where a fault is said: on a fault line of the
@@ -8566,7 +8568,7 @@ fn a_watched_folder_that_cannot_be_listed_retracts_nothing_and_reports_no_change
         "{coverage:?}"
     );
     assert!(
-        printed.contains("not read in full: launch agents and daemons (partial), ssh access files (nothing read), programs that launch agents, daemons and login hooks run (nothing read)."),
+        printed.contains("not read in full: launch agents and daemons (partial), ssh access files (nothing read), programs that launch agents, daemons and login hooks run (nothing read), "),
         "{printed}"
     );
     // Something of the kind could be read: the reading is partial.
@@ -11121,8 +11123,9 @@ fn lists_are_capped_with_their_totals_and_names_and_times_are_stable() {
     // An agent reads the status whole, so it stays bounded whatever the store holds. The bound
     // is the capped lists plus the fixed sections, with room: it was 64 KiB until the event
     // level and the published rules got sections of their own, and 80 KiB until the places not
-    // checked on this macOS were told.
-    assert!(stdout.len() < 96 * 1024, "{} bytes", stdout.len());
+    // checked on this macOS were told, and 96 KiB until the kinds of the rows read here were
+    // told among the watched places.
+    assert!(stdout.len() < 112 * 1024, "{} bytes", stdout.len());
     let r = &serde_json::from_str::<serde_json::Value>(&stdout).unwrap();
     // The rules that matched: the ten that matched most, with the total of rules and of
     // matches.
