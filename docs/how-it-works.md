@@ -214,7 +214,7 @@ The states are `open`, `expected`, `seen` and `cleared`.
 
 A finding stays open until someone answers it.
 
-- `immunity finding <id> expected --reason <text>` hides it for 30 days, or `--days` from 1 to 3650. If it was found again in the meantime, it opens again when that time ends.
+- `immunity finding <id> expected --reason <text>` hides it for 30 days, or `--days` from 1 to 3650. If it was found again in the meantime, it opens again when that time ends. Found again is told by the order in which the store wrote the answer and the occurrence, never by their times.
 - `immunity finding <id> seen` closes it. The next time it is found is a new finding.
 - `immunity finding <id> reopen` takes an answer back.
 - `--with <id>` gives the same answer, or takes it back, on the other finding of a pair: the core's finding of a rule and the response layer's finding of that rule about the same thing (see [Verdicts](#verdicts)). The caller names both, both answers are recorded or neither is, and each finding keeps an ordinary answer of its own.
