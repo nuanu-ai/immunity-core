@@ -1576,6 +1576,8 @@ fn write_view(store: &Path, if_stale: bool) -> Result<Vec<PathBuf>, Box<dyn Erro
     }
     let now = now_secs();
     let folder = home(store);
+    // Where ids name paths, for `immunity machine` (`known::known_of`).
+    let home_folder = user_home().unwrap_or_default();
     let (current, pages, basis, events_basis, until) = store::read(store, |tx| {
         let current = match if_stale {
             true => current_view(tx, store, now)?,
@@ -1594,14 +1596,16 @@ fn write_view(store: &Path, if_stale: bool) -> Result<Vec<PathBuf>, Box<dyn Erro
         let (state, result) = status_read(tx, store, now)?;
         let found = findings::all(tx, now)?;
         let level = state.event_level.as_ref();
-        // Where every page is written, `immunity machine` for this Mac and `immunity
-        // vulnerabilities` too.
+        // Where every page is written, `immunity vulnerabilities` too.
         let all = !matches!(current, Current::Events(_));
         let answers = view::Answers {
             findings: finding_answer::list_of(tx, &found, now)?,
             finding: Box::new(|id| finding_answer::of(tx, &found, id, now)),
             rules: rules_answer(level, result.store_id.clone(), true, now),
-            machine: all.then(|| machine::this_mac(tx, now)).transpose()?,
+            statements: owner::statements(tx, now)?,
+            machine: Box::new(|id, files_anywhere| {
+                Ok(machine::answer(tx, Some(id), &home_folder, files_anywhere, now)?.ok())
+            }),
             vulnerabilities: all
                 .then(|| vulnerabilities::list(Some(tx), now))
                 .transpose()?,
@@ -2218,23 +2222,9 @@ fn owner_cmd(args: &OwnerArgs) -> ExitCode {
         .unwrap_or_default();
     let at = now.as_secs() as i64;
     let Some((name, act)) = &args.act else {
-        let listed = store::read(store_path, |c| {
-            Ok((
-                owner::standing(c)?,
-                owner::withdrawn(c)?,
-                Some(store::id(c)?),
-            ))
-        });
-        let (standing, withdrawn, store_id) = match listed {
-            Ok(l) => l,
+        let m = match store::read(store_path, |c| Ok(owner::statements(c, at)?)) {
+            Ok(m) => m,
             Err(e) => return failed(&e),
-        };
-        let m = v1::Statements {
-            format: 1,
-            answered_at: at,
-            store_id,
-            statements: standing.iter().map(owner::statement).collect(),
-            withdrawn: withdrawn.max(0) as u64,
         };
         return answer::print("owner", args.form, &m, |m| {
             lists::statements(m, &screen::Screen::of_stdout())
@@ -2478,7 +2468,10 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     let servers = args.servers_input.clone();
     read_servers(&mut run, servers.as_deref())?;
     stage(CheckStage::Projects);
-    let (walked, walk_failure, not_told) = read_checkouts(&mut run, args)?;
+    // Where the walk starts, made real once: the walk and whether the run is a full check
+    // (`narrowed`) both rest on it.
+    let start = checkouts::start(args.checkouts_root.as_deref(), &args.home);
+    let (walked, walk_failure, not_told) = read_checkouts(&mut run, args, &start)?;
     let from_agents = read_agent_folders(&mut run, args, agent_folders::LOOK_LIMIT)?;
     let any_checkouts = walked.is_some() || !from_agents.is_empty();
     // One checkout found by both readers is read once.
@@ -2523,7 +2516,7 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     read_threats(&run, catalogue)?;
     read_feeds(&run, feeds)?;
     opened += match_dependencies(&run)?;
-    let narrowed = narrowed(args);
+    let narrowed = narrowed(&start);
     if let Some(what) = &narrowed {
         run.notes
             .push(format!("Not a full check: {}.", known::whole(what)));
@@ -2571,8 +2564,7 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
 /// rest of the home folder's projects unlooked for, and what the store knew outside it is kept
 /// unread. Every other root and input stands in for a source whole, as an invented home does,
 /// and its reader reads all of it.
-fn narrowed(args: &Args) -> Option<String> {
-    let start = checkouts::start(args.checkouts_root.as_deref(), &args.home);
+fn narrowed(start: &checkouts::Start) -> Option<String> {
     (start.root != start.real_home).then(|| {
         format!(
             "projects were looked for only in {}, not in the whole home folder",
@@ -3069,8 +3061,11 @@ type CheckoutWalk = (
 /// real path. Its completeness, cause and reason follow from what it read and did not
 /// (`look.rs`): the folders it listed and the checkouts it found are read, a folder it could
 /// not list is a unit not read, and what it did not look at that is no unit is said apart.
-fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Error>> {
-    let start = checkouts::start(args.checkouts_root.as_deref(), &args.home);
+fn read_checkouts(
+    run: &mut Run,
+    args: &Args,
+    start: &checkouts::Start,
+) -> Result<CheckoutWalk, Box<dyn Error>> {
     let root = &start.root;
     let (run_id, machine) = (run.run_id.to_string(), run.machine.to_string());
     let reading = Reading {
@@ -3090,7 +3085,13 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
             "could not look for checkouts in {}: not a folder",
             root.display()
         );
-        let gap = Gap::of(Cause::Failed);
+        // It looked at nothing, so what the walk before it failed to read is still not read.
+        let mut look = look::Look::default();
+        carry_failed(run.tx, &reading, &mut look, |_| true)?;
+        let gap = Gap {
+            not_read: look.not_read_rows(),
+            ..Gap::of(Cause::Failed)
+        };
         run.apply(&reading, checkouts::BASIS, "none", Some(&reason), &gap, &[])?;
         // Its root is the unit of the failure (`fault.rs`).
         let unit = Unit::whole(checkouts::rel(&start.home, root));
@@ -3118,7 +3119,7 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
             kept.push(rel);
             continue;
         };
-        match walk.look_again(under, &start) {
+        match walk.look_again(under, start) {
             checkouts::Again::Gone => {}
             checkouts::Again::Kept => kept.push(rel),
             checkouts::Again::NotTold => {
@@ -3186,6 +3187,11 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
     for (folder, why, errno) in &walk.unlisted {
         look.not_looked_at(Unit::whole(folder), *errno, why.clone());
     }
+    // A walk of another folder than the home folder did not read what lies outside it: what
+    // the walk before it failed to read there is still not read. A walk of the home folder
+    // has nothing outside it.
+    let outside = |rel: &str| !start.home.join(rel).starts_with(root);
+    let carried = carry_failed(run.tx, &reading, &mut look, outside)?;
     if args.checkouts_root.is_some() {
         let given = checkouts::ONLY_GIVEN.to_string();
         look.short_as(Cause::NotGiven, checkouts::GIVEN, given);
@@ -3209,9 +3215,11 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
         let why = format!("{}{}", checkouts::UNDER_LINK, linked.join(", "));
         look.short(Cause::NotGiven, why);
     }
-    let failure = (!walk.unlisted.is_empty()).then(|| {
+    let failure = (!walk.unlisted.is_empty() || carried).then(|| {
         let folders: Vec<String> = walk.unlisted.iter().map(|(f, ..)| f.clone()).collect();
-        run.notes.push(unlisted_note(&folders));
+        if !folders.is_empty() {
+            run.notes.push(unlisted_note(&folders));
+        }
         "the checkout walk could not list some folders"
     });
     let (completeness, reason) = look.completeness_noted(None);
@@ -3252,6 +3260,39 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
         &walk.seen.iter().map(Unit::whole).collect::<Vec<_>>(),
     )?;
     Ok((Some(walk.checkouts), failure, unknown))
+}
+
+/// Adds to `look` as failed what the latest earlier reading of `reading`'s reader, scope and kind
+/// failed to read at a path `outside` says this run did not look at, with the error and what
+/// the source said then; whether there was any. What a reading did not read keeps what was
+/// known of it, its failure included. Called before the reading is written, so the latest is
+/// an earlier one; the readings it serves name whole files and folders.
+fn carry_failed(
+    tx: &rusqlite::Connection,
+    reading: &Reading,
+    look: &mut look::Look,
+    outside: impl Fn(&str) -> bool,
+) -> rusqlite::Result<bool> {
+    let failed: Vec<(String, Option<i32>, Option<String>)> = tx
+        .prepare(
+            "SELECT path, errno, said FROM coverage_unread
+             WHERE coverage = (SELECT MAX(id) FROM coverage WHERE reader = ?1 AND scope = ?2
+                                 AND kind = ?3)
+               AND cause = 'failed' AND path IS NOT NULL",
+        )?
+        .query_map(
+            rusqlite::params![reading.reader, reading.scope, reading.kind],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut any = false;
+    for (path, errno, said) in failed.into_iter().filter(|(path, ..)| outside(path)) {
+        // Kept in the store's form, it is the source's words again (`contract::unescape`).
+        let why = said.as_deref().map_or_else(String::new, contract::unescape);
+        look.not_looked_at(Unit::whole(path), errno, why);
+        any = true;
+    }
+    Ok(any)
 }
 
 /// Checkouts in the folders agents worked in. The candidates are the working folders in the
@@ -3646,6 +3687,8 @@ struct ServerCounts {
     /// Servers the latest server check has a visit of, and of them those it read.
     in_last_check: usize,
     checked_in_last_check: usize,
+    /// When the server check last visited a server: the latest of each server's latest visit.
+    last_check_at: Option<i64>,
     /// The owner's own phones, tablets and computers in the private network.
     own_devices: usize,
     /// Other people's computers and phones seen in the private network.
@@ -3669,16 +3712,16 @@ fn server_counts(
         aliases.contains(id)
             && sweep::not_offered(id.strip_prefix("machine:").unwrap_or(id), skip).is_none()
     };
-    // The latest visit of each server, and whether it read the server.
-    let visits: BTreeMap<String, bool> = conn
+    // The latest visit of each server, whether it read the server, and when it was.
+    let visits: BTreeMap<String, (bool, i64)> = conn
         .prepare(
-            "SELECT scope, completeness = 'full' FROM coverage
+            "SELECT scope, completeness = 'full', observed_at FROM coverage
              WHERE reader = ?1 AND kind = ?2
                AND id IN (SELECT MAX(id) FROM coverage WHERE reader = ?1 AND kind = ?2
                           GROUP BY scope)",
         )?
         .query_map([servers::READER, servers::VISIT], |r| {
-            Ok((r.get(0)?, r.get(1)?))
+            Ok((r.get(0)?, (r.get(1)?, r.get(2)?)))
         })?
         .collect::<rusqlite::Result<_>>()?;
     let standing = owner::standing(conn)?;
@@ -3689,9 +3732,10 @@ fn server_counts(
         read: 0,
         in_last_check: 0,
         checked_in_last_check: 0,
+        last_check_at: visits.values().map(|(_, at)| *at).max(),
         own_devices: beyond.own_devices.len(),
         other_devices: beyond.other_devices.len(),
-        system_not_given: beyond.system_not_given,
+        system_not_given: beyond.system_not_given.len(),
         set_aside: standing.len(),
         seen: standing
             .iter()
@@ -3705,7 +3749,7 @@ fn server_counts(
         counts.read += usize::from(group.iter().any(|m| read.contains(m)));
         let visited: Vec<bool> = group
             .iter()
-            .filter_map(|m| visits.get(m).copied())
+            .filter_map(|m| visits.get(m).map(|(full, _)| *full))
             .collect();
         counts.in_last_check += usize::from(!visited.is_empty());
         counts.checked_in_last_check += usize::from(visited.contains(&true));
@@ -5138,6 +5182,12 @@ fn read_indicators(
         let held = things(n, "known checkout was", "known checkouts were");
         look.short(Cause::NotGiven, format!("{held} not looked into"));
     }
+    // What the matching before it failed to read in a known checkout this run did not look
+    // into is still not read.
+    let looked = &visited.looked;
+    let not_looked = |path: &str| visited.owner(path).is_some_and(|o| !looked.contains(o));
+    let matching = on_machine(indicators::MATCH_KIND);
+    carry_failed(run.tx, &matching, &mut look, not_looked)?;
     let mut statements: Vec<Statement> = matches
         .iter()
         .map(|(file, i)| Statement {
@@ -6108,7 +6158,8 @@ mod tests {
                 readers: 0,
                 settle: Settle::default(),
             };
-            read_checkouts(&mut run, &args).unwrap();
+            let start = checkouts::start(args.checkouts_root.as_deref(), &args.home);
+            read_checkouts(&mut run, &args, &start).unwrap();
             read_agent_folders(&mut run, &args, agent_folders::LOOK_LIMIT).unwrap();
         };
         let said = |s: [&str; 3]| s.map(|s| Some(s.to_string()));

@@ -16,6 +16,7 @@
 //! names and text from a source through `secrets::Name` and `secrets::Said`. Text the rest reads
 //! from the store goes through `esc`, as on every page of the view.
 
+pub(crate) mod beyond;
 pub(crate) mod findings_table;
 pub(crate) mod rules;
 pub(crate) mod this_mac;
@@ -24,10 +25,8 @@ pub(crate) mod vulnerabilities;
 use crate::contract::v1;
 use crate::covered::{self, Count, YOU};
 use crate::secrets::{Name, Said};
-use crate::view::{self, DETAILS, FOOT, Latest, Out, counted, esc, esc_said, utc, utc_or};
-use crate::{beyond, servers};
-use rusqlite::Connection;
-use std::collections::{BTreeMap, BTreeSet};
+use crate::view::{self, DETAILS, FOOT, Latest, Out, counted, esc, esc_said, utc};
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::Write;
 
@@ -57,6 +56,17 @@ pub fn anchor(what: &str) -> String {
         .map(str::to_ascii_lowercase)
         .collect::<Vec<_>>()
         .join("-")
+}
+
+/// Names from `_text` fields, each in its own element, joined by commas.
+fn names(all: &[String]) -> String {
+    let shown: Vec<String> = all.iter().map(|n| Name::given(n).html()).collect();
+    shown.join(", ")
+}
+
+/// A reason a message gives whole, cut where it is shown.
+fn said(whole: &str) -> String {
+    Said::of(&crate::contract::unescape(whole)).html()
 }
 
 /// Words as they begin a line: `Startup items`. A name written in lower case stays so.
@@ -562,7 +572,7 @@ fn watched_table(out: &mut String, r: &v1::Status, faults: &[&v1::Uncovered], no
             ),
             (&grouped(e.servers as i64), Some(listed.as_str())),
             &states,
-            None,
+            e.server_check_at,
             now,
         )?;
     }
@@ -712,10 +722,6 @@ fn uncovered(out: &mut String, u: &v1::Uncovered) -> Out {
 
 /// At most this many readings are named under a list that is not whole.
 const GAPS_SHOWN: usize = 3;
-/// The same for the list of servers.
-const NONE_KNOWN: &str = "None known.";
-/// The same for lists of devices seen in the private network.
-const NONE_SEEN: &str = "None seen.";
 
 /// What a list cannot claim, from the latest readings that fill it: `None` when there is at
 /// least one and every one is full and fresh, that is taken by the latest check and dated no
@@ -795,223 +801,6 @@ fn top(title: &str, meta: &str) -> String {
     out
 }
 
-/// What the owner's other devices are, on the summary and on the page beyond this Mac.
-const YOUR_DEVICES: &str = "Phones, tablets and computers on your private network that you do not log in to over SSH. They are not checked: this version looks at this Mac and at servers.";
-
-/// Servers, the owner's other devices, other people's devices and machines the owner set
-/// aside, each in a section of its own.
-pub fn beyond(conn: &Connection, latest: &[Latest], now: i64) -> Result<String, Box<dyn Error>> {
-    // When its "none" was established: the last full check, as on the page of this Mac.
-    let checked_at = crate::status::latest_check(conn)?.and_then(|r| r.finished_at);
-    let mut out = top(
-        "Beyond this Mac",
-        &format!(
-            "Last full check {} · this page made {}",
-            utc_or(checked_at, "never"),
-            utc(now)
-        ),
-    );
-    let this = covered::this_machine(conn)?.unwrap_or_default();
-    let split = beyond::split(conn, &this)?;
-    // Every name and address each machine entity is known by.
-    let mut names: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT subject, object FROM assertion
-         WHERE layer = 'live' AND predicate = 'known_as' AND subject LIKE 'machine:%'",
-    )?;
-    for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
-        let (subject, name) = row?;
-        names.entry(subject).or_default().insert(name);
-    }
-    let visits: Vec<&Latest> = latest
-        .iter()
-        .filter(|r| r.reader == servers::READER && r.kind == servers::VISIT)
-        .collect();
-    let bare = |m: &str| m.strip_prefix("machine:").unwrap_or(m).to_string();
-    // The name a machine is shown by, the one it was checked under if any, and the others.
-    let named = |group: &[String]| -> (String, String) {
-        let label = group
-            .iter()
-            .find(|m| visits.iter().any(|v| &v.scope == *m))
-            .or(group.first())
-            .map(|m| bare(m))
-            .unwrap_or_default();
-        let mut others: BTreeSet<String> = group.iter().map(|m| bare(m)).collect();
-        for m in group {
-            others.extend(names.get(m).into_iter().flatten().cloned());
-        }
-        others.remove(&label);
-        (label, others.into_iter().collect::<Vec<_>>().join(", "))
-    };
-
-    // What each list rests on: the readings of this Mac that name machines.
-    let latest_run = crate::status::latest_finished(conn)?.map(|r| r.started_at);
-    let of_readers = |readers: &[&str]| -> Vec<&Latest> {
-        latest
-            .iter()
-            .filter(|r| r.scope == this && readers.contains(&r.reader.as_str()))
-            .collect()
-    };
-    let tailnet = unread(&of_readers(&[crate::tailnet::READER]), latest_run, now, &[]);
-
-    out.push_str("<section id=\"servers\">\n<h2>Servers</h2>\n<p class=\"muted\">Machines you log in to over SSH, as your SSH settings, the list of machines SSH has connected to and the server check name them, and those your private network shows as yours. They are checked only when you run the server check; this program never connects to them by itself.</p>\n");
-    let gap = unread(
-        &of_readers(&[
-            crate::ssh_config::READER,
-            crate::known_hosts::READER,
-            crate::tailnet::READER,
-        ]),
-        latest_run,
-        now,
-        &[],
-    );
-    coverage_of_list(
-        &mut out,
-        gap.as_deref(),
-        split.servers.is_empty(),
-        NONE_KNOWN,
-    );
-    if !split.servers.is_empty() {
-        let mut rows: Vec<[String; 4]> = Vec::new();
-        for group in &split.servers {
-            let (label, others) = named(group);
-            let mine: Vec<&&Latest> = visits.iter().filter(|v| group.contains(&v.scope)).collect();
-            let state = match mine.iter().max_by_key(|v| v.at) {
-                None => "not part of it".to_string(),
-                Some(v) if v.completeness == "full" => "checked".to_string(),
-                Some(v) if v.reason.as_deref() == Some(servers::NOT_COMPLETE) => {
-                    "did not finish".to_string()
-                }
-                Some(v) => format!(
-                    "could not be opened: {}",
-                    view::said(v.reason.as_deref().unwrap_or_default())
-                ),
-            };
-            let last = mine.iter().filter_map(|v| v.last_full).max();
-            rows.push([label, state, utc_or(last, "never"), others]);
-        }
-        rows.sort();
-        out.push_str("<div class=\"scroll\"><table class=\"dense\">\n");
-        view::thead(
-            &mut out,
-            &[
-                "Server",
-                "At the last server check",
-                "Last checked",
-                "Also known as",
-            ],
-        );
-        for [label, state, last, others] in rows {
-            out.push_str("<tr>");
-            view::td(&mut out, "mono", &label)?;
-            view::td_said(&mut out, "", &state)?;
-            view::td(&mut out, "nowrap", &last)?;
-            view::td(&mut out, "mono", &others)?;
-            out.push_str("</tr>\n");
-        }
-        out.push_str("</tbody></table></div>\n");
-    }
-    // Never guessed: a server the private network alone knows, without a system, says so.
-    match split.system_not_given {
-        0 => {}
-        1 => out.push_str("<p class=\"muted\">1 of them is known only from your private network, which does not say what system it runs, so it is counted as a server.</p>\n"),
-        n => writeln!(
-            out,
-            "<p class=\"muted\">{n} of them are known only from your private network, which does not say what system they run, so they are counted as servers.</p>"
-        )?,
-    }
-    out.push_str("</section>\n");
-
-    writeln!(
-        out,
-        "<section id=\"your-devices\">\n<h2>Your other devices</h2>\n<p class=\"muted\">{YOUR_DEVICES}</p>"
-    )?;
-    coverage_of_list(
-        &mut out,
-        tailnet.as_deref(),
-        split.own_devices.is_empty(),
-        NONE_SEEN,
-    );
-    if !split.own_devices.is_empty() {
-        let mut rows: Vec<(String, String, String)> = split
-            .own_devices
-            .iter()
-            .map(|g| {
-                let (label, others) = named(g);
-                let system = g
-                    .iter()
-                    .find_map(|m| split.platform.get(m))
-                    .cloned()
-                    .unwrap_or_default();
-                (label, system, others)
-            })
-            .collect();
-        rows.sort();
-        out.push_str("<div class=\"scroll\"><table class=\"dense\">\n");
-        view::thead(&mut out, &["Device", "System", "Also known as"]);
-        for (label, system, others) in rows {
-            out.push_str("<tr>");
-            view::td(&mut out, "mono", &label)?;
-            view::td(&mut out, "", &system)?;
-            view::td(&mut out, "mono", &others)?;
-            out.push_str("</tr>\n");
-        }
-        out.push_str("</tbody></table></div>\n");
-    }
-    out.push_str("</section>\n");
-
-    out.push_str("<section id=\"other-devices\">\n<h2>Other devices</h2>\n<p class=\"muted\">Other people's computers and phones seen in your private network, such as a colleague's laptop. They are not yours to check, and this program does not read them. Only a Tailscale network is looked at; devices in a network of another kind are not known here.</p>\n");
-    coverage_of_list(
-        &mut out,
-        tailnet.as_deref(),
-        split.other_devices.is_empty(),
-        NONE_SEEN,
-    );
-    if !split.other_devices.is_empty() {
-        let mut rows: Vec<(String, String)> =
-            split.other_devices.iter().map(|g| named(g)).collect();
-        rows.sort();
-        out.push_str("<div class=\"scroll\"><table class=\"dense\">\n");
-        view::thead(&mut out, &["Device", "Also known as"]);
-        for (label, others) in rows {
-            out.push_str("<tr>");
-            view::td(&mut out, "mono", &label)?;
-            view::td(&mut out, "mono", &others)?;
-            out.push_str("</tr>\n");
-        }
-        out.push_str("</tbody></table></div>\n");
-    }
-    out.push_str("</section>\n");
-
-    out.push_str("<section id=\"retired\">\n<h2>Retired or not yours</h2>\n<p class=\"muted\">Machines you said are retired or not yours. They are not checked, and what was read on them before is kept.</p>\n");
-    let standing: Vec<crate::owner::Standing> = crate::owner::standing(conn)?
-        .into_iter()
-        .filter(|s| s.seen.is_none())
-        .collect();
-    if standing.is_empty() {
-        out.push_str("<p class=\"muted\">None.</p>\n");
-    } else {
-        out.push_str("<div class=\"scroll\"><table class=\"dense\">\n");
-        view::thead(
-            &mut out,
-            &["Machine", "You said", "Since", "Why", "How it was given"],
-        );
-        for s in &standing {
-            out.push_str("<tr>");
-            view::td(&mut out, "mono", s.name())?;
-            view::td(&mut out, "", &s.word.said)?;
-            view::td(&mut out, "nowrap", &utc(s.word.made_at))?;
-            view::td_said(&mut out, "", &s.word.reason.said())?;
-            view::td(&mut out, "", view::given_by(s.word.via))?;
-            out.push_str("</tr>\n");
-        }
-        out.push_str("</tbody></table></div>\n");
-    }
-    out.push_str("</section>\n");
-    out.push_str(FOOT);
-    Ok(out)
-}
-
 /// The technical pages, each in a line: everything the program keeps, as it keeps it.
 pub fn technical() -> String {
     let mut out = top(
@@ -1023,7 +812,7 @@ pub fn technical() -> String {
         "<li><a href=\"{THIS_MAC}.html\">{THIS_MAC_TITLE}: every kind of place, its things and its rules</a></li>\n<li><a href=\"{VULNERABILITIES}.html\">Known vulnerabilities in the packages your projects use</a></li>\n"
     ));
     out.push_str(&format!(
-        "<li><a href=\"{BEYOND}.html\">Beyond this Mac: servers, your other devices, other people's devices, and machines you set aside</a></li>\n"
+        "<li><a href=\"{BEYOND}.html\">Beyond this Mac: servers with what was read on each, your other devices, other people's devices, and machines you set aside</a></li>\n"
     ));
     out.push_str(&format!(
         "<li><a href=\"{THREAT_DATA}.html\">{THREAT_DATA_TITLE}: every source of known vulnerabilities, and the list of those used in attacks</a></li>\n"
@@ -1460,6 +1249,9 @@ mod tests {
         coverage_of_list(&mut out, None, false, NONE_KNOWN);
         assert!(out.is_empty());
     }
+
+    /// What a list of servers says when it is empty, as the page beyond this Mac says it.
+    const NONE_KNOWN: &str = "None known.";
 
     /// The part of a page from the section with `id` to its end, or nothing.
     fn section_of<'a>(html: &'a str, id: &str) -> &'a str {

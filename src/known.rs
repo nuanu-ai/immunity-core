@@ -70,9 +70,9 @@ pub struct Question<'a> {
     /// The readings of this Mac, as reader and kind, that read inside every thing of its kind:
     /// they speak for every one the store knows, whatever was found in it.
     pub inside: &'a [(&'a str, String)],
-    /// For a machine: its watched files are its parts wherever they are kept, those of its
-    /// checkouts, such as their hooks, among them. The page of this Mac lists them by kind;
-    /// `immunity machine` gives one level.
+    /// For a machine, `immunity machine --files-anywhere`: its watched files are its parts
+    /// wherever they are kept, those of its checkouts, such as their hooks, among them. Without
+    /// it a machine's parts are one level.
     pub files_anywhere: bool,
 }
 
@@ -817,15 +817,17 @@ fn reading_keys<'a>(
 }
 
 /// The latest reading of a reader, scope and kind, as the store keeps it.
-struct Reading {
+pub(crate) struct Reading {
     id: i64,
-    reader: String,
-    scope: String,
-    kind: String,
-    completeness: String,
+    pub reader: String,
+    pub scope: String,
+    pub kind: String,
+    pub completeness: String,
     reason: Option<String>,
     cause: Option<String>,
-    at: i64,
+    pub at: i64,
+    /// When it was last read in full.
+    last_full: Option<i64>,
     /// The run that took it.
     run: String,
     /// What it did not read (`store::unread_of`); none on a full reading.
@@ -833,12 +835,16 @@ struct Reading {
 }
 
 /// The latest reading of every reader, scope and kind, with what each did not read.
-fn latest(conn: &Connection) -> rusqlite::Result<Vec<Reading>> {
+pub(crate) fn latest(conn: &Connection) -> rusqlite::Result<Vec<Reading>> {
     let mut latest: Vec<Reading> = conn
         .prepare(&format!(
             "{latest}
-         SELECT id, reader, scope, kind, completeness, reason, cause, observed_at, run_id
-         FROM latest
+         SELECT id, reader, scope, kind, completeness, reason, cause, observed_at,
+                (SELECT MAX(f.observed_at) FROM coverage f
+                 WHERE f.reader = c.reader AND f.scope = c.scope AND f.kind = c.kind
+                   AND f.completeness = 'full'),
+                run_id
+         FROM latest c
          ORDER BY scope, reader, kind",
             latest = store::LATEST
         ))?
@@ -852,7 +858,8 @@ fn latest(conn: &Connection) -> rusqlite::Result<Vec<Reading>> {
                 reason: r.get(5)?,
                 cause: r.get(6)?,
                 at: r.get(7)?,
-                run: r.get(8)?,
+                last_full: r.get(8)?,
+                run: r.get(9)?,
                 unread: Vec::new(),
             })
         })?
@@ -870,7 +877,7 @@ fn latest(conn: &Connection) -> rusqlite::Result<Vec<Reading>> {
 /// A reading as the contract gives it, with what it names as having no reader. A reading that
 /// is not full has the cause the status classes it by (`status::class`). Its reason is given
 /// whole: what was cut off could be what the reading did not cover.
-fn coverage(conn: &Connection, r: Reading) -> rusqlite::Result<v1::Coverage> {
+pub(crate) fn coverage(conn: &Connection, r: Reading) -> rusqlite::Result<v1::Coverage> {
     let cause = match r.completeness.as_str() {
         "full" => r.cause.as_deref(),
         c => status::class(c, r.reason.as_deref(), r.cause.as_deref()),
@@ -885,22 +892,12 @@ fn coverage(conn: &Connection, r: Reading) -> rusqlite::Result<v1::Coverage> {
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
-    // A full reading was last full at its own time; another, at the latest of its full ones.
-    let last_full_at = match r.completeness.as_str() {
-        "full" => Some(r.at),
-        _ => conn.query_row(
-            "SELECT MAX(observed_at) FROM coverage
-             WHERE reader = ?1 AND scope = ?2 AND kind = ?3 AND completeness = 'full'",
-            [&r.reader, &r.scope, &r.kind],
-            |row| row.get(0),
-        )?,
-    };
     Ok(v1::Coverage {
-        last_full_at,
         completeness: value_of::<v1::Completeness>(&r.completeness),
         reason_text: r.reason.as_deref().map(whole),
         cause: cause.map(value_of::<v1::Cause>),
         observed_at: Some(r.at),
+        last_full_at: r.last_full,
         run_id: Some(r.run),
         scope_text: whole(&r.scope),
         reader: r.reader,

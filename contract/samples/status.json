@@ -482,6 +482,7 @@
     "own_devices": 0,
     "servers": 0,
     "servers_checked_in_last_check": 0,
+    "server_check_at": null,
     "servers_in_last_check": 0,
     "servers_offered": 0,
     "servers_read": 0,

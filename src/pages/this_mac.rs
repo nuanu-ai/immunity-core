@@ -7,12 +7,12 @@
 //! their reasons cut on the page (`view::said`, `Said::of`).
 
 use super::{FOOT, NOT_READ, NOT_READ_TITLE, THIS_MAC_TITLE, VULNERABILITIES, anchor, capital};
-use super::{coverage_of_list, grouped, installed_whole, top, uncovered, unread};
+use super::{coverage_of_list, grouped, installed_whole, said, top, uncovered, unread};
 use crate::contract::{self, v1};
 use crate::covered::{self, Count};
 use crate::findings::{self, This};
-use crate::secrets::{Name, Said};
-use crate::view::{self, Latest, Out, counted, esc, utc, utc_or};
+use crate::secrets::Name;
+use crate::view::{self, Latest, Out, cell, counted, esc, utc, utc_or};
 use crate::{autorun, integrity, watched};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -190,15 +190,6 @@ fn latest_of(c: &v1::Coverage) -> Latest {
         last_full: c.last_full_at,
         ..Default::default()
     }
-}
-
-/// A cell of a table holding what the printer printed.
-fn cell(out: &mut String, class: &str, html: &str) {
-    let class = match class {
-        "" => String::new(),
-        c => format!(" class=\"{c}\""),
-    };
-    let _ = write!(out, "<td{class}>{html}</td>");
 }
 
 /// What is watched on this Mac, one section per kind with the things of that kind, the ways code
@@ -390,7 +381,7 @@ fn files(out: &mut String, s: &Mac, as_: &str, gap: Option<&str>, none: &str) ->
     view::thead(out, &["File", "First seen", "Last changed"]);
     for (id, first) in of_kind {
         out.push_str("<tr>");
-        cell(out, "mono", &s.place(id));
+        cell(out, "mono", &s.place(id))?;
         view::td(out, "nowrap", &utc(first.observed_at))?;
         // Changed when its content or link target now was first read by a later run than the one
         // that first saw it, told by run and not by time, which two runs may share.
@@ -409,7 +400,7 @@ fn files(out: &mut String, s: &Mac, as_: &str, gap: Option<&str>, none: &str) ->
             }
             (None, false, Some(_)) => ("nowrap", "not since first seen".to_string()),
         };
-        cell(out, class, &last);
+        cell(out, class, &last)?;
         out.push_str("</tr>\n");
     }
     out.push_str("</tbody></table></div>\n");
@@ -438,11 +429,7 @@ fn content_now(s: &Mac, id_text: &str) -> Option<String> {
         _ => return Some(not_read(esc(watched::CONTENT_NOT_READ))),
     };
     (read.completeness != full).then(|| {
-        not_read(
-            (read.reason_text.as_deref()).map_or(esc(watched::CONTENT_NOT_READ), |r| {
-                Said::of(&contract::unescape(r)).html()
-            }),
-        )
+        not_read((read.reason_text.as_deref()).map_or(esc(watched::CONTENT_NOT_READ), said))
     })
 }
 
@@ -523,12 +510,12 @@ fn installed(out: &mut String, s: &Mac, kind: &str, gap: Option<&str>) -> Out {
     }
     for t in &list {
         out.push_str("<tr>");
-        cell(out, "", &Name::of(&t.name).html());
+        cell(out, "", &Name::of(&t.name).html())?;
         if signed {
-            cell(out, "", &join(&t.signed_by));
+            cell(out, "", &join(&t.signed_by))?;
         }
-        cell(out, "mono", &join(&t.version));
-        cell(out, "mono", &Name::of(&t.at).html());
+        cell(out, "mono", &join(&t.version))?;
+        cell(out, "mono", &Name::of(&t.at).html())?;
         out.push_str("</tr>\n");
     }
     out.push_str("</tbody></table></div>\n");
@@ -671,7 +658,7 @@ fn projects(out: &mut String, s: &Mac, now: i64) -> Out {
         view::thead(out, &["Project", "Dependencies known"]);
         for (id, n) in list {
             out.push_str("<tr>");
-            cell(out, "mono", &s.place(&id));
+            cell(out, "mono", &s.place(&id))?;
             view::td(out, "", &grouped(n as i64))?;
             out.push_str("</tr>\n");
         }

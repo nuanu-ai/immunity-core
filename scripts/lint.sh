@@ -142,7 +142,6 @@ src/overview.rs
 src/secrets.rs
 src/sigma.rs
 src/store.rs
-src/view.rs
 src/vulnerabilities.rs
 src/watch.rs
 tests/event_level.rs

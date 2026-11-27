@@ -815,7 +815,7 @@ pub struct Entity {
     pub r#type: ::prost::alloc::string::String,
     /// For a part of the thing asked about, how many things with facts in force are `part_of` it,
     /// such as the packages a checkout's lockfiles declare in `immunity machine`. Absent for the
-    /// thing itself and its other ids. Since 1.39.0.
+    /// thing itself and its other ids. Since 1.40.0.
     #[prost(uint64, optional, tag = "3")]
     pub parts_total: ::core::option::Option<u64>,
 }
@@ -861,7 +861,7 @@ pub struct Assertion {
     #[prost(string, tag = "6")]
     pub kind: ::prost::alloc::string::String,
     /// The run that first read it, as `Coverage.run_id` names runs: two assertions first read by
-    /// one run share it, also where two runs began in the same second. Since 1.39.0.
+    /// one run share it, also where two runs began in the same second. Since 1.40.0.
     #[prost(string, tag = "7")]
     pub run_id: ::prost::alloc::string::String,
 }
@@ -901,12 +901,12 @@ pub struct Coverage {
     /// What this build has no reader for, found in this reading.
     #[prost(message, repeated, tag = "8")]
     pub lacks: ::prost::alloc::vec::Vec<Lack>,
-    /// When this reader last read this scope and kind in full. Absent when it never has, and for a
-    /// reading made by rule. Since 1.39.0.
+    /// When it was last read in full: `observed_at` on a full reading, an earlier time on one that
+    /// was not. Absent when it was never read in full, and on a reading made by rule. Since 1.39.0.
     #[prost(int64, optional, tag = "9")]
     pub last_full_at: ::core::option::Option<i64>,
     /// The run that took it, as the journal names runs: the readings of one run share it, also
-    /// where two runs began in the same second. Absent for a reading made by rule. Since 1.39.0.
+    /// where two runs began in the same second. Absent for a reading made by rule. Since 1.40.0.
     #[prost(string, optional, tag = "10")]
     pub run_id: ::core::option::Option<::prost::alloc::string::String>,
 }
@@ -2540,11 +2540,62 @@ pub struct Statements {
     /// The store this answer was read from, as in every answer (`common.proto`).
     #[prost(string, optional, tag = "3")]
     pub store_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// In the order of the name each was made under.
     #[prost(message, repeated, tag = "4")]
     pub statements: ::prost::alloc::vec::Vec<Statement>,
     /// How many were withdrawn and are kept.
     #[prost(uint64, tag = "5")]
     pub withdrawn: u64,
+    /// The machines beyond this Mac that the store knows and that a statement can be made about,
+    /// servers first, then the person's own devices, then other people's, each kind in the order of
+    /// the name shown. A machine
+    /// set aside by a statement that stands, which nothing seen since contradicts, is in
+    /// `statements` and not here. Since 1.39.0.
+    #[prost(message, repeated, tag = "6")]
+    pub machines: ::prost::alloc::vec::Vec<KnownMachine>,
+    /// The readings on this Mac that find machines (the SSH settings, the list of machines SSH has
+    /// connected to, and the private network) whose latest reading was not full or was not taken by
+    /// the latest run that finished. One never taken is here too, made by rule: completeness
+    /// `none` and no `observed_at`. While one is here, `machines` may not be whole; empty means
+    /// each was read in full by that run. Since 1.39.0.
+    #[prost(message, repeated, tag = "7")]
+    pub machines_not_read: ::prost::alloc::vec::Vec<Coverage>,
+}
+/// A machine beyond this Mac, as the traces on this Mac and the private network tell it apart.
+/// Since 1.39.0.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct KnownMachine {
+    /// The machine by the name it is shown by: the id the server check visited it under, else its
+    /// first id, without `machine:`. Whole.
+    #[prost(string, tag = "1")]
+    pub machine_text: ::prost::alloc::string::String,
+    /// Every id the store knows it by, which `immunity machine` and `immunity owner` take. Whole.
+    #[prost(string, repeated, tag = "2")]
+    pub entities_text: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Every other name and address the store knows it by. Whole.
+    #[prost(string, repeated, tag = "3")]
+    pub names_text: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(enumeration = "MachineKind", tag = "4")]
+    #[serde(
+        serialize_with = "crate::enum_name::<MachineKind, _>",
+        deserialize_with = "crate::enum_from_name::<MachineKind, _>"
+    )]
+    pub kind: i32,
+    /// The system the private network gives, for a machine that no other trace names. Whole.
+    /// Absent when it gives none.
+    #[prost(string, optional, tag = "5")]
+    pub system_text: ::core::option::Option<::prost::alloc::string::String>,
+    /// A server known only from the private network, which does not say what system it runs: it is
+    /// counted as a server, and its system is not guessed.
+    #[prost(bool, tag = "6")]
+    pub system_not_given: bool,
+    /// The kinds of the readings that name it, in the core's words and in their order: the readings
+    /// that find machines (`ssh configuration`, `known hosts`, `tailnet peers`) and the server
+    /// check's own (`own names and addresses`).
+    #[prost(string, repeated, tag = "7")]
+    pub known_from: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// A statement that stands.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2686,6 +2737,50 @@ pub struct SweepWritten {
     pub servers: ::core::option::Option<u64>,
     #[prost(string, optional, tag = "2")]
     pub problem_text: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// What a machine beyond this Mac is. `UNSPECIFIED`, or a value the reader does not know, is read
+/// as a server.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum MachineKind {
+    #[serde(rename = "unspecified")]
+    Unspecified = 0,
+    /// One the person logs in to over SSH, or one the private network shows as theirs or as the
+    /// network's own and does not name as a phone, a tablet, a TV or a desktop system.
+    #[serde(rename = "server")]
+    Server = 1,
+    /// One of the person's own phones, tablets or computers that the private network alone names
+    /// and that the server check cannot read.
+    #[serde(rename = "own_device")]
+    OwnDevice = 2,
+    /// Someone else's device, which the private network alone names as another user's.
+    #[serde(rename = "other_device")]
+    OtherDevice = 3,
+}
+impl MachineKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MACHINE_KIND_UNSPECIFIED",
+            Self::Server => "MACHINE_KIND_SERVER",
+            Self::OwnDevice => "MACHINE_KIND_OWN_DEVICE",
+            Self::OtherDevice => "MACHINE_KIND_OTHER_DEVICE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MACHINE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "MACHINE_KIND_SERVER" => Some(Self::Server),
+            "MACHINE_KIND_OWN_DEVICE" => Some(Self::OwnDevice),
+            "MACHINE_KIND_OTHER_DEVICE" => Some(Self::OtherDevice),
+            _ => None,
+        }
+    }
 }
 /// The answer to `immunity vulnerabilities`: the "affects" answers, the most severe first.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2875,7 +2970,7 @@ pub struct VulnerabilityTotals {
     /// Records that affect something and that the catalogue of exploited vulnerabilities lists as
     /// used in attacks, each counted once, however old the catalogue. Zero says none is listed;
     /// whether none is used in attacks rests on the catalogue being current, which `Threats` in the
-    /// status says. Since 1.39.0.
+    /// status says. Since 1.40.0.
     #[prost(uint64, tag = "21")]
     pub affected_exploited: u64,
 }
@@ -3815,7 +3910,7 @@ pub struct Uncovered {
     /// `IntegrityReading.kind`, or `packages your projects depend on` for the projects' lockfiles: a
     /// reading of that kind on this Mac that failed or was not given, the search for projects for
     /// the kinds kept in projects and their packages, or a watched file of that kind read before and
-    /// not read now. Empty for a cause about no kind of place. Since 1.39.0.
+    /// not read now. Empty for a cause about no kind of place. Since 1.40.0.
     #[prost(string, repeated, tag = "16")]
     pub watched_kinds: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
@@ -3931,6 +4026,10 @@ pub struct Estate {
     pub checkouts: u64,
     #[prost(uint64, tag = "13")]
     pub components: u64,
+    /// When the server check last visited a server: the latest of every server's latest visit.
+    /// Absent when no server was ever visited. Since 1.40.0.
+    #[prost(int64, optional, tag = "14")]
+    pub server_check_at: ::core::option::Option<i64>,
 }
 /// The watched places.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -3999,12 +4098,12 @@ pub struct WatchedKind {
     /// `ReadingGroup.reason_text` is.
     #[prost(string, optional, tag = "7")]
     pub reason_text: ::core::option::Option<::prost::alloc::string::String>,
-    /// When its latest reading here was taken. Absent when it has no reading. Since 1.39.0.
+    /// When its latest reading here was taken. Absent when it has no reading. Since 1.40.0.
     #[prost(int64, optional, tag = "8")]
     pub read_at: ::core::option::Option<i64>,
     /// Every reading of it here was taken by the latest full check and is not dated ahead of this
     /// Mac's clock. False when it has no reading, and before any full check: only a kind read in full
-    /// and fresh may be said to hold nothing. Since 1.39.0.
+    /// and fresh may be said to hold nothing. Since 1.40.0.
     #[prost(bool, tag = "9")]
     pub fresh: bool,
 }
@@ -4079,7 +4178,7 @@ pub struct Threats {
     pub matched: bool,
     /// The ecosystems whose packages in the projects' lockfiles were compared, at the latest
     /// check, with current data whose records the catalogue's entries are linked through: only
-    /// through them is an entry compared with anything here. Empty when none was. Since 1.39.0.
+    /// through them is an entry compared with anything here. Empty when none was. Since 1.40.0.
     #[prost(string, repeated, tag = "11")]
     pub compared_ecosystems: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }

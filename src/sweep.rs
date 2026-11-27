@@ -179,14 +179,20 @@ pub fn failed_visit(at: i64, reason: &str) -> String {
         crate::view::utc(at),
         crate::secrets::said(reason.trim_end_matches('.'))
     );
-    if reason
-        .to_ascii_lowercase()
-        .contains("host key verification failed")
-    {
+    if let Some(advice) = advice(reason) {
         out.push(' ');
-        out.push_str(HOST_KEY);
+        out.push_str(advice);
     }
     out
+}
+
+/// What to do about a failed visit, decided from what the server's ssh said, as it said it: check
+/// a host key by hand when it could not be verified.
+pub fn advice(reason: &str) -> Option<&'static str> {
+    (reason
+        .to_ascii_lowercase()
+        .contains("host key verification failed"))
+    .then_some(HOST_KEY)
 }
 
 /// Writes the probe, the script and an empty `skip.txt` when there is none.

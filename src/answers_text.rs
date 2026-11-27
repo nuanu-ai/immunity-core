@@ -1629,9 +1629,7 @@ mod tests {
             reason_text: reason.map(str::to_string),
             cause: (completeness != v1::Completeness::Full).then_some(v1::Cause::NoReader as i32),
             observed_at: Some(1_794_800_000),
-            lacks: Vec::new(),
-            last_full_at: None,
-            run_id: None,
+            ..Default::default()
         }
     }
 
@@ -1645,9 +1643,7 @@ mod tests {
             reason_text: Some(reason.to_string()),
             cause: Some(v1::Cause::NotGiven as i32),
             observed_at: None,
-            lacks: Vec::new(),
-            last_full_at: None,
-            run_id: None,
+            ..Default::default()
         }
     }
 

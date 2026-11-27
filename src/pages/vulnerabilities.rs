@@ -6,8 +6,8 @@
 //! (`vulnerabilities::catalogue_current_at` over `Threats.read_at`), never by the latest
 //! attempt's outcome.
 
-use super::{THREAT_DATA_TITLE, anchor, capital, grouped, top};
-use crate::contract::{self, v1};
+use super::{THREAT_DATA_TITLE, anchor, capital, grouped, names, said, top};
+use crate::contract::v1;
 use crate::covered::{self, Found};
 use crate::secrets::{Name, Said};
 use crate::view::{FOOT, Out, counted, esc, utc};
@@ -29,12 +29,6 @@ fn label_words(label: &str) -> &'static str {
     }
 }
 
-/// Names from the answer, as the printer prints them, joined.
-fn names(list: &[String]) -> String {
-    let shown: Vec<String> = list.iter().map(|n| Name::given(n).html()).collect();
-    shown.join(", ")
-}
-
 /// What the list cannot claim, as safe HTML: the places whose lockfiles were not read, with why,
 /// cut where it is printed, and each matched feed of vulnerability data that is not current.
 /// `None` when nothing is short.
@@ -42,9 +36,7 @@ fn gap(v: &v1::Vulnerabilities, t: &v1::VulnerabilityTotals) -> Option<String> {
     let unread = v.unread.clone().unwrap_or_default();
     let mut said: Vec<String> = (unread.items.iter())
         .map(|p| {
-            let why = (p.why_text.as_deref()).map_or(esc("not read in full"), |w| {
-                Said::of(&contract::unescape(w)).html()
-            });
+            let why = (p.why_text.as_deref()).map_or(esc("not read in full"), said);
             format!(
                 "{} ({}, {why})",
                 Name::given(&p.project_text).html(),

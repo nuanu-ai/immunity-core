@@ -682,9 +682,12 @@ pub fn unreadable(machine: &str) -> Vec<Outcome> {
     nothing_read(machine, "the file of this server could not be read")
 }
 
-/// The readings of a server with no complete file whose latest visit failed.
+/// The readings of a server with no complete file whose latest visit failed: why, the visit's
+/// reason after these words.
+pub const VISIT_FAILED: &str = "the latest visit failed: ";
+
 pub fn visit_failed(machine: &str, reason: &str) -> Vec<Outcome> {
-    nothing_read(machine, &format!("the latest visit failed: {reason}"))
+    nothing_read(machine, &format!("{VISIT_FAILED}{reason}"))
 }
 
 /// The readings of a server whose file could not be read or whose visit failed: the reader

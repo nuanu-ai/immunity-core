@@ -539,7 +539,7 @@ message Uncovered {
   // `IntegrityReading.kind`, or `packages your projects depend on` for the projects' lockfiles: a
   // reading of that kind on this Mac that failed or was not given, the search for projects for
   // the kinds kept in projects and their packages, or a watched file of that kind read before and
-  // not read now. Empty for a cause about no kind of place. Since 1.39.0.
+  // not read now. Empty for a cause about no kind of place. Since 1.40.0.
   repeated string watched_kinds = 16;
 }
 
@@ -619,6 +619,9 @@ message Estate {
   repeated string machines_seen_after_owner_word_text = 11;
   uint64 checkouts = 12;
   uint64 components = 13;
+  // When the server check last visited a server: the latest of every server's latest visit.
+  // Absent when no server was ever visited. Since 1.40.0.
+  optional int64 server_check_at = 14;
 }
 
 // The watched places.
@@ -660,11 +663,11 @@ message WatchedKind {
   // Why they were not full, each reason once; on one full reading, its note. Cut as
   // `ReadingGroup.reason_text` is.
   optional string reason_text = 7;
-  // When its latest reading here was taken. Absent when it has no reading. Since 1.39.0.
+  // When its latest reading here was taken. Absent when it has no reading. Since 1.40.0.
   optional int64 read_at = 8;
   // Every reading of it here was taken by the latest full check and is not dated ahead of this
   // Mac's clock. False when it has no reading, and before any full check: only a kind read in full
-  // and fresh may be said to hold nothing. Since 1.39.0.
+  // and fresh may be said to hold nothing. Since 1.40.0.
   bool fresh = 9;
 }
 
@@ -706,7 +709,7 @@ message Threats {
   bool matched = 10;
   // The ecosystems whose packages in the projects' lockfiles were compared, at the latest
   // check, with current data whose records the catalogue's entries are linked through: only
-  // through them is an entry compared with anything here. Empty when none was. Since 1.39.0.
+  // through them is an entry compared with anything here. Empty when none was. Since 1.40.0.
   repeated string compared_ecosystems = 11;
 }
 

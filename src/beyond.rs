@@ -30,8 +30,9 @@ pub struct Beyond {
     pub own_devices: Vec<Vec<String>>,
     /// Other people's devices.
     pub other_devices: Vec<Vec<String>>,
-    /// Servers known only from the tailnet, which gives no system for them.
-    pub system_not_given: usize,
+    /// The servers known only from the tailnet, which gives no system for them, by their place in
+    /// `servers`.
+    pub system_not_given: Vec<usize>,
     /// The system the tailnet gives, by entity, for machines it alone names.
     pub platform: BTreeMap<String, String>,
 }
@@ -81,7 +82,7 @@ pub fn split(conn: &Connection, this: &str) -> rusqlite::Result<Beyond> {
         servers: Vec::new(),
         own_devices: Vec::new(),
         other_devices: Vec::new(),
-        system_not_given: 0,
+        system_not_given: Vec::new(),
         platform: only
             .iter()
             .filter_map(|(m, (_, p))| p.clone().map(|p| (m.clone(), p)))
@@ -100,7 +101,9 @@ pub fn split(conn: &Connection, this: &str) -> rusqlite::Result<Beyond> {
         } else if group.iter().all(own) {
             out.own_devices.push(group);
         } else {
-            out.system_not_given += usize::from(group.iter().all(not_given));
+            if group.iter().all(not_given) {
+                out.system_not_given.push(out.servers.len());
+            }
             out.servers.push(group);
         }
     }

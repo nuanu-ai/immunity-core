@@ -1053,6 +1053,7 @@ pub fn message(
                 servers_read: n(sv.read),
                 servers_in_last_check: n(sv.in_last_check),
                 servers_checked_in_last_check: n(sv.checked_in_last_check),
+                server_check_at: sv.last_check_at,
                 servers_system_not_given: n(sv.system_not_given),
                 own_devices: n(sv.own_devices),
                 other_devices: n(sv.other_devices),
