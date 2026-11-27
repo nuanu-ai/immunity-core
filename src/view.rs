@@ -530,6 +530,9 @@ table.dense th, table.dense td { padding: 4px 8px; }
    - Words (a plain td) wrap, and a long path or id among them breaks rather than widening the
      column. */
 td.mono { white-space: normal; overflow-wrap: break-word; max-width: 36ch; }
+/* A name from a source is wrapped in its own element, which breaks anywhere; in a column of data
+   it follows the column, or the column would shrink to a few letters and cut every name. */
+td.mono bdi.src { overflow-wrap: break-word; }
 td:not(.mono):not(.nowrap) { min-width: 12ch; overflow-wrap: anywhere; }
 tr.bad td { font-weight: 600; }
 

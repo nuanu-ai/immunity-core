@@ -275,10 +275,12 @@ fn groups(out: &mut String, c: &v1::CoverageSummary) -> Out {
         for g in rows {
             let failed = class_words(g.class) == "failed";
             out.push_str(if failed { "<tr class=\"bad\">" } else { "<tr>" });
+            // A reader's name and a count keep their line and their own width, so the words
+            // beside them have the rest.
             cell(out, "", &esc(class_words(g.class)))?;
-            cell(out, "", &esc(&g.reader))?;
+            cell(out, "nowrap", &esc(&g.reader))?;
             cell(out, "", &esc(&g.kind))?;
-            cell(out, "num", &grouped(g.count as i64))?;
+            cell(out, "num nowrap", &grouped(g.count as i64))?;
             let mut examples: Vec<String> = (g.examples_text.iter())
                 .map(|e| Name::given(e).html())
                 .collect();
