@@ -440,7 +440,8 @@ pub fn statements(
     for r in crate::known::latest(conn)? {
         let key = (r.reader.clone(), r.kind.clone());
         let finds = crate::machine::FOUND_BY.contains(&(key.0.as_str(), key.1.as_str()));
-        if !finds {
+        // A reading under a former id of this Mac neither stands for this Mac's nor is its gap.
+        if !finds || r.scope != this {
             continue;
         }
         taken.push(key);
@@ -595,5 +596,67 @@ mod tests {
             "{:?}",
             not_read(&conn)
         );
+    }
+
+    #[test]
+    fn a_full_reading_under_another_machines_id_neither_stands_for_this_macs_missing_one_nor_is_named_as_its_gap()
+     {
+        // A Mac whose name changed keeps readings under its former id: they say nothing of
+        // whether this Mac's list of machines is whole.
+        let scratch = crate::common::Scratch::new("owner-former-id");
+        let mut conn = crate::store::open_or_make(&scratch.0.join("store.db")).unwrap();
+        let (at, run_id) = (1_900_000_000, "1900000000-000000000");
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(
+            "INSERT INTO meta (key, value) VALUES ('machine', 'machine:mac'), ('machine_name', 'mac')",
+        )
+        .unwrap();
+        journal_note(&tx, at, run_id, "run_started", "").unwrap();
+        use crate::{known_hosts, ssh_config, tailnet};
+        for (reader, kind, scope, completeness) in [
+            (ssh_config::READER, ssh_config::KIND, "machine:mac", "full"),
+            (
+                known_hosts::READER,
+                known_hosts::KIND,
+                "machine:mac",
+                "full",
+            ),
+            (tailnet::READER, tailnet::KIND, "machine:old-mac", "full"),
+            (
+                known_hosts::READER,
+                known_hosts::KIND,
+                "machine:old-mac",
+                "none",
+            ),
+        ] {
+            crate::store::put_entity(&tx, scope).unwrap();
+            let r = Reading {
+                reader,
+                scope,
+                kind,
+                run_id,
+                at,
+                observed_at: at,
+            };
+            let gap = match completeness {
+                "full" => Gap::default(),
+                _ => Gap::of(crate::store::Cause::Failed),
+            };
+            put_coverage(
+                &tx,
+                &r,
+                completeness,
+                (completeness != "full").then_some("refused"),
+                &gap,
+            )
+            .unwrap();
+        }
+        journal_note(&tx, at + 1, run_id, "run_finished", "").unwrap();
+        tx.commit().unwrap();
+        let m = super::statements(&conn, at + 60).unwrap();
+        let not_read: Vec<(&str, &str, Option<i64>)> = (m.machines_not_read.iter())
+            .map(|c| (c.reader.as_str(), c.scope_text.as_str(), c.observed_at))
+            .collect();
+        assert_eq!(not_read, [(tailnet::READER, "machine:mac", None)]);
     }
 }

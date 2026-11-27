@@ -243,6 +243,22 @@ fn reading_badge(out: &mut String, c: &v1::Coverage) -> Out {
     }
 }
 
+/// The statement that sets a machine aside, with how it came and why.
+fn statement(out: &mut String, word: Option<&v1::Statement>) -> Out {
+    let Some(w) = word else { return Ok(()) };
+    write!(
+        out,
+        "<p>You said it is {}, {}.",
+        esc(&w.said),
+        crate::finding_text::given_by(w.via)
+    )?;
+    if !w.reason_text.is_empty() {
+        write!(out, " Why: {}.", Said::given(&w.reason_text).html())?;
+    }
+    out.push_str("</p>\n");
+    Ok(())
+}
+
 /// One machine, opening to what `immunity machine` knows of it: its latest visit by the server
 /// check, what it runs, every reading of it with how much it read, and what is on it. With the
 /// statement that sets it aside, as the statement says it. `names` is the name it is shown by,
@@ -259,8 +275,29 @@ fn block(
         "<details class=\"machine\">\n<summary><strong>{}</strong>",
         Name::given(name).html()
     )?;
+    // A machine set aside is shown as its statement says, whatever its answer: who set it aside
+    // and how is said where it is listed, so an answer through an agent is seen.
+    let mut meta: Vec<String> = Vec::new();
+    if let Some(w) = word {
+        write!(out, " <span class=\"badge good\">{}</span>", esc(&w.said))?;
+        let agent = (w.via == v1::Via::Agent as i32)
+            .then(|| format!(", {}", crate::finding_text::given_by(w.via)));
+        meta.push(format!(
+            "you said so {}{}",
+            utc(w.at),
+            agent.unwrap_or_default()
+        ));
+    }
     let Some(k) = k else {
-        out.push_str(" <span class=\"badge bad\">not known</span></summary>\n<div class=\"inner\">\n<p class=\"alert\">immunity machine gives no answer about it, so nothing of what was read on it is known here.</p>\n</div>\n</details>\n");
+        if word.is_none() {
+            out.push_str(" <span class=\"badge bad\">not known</span>");
+        }
+        for said in &meta {
+            write!(out, " <span class=\"muted\">· {said}</span>")?;
+        }
+        out.push_str("</summary>\n<div class=\"inner\">\n");
+        statement(out, word)?;
+        out.push_str("<p class=\"alert\">immunity machine gives no answer about it, so nothing of what was read on it is known here.</p>\n</div>\n</details>\n");
         return Ok(());
     };
     let own: Vec<&str> = (k.thing.iter().map(|t| t.id_text.as_str()))
@@ -282,10 +319,9 @@ fn block(
         }
         Some(_) => ("bad", "could not be opened"),
     };
-    // A machine set aside is shown as its statement says; the server check no longer visits it.
-    match word {
-        Some(w) => write!(out, " <span class=\"badge good\">{}</span>", esc(&w.said))?,
-        None => write!(out, " <span class=\"badge {class}\">{state}</span>")?,
+    // The server check no longer visits a machine set aside: its state is its statement's.
+    if word.is_none() {
+        write!(out, " <span class=\"badge {class}\">{state}</span>")?;
     }
     // A finding in a state this build does not know is read as open.
     let closed = [
@@ -303,22 +339,12 @@ fn block(
             crate::view::plural(open, "finding needs a look", "findings need a look")
         )?;
     }
-    // Who set it aside and how is said where it is listed; an answer through an agent is shown.
-    let mut meta: Vec<String> = Vec::new();
-    if let Some(w) = word {
-        let agent = (w.via == v1::Via::Agent as i32)
-            .then(|| format!(", {}", crate::finding_text::given_by(w.via)));
-        meta.push(format!(
-            "you said so {}{}",
-            utc(w.at),
-            agent.unwrap_or_default()
-        ));
-    }
+    // Read when a reading of substance read something; a full visit alone read nothing of it.
     let read_at = (readings.iter())
-        .filter(|c| c.completeness != v1::Completeness::None as i32)
+        .filter(|c| !is_visit(c) && c.completeness != v1::Completeness::None as i32)
         .filter_map(|c| c.observed_at)
         .max();
-    // One time is said once: the visit only when it is not the latest reading.
+    // One time is said once: the visit only when it is not the latest reading too.
     if let Some(at) = visit
         .and_then(|c| c.observed_at)
         .filter(|at| Some(*at) != read_at)
@@ -335,18 +361,7 @@ fn block(
         meta.join(" · ")
     )?;
 
-    if let Some(w) = word {
-        write!(
-            out,
-            "<p>You said it is {}, {}.",
-            esc(&w.said),
-            crate::finding_text::given_by(w.via)
-        )?;
-        if !w.reason_text.is_empty() {
-            write!(out, " Why: {}.", Said::given(&w.reason_text).html())?;
-        }
-        out.push_str("</p>\n");
-    }
+    statement(out, word)?;
     if !others.is_empty() {
         writeln!(
             out,
@@ -369,7 +384,8 @@ fn block(
             utc(c.observed_at.unwrap_or_default()),
             Said::of(reason.trim_end_matches('.')).html()
         )?;
-        if let Some(advice) = crate::sweep::advice(&reason) {
+        // Never asked of a machine the person said is retired or not theirs.
+        if let Some(advice) = crate::sweep::advice(&reason).filter(|_| word.is_none()) {
             write!(out, " {advice}")?;
         }
         out.push_str("</p>\n");
@@ -608,6 +624,15 @@ mod tests {
             earlier.contains(&format!("read {}", utc(NOW - 86_400))),
             "{earlier}"
         );
+        // A full visit whose readings of substance read nothing read nothing of the server.
+        let empty = page(vec![
+            reading("system packages", C::None, Some(NOW)),
+            reading(servers::VISIT, C::Full, Some(NOW)),
+        ]);
+        assert!(
+            empty.contains(&format!("visited {} · nothing read", utc(NOW))),
+            "{empty}"
+        );
     }
 
     #[test]
@@ -704,6 +729,33 @@ mod tests {
         assert!(
             line.contains(&format!("· you said so {} ·", utc(NOW - 3600))),
             "{line}"
+        );
+        // Without an answer about the machine, the statement is still drawn whole.
+        let s = v1::Statements {
+            statements: vec![word(v1::Via::Agent, false)],
+            ..Default::default()
+        };
+        let page = drawn(&s, None);
+        let aside = &page[page.find("<section id=\"retired\"").unwrap()..];
+        assert!(
+            summary(aside).contains(&format!("you said so {}, through your agent", utc(NOW - 3600)))
+                && aside.contains("You said it is not mine, through your agent. Why: <bdi class=\"src\">A client&#39;s server</bdi>.")
+                && aside.contains("gives no answer about it"),
+            "{aside}"
+        );
+        // Its failed visit keeps its reason and never asks the person to connect to it.
+        let why = "Host key verification failed.";
+        let mut visit = reading(servers::VISIT, v1::Completeness::None, Some(NOW));
+        visit.reason_text = Some(why.to_string());
+        let mut k = known(vec![visit]);
+        k.thing.as_mut().unwrap().id_text = "machine:old-box".to_string();
+        k.coverage[0].scope_text = "machine:old-box".to_string();
+        let page = drawn(&s, Some(k));
+        let aside = &page[page.find("<section id=\"retired\"").unwrap()..];
+        assert!(
+            aside.contains("Host key verification failed")
+                && !aside.contains(crate::sweep::advice(why).unwrap()),
+            "{aside}"
         );
         // One that something seen since contradicts sets nothing aside, and says so.
         let s = v1::Statements {
