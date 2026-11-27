@@ -385,13 +385,13 @@ pub fn component_name(id: &str) -> (&str, &str) {
     split_component(id).map_or(("", id), |(_, ecosystem, name)| (ecosystem, name))
 }
 
-/// The time and how many whole days ago it was, or that it is ahead of the clock
-/// (`store::age`).
-pub(crate) fn utc_age(secs: i64, now: i64) -> String {
+/// The time as the pages show it (`when`) and how many whole days ago it was, or that it is
+/// ahead of the clock (`store::age`).
+pub(crate) fn when_age(secs: i64, now: i64) -> String {
     match crate::store::age(secs, now).map(|age| age / 86_400) {
-        Some(1) => format!("{} · 1 day ago", utc(secs)),
-        Some(days) => format!("{} · {days} days ago", utc(secs)),
-        None => format!("{} · ahead of this Mac's clock", utc(secs)),
+        Some(1) => format!("{} · 1 day ago", when(secs, now)),
+        Some(days) => format!("{} · {days} days ago", when(secs, now)),
+        None => format!("{} · ahead of this Mac's clock", when(secs, now)),
     }
 }
 
@@ -609,31 +609,31 @@ footer.licence { margin-top: 32px; }
 .fg { font: 600 12px/16px var(--font); color: var(--t2); padding: 16px 12px 8px; margin: 0; }
 .fg.open { color: var(--look-ink); }
 .fg.now { color: var(--now-ink); }
-/* Seen holds a time, or a date and a time: one line, as wide as "2026-11-13 14:37" in its digits. */
-.fh, .fr > summary { display: grid; grid-template-columns: minmax(0, 1fr) 240px 96px 16ch 16px; column-gap: 12px; align-items: center;
-  min-height: 40px; padding: 0 12px; border-bottom: 1px solid var(--sep); }
-/* Each row's dot in its group's colour, in the first cell's padding: red needs you now, orange to
-   look at, grey answered. */
+/* A row: the thing, what happened, in how many places, when it was last seen. Seen holds a time,
+   or a date and a time: one line, as wide as "2026-11-13 14:37" in its digits. */
+.fr > summary { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) 96px 16ch 16px; column-gap: 16px;
+  align-items: baseline; padding: 10px 12px; border-bottom: 1px solid var(--sep); }
+/* Each row's dot in its group's colour, in the first cell's padding beside the first line: red
+   needs you now, orange to look at, grey answered. */
 .fr > summary { position: relative; }
-.fr > summary::before { content: ""; position: absolute; left: 2px; top: 50%; width: 6px; height: 6px; margin-top: -3px;
+.fr > summary::before { content: ""; position: absolute; left: 2px; top: 17px; width: 6px; height: 6px;
   border-radius: 50%; background: var(--quiet); }
 .fr.open > summary::before { background: var(--look); }
 .fr.urgent > summary::before { background: var(--now); }
 .fr.suspicious .fv { color: var(--now-ink); }
 .fr.harmless .fv { color: var(--calm-ink); }
-.fh { min-height: 32px; font: var(--caption); color: var(--t2); }
-.fh .fs { text-align: right; }
 .fr { margin: 0; }
 .fr > summary { list-style: none; cursor: pointer; }
 .fr > summary::-webkit-details-marker { display: none; }
 .fr > summary:hover { background: var(--fill); }
 .fr[open] > summary { background: var(--fill); border-bottom: 0; border-radius: var(--radius-row) var(--radius-row) 0 0; }
-.fr .fw { font: var(--data); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.fr .fk, .fr .fs { color: var(--t2); }
-.fr .fs { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
-.fr .fv .none { color: var(--t3); }
-/* Whose word the cell is: said to a screen reader always, shown where the column has no header. */
-.fr .fv .src { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+.fr .fw { font: var(--data); overflow-wrap: anywhere; min-width: 0; }
+.fr .fw .v { color: var(--t2); }
+.fr .fk { min-width: 0; }
+.fr .fc, .fr .fs { color: var(--t2); text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* The response layer's word under what happened, whose word it is said first. */
+.fr .fv { display: block; font: var(--caption); }
+.fr .fv .src { color: var(--t2); }
 .fr .fch { color: var(--t3); justify-self: end; }
 .fr .fch::before { content: "\203A"; }
 .fr[open] .fch::before { content: "\2039"; display: inline-block; transform: rotate(-90deg); }
@@ -644,6 +644,17 @@ footer.licence { margin-top: 32px; }
 .fx .also { grid-column: 1 / -1; border-top: 1px solid var(--sep); padding-top: 12px;
   display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 32px; row-gap: 16px; }
 .fx .also > .wsh2 { grid-column: 1 / -1; }
+/* The places of a row of several, a line each: where, the command for its finding, and what it
+   alone says under them. */
+.fx .in { grid-column: 1 / -1; border-top: 1px solid var(--sep); padding-top: 12px; }
+.in ul { list-style: none; margin: 0; padding: 0; }
+.in li { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 0 16px;
+  padding: 4px 0; border-bottom: 1px solid var(--sep); }
+.in li:last-child { border-bottom: 0; }
+.in .p { flex: 1 1 240px; font: var(--data); overflow-wrap: anywhere; min-width: 0; }
+.in .cmd { white-space: nowrap; }
+.in .cmd .mono { color: var(--t2); }
+.in .own { flex: 1 1 100%; display: flex; flex-direction: column; gap: 8px; padding: 4px 0 4px 12px; }
 dl.facts { display: grid; grid-template-columns: 96px minmax(0, 1fr); column-gap: 12px; row-gap: 4px; margin: 0; align-content: start; }
 dl.facts dt { font: 12px/20px var(--font); color: var(--t2); }
 dl.facts dd { margin: 0; font: var(--data); overflow-wrap: anywhere; min-width: 0; }
@@ -677,6 +688,13 @@ dl.facts dd .w { font: 12px/20px var(--font); }
 #you-can-fix .empty { border-bottom: 0; }
 /* Its count in orange while there is something to fix. */
 #you-can-fix:has(.fixg) .wsh .n { color: var(--look-ink); }
+
+/* Known vulnerabilities, src/pages/vulnerabilities.rs: a row per record, the finding row's form. */
+.vr > summary { grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.3fr) 172px 88px 16px; }
+.vr .fk .mono { color: var(--t2); margin-right: 4px; }
+.vr .att { color: var(--t2); }
+.vr .att.now { color: var(--now-ink); }
+.in .c { font: var(--data); color: var(--t2); overflow-wrap: anywhere; min-width: 0; }
 
 /* What is watched: a row per kind of place, grouped; the state is coverage alone. */
 .wt { overflow-x: auto; }
@@ -771,12 +789,32 @@ footer.links { display: flex; flex-wrap: wrap; gap: 8px 24px; margin-top: var(--
 @media (max-width: 760px) {
   main { padding: 16px 16px 40px; }
   #this-mac { padding: 16px; }
-  .fh { display: none; }
-  .fr > summary { grid-template-columns: minmax(0, 1fr) auto 16px; row-gap: 0; padding: 8px 12px; }
-  .fr > summary .fw { grid-column: 1 / -1; white-space: normal; overflow-wrap: anywhere; }
-  .fr > summary .fk { grid-column: 1 / -1; }
-  .fr > summary::before { top: 15px; margin-top: 0; }
-  .fr .fv .src { position: static; width: auto; height: auto; overflow: visible; clip-path: none; color: var(--t2); }  .fx, .fx .also { grid-template-columns: minmax(0, 1fr); padding-left: 12px; }
+  /* A row in two lines: the thing and when it was seen, then what happened and in how many places. */
+  .fr > summary { grid-template-columns: minmax(0, 1fr) auto 16px; column-gap: 12px; row-gap: 2px; padding: 8px 12px; }
+  .fr > summary .fw { grid-column: 1; grid-row: 1; }
+  .fr > summary .fs { grid-column: 2; grid-row: 1; font: var(--caption); }
+  .fr > summary .fch { grid-column: 3; grid-row: 1; }
+  .fr > summary .fk { grid-column: 1; grid-row: 2; font: var(--caption); color: var(--t2); }
+  .fr > summary .fc { grid-column: 2 / 4; grid-row: 2; font: var(--caption); }
+  .fr > summary::before { top: 15px; }
+  .fx, .fx .also { grid-template-columns: minmax(0, 1fr); padding-left: 12px; }
+  /* A record in three lines: its packages and in how many projects, the record, its mark. */
+  .vr > summary .fc { grid-column: 2; grid-row: 1; font: var(--body); }
+  .vr > summary .fk { grid-column: 1 / -1; grid-row: 2; }
+  .vr > summary .att { grid-column: 1 / -1; grid-row: 3; font: var(--caption); }
+  /* A table in one column: each row its first cell, then the others as a caption under it, in
+     the order the header names them once above the rows, so no cell is off the screen. */
+  .scroll { overflow-x: visible; }
+  .scroll table, .scroll thead, .scroll tbody, .scroll tr { display: block; }
+  .scroll tr { padding: 8px 0; border-bottom: 1px solid var(--sep); }
+  .scroll thead tr { padding: 0 0 4px; }
+  .scroll th, .scroll td { display: inline; padding: 0; border: 0; white-space: normal; max-width: none; min-width: 0; }
+  .scroll table.dense th, .scroll table.dense td { padding: 0; }
+  .scroll th:first-child, .scroll td:first-child { display: block; }
+  .scroll th + th + th::before, .scroll td + td + td::before { content: " · "; }
+  .scroll td { font: var(--caption); color: var(--t2); }
+  .scroll td:first-child { font: var(--body); color: var(--t1); }
+  .scroll td.mono:first-child { font: var(--data); }
   .wr.wh { display: none; }
   .wr { grid-template-columns: minmax(0, 1fr) auto; row-gap: 0; }
   .wr .wh2, .wr .wc { grid-column: 1 / -1; }
@@ -795,7 +833,7 @@ footer.links { display: flex; flex-wrap: wrap; gap: 8px 24px; margin-top: var(--
 
 #[cfg(test)]
 mod tests {
-    use super::{esc, shown, utc};
+    use super::{esc, shown, utc, when};
     use crate::secrets::{Name, Said};
 
     #[test]
@@ -803,16 +841,16 @@ mod tests {
         let now = 1_800_000_000;
         let ahead = now + crate::store::AHEAD_ALLOWED + 1;
         assert_eq!(
-            super::utc_age(ahead, now),
-            format!("{} · ahead of this Mac's clock", utc(ahead))
+            super::when_age(ahead, now),
+            format!("{} · ahead of this Mac's clock", when(ahead, now))
         );
         assert_eq!(
-            super::utc_age(now - 86_400, now),
-            format!("{} · 1 day ago", utc(now - 86_400))
+            super::when_age(now - 86_400, now),
+            format!("{} · 1 day ago", when(now - 86_400, now))
         );
         assert_eq!(
-            super::utc_age(now - 3 * 86_400, now),
-            format!("{} · 3 days ago", utc(now - 3 * 86_400))
+            super::when_age(now - 3 * 86_400, now),
+            format!("{} · 3 days ago", when(now - 3 * 86_400, now))
         );
     }
 

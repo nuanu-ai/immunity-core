@@ -25,7 +25,7 @@ pub(crate) mod vulnerabilities;
 use crate::contract::v1;
 use crate::covered::{self, Count, Latest, YOU};
 use crate::secrets::{Name, Said};
-use crate::view::{self, DETAILS, FOOT, Out, counted, esc, utc};
+use crate::view::{self, DETAILS, FOOT, Out, counted, esc};
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::Write;
@@ -754,7 +754,7 @@ fn unread(
                 (_, None) => "not read in full".to_string(),
             };
             let last = r.last_full.map_or("never read in full".to_string(), |at| {
-                format!("last read in full {}", utc(at))
+                format!("last read in full {}", view::when(at, now))
             });
             format!("{} ({why}; {last})", esc(&r.kind))
         })
@@ -796,14 +796,15 @@ fn coverage_of_list(out: &mut String, unread: Option<&str>, empty: bool, absent:
     }
 }
 
-/// The top of a page of details for a person.
+/// The top of a page of details for a person: its title, and under it a line already safe HTML,
+/// such as the times it rests on (`view::when`).
 fn top(title: &str, meta: &str) -> String {
     let mut out = view::head(title);
     out.push_str(BACK);
     out.push_str(&format!(
         "<header>\n<h1>{}</h1>\n<p class=\"meta\">{}</p>\n</header>\n",
         esc(title),
-        esc(meta)
+        meta
     ));
     out
 }

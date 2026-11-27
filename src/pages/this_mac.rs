@@ -13,7 +13,7 @@ use crate::contract::{self, v1};
 use crate::covered::{self, Count, Latest};
 use crate::findings::{self, This};
 use crate::secrets::{Name, Said};
-use crate::view::{self, Out, cell, counted, esc, utc, utc_or};
+use crate::view::{self, Out, cell, counted, esc, when};
 use crate::{autorun, integrity, watched};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -206,8 +206,9 @@ pub fn page(r: &v1::Status, m: Option<&v1::Known>, now: i64) -> String {
         THIS_MAC_TITLE,
         &format!(
             "Last full check {} · this page made {}",
-            utc_or(mac.checked_at, "never"),
-            utc(now)
+            mac.checked_at
+                .map_or("never".to_string(), |at| when(at, now)),
+            when(now, now)
         ),
     );
     match m {
@@ -226,7 +227,7 @@ pub fn page(r: &v1::Status, m: Option<&v1::Known>, now: i64) -> String {
                 found,
             };
             let _ = kinds(&mut out, &s, r, now);
-            let _ = also(&mut out, &s);
+            let _ = also(&mut out, &s, now);
             let _ = ways(&mut out, &s);
             let _ = projects(&mut out, &s, now);
         }
@@ -280,7 +281,7 @@ fn kinds(out: &mut String, s: &Mac, r: &v1::Status, now: i64) -> Out {
                     true => NONE_IN_FOUND,
                     false => NONE_FOUND,
                 };
-                files(out, s, as_, gap.as_deref(), none)?;
+                files(out, s, as_, gap.as_deref(), none, now)?;
             }
             Count::Installed(kind) => {
                 let whole = installed_whole(r, kind) == Some(true);
@@ -326,7 +327,7 @@ fn kinds(out: &mut String, s: &Mac, r: &v1::Status, now: i64) -> Out {
         Some(l) => writeln!(
             out,
             "<p>The latest sample, taken {}, saw {} and {}.</p>",
-            utc(l.at),
+            when(l.at, now),
             counted(l.programs as i64, "running program", "running programs"),
             counted(l.connections as i64, "connection", "connections")
         )?,
@@ -343,7 +344,7 @@ fn kinds(out: &mut String, s: &Mac, r: &v1::Status, now: i64) -> Out {
 
 /// After the kinds: the rules about no one kind, so that every rule the owner can be told by is
 /// named on this page, and whether a list of indicators was read, by the answer's reading of it.
-fn also(out: &mut String, s: &Mac) -> Out {
+fn also(out: &mut String, s: &Mac, now: i64) -> Out {
     out.push_str("<section id=\"also\">\n<h2>Also told</h2>\n<h3>A list of signs of a known attack, when you give one</h3>\n");
     told(out, &rule_with(INDICATOR_RULE))?;
     let lists: Vec<&v1::Coverage> = (s.m.coverage.iter())
@@ -360,7 +361,8 @@ fn also(out: &mut String, s: &Mac) -> Out {
     } else if of_last.is_empty() {
         format!(
             "The last check read no list. One was last read in full {}.",
-            utc_or(lists.iter().filter_map(|c| c.last_full_at).max(), "never")
+            (lists.iter().filter_map(|c| c.last_full_at).max())
+                .map_or("never".to_string(), |at| when(at, now))
         )
     } else if of_last.iter().any(full) {
         "A list was read at the last check.".to_string()
@@ -388,7 +390,7 @@ const FIRST_READ_RULE: &str = "watched.first-read";
 /// changed, from the answer's facts. Only checksums are kept, never content. `gap` is what the
 /// list cannot claim. An entry watched only for presence says so instead of when it changed, and
 /// one whose content the latest reading did not read says that.
-fn files(out: &mut String, s: &Mac, as_: &str, gap: Option<&str>, none: &str) -> Out {
+fn files(out: &mut String, s: &Mac, as_: &str, gap: Option<&str>, none: &str, now: i64) -> Out {
     let of_kind: Vec<(&str, &v1::Assertion)> = (s.m.parts.iter())
         .filter_map(|p| {
             let seen = (s.values(&p.id_text, "watched_as").into_iter())
@@ -407,7 +409,7 @@ fn files(out: &mut String, s: &Mac, as_: &str, gap: Option<&str>, none: &str) ->
     for (id, first) in of_kind {
         out.push_str("<tr>");
         cell(out, "mono", &s.place(id))?;
-        view::td(out, "nowrap", &utc(first.observed_at))?;
+        cell(out, "nowrap", &when(first.observed_at, now))?;
         // Changed when its content or link target now was first read by a later run than the one
         // that first saw it, told by run and not by time, which two runs may share.
         let content = s.values(id, "has_content");
@@ -421,7 +423,7 @@ fn files(out: &mut String, s: &Mac, as_: &str, gap: Option<&str>, none: &str) ->
             (None, true, _) => ("", esc(watched::PRESENCE_ONLY)),
             (None, false, None) => ("", esc(watched::NEVER_READ)),
             (None, false, Some(t)) if t.run_id != first.run_id => {
-                ("nowrap", esc(&utc(t.observed_at)))
+                ("nowrap", when(t.observed_at, now))
             }
             (None, false, Some(_)) => ("nowrap", "not since first seen".to_string()),
         };
@@ -957,7 +959,7 @@ mod tests {
         assert!(
             earlier.contains(&format!(
                 "The latest sample, taken {}, saw 2 running programs and 1 connection.",
-                utc(NOW - 600)
+                when(NOW - 600, NOW)
             )) && earlier.contains("No watcher samples them now."),
             "{earlier}"
         );
@@ -1016,7 +1018,7 @@ mod tests {
             !earlier.contains("at the last check.")
                 && earlier.contains(&format!(
                     "The last check read no list. One was last read in full {}.",
-                    utc(NOW - 86_400)
+                    when(NOW - 86_400, NOW)
                 )),
             "{earlier}"
         );

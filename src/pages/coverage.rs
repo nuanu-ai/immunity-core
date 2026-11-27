@@ -10,7 +10,7 @@
 use super::{COVERAGE_TITLE, grouped, top};
 use crate::contract::v1;
 use crate::secrets::{Name, Said};
-use crate::view::{FOOT, Out, cell, counted, esc, thead, utc, utc_or};
+use crate::view::{FOOT, Out, cell, counted, esc, thead, when};
 use std::fmt::Write;
 
 /// The page, from the status alone.
@@ -20,11 +20,11 @@ pub fn page(r: &v1::Status, now: i64) -> String {
         COVERAGE_TITLE,
         &format!(
             "Last full check {} · this page made {}",
-            utc_or(checked_at, "never"),
-            utc(now)
+            checked_at.map_or("never".to_string(), |at| when(at, now)),
+            when(now, now)
         ),
     );
-    let _ = body(&mut out, r);
+    let _ = body(&mut out, r, now);
     out.push_str(FOOT);
     out
 }
@@ -151,7 +151,7 @@ fn not_repeated(r: &v1::Status) -> u64 {
         .map_or(0, |x| x.not_repeated)
 }
 
-fn body(out: &mut String, r: &v1::Status) -> Out {
+fn body(out: &mut String, r: &v1::Status, now: i64) -> Out {
     out.push_str("<section id=\"coverage\">\n<p class=\"muted\">What the other pages say is only as good as this.</p>\n");
     if r.running {
         out.push_str("<p class=\"alert\">A check is running now. This page shows what was read before it.</p>\n");
@@ -164,7 +164,7 @@ fn body(out: &mut String, r: &v1::Status) -> Out {
         writeln!(
             out,
             "<p class=\"alert\">The latest check started {} and never finished. Nothing it read is in the store.</p>",
-            utc(at)
+            when(at, now)
         )?;
     }
     let Some(c) = &r.coverage else {
@@ -218,7 +218,7 @@ fn body(out: &mut String, r: &v1::Status) -> Out {
             esc(&crate::overview::not_repeated(stale))
         )?;
     }
-    unreached(out, c)?;
+    unreached(out, c, now)?;
     groups(out, c)?;
     out.push_str("</section>\n");
     Ok(())
@@ -226,7 +226,7 @@ fn body(out: &mut String, r: &v1::Status) -> Out {
 
 /// The machines whose latest visit failed, each with when its visits began to fail and why, and
 /// how many more there are than the message lists.
-fn unreached(out: &mut String, c: &v1::CoverageSummary) -> Out {
+fn unreached(out: &mut String, c: &v1::CoverageSummary, now: i64) -> Out {
     if c.unreached_total == 0 && c.unreached.is_empty() {
         return Ok(());
     }
@@ -237,7 +237,7 @@ fn unreached(out: &mut String, c: &v1::CoverageSummary) -> Out {
         for u in &c.unreached {
             out.push_str("<tr class=\"bad\">");
             cell(out, "mono", &Name::given(&u.scope_text).html())?;
-            cell(out, "nowrap", &esc(&utc(u.since_at)))?;
+            cell(out, "nowrap", &when(u.since_at, now))?;
             cell(out, "", &reason(u.reason_text.as_deref()))?;
             out.push_str("</tr>\n");
         }
