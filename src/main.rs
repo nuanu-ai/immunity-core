@@ -2456,7 +2456,10 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     let servers = args.servers_input.clone();
     read_servers(&mut run, servers.as_deref())?;
     stage(CheckStage::Projects);
-    let (walked, walk_failure, not_told) = read_checkouts(&mut run, args)?;
+    // Where the walk starts, made real once: the walk and whether the run is a full check
+    // (`narrowed`) both rest on it.
+    let start = checkouts::start(args.checkouts_root.as_deref(), &args.home);
+    let (walked, walk_failure, not_told) = read_checkouts(&mut run, args, &start)?;
     let from_agents = read_agent_folders(&mut run, args, agent_folders::LOOK_LIMIT)?;
     let any_checkouts = walked.is_some() || !from_agents.is_empty();
     // One checkout found by both readers is read once.
@@ -2501,7 +2504,7 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     read_threats(&run, catalogue)?;
     read_feeds(&run, feeds)?;
     opened += match_dependencies(&run)?;
-    let narrowed = narrowed(args);
+    let narrowed = narrowed(&start);
     if let Some(what) = &narrowed {
         run.notes
             .push(format!("Not a full check: {}.", known::whole(what)));
@@ -2549,8 +2552,7 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
 /// rest of the home folder's projects unlooked for, and what the store knew outside it is kept
 /// unread. Every other root and input stands in for a source whole, as an invented home does,
 /// and its reader reads all of it.
-fn narrowed(args: &Args) -> Option<String> {
-    let start = checkouts::start(args.checkouts_root.as_deref(), &args.home);
+fn narrowed(start: &checkouts::Start) -> Option<String> {
     (start.root != start.real_home).then(|| {
         format!(
             "projects were looked for only in {}, not in the whole home folder",
@@ -3047,8 +3049,11 @@ type CheckoutWalk = (
 /// real path. Its completeness, cause and reason follow from what it read and did not
 /// (`look.rs`): the folders it listed and the checkouts it found are read, a folder it could
 /// not list is a unit not read, and what it did not look at that is no unit is said apart.
-fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Error>> {
-    let start = checkouts::start(args.checkouts_root.as_deref(), &args.home);
+fn read_checkouts(
+    run: &mut Run,
+    args: &Args,
+    start: &checkouts::Start,
+) -> Result<CheckoutWalk, Box<dyn Error>> {
     let root = &start.root;
     let (run_id, machine) = (run.run_id.to_string(), run.machine.to_string());
     let reading = Reading {
@@ -3096,7 +3101,7 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
             kept.push(rel);
             continue;
         };
-        match walk.look_again(under, &start) {
+        match walk.look_again(under, start) {
             checkouts::Again::Gone => {}
             checkouts::Again::Kept => kept.push(rel),
             checkouts::Again::NotTold => {
@@ -3164,6 +3169,11 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
     for (folder, why, errno) in &walk.unlisted {
         look.not_looked_at(Unit::whole(folder), *errno, why.clone());
     }
+    // A walk of another folder than the home folder did not read what lies outside it: what
+    // the walk before it failed to read there is still not read. A walk of the home folder
+    // has nothing outside it.
+    let outside = |rel: &str| !start.home.join(rel).starts_with(root);
+    let carried = carry_failed(run.tx, &reading, &mut look, outside)?;
     if args.checkouts_root.is_some() {
         let given = checkouts::ONLY_GIVEN.to_string();
         look.short_as(Cause::NotGiven, checkouts::GIVEN, given);
@@ -3187,9 +3197,11 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
         let why = format!("{}{}", checkouts::UNDER_LINK, linked.join(", "));
         look.short(Cause::NotGiven, why);
     }
-    let failure = (!walk.unlisted.is_empty()).then(|| {
+    let failure = (!walk.unlisted.is_empty() || carried).then(|| {
         let folders: Vec<String> = walk.unlisted.iter().map(|(f, ..)| f.clone()).collect();
-        run.notes.push(unlisted_note(&folders));
+        if !folders.is_empty() {
+            run.notes.push(unlisted_note(&folders));
+        }
         "the checkout walk could not list some folders"
     });
     let (completeness, reason) = look.completeness_noted(None);
@@ -3230,6 +3242,39 @@ fn read_checkouts(run: &mut Run, args: &Args) -> Result<CheckoutWalk, Box<dyn Er
         &walk.seen.iter().map(Unit::whole).collect::<Vec<_>>(),
     )?;
     Ok((Some(walk.checkouts), failure, unknown))
+}
+
+/// Adds to `look` as failed what the latest earlier reading of `reading`'s reader, scope and kind
+/// failed to read at a path `outside` says this run did not look at, with the error and what
+/// the source said then; whether there was any. What a reading did not read keeps what was
+/// known of it, its failure included. Called before the reading is written, so the latest is
+/// an earlier one; the readings it serves name whole files and folders.
+fn carry_failed(
+    tx: &rusqlite::Connection,
+    reading: &Reading,
+    look: &mut look::Look,
+    outside: impl Fn(&str) -> bool,
+) -> rusqlite::Result<bool> {
+    let failed: Vec<(String, Option<i32>, Option<String>)> = tx
+        .prepare(
+            "SELECT path, errno, said FROM coverage_unread
+             WHERE coverage = (SELECT MAX(id) FROM coverage WHERE reader = ?1 AND scope = ?2
+                                 AND kind = ?3)
+               AND cause = 'failed' AND path IS NOT NULL",
+        )?
+        .query_map(
+            rusqlite::params![reading.reader, reading.scope, reading.kind],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut any = false;
+    for (path, errno, said) in failed.into_iter().filter(|(path, ..)| outside(path)) {
+        // Kept in the store's form, it is the source's words again (`contract::unescape`).
+        let why = said.as_deref().map_or_else(String::new, contract::unescape);
+        look.not_looked_at(Unit::whole(path), errno, why);
+        any = true;
+    }
+    Ok(any)
 }
 
 /// Checkouts in the folders agents worked in. The candidates are the working folders in the
@@ -5116,6 +5161,12 @@ fn read_indicators(
         let held = things(n, "known checkout was", "known checkouts were");
         look.short(Cause::NotGiven, format!("{held} not looked into"));
     }
+    // What the matching before it failed to read in a known checkout this run did not look
+    // into is still not read.
+    let looked = &visited.looked;
+    let not_looked = |path: &str| visited.owner(path).is_some_and(|o| !looked.contains(o));
+    let matching = on_machine(indicators::MATCH_KIND);
+    carry_failed(run.tx, &matching, &mut look, not_looked)?;
     let mut statements: Vec<Statement> = matches
         .iter()
         .map(|(file, i)| Statement {
@@ -6086,7 +6137,8 @@ mod tests {
                 readers: 0,
                 settle: Settle::default(),
             };
-            read_checkouts(&mut run, &args).unwrap();
+            let start = checkouts::start(args.checkouts_root.as_deref(), &args.home);
+            read_checkouts(&mut run, &args, &start).unwrap();
             read_agent_folders(&mut run, &args, agent_folders::LOOK_LIMIT).unwrap();
         };
         let said = |s: [&str; 3]| s.map(|s| Some(s.to_string()));

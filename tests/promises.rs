@@ -3879,6 +3879,76 @@ fn a_run_given_another_checkouts_root_is_not_a_full_check_and_the_status_is_as_o
 }
 
 #[test]
+fn a_walk_of_another_folder_keeps_the_failure_of_the_walk_before_it_outside_that_folder() {
+    // No false calm: a run pointed at one folder read nothing outside it, so a folder the full
+    // check could not list there is still not read, and its failure stands.
+    let dir = Dir::new("narrowed-keeps-failure");
+    let store = dir.store();
+    let brew = dir.input("brew.txt", SAMPLE);
+    let absent = dir.0.join("absent");
+    checkout(&dir.0, "dev/shop");
+    checkout(&dir.0, "work/site");
+    // The matching of indicators beside the projects, which met a file it could not read in a
+    // project the narrowed run does not look into.
+    let app = checkout(&dir.0, "other/app");
+    put(&app, "package-lock.json", "{}");
+    // A lockfile that is a link is not opened, which is no failure.
+    std::os::unix::fs::symlink("package-lock.json", app.join("yarn.lock")).unwrap();
+    let list = r#"[{"kind": "domain-name:value", "value": "example.invalid"}]"#;
+    dir.input("indicators.json", list);
+    let failed = |kind: &str| {
+        let sql = format!(
+            "SELECT completeness, cause, (SELECT group_concat(path) FROM coverage_unread u
+               WHERE u.coverage = c.id AND u.cause = 'failed') FROM coverage c
+             WHERE kind = '{kind}' ORDER BY id DESC LIMIT 1"
+        );
+        rows(&store, &sql)
+    };
+    let walk = || failed("checkouts under the home folder");
+    let matching =
+        || failed("indicators matched against watched files and texts read in checkouts");
+    let locked = Locked::new(dir.0.join("work"));
+    let unreadable = Locked::new(app.join("package-lock.json"));
+    immunity_home(&store, &brew, &absent);
+    assert_eq!(walk(), ["partial|failed|work"]);
+    assert_eq!(matching(), ["partial|failed|other/app/package-lock.json"]);
+    // What the source said is kept as it was, here a backslash in the store's form.
+    let said = "SELECT errno, said FROM coverage_unread WHERE cause = 'failed' AND coverage =
+                  (SELECT MAX(id) FROM coverage WHERE kind = 'checkouts under the home folder')";
+    let conn = common::open_store(&store);
+    conn.execute(
+        "UPDATE coverage_unread SET said = said || ' \\u{5c}' WHERE path = 'work'",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let said_then = rows(&store, said);
+    let faults = || -> Vec<serde_json::Value> {
+        let s = status_json(&store);
+        let items = s["not_covered"].as_array().unwrap().iter();
+        items
+            .filter(|u| u["fault"] == true)
+            .map(|u| u["id"].clone())
+            .collect()
+    };
+    let before = faults();
+    let report = immunity_all(&store, &brew, &absent, &dir.0.join("dev"));
+    assert_eq!(walk(), ["partial|failed|work"], "{report}");
+    assert_eq!(rows(&store, said), said_then);
+    assert!(!report.contains("could not be listed"), "{report}");
+    assert_eq!(matching(), ["partial|failed|other/app/package-lock.json"]);
+    assert_eq!(faults(), before);
+    // A walk of the folder that failed reads it again and judges it.
+    drop(locked);
+    immunity_all(&store, &brew, &absent, &dir.0.join("work"));
+    assert_eq!(walk(), ["partial|not_given|NULL"]);
+    // A project the run looked into is judged by what this run read there.
+    drop(unreadable);
+    immunity_all(&store, &brew, &absent, &dir.0.join("other"));
+    assert_eq!(matching(), ["partial|no_reader|NULL"]);
+}
+
+#[test]
 fn an_explicit_checkouts_root_never_retracts_checkouts_found_by_the_home_walk() {
     // A walk of one folder says nothing about the rest of the home folder.
     let dir = Dir::new("given-root");

@@ -1171,8 +1171,8 @@ fn write_answers(
     Ok(())
 }
 
-/// Links records to the catalogue's exploited CVEs through their aliases, and through the
-/// aliases of a record they name, as a RustSec record names a GitHub one.
+/// Links records to the catalogue's exploited CVEs through their own ids and aliases, and through
+/// the aliases of a record they name, as a RustSec record names a GitHub one.
 fn link_catalogue(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute("DELETE FROM vulnerability_linked", [])?;
     let catalogue: HashSet<String> = tx
@@ -1185,7 +1185,7 @@ fn link_catalogue(tx: &Transaction) -> rusqlite::Result<()> {
     let records: Vec<(String, String, Vec<String>)> = tx
         .prepare(
             "SELECT source, id, aliases FROM advisory
-             WHERE gone_at IS NULL AND withdrawn IS NULL AND aliases != '[]'",
+             WHERE gone_at IS NULL AND withdrawn IS NULL",
         )?
         .query_map([], |r| {
             let aliases: String = r.get(2)?;
