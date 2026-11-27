@@ -1,0 +1,45 @@
+name: Bug report
+description: Immunity Core gave a wrong answer, missed something it says it covers, or failed.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not report a security flaw here. Use the Security tab, "Report a vulnerability", as described in SECURITY.md.
+        Use invented data in this report. Leave out paths, host names, addresses and command lines from your own Mac.
+  - type: input
+    id: commit
+    attributes:
+      label: Commit
+      description: The output of `git rev-parse --short HEAD` in your checkout.
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version and chip
+      placeholder: macOS 15.x, Apple Silicon
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command and answer
+      description: The command you ran and the answer, with `--json` if you can.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected instead
+    validations:
+      required: true
+  - type: dropdown
+    id: collector
+    attributes:
+      label: Is the collector installed
+      options:
+        - "Yes"
+        - "No"
+    validations:
+      required: true
