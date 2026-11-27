@@ -406,3 +406,4 @@
 {"event":{"executable":"/usr/bin/_ollama.exe","kind":"create","path":"/private/tmp/.bashrc","signing_id":"com.example.tool"},"matches":[]}
 {"event":{"executable":"/usr/bin/ollama.exe","kind":"create","path":"/private/tmp/key9.dbz","signing_id":"com.example.tool"},"matches":[]}
 {"event":{"executable":"/usr/bin/gpt4all.exe","kind":"create","path":"/private/tmp/ey .db","signing_id":"com.example.tool"},"matches":[]}
+{"event":{"args":["codesign","-v"],"executable":"/usr/bin/codesign","kind":"exec","parent_executable":"/Library/PrivilegedHelperTools/com.adobe.ARMDC.SMJobBlessHelper","user_id":0,"working_directory":"/Users/someone"},"matches":[]}

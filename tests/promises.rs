@@ -14086,7 +14086,7 @@ fn every_published_rule_is_listed_once_in_its_place_and_none_is_said_to_watch_wh
         .find(|(p, _)| p.ends_with("view/rules.html"))
         .unwrap()
         .1;
-    let told = "The event level is on, so 164 of them are watching every program start on this Mac, and 23 more are checked in part. The 14 rules for files created or renamed are not watching: the collector installed here records program starts only, and installing the event level again adds file events. In the last day they matched 1 time.";
+    let told = "The event level is on, so 162 of them are watching every program start on this Mac, and 28 more are checked in part. The 11 rules for files created or renamed are not watching: the collector installed here records program starts only, and installing the event level again adds file events. In the last day they matched 1 time.";
     let text = &page[page.find("<main>").unwrap()..];
     assert!(text.contains(told), "{text}");
     // Watching is said twice above, and each rule for file events says it does not.
@@ -14100,7 +14100,7 @@ fn every_published_rule_is_listed_once_in_its_place_and_none_is_said_to_watch_wh
     let summary = section(&pages[0].1, "as-it-happens");
     assert!(
         summary
-            .contains("<span class=\"st\">Rules watching now</span><span class=\"sv\" data-live=\"watching\">164</span>"),
+            .contains("<span class=\"st\">Rules watching now</span><span class=\"sv\" data-live=\"watching\">162</span>"),
         "{summary}"
     );
     assert!(!summary.contains("data-live=\"files\""), "{summary}");
@@ -14201,12 +14201,12 @@ fn every_published_rule_is_listed_once_in_its_place_and_none_is_said_to_watch_wh
         .find(|(p, _)| p.ends_with("view/rules.html"))
         .unwrap()
         .1;
-    let told = "The event level is on, so 178 of them are watching this Mac: 164 every program start and 14 every file created or renamed; 23 more are checked in part.";
+    let told = "The event level is on, so 173 of them are watching this Mac: 162 every program start and 11 every file created or renamed; 28 more are checked in part.";
     assert!(page.contains(told), "{page}");
     assert!(!page.contains(unwatched), "{page}");
     let summary = section(&pages[0].1, "as-it-happens");
     assert!(
-        summary.contains("data-live=\"watching\">178</span>")
+        summary.contains("data-live=\"watching\">173</span>")
             && summary.contains(
                 "<span class=\"ss\" data-live=\"files\">1 file event checked in the last day</span>"
             ),

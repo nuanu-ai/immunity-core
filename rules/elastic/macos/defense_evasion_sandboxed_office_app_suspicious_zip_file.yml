@@ -14,4 +14,4 @@ detection:
   s2: {"file.name": ["~$*.zip"]}
   condition: "(s1 and s2)"
 level: "high"
-elastic: {"rule_id": "d22a85c6-d2ad-4cc4-bf7b-54787473669a", "severity": "high", "risk_score": 73, "query_sha256": "04e926f058fe53b6c51c02c0809e326b17f4f369350f4cb5b525f76fee10368d", "kinds": ["rename"], "in_part_missing_fields": [], "also_asks_events": ["modification"], "null_sensitive": [], "folded_fields": []}
+elastic: {"rule_id": "d22a85c6-d2ad-4cc4-bf7b-54787473669a", "severity": "high", "risk_score": 73, "query_sha256": "04e926f058fe53b6c51c02c0809e326b17f4f369350f4cb5b525f76fee10368d", "kinds": ["rename"], "in_part_missing_fields": ["needs_events modification"], "also_asks_events": [], "null_sensitive": [], "folded_fields": []}

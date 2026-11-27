@@ -17,4 +17,4 @@ detection:
   s5: {"process.name|cased": [".flatpak-wrapped"]}
   condition: "((s1 or s2) and s3 and (not s4 and not s5))"
 level: "medium"
-elastic: {"rule_id": "2388c687-cb2c-4b7b-be8f-6864a2385048", "severity": "medium", "risk_score": 47, "query_sha256": "3341855363d4921208e5ebf3e92d59db112126f3c4afbf8439351d0a8b32af31", "kinds": ["start"], "in_part_missing_fields": [], "also_asks_events": ["exec_event", "executed", "process_started"], "null_sensitive": [], "folded_fields": ["process.args"]}
+elastic: {"rule_id": "2388c687-cb2c-4b7b-be8f-6864a2385048", "severity": "medium", "risk_score": 47, "query_sha256": "3341855363d4921208e5ebf3e92d59db112126f3c4afbf8439351d0a8b32af31", "kinds": ["start"], "in_part_missing_fields": [], "also_asks_events": ["exec_event", "executed", "process_started", "start"], "null_sensitive": [], "folded_fields": ["process.args"]}

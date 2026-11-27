@@ -2710,8 +2710,8 @@ fn a_binary_padding_start_raises_one_finding_with_its_authors_and_arguments_and_
             &rules["judged"],
             &rules["matches_last_day"]
         ),
-        // 164 for program starts and 14 for file events, which this install collects.
-        (&json!(true), &json!(178), &json!("all"), &json!(1)),
+        // 162 for program starts and 11 for file events, which this install collects.
+        (&json!(true), &json!(173), &json!("all"), &json!(1)),
         "{rules:#}"
     );
     assert_eq!(
@@ -3098,10 +3098,10 @@ const AXIOS: &str = "2db0458c-05c9-4069-a26f-77becd9c8c13";
 const AMOS: &str = "e710a880-1f18-4417-b6a0-b5afdf7e3023";
 /// "Python Path Configuration File Creation - MacOS", medium.
 const PTH: &str = "4f394635-13ef-4599-b677-3353e0f84f55";
-/// The rules for file events SigmaHQ ships for macOS, all five evaluated in full, and the six
-/// of Elastic's translated detection rules and three of its behaviour rules for file events,
-/// each evaluated in full.
-const FILE_RULES: [&str; 14] = [
+/// The rules for file events SigmaHQ ships for macOS, all five evaluated in full, and the four
+/// of Elastic's translated detection rules and two of its behaviour rules for file events
+/// evaluated in full.
+const FILE_RULES: [&str; 11] = [
     "23c43900-e732-45a4-8354-63e4a6c187ce",
     AXIOS,
     PTH,
@@ -3109,13 +3109,10 @@ const FILE_RULES: [&str; 14] = [
     AMOS,
     "530178da-92ea-43ce-94c2-8877a826783d",
     "931e25a5-0f5e-4ae0-ba0d-9e94eff7e3a4",
-    "d22a85c6-d2ad-4cc4-bf7b-54787473669a",
     "d7b57cbd-de03-4c3b-8278-daa1ee4a6772",
     "e3f5a566-df31-40cc-987c-24bc4bb94ba5",
     "ced79436-2518-4aac-8939-c775b4b4ccd5",
-    "fdb0e7ed-4210-4b71-be47-d0b0d9458fa7",
     "31151602-1de1-4301-9b75-215ac8902b75",
-    "c0136397-f82a-45e5-9b9f-a3651d77e21a",
 ];
 /// What the level says it cannot see while the collector here does not record file events.
 const FILES_NOT_SEEN: &str =
@@ -3614,7 +3611,7 @@ fn no_rule_for_files_watches_until_the_collector_here_is_established_to_record_f
                 &rules["file_events_collected"],
                 &rules["judged"]
             ),
-            (&json!(true), &json!(164), &json!(false), &json!("all")),
+            (&json!(true), &json!(162), &json!(false), &json!("all")),
             "{rules:#}"
         );
         let not_watching: Vec<Value> = rules["not_watching"]
@@ -3729,7 +3726,7 @@ fn no_rule_for_files_watches_until_the_collector_here_is_established_to_record_f
             &rules["file_events_collected"],
             &rules["not_watching"]
         ),
-        (&json!(178), &json!(true), &json!([])),
+        (&json!(173), &json!(true), &json!([])),
         "{rules:#}"
     );
     let l = &r["event_level"];
@@ -3803,7 +3800,7 @@ fn file_events_lost_or_unreadable_judge_files_in_part_and_leave_program_starts_w
             &rules["judged_note"]
         ),
         (
-            &json!(178),
+            &json!(173),
             &json!("part"),
             &json!(
                 "Over the last day some file events were lost, could not be read or were deleted before they were read, so the rules judged only those that were read."

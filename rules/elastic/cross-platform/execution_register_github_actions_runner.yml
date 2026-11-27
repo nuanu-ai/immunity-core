@@ -16,5 +16,5 @@ detection:
   s4: {"process.args|contains|cased": ["\u0000--token\u0000"]}
   condition: "(s1 and s2 and s3 and s4)"
 level: "medium"
-elastic: {"rule_id": "57e118c1-19eb-4c20-93a6-8a6c30a5b48b", "severity": "medium", "risk_score": 47, "query_sha256": "dc35acab62acbc4c581c0e054a68ecb2a1e695910797e430b410ff8393bc59dd", "kinds": ["start"], "in_part_missing_fields": [], "also_asks_events": ["ProcessRollup2", "exec_event", "executed", "process_started"], "null_sensitive": [], "folded_fields": []}
+elastic: {"rule_id": "57e118c1-19eb-4c20-93a6-8a6c30a5b48b", "severity": "medium", "risk_score": 47, "query_sha256": "dc35acab62acbc4c581c0e054a68ecb2a1e695910797e430b410ff8393bc59dd", "kinds": ["start"], "in_part_missing_fields": [], "also_asks_events": ["ProcessRollup2", "exec_event", "executed", "process_started", "start"], "null_sensitive": [], "folded_fields": []}
 falsepositives: ["Authorized github repository with no malicious workflow actions."]

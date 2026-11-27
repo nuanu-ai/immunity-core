@@ -2463,19 +2463,19 @@ mod tests {
             ]
         };
         assert_eq!(totals("sigma"), [75, 0, 74, 1, 0]);
-        // Of Elastic's 185 rules for macOS, 68 translated: 12 of them with an alternative the
-        // translation left out, and 117 not taken.
-        assert_eq!(totals("elastic"), [68, 117, 56, 12, 117]);
-        // Of Elastic's 278 behaviour rules for macOS, 58 translated: 10 of them with an
+        // Of Elastic's 185 rules for macOS, 68 translated: 16 of them with an alternative the
+        // translation left out, a field or a kind of event, and 117 not taken.
+        assert_eq!(totals("elastic"), [68, 117, 52, 16, 117]);
+        // Of Elastic's 278 behaviour rules for macOS, 58 translated: 11 of them with an
         // alternative the translation left out, and 220 not taken.
-        assert_eq!(totals("elastic-behaviour"), [58, 220, 48, 10, 220]);
+        assert_eq!(totals("elastic-behaviour"), [58, 220, 47, 11, 220]);
         assert_eq!(
             s.totals,
             Some(v1::RuleTotals {
                 shipped: 201,
                 not_taken: 337,
-                evaluated: 178,
-                in_part: 23,
+                evaluated: 173,
+                in_part: 28,
                 not_evaluated: 337
             })
         );
@@ -2497,16 +2497,16 @@ mod tests {
         assert_eq!(ids("in_part", "sigma", CATEGORY), [RENAMED_MESHAGENT]);
         // The five rules for file events, each evaluated in full over files created or renamed.
         assert_eq!(ids("evaluated", "sigma", FILE_CATEGORY), FILE_RULES);
-        assert_eq!(ids("evaluated", "elastic", CATEGORY).len(), 50);
-        assert_eq!(ids("evaluated", "elastic", FILE_CATEGORY).len(), 6);
+        assert_eq!(ids("evaluated", "elastic", CATEGORY).len(), 48);
+        assert_eq!(ids("evaluated", "elastic", FILE_CATEGORY).len(), 4);
         assert_eq!(ids("evaluated", "elastic-behaviour", CATEGORY).len(), 45);
         assert_eq!(
             ids("evaluated", "elastic-behaviour", FILE_CATEGORY).len(),
-            3
+            2
         );
         assert_eq!(
             (rules.evaluated(Kind::Process), rules.evaluated(Kind::File)),
-            (69 + 50 + 45, 5 + 6 + 3)
+            (69 + 48 + 45, 5 + 4 + 2)
         );
         // No two rules share an id: the store counts matches by a rule's id.
         let all: Vec<&str> = rules
@@ -3142,6 +3142,10 @@ mod tests {
             start
         };
         assert_eq!(root.evaluate(&*start(0)).len(), 1);
+        // User id 1 is `daemon` on every Mac: the name is looked up, never assumed.
+        let daemon = rule("\"user.name|cased\": [\"daemon\"]", CATEGORY);
+        assert_eq!(daemon.evaluate(&*start(1)).len(), 1);
+        assert_eq!(daemon.evaluate(&*start(0)).len(), 0);
         // No account has user id 4,000,000,000, and 2^32 wraps round to 0 as a `uid_t`.
         for other in [501, 4_000_000_000, 1 << 32] {
             assert_eq!(root.evaluate(&*start(other)).len(), 0, "{other}");
@@ -4377,10 +4381,10 @@ mod tests {
             .iter()
             .filter(|r| level(r) == "not_stated")
             .collect();
-        assert_eq!(none.len(), 48);
+        assert_eq!(none.len(), 47);
         assert!(none.iter().all(|r| r["source"] == "elastic-behaviour"));
         assert!(
-            evaluated[evaluated.len() - 48..]
+            evaluated[evaluated.len() - 47..]
                 .iter()
                 .all(|r| level(r) == "not_stated")
         );
@@ -4422,12 +4426,12 @@ mod tests {
         assert_eq!(
             lines[..6],
             [
-                "Immunity Core evaluates 178 published rules in full and 23 in part; 337 it cannot yet",
+                "Immunity Core evaluates 173 published rules in full and 28 in part; 337 it cannot yet",
                 "",
                 "  Source                     In full  In part  Not evaluated",
                 "  SigmaHQ's rule set              74        1              0",
-                "  Elastic's detection rules       56       12            117",
-                "  Elastic's behaviour rules       48       10            220",
+                "  Elastic's detection rules       52       16            117",
+                "  Elastic's behaviour rules       47       11            220",
             ],
             "{text}"
         );
@@ -4450,12 +4454,12 @@ mod tests {
             })
             .filter(|r| r.contains(&"in full"))
             .collect();
-        assert_eq!(full.len(), 178);
+        assert_eq!(full.len(), 173);
         let first_silent = full
             .iter()
             .position(|r| r[0] == "not stated")
             .expect("rules of a set that states no level");
-        assert_eq!(full.len() - first_silent, 48);
+        assert_eq!(full.len() - first_silent, 47);
         assert!(full[first_silent..].iter().all(|r| r[0] == "not stated"));
         assert!(
             full.iter()

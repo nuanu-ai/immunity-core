@@ -2057,7 +2057,7 @@ fn unreadable_lines_are_counted_and_the_rules_that_judge_nothing_are_named_with_
         [
             ("backslash_in_wildcard", 2),
             ("function", 1),
-            ("in_part", 23),
+            ("in_part", 28),
             ("needs_events", 23 + 42),
             ("needs_fields", 21 + 60),
             ("never_true", 4),
@@ -2702,11 +2702,13 @@ fn a_rule_a_translated_set_did_not_take_is_named_with_its_reason_and_what_the_tr
         ),
         (&json!("in_part"), &json!([]), &json!("critical"))
     );
+    // A kind of event the log does not hold is said as the translation wrote it, never as a
+    // field.
     assert!(
         papercut["detail_text"]
             .as_str()
             .unwrap()
-            .starts_with("backslash_in_wildcard file.path: ")
+            .starts_with("needs_events overwrite; backslash_in_wildcard file.path: ")
     );
     // The same in the binary form: the reasons are the schema's values, not numbers made up.
     let binary = v1::Matches::decode(dir.matches_binary(&[]).as_slice()).unwrap();

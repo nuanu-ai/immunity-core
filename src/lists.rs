@@ -806,7 +806,7 @@ fn state_said(r: &v1::ShippedRule, part: Part) -> (&'static str, Style, String) 
 /// What a translation said of a rule, its reasons in words: a piece that begins with a reason's
 /// name of more than one word, as `needs_fields process.parent.name`, begins with the reason's
 /// words instead. A name of one word reads as a word already.
-fn translated(said: &str) -> String {
+pub(crate) fn translated(said: &str) -> String {
     said.split("; ")
         .map(|piece| {
             let (head, rest) = piece.split_once(' ').unwrap_or((piece, ""));

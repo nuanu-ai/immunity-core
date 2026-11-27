@@ -37,6 +37,9 @@ What the translations rest on:
   trusted (`code_signature.exists`, `code_signature.trusted`) in 3, and
   `process.code_signature.signing_id` in 2. One rule lacks both the effective parent and
   `signing_id`.
+- 1 more is evaluated in part, Suspicious DMG File Creation in Tmp Directory. It also asks for
+  files modified, which the log does not hold, and the translation left that kind out as an
+  alternative, `needs_events modification`.
 - 6 negate a field an event may lack: `process.args` or `process.parent.executable`.
   Elasticsearch treats a comparison with a field the event does not have as neither true nor
   false, so its negation does not hold either. The translation asks for the field to be present
@@ -44,7 +47,7 @@ What the translations rest on:
 - 12 do not ask for `event.action == "exec"`, so Elastic would also evaluate them on a fork. The
   collector records no fork, so they see only programs started by `exec`.
 - The 3 file rules would also be evaluated on kinds of file event the log does not hold, such as
-  files modified or opened. One of them also asks for files modified, which never match here.
+  files modified or opened.
 
 6 titles are shared by two sets among the rules evaluated, and 14 among all the rules listed,
 taken or not, each pair under different ids. Among the rules evaluated, 5 of the 58 share a

@@ -19,4 +19,4 @@ detection:
   s7: {"process.parent.name|cased": [".*", "*.sh", "python*"]}
   condition: "(s1 and ((s2 and s3) or s4) and (s5 or (s6 or s7)))"
 level: "low"
-elastic: {"rule_id": "877cc04a-3320-411d-bbe9-53266fa5e107", "severity": "low", "risk_score": 21, "query_sha256": "72826542fa9004899ed3c521eba1f32e59b2aa5688cf0c0d8f9d9aab569cde55", "kinds": ["start"], "in_part_missing_fields": [], "also_asks_events": ["ProcessRollup2", "exec_event"], "null_sensitive": [], "folded_fields": []}
+elastic: {"rule_id": "877cc04a-3320-411d-bbe9-53266fa5e107", "severity": "low", "risk_score": 21, "query_sha256": "72826542fa9004899ed3c521eba1f32e59b2aa5688cf0c0d8f9d9aab569cde55", "kinds": ["start"], "in_part_missing_fields": [], "also_asks_events": ["ProcessRollup2", "exec_event", "start"], "null_sensitive": [], "folded_fields": []}

@@ -16,4 +16,4 @@ detection:
   s4: {"process.args|contains": ["\u0000-out\u0000"]}
   condition: "(s1 and s2 and s3 and s4)"
 level: "low"
-elastic: {"rule_id": "feba48f6-40ca-4d04-b41f-5dfa327de865", "severity": "low", "risk_score": 21, "query_sha256": "9ad0efebc2a81131a3f74ac1cfb3a432ad481f38d66ec58ea5efb9520d4f64bb", "kinds": ["start"], "in_part_missing_fields": [], "also_asks_events": ["ProcessRollup2", "exec_event", "executed"], "null_sensitive": [], "folded_fields": []}
+elastic: {"rule_id": "feba48f6-40ca-4d04-b41f-5dfa327de865", "severity": "low", "risk_score": 21, "query_sha256": "9ad0efebc2a81131a3f74ac1cfb3a432ad481f38d66ec58ea5efb9520d4f64bb", "kinds": ["start"], "in_part_missing_fields": [], "also_asks_events": ["ProcessRollup2", "exec_event", "executed", "start"], "null_sensitive": [], "folded_fields": []}
