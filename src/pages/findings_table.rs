@@ -3,8 +3,10 @@
 //! reads the store or decides again what the messages say. A finding of the core and the
 //! response layer's own finding about the same rule and thing are one row, joined by what the
 //! messages name: the rule a `verdict.suspicious` finding's verdicts were about
-//! (`VerdictGiven.rule`) and the thing (`about_text`). Every finding open or answered is in
-//! exactly one row. The tabs count findings as the status does, each finding of a pair one.
+//! (`VerdictGiven.rule`) and the thing (`about_text`). Findings of one rule about one thing, a
+//! package in several projects or a folder of hooks, are one row by one key (`Key`), each on a
+//! line of its own with its id. Every finding open or answered is in exactly one row. The tabs
+//! count findings as the status does, each finding of a pair or a row of several one.
 //! Text from the Mac or a source in a row is printed through `secrets::Name` and
 //! `secrets::Said`.
 
@@ -53,13 +55,78 @@ impl<'a> Listed<'a> {
 }
 
 /// One row of the table: one thing. Its finding, the response layer's own findings about the same
-/// thing, and the other findings of its group drawn in it.
+/// thing, and the other findings with its key (`Key`) drawn in it.
 struct FindingRow<'a> {
     item: Listed<'a>,
     under: Vec<Listed<'a>>,
-    /// The other findings of the item's group (`ListedFinding.group`) in its state, none with a
-    /// verdict or a pair: the row is their folder.
+    /// The other findings with the item's key, none with a verdict or a pair: each is drawn in
+    /// the row on a line of its own, by its id.
     siblings: Vec<Listed<'a>>,
+}
+
+/// What joins findings into one row, the one rule for every kind of finding: the same rule, about
+/// the same thing, in the same state, as severe, as sure and as urgent, and, once answered, with
+/// the same answer, so what the row's summary says of one finding it says truly of each. The
+/// thing is the folder of a group the core names (`ListedFinding.group`, one rule, machine,
+/// change and folder: a folder of git hooks), or a package by its ecosystem and name, its source
+/// said in the name (`view::component_name`), with the releases the list gives. A finding with
+/// neither is a row of its own. So is one the response layer gave a word on, and one with the
+/// response layer's own finding inside its row: the summary says that word, and it would stand
+/// for findings it was not said of. The key decides only what is drawn together: every finding
+/// keeps its id, its line in the row and its count in the tabs.
+#[derive(PartialEq, Eq, Hash)]
+struct Key<'a> {
+    rule: Option<&'a str>,
+    thing: Thing<'a>,
+    state: i32,
+    severity: Option<i32>,
+    confidence: Option<i32>,
+    urgent: bool,
+    /// Which answer, how it came and until when, for a finding not open.
+    answer: Option<(i32, i32, Option<i64>)>,
+}
+
+/// The thing of a key: a folder by its group, or a package by ecosystem, name and releases.
+#[derive(PartialEq, Eq, Hash)]
+enum Thing<'a> {
+    Folder(&'a str),
+    Package(&'a str, &'a str, &'a [String]),
+}
+
+impl<'a> FindingRow<'a> {
+    /// Its key, `None` for a row that is joined with no other.
+    fn key(&self) -> Option<Key<'a>> {
+        let (l, r) = (self.item.l, self.item.r);
+        if !self.under.is_empty() || verdict_word(l).is_some() {
+            return None;
+        }
+        let thing = match (&l.group, &l.package_text) {
+            (Some(group), _) => Thing::Folder(group),
+            (None, Some(_)) => {
+                let (ecosystem, name) = view::component_name(&r.about_text);
+                Thing::Package(ecosystem, name, &l.releases_text)
+            }
+            (None, None) => return None,
+        };
+        Some(Key {
+            rule: r.rule.as_deref(),
+            thing,
+            state: r.state,
+            severity: r.severity,
+            confidence: r.confidence,
+            urgent: r.urgent,
+            answer: (l.answer.as_ref())
+                .filter(|_| !self.item.open)
+                .map(|a| (a.given, a.via, a.until_at)),
+        })
+    }
+
+    /// The findings drawn on lines of their own: the item and the others with its key.
+    fn members(&self) -> Vec<Listed<'a>> {
+        std::iter::once(self.item)
+            .chain(self.siblings.iter().copied())
+            .collect()
+    }
 }
 
 impl FindingRow<'_> {
@@ -126,21 +193,19 @@ fn finding_rows<'a>(
                 .collect(),
             siblings: Vec::new(),
         });
-    // A row of a group in the same state as the first row of that group goes into the first's
-    // row, so the answer its summary shows is every member's. A row with anything under it or
-    // with the response layer's word is never folded nor folded into, so every finding stays in
-    // exactly one row.
-    fn key<'b>(r: &FindingRow<'b>) -> Option<(&'b str, i32)> {
-        let alone = r.under.is_empty() && verdict_word(r.item.l).is_none();
-        Some((r.item.l.group.as_deref().filter(|_| alone)?, r.item.r.state))
-    }
+    // A row with the key of an earlier row goes into it, at the earlier row's place; a row with
+    // no key goes into none, so every finding stays in exactly one row.
     let mut out: Vec<FindingRow> = Vec::new();
+    let mut at: std::collections::HashMap<Key, usize> = Default::default();
     for row in rows {
-        match out
-            .iter_mut()
-            .find(|o| key(&row).is_some() && key(o) == key(&row))
-        {
-            Some(first) => first.siblings.push(row.item),
+        match row.key() {
+            Some(key) => match at.get(&key) {
+                Some(&n) => out[n].siblings.push(row.item),
+                None => {
+                    at.insert(key, out.len());
+                    out.push(row);
+                }
+            },
             None => out.push(row),
         }
     }
@@ -193,21 +258,18 @@ pub(super) fn table(out: &mut String, a: &Answers, now: i64) -> Result<(), Box<d
     // The open rows drawn, the urgent first, and the answered, each cut at `ITEMS_SHOWN`.
     let open_cut = now_rows.len().min(ITEMS_SHOWN);
     let look_cut = look.len().min(ITEMS_SHOWN - open_cut);
-    if !rows.is_empty() {
-        out.push_str("<div class=\"fh open answered\" aria-hidden=\"true\"><span>Thing</span><span>What happened</span><span>Response layer</span><span class=\"fs\">Seen</span><span></span></div>\n");
-        for (group, class, rows) in [
-            // The one place on the page in the colour of what needs the person now.
-            ("Needs you now", "open now", &now_rows[..open_cut]),
-            ("To look at", "open", &look[..look_cut]),
-            ("Answered", "answered", &done[..done.len().min(ITEMS_SHOWN)]),
-        ] {
-            if rows.is_empty() {
-                continue;
-            }
-            writeln!(out, "<p class=\"fg {class}\">{group}</p>")?;
-            for row in rows {
-                finding_row(out, a, row, now)?;
-            }
+    for (group, class, rows) in [
+        // The one place on the page in the colour of what needs the person now.
+        ("Needs you now", "open now", &now_rows[..open_cut]),
+        ("To look at", "open", &look[..look_cut]),
+        ("Answered", "answered", &done[..done.len().min(ITEMS_SHOWN)]),
+    ] {
+        if rows.is_empty() {
+            continue;
+        }
+        writeln!(out, "<p class=\"fg {class}\">{group}</p>")?;
+        for row in rows {
+            finding_row(out, a, row, now)?;
         }
     }
     // What is not drawn, in findings as the tabs count them.
@@ -271,9 +333,14 @@ fn thing_of(l: &v1::ListedFinding, f: Option<&v1::Finding>) -> String {
             if let Some(package) = &p.package_text {
                 let releases: Vec<String> =
                     p.releases.iter().map(|r| name(&r.version_text)).collect();
-                return format!("{} {}", name(package), releases.join(", "))
-                    .trim_end()
-                    .to_string();
+                return match releases.is_empty() {
+                    true => name(package),
+                    false => format!(
+                        "{} <span class=\"v\">{}</span>",
+                        name(package),
+                        releases.join(", ")
+                    ),
+                };
             }
             &[]
         }
@@ -299,9 +366,10 @@ fn thing_of(l: &v1::ListedFinding, f: Option<&v1::Finding>) -> String {
     )
 }
 
-/// One row, one thing: the thing as data, its kind and what happened, the response layer's word
-/// as plain text, and when it was last seen. It opens to the facts and voices of each finding in
-/// it, each with the command that answers it.
+/// One row, one thing: the thing as data; what happened to it, with the response layer's word and
+/// the answer under it; in how many places it is; and when it was last seen. A row of one finding
+/// opens to its facts and voices and the command that reads it. A row of several opens to what
+/// every one of them says alike, said once, then each finding on a line of its own (`group_body`).
 fn finding_row(
     out: &mut String,
     a: &Answers,
@@ -309,22 +377,36 @@ fn finding_row(
     now: i64,
 ) -> Result<(), Box<dyn Error>> {
     let i = row.item;
-    let whole = (a.finding)(&i.r.id)?;
-    // The kind in the words a person reads, the same as the app's, and what happened to a place.
-    let mut kind = i.l.kind_title.clone();
-    if let Some(change) = i.l.change {
-        kind.push_str(" · ");
-        kind.push_str(crate::finding_text::change_said(change));
-    }
-    // A group's row is its folder, with how many findings it holds.
-    let members: Vec<Listed> = std::iter::once(i).chain(row.siblings.clone()).collect();
-    let folder = i.l.folder_text.as_deref().filter(|_| members.len() > 1);
-    if folder.is_some() {
-        kind.push_str(&format!(
-            " · {}",
-            counted(members.len() as i64, "finding", "findings")
-        ));
-    }
+    let members = row.members();
+    let wholes = (members.iter())
+        .map(|m| (a.finding)(&m.r.id))
+        .collect::<Result<Vec<_>, _>>()?;
+    // What happened, in the words a person reads: the kind and the change for a place that
+    // changed, the same as the app's; else the rule's short title.
+    let kind = match i.l.change {
+        Some(change) => format!(
+            "{} · {}",
+            i.l.kind_title,
+            crate::finding_text::change_said(change)
+        ),
+        None if !i.l.short_title.is_empty() => i.l.short_title.clone(),
+        None => i.l.kind_title.clone(),
+    };
+    // In how many places: projects for a package, files for a folder that holds several.
+    let n = members.len() as i64;
+    let places = match (&i.l.package_text, &i.l.folder_text) {
+        (Some(_), _) => counted(n, "project", "projects"),
+        (None, Some(_)) if n > 1 => counted(n, "file", "files"),
+        _ => String::new(),
+    };
+    // A row of several in one folder is the folder.
+    let thing = match i.l.folder_text.as_deref().filter(|_| n > 1) {
+        Some(folder) => Name::given(folder).html(),
+        None => thing_of(i.l, wholes[0].as_ref()),
+    };
+    let verdict = verdict_word(i.l).map_or(String::new(), |w| {
+        format!("<span class=\"fv\"><span class=\"src\">Response layer: </span>{w}</span>")
+    });
     let answer = i.l.answer.as_ref().filter(|_| !i.open).map(|a| {
         let said = match a.until_at {
             Some(u) => format!("expected until {}", view::when(u, now)),
@@ -335,9 +417,10 @@ fn finding_row(
             esc(crate::finding_text::given_by(a.via))
         )
     });
+    let last = (members.iter().map(|m| m.l.last_seen_at).max()).unwrap_or(i.l.last_seen_at);
     writeln!(
         out,
-        "<details class=\"fr{}{}{}{}\" id=\"{}\">\n<summary><span class=\"fw\">{}</span><span class=\"fk\">{}{}</span><span class=\"fv\">{}</span><span class=\"fs\">{}</span><span class=\"fch\" aria-hidden=\"true\"></span></summary>\n<div class=\"fx\">",
+        "<details class=\"fr{}{}{}{}\" id=\"{}\">\n<summary><span class=\"fw\">{thing}</span><span class=\"fk\">{}{verdict}{}</span><span class=\"fc\">{places}</span><span class=\"fs\">{}</span><span class=\"fch\" aria-hidden=\"true\"></span></summary>\n<div class=\"fx\">",
         if row.open() { " open" } else { "" },
         if row.answered() { " answered" } else { "" },
         if row.urgent() { " urgent" } else { "" },
@@ -348,31 +431,13 @@ fn finding_row(
             _ => "",
         },
         i.anchor(),
-        folder.map_or_else(|| thing_of(i.l, whole.as_ref()), |f| Name::given(f).html()),
         esc(&kind),
         answer.unwrap_or_default(),
-        verdict_word(i.l).map_or("<span class=\"none\">—</span>".to_string(), |w| format!(
-            "<span class=\"src\">Response layer: </span>{w}"
-        )),
-        view::when(i.l.last_seen_at, now),
+        view::when(last, now),
     )?;
-    if folder.is_none() {
-        finding_body(out, i, whole.as_ref(), now)?;
-    }
-    // Each finding of a group under its own thing, the first by the row's own id.
-    for (k, m) in members.iter().enumerate().filter(|_| folder.is_some()) {
-        let anchor = match k {
-            0 => String::new(),
-            _ => format!(" id=\"{}\"", m.anchor()),
-        };
-        let whole = (a.finding)(&m.r.id)?;
-        writeln!(
-            out,
-            "<div class=\"also\"{anchor}>\n<p class=\"wsh2\">{}</p>",
-            thing_of(m.l, whole.as_ref())
-        )?;
-        finding_body(out, *m, whole.as_ref(), now)?;
-        out.push_str("</div>\n");
+    match members.len() {
+        1 => finding_body(out, i, wholes[0].as_ref(), now)?,
+        _ => group_body(out, &members, &wholes, now)?,
     }
     for c in &row.under {
         writeln!(
@@ -388,17 +453,14 @@ fn finding_row(
     Ok(())
 }
 
-/// What one finding says in an opened row: on the left its facts, where first, then the evidence
-/// as `immunity finding <id>` gives it; on the right who said what, each voice named: the rule's
-/// authors, the response layer, the person's answer, Immunity Core's own words, and what to do. Under
-/// them, when it was seen and the command an agent reads it with.
-fn finding_body(
-    out: &mut String,
-    i: Listed,
-    f: Option<&v1::Finding>,
-    now: i64,
-) -> Result<(), Box<dyn Error>> {
-    let mut facts: Vec<(&str, String)> = vec![("Where", named(&i.l.where_text))];
+/// A fact of an opened row: its term and its value, already safe.
+type Fact = (&'static str, String);
+
+/// What one finding says, but for where it is: its facts, the evidence as `immunity finding <id>`
+/// gives it, then who said what, each voice named: the rule's authors, the response layer, the
+/// person's answer, Immunity Core's own words, and what to do.
+fn said(i: Listed, f: Option<&v1::Finding>, now: i64) -> (Vec<Fact>, Vec<Voice>) {
+    let mut facts: Vec<Fact> = Vec::new();
     // A finding of a rule this build does not have names the rule as the store keeps it: the
     // one thing beside where it is that says what found it.
     if i.l.kind == crate::findings::KEPT_KIND {
@@ -416,9 +478,9 @@ fn finding_body(
     if let Some(t) = f.and_then(|f| f.technique_text.as_deref()) {
         facts.push(("ATT&amp;CK", named(t)));
     }
-    out.push_str("<div>");
-    dl(out, &facts);
-    out.push_str("</div>\n<div><p class=\"wsh2\">Who said what</p><div class=\"voices\">");
+    // A release declared where the finding is, is said once, as where it is.
+    let here = named(&i.l.where_text);
+    facts.retain(|(k, v)| !(*k == "Declared at" && *v == here));
     voices.push(Voice {
         name: "Immunity Core".to_string(),
         said: esc(f.map_or(&i.l.title, |f| &f.title)),
@@ -434,7 +496,133 @@ fn finding_body(
         detail: String::new(),
         quote: None,
     });
-    for v in &voices {
+    (facts, voices)
+}
+
+/// What one finding says in an opened row: on the left where it is, then its facts; on the right
+/// who said what. Under them, when it was seen and the command an agent reads it with.
+fn finding_body(
+    out: &mut String,
+    i: Listed,
+    f: Option<&v1::Finding>,
+    now: i64,
+) -> Result<(), Box<dyn Error>> {
+    let (mut facts, voices) = said(i, f, now);
+    facts.insert(0, ("Where", named(&i.l.where_text)));
+    out.push_str("<div>");
+    dl(out, &facts);
+    out.push_str("</div>\n<div><p class=\"wsh2\">Who said what</p>");
+    voices_of(out, voices.iter())?;
+    out.push_str("</div>\n");
+    writeln!(
+        out,
+        "<div class=\"fxb\"><span>{}</span><span>For your agent {}</span></div>",
+        seen(i.l.first_seen_at, i.l.last_seen_at, now),
+        command(&i.r.id)
+    )?;
+    Ok(())
+}
+
+/// What the findings of a row of several say. What every one of them says alike, once: its facts
+/// on the left, its voices on the right. Then each finding on a line of its own, every one, in the
+/// row's order: where it is, the command that reads it by its id, and what it says that the others
+/// do not, its answer through an agent or its time to expect among them. Under them, when the
+/// first was first seen and the last last seen.
+fn group_body(
+    out: &mut String,
+    members: &[Listed],
+    wholes: &[Option<v1::Finding>],
+    now: i64,
+) -> Result<(), Box<dyn Error>> {
+    let all: Vec<(Vec<Fact>, Vec<Voice>)> = (members.iter().zip(wholes))
+        .map(|(m, f)| said(*m, f.as_ref(), now))
+        .collect();
+    let facts: Vec<&Fact> = (all[0].0.iter())
+        .filter(|f| all.iter().all(|(of, _)| of.contains(f)))
+        .collect();
+    let voices: Vec<&Voice> = (all[0].1.iter())
+        .filter(|v| all.iter().all(|(_, of)| of.contains(v)))
+        .collect();
+    out.push_str("<div>");
+    dl(out, facts.iter().copied());
+    out.push_str("</div>\n<div><p class=\"wsh2\">Who said what</p>");
+    voices_of(out, voices.iter().copied())?;
+    out.push_str("</div>\n");
+    let (one, many) = match members[0].l.package_text {
+        Some(_) => ("project", "projects"),
+        None => ("file", "files"),
+    };
+    writeln!(
+        out,
+        "<div class=\"in\"><p class=\"wsh2\">In {}, one finding each</p>\n<ul>",
+        counted(members.len() as i64, one, many)
+    )?;
+    for (k, (m, (own_facts, own_voices))) in members.iter().zip(&all).enumerate() {
+        // The first is the row's own, by the row's id.
+        let id = match k {
+            0 => String::new(),
+            _ => format!(" id=\"{}\"", m.anchor()),
+        };
+        let place = Some(m.l.where_text.as_str())
+            .filter(|w| !w.is_empty())
+            .unwrap_or(&m.r.about_text);
+        write!(
+            out,
+            "<li{id}><span class=\"p\">{}</span>{}",
+            Name::given(place).html(),
+            command(&m.r.id)
+        )?;
+        let own_facts: Vec<&Fact> = (own_facts.iter()).filter(|f| !facts.contains(f)).collect();
+        let own_voices: Vec<&Voice> = (own_voices.iter())
+            .filter(|v| !voices.contains(v))
+            .collect();
+        if !own_facts.is_empty() || !own_voices.is_empty() {
+            out.push_str("<div class=\"own\">");
+            dl(out, own_facts.iter().copied());
+            if !own_voices.is_empty() {
+                voices_of(out, own_voices.iter().copied())?;
+            }
+            out.push_str("</div>");
+        }
+        out.push_str("</li>\n");
+    }
+    out.push_str("</ul></div>\n");
+    let first = members.iter().map(|m| m.l.first_seen_at).min();
+    let last = members.iter().map(|m| m.l.last_seen_at).max();
+    writeln!(
+        out,
+        "<div class=\"fxb\"><span>{}</span></div>",
+        seen(first.unwrap_or_default(), last.unwrap_or_default(), now)
+    )?;
+    Ok(())
+}
+
+/// When a finding, or the findings of a row, were seen: the first and the last time, or the one.
+fn seen(first: i64, last: i64, now: i64) -> String {
+    match first != last {
+        true => format!(
+            "First seen {} · last seen {}",
+            view::when(first, now),
+            view::when(last, now)
+        ),
+        false => format!("Seen {}", view::when(last, now)),
+    }
+}
+
+/// The command an agent reads a finding with, escaped, and the fixed copy button after it, the
+/// two never wrapped apart.
+fn command(id: &str) -> String {
+    format!(
+        "<span class=\"cmd\"><span class=\"mono\">{}</span>{COPY}</span>",
+        esc(&format!("immunity finding {id} --json"))
+    )
+}
+
+/// Voices as "Who said what" draws them: each its name, what it said, a quieter line, and a
+/// quote of its own words when it has one.
+fn voices_of<'v>(out: &mut String, voices: impl Iterator<Item = &'v Voice>) -> std::fmt::Result {
+    out.push_str("<div class=\"voices\">");
+    for v in voices {
         write!(
             out,
             "<div class=\"voice\"><div class=\"vn\">{}</div><div class=\"vs\">{}</div>",
@@ -452,27 +640,14 @@ fn finding_body(
         }
         out.push_str("</div>");
     }
-    out.push_str("</div></div>\n");
-    let (first, last) = (i.l.first_seen_at, i.l.last_seen_at);
-    let seen = match first != last {
-        true => format!(
-            "First seen {} · last seen {}",
-            view::when(first, now),
-            view::when(last, now)
-        ),
-        false => format!("Seen {}", view::when(last, now)),
-    };
-    let command = format!("immunity finding {} --json", i.r.id);
-    writeln!(
-        out,
-        "<div class=\"fxb\"><span>{seen}</span><span>For your agent <span class=\"cmd\"><span class=\"mono\">{}</span>{COPY}</span></span></div>",
-        esc(&command)
-    )?;
+    out.push_str("</div>");
     Ok(())
 }
 
 /// One voice of "Who said what": who, what they said and a quieter line, all safe HTML, and a
-/// quote of their own words, cut as the message gives it, printed when it is written.
+/// quote of their own words, cut as the message gives it, printed when it is written. Two voices
+/// are alike when every part is (`group_body`).
+#[derive(PartialEq)]
 struct Voice {
     name: String,
     said: String,
@@ -547,8 +722,9 @@ fn event_facts(e: &v1::Event, now: i64) -> Vec<(&'static str, String)> {
 }
 
 /// Facts as a list of terms and values; each value is already safe.
-fn dl(out: &mut String, facts: &[(&str, String)]) {
-    if facts.is_empty() {
+fn dl<'f>(out: &mut String, facts: impl IntoIterator<Item = &'f Fact>) {
+    let mut facts = facts.into_iter().peekable();
+    if facts.peek().is_none() {
         return;
     }
     out.push_str("<dl class=\"facts\">");
@@ -924,6 +1100,12 @@ mod tests {
         all.push(listed("core", "sigma:x", "thing", open));
         all.push(listed("own", crate::verdict::RULE, "thing", open));
         all.push(listed("self", crate::verdict::RULE, "self", open));
+        // Two findings in one row past the cut, each counted.
+        for (id, project) in [("one", "dev/one"), ("two", "dev/two")] {
+            let mut f = package(id, project);
+            f.finding.as_mut().unwrap().urgent = false;
+            all.push(f);
+        }
         let about = |rule: &str| v1::Finding {
             evidence: Some(v1::Evidence {
                 body: Some(v1::evidence::Body::VerdictGiven(v1::VerdictGiven {
@@ -949,9 +1131,9 @@ mod tests {
         };
         let mut out = String::new();
         table(&mut out, &answers, 0).unwrap();
-        let tab = format!("Open <span class=\"tn\">{}</span>", ITEMS_SHOWN + 3);
+        let tab = format!("Open <span class=\"tn\">{}</span>", ITEMS_SHOWN + 5);
         assert!(out.contains(&tab), "{out}");
-        assert!(out.contains(">3 more, the mildest;"), "{out}");
+        assert!(out.contains(">5 more, the mildest;"), "{out}");
     }
 
     #[test]
@@ -1080,5 +1262,252 @@ mod tests {
         };
         assert_eq!(raised(crate::events::EVIDENCE), None);
         assert_eq!(raised(crate::events::EVIDENCE + 1), Some(0));
+    }
+
+    /// An open finding of a malicious package in a project, as the list gives it.
+    fn package(id: &str, project: &str) -> v1::ListedFinding {
+        v1::ListedFinding {
+            finding: Some(v1::FindingRef {
+                id: id.to_string(),
+                rule: Some("osv.malicious".to_string()),
+                about_text: format!("component:machine:mac/{project}/npm/left-pad"),
+                state: v1::FindingState::Open as i32,
+                severity: Some(v1::Level::Critical as i32),
+                confidence: Some(v1::Level::High as i32),
+                urgent: true,
+            }),
+            short_title: "Malicious package in a project".to_string(),
+            package_text: Some("left-pad".to_string()),
+            releases_text: vec!["1.0.0".to_string()],
+            where_text: format!("~/{project}/package-lock.json"),
+            first_seen_at: 1,
+            last_seen_at: 1,
+            ..Default::default()
+        }
+    }
+
+    /// The table of these findings, each read whole as `wholes` gives it by id.
+    fn drawn_with(all: Vec<v1::ListedFinding>, wholes: Vec<(String, v1::Finding)>) -> String {
+        let answers = Answers {
+            findings: v1::Findings {
+                findings: all,
+                ..Default::default()
+            },
+            finding: Box::new(move |id| {
+                Ok((wholes.iter())
+                    .find(|(of, _)| of == id)
+                    .map(|(_, f)| f.clone()))
+            }),
+            ..Answers::none()
+        };
+        let mut out = String::new();
+        table(&mut out, &answers, 0).unwrap();
+        out
+    }
+
+    /// The ids in each row the page draws: the row's own, then every one inside it.
+    fn rows(page: &str) -> Vec<Vec<String>> {
+        (page.split("<details class=\"fr").skip(1))
+            .map(|r| {
+                let r = &r[..r.find("</details>").unwrap()];
+                (r.split(" id=\"").skip(1))
+                    .map(|s| {
+                        let id = &s[..s.find('"').unwrap()];
+                        id.strip_prefix("answered-").unwrap_or(id).to_string()
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_row_of_several_draws_every_finding_by_its_own_id_with_no_cap_and_the_tabs_count_findings()
+    {
+        // Three hundred projects with the same package and release: one row, which says in how
+        // many projects it is, and holds each finding on its own line with the command that
+        // answers it. The tab counts findings, never rows.
+        let n = 300;
+        let mut all: Vec<v1::ListedFinding> = (0..n)
+            .map(|k| package(&format!("f{k}"), &format!("dev/p{k}")))
+            .collect();
+        all.push(package("other", "dev/p0"));
+        all[n].releases_text = vec!["2.0.0".to_string()];
+        let page = drawn_with(all, Vec::new());
+        assert!(
+            page.contains(&format!("Open <span class=\"tn\">{}</span>", n + 1)),
+            "{page}"
+        );
+        let rows = rows(&page);
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        let ids: Vec<String> = (0..n).map(|k| format!("f{k}")).collect();
+        assert_eq!(rows[0], ids);
+        assert!(
+            page.contains("<span class=\"fc\">300 projects</span>"),
+            "{page}"
+        );
+        for id in ids.iter().chain(["other".to_string()].iter()) {
+            let command = format!("immunity finding {id} --json</span>");
+            assert_eq!(page.matches(&command).count(), 1, "{id}");
+        }
+    }
+
+    #[test]
+    fn findings_of_another_rule_thing_release_level_state_or_answer_are_never_drawn_in_one_row() {
+        // Beside two findings that share every part of the key, each of the others differs from
+        // them in one part alone, and so is a row of its own; one with the response layer's word
+        // is never joined either.
+        let base = || package("a", "dev/one");
+        let mut twin = package("b", "dev/two");
+        (twin.first_seen_at, twin.last_seen_at) = (5, 9);
+        let mut variants: Vec<v1::ListedFinding> = Vec::new();
+        let mut vary = |id: &str, change: &dyn Fn(&mut v1::ListedFinding)| {
+            let mut f = base();
+            let r = f.finding.as_mut().unwrap();
+            r.id = id.to_string();
+            r.about_text = format!("component:machine:mac/dev/{id}/npm/left-pad");
+            change(&mut f);
+            variants.push(f);
+        };
+        fn r(f: &mut v1::ListedFinding) -> &mut v1::FindingRef {
+            f.finding.as_mut().unwrap()
+        }
+        vary("rule", &|f| r(f).rule = Some("osv.exploited".to_string()));
+        vary("name", &|f| {
+            r(f).about_text = "component:machine:mac/dev/name/npm/left-pads".to_string()
+        });
+        vary("ecosystem", &|f| {
+            r(f).about_text = "component:machine:mac/dev/ecosystem/PyPI/left-pad".to_string()
+        });
+        vary("release", &|f| f.releases_text = vec!["1.0.1".to_string()]);
+        vary("severity", &|f| {
+            r(f).severity = Some(v1::Level::High as i32)
+        });
+        vary("confidence", &|f| {
+            r(f).confidence = Some(v1::Level::Medium as i32)
+        });
+        vary("urgent", &|f| r(f).urgent = false);
+        vary("verdict", &|f| {
+            f.verdicts = Some(v1::Verdicts {
+                total: 1,
+                ..Default::default()
+            })
+        });
+        // Two answered alike but for one part of the answer: which, how it came, until when.
+        let answered = |f: &mut v1::ListedFinding, given, via, until_at| {
+            r(f).state = v1::FindingState::Expected as i32;
+            f.answer = Some(v1::Answer {
+                given,
+                via,
+                until_at,
+                in_force: true,
+                ..Default::default()
+            });
+        };
+        let (expected, agent) = (v1::AnswerKind::Expected as i32, v1::Via::Agent as i32);
+        vary("answered", &|f| answered(f, expected, agent, Some(5)));
+        vary("given", &|f| {
+            answered(f, v1::AnswerKind::Seen as i32, agent, Some(5))
+        });
+        vary("via", &|f| {
+            answered(f, expected, v1::Via::App as i32, Some(5))
+        });
+        vary("until", &|f| answered(f, expected, agent, Some(6)));
+        vary("state", &|f| {
+            answered(f, expected, agent, Some(5));
+            r(f).state = v1::FindingState::Seen as i32;
+        });
+        let alone: Vec<String> = variants
+            .iter()
+            .map(|f| f.finding.as_ref().unwrap().id.clone())
+            .collect();
+        let page = drawn_with([vec![base(), twin], variants].concat(), Vec::new());
+        let rows = rows(&page);
+        assert!(
+            rows.contains(&vec!["a".to_string(), "b".to_string()]),
+            "{rows:?}"
+        );
+        for id in alone {
+            assert!(rows.contains(&vec![id.clone()]), "{id}: {rows:?}");
+        }
+        // The row says the latest time any finding in it was seen, and opened, the first too.
+        let at = |s: i64| format!("<time datetime=\"1970-01-01T00:00:0{s}Z\"");
+        assert!(
+            page.contains(&format!("<span class=\"fs\">{}", at(9))),
+            "{page}"
+        );
+        assert!(page.contains(&format!("First seen {}", at(1))), "{page}");
+        assert!(page.contains(&format!(" · last seen {}", at(9))), "{page}");
+    }
+
+    #[test]
+    fn an_answer_through_an_agent_in_a_row_of_several_stands_on_its_finding_s_line_with_its_reason()
+    {
+        // Two findings answered alike through an agent, each with its own reason: the row says
+        // the answer once, and each line says who gave it and why, so neither is quieted out of
+        // sight. What both say alike (the package, the record) is said once for the row, and what
+        // one source said of one finding only on its line.
+        let answer = |reason: &str| v1::Answer {
+            given: v1::AnswerKind::Expected as i32,
+            via: v1::Via::Agent as i32,
+            until_at: Some(86_400),
+            reason_text: Some(reason.to_string()),
+            in_force: true,
+            ..Default::default()
+        };
+        let listed = |id: &str, project: &str, reason: &str| {
+            let mut f = package(id, project);
+            f.finding.as_mut().unwrap().state = v1::FindingState::Expected as i32;
+            f.answer = Some(answer(reason));
+            f
+        };
+        let whole = |reason: &str| v1::Finding {
+            title: "Invented title".to_string(),
+            value_text: Some(format!("said {reason}")),
+            answer: Some(answer(reason)),
+            evidence: Some(v1::Evidence {
+                body: Some(v1::evidence::Body::VulnerablePackage(
+                    v1::VulnerablePackage {
+                        package_text: Some("left-pad".to_string()),
+                        ..Default::default()
+                    },
+                )),
+            }),
+            ..Default::default()
+        };
+        let page = drawn_with(
+            vec![
+                listed("a", "dev/one", "invented: first"),
+                listed("b", "dev/two", "invented: second"),
+            ],
+            vec![
+                ("a".to_string(), whole("invented: first")),
+                ("b".to_string(), whole("invented: second")),
+            ],
+        );
+        assert_eq!(rows(&page), [["a", "b"]], "{page}");
+        assert_eq!(
+            page.matches("<span class=\"ans\">Answered: expected until ")
+                .count(),
+            1
+        );
+        let lines: Vec<&str> = page.split("<li").skip(1).collect();
+        assert_eq!(lines.len(), 2, "{page}");
+        for (line, reason) in lines.iter().zip(["invented: first", "invented: second"]) {
+            assert!(
+                line.contains("<div class=\"vn\">Your agent</div>") && line.contains(reason),
+                "{line}"
+            );
+            assert!(
+                !line.contains("<dt>Package</dt>") && !line.contains("Immunity Core"),
+                "{line}"
+            );
+            assert!(line.contains(&format!("said {reason}")), "{line}");
+        }
+        let shared = &page[..page.find("<div class=\"in\">").unwrap()];
+        assert_eq!(shared.matches("<dt>Package</dt>").count(), 1, "{page}");
+        assert!(
+            !shared.contains("Your agent") && !shared.contains("said invented"),
+            "{shared}"
+        );
     }
 }

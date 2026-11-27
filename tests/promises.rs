@@ -1111,7 +1111,13 @@ fn time_of_a_server_reading_is_taken_at_from_the_file_not_its_time_on_disk() {
     assert_eq!(times("coverage"), expected);
     assert_eq!(times("assertion"), expected);
     let web = machine_block(&view(&store), "web-1");
-    assert!(web.contains("· read 2026-01-02 03:04 UTC"), "{web}");
+    assert!(
+        web.contains(&format!(
+            "· read {}",
+            time_at("2026-01-02T03:04:05Z", "2026-01-02 03:04")
+        )),
+        "{web}"
+    );
 }
 
 #[test]
@@ -3500,7 +3506,10 @@ fn each_tailscale_state_is_told_as_what_it_is_with_the_date_the_tailnet_was_last
         let s = section(&page, id);
         assert!(
             s.contains("Tailscale is switched off on this Mac")
-                && s.contains(&format!("last read in full {}", &iso_utc(read_at)[..10]))
+                && s.contains(&format!(
+                    "last read in full <time datetime=\"{}T",
+                    &iso_utc(read_at)[..10]
+                ))
                 && !s.contains("None seen")
                 && !s.contains("None known"),
             "{s}"
@@ -3622,17 +3631,21 @@ fn canary_mac(tag: &str) -> (Dir, PathBuf, PathBuf) {
     let dir = Dir::new(tag);
     let mac = dir.0.join(CANARY);
     let home = mac.join("home");
+    // Two projects with the same malicious package: one row of the summary and one record of the
+    // vulnerabilities page hold both, so the markup of a row of several is read too.
     let project = checkout(&home, &format!("dev/{CANARY}"));
+    let second = checkout(&home, &format!("dev/{CANARY} 2"));
     let lock = r#"{"name": "shop", "lockfileVersion": 3, "packages": {"": {"name": "shop"},
         "node_modules/cxp-jquery": {"version": "0.0.1-security"}}}"#;
     put(&project, "package-lock.json", lock);
+    put(&second, "package-lock.json", lock);
     osv_npm(&home, &["MAL-2021-1"]);
     std::fs::create_dir_all(home.join(".gemini/tmp")).unwrap();
     let agents = format!("Library/LaunchAgents/{CANARY}");
     let changed = put(&home, &format!("{agents}.plist"), "not a property list\n");
     let closed = put(&home, &format!("{agents} closed.plist"), "invented\n");
     let sessions = mac.join("sessions");
-    session(&sessions, "s1", &[&project]);
+    session(&sessions, "s1", &[&project, &second]);
     let (absent, store) = (dir.0.join("absent"), dir.store());
     let run = |brew: Option<&Path>, tailscale: &Path| {
         let mut cmd = immunity_run(&home, &store);
@@ -3674,7 +3687,7 @@ fn text_from_the_mac_reaches_the_contracts_json_only_in_fields_named_for_it() {
         ("vulnerabilities", contract(&["vulnerabilities"])),
         ("vulnerability", contract(&["vulnerability", "MAL-2021-1"])),
     ];
-    assert_eq!(answers[1].1["affected"]["total"], 1, "{:#}", answers[1].1);
+    assert_eq!(answers[1].1["affected"]["total"], 2, "{:#}", answers[1].1);
     // The marker is there to be found: the lost places and the project are named.
     assert!(
         answers[0].1.to_string().contains(CANARY_WORD),
@@ -3822,8 +3835,15 @@ fn text_from_the_mac_on_every_page_stands_only_in_an_element_of_its_own_or_an_at
         .arg(&store));
     let mut found = Vec::new();
     let mut marked = 0;
+    let mut of_two = 0;
     for path in out.lines() {
         let page = std::fs::read_to_string(path).unwrap();
+        // A row of several is among what is read: the summary's row of the two projects, with
+        // each one's line, and the row of their one record on the vulnerabilities page.
+        of_two += usize::from(
+            page.contains("<span class=\"fc\">2 projects</span>")
+                && page.contains("<div class=\"in\">"),
+        );
         assert!(!page.contains('\u{202e}'), "{path}");
         assert!(!page.contains("\n(os error 13)"), "{path}");
         marked += usize::from(page.contains(CANARY_WORD));
@@ -3836,6 +3856,7 @@ fn text_from_the_mac_on_every_page_stands_only_in_an_element_of_its_own_or_an_at
     // The marker is there to be found: on the summary, the page of this Mac, the page of known
     // vulnerabilities and the page of what was read.
     assert!(marked >= 4, "{marked}");
+    assert_eq!(of_two, 2);
     assert!(found.is_empty(), "{found:#?}");
 }
 
@@ -5328,13 +5349,16 @@ fn the_page_beyond_this_mac_says_when_the_check_its_lists_rest_on_was_made() {
     .unwrap();
     let page =
         std::fs::read_to_string(store.parent().unwrap().join("view").join("beyond.html")).unwrap();
-    let date = rows(
-        &store,
-        &format!("SELECT strftime('%Y-%m-%d %H:%M', {finished}, 'unixepoch')"),
-    )[0]
-    .clone();
+    let date = |format: &str| {
+        rows(
+            &store,
+            &format!("SELECT strftime('{format}', {finished}, 'unixepoch')"),
+        )[0]
+        .clone()
+    };
+    let (date, iso) = (date("%Y-%m-%d %H:%M"), date("%Y-%m-%dT%H:%M:%SZ"));
     assert!(
-        page.contains(&format!("Last full check {date} UTC")),
+        page.contains(&format!("Last full check {}", time_at(&iso, &date))),
         "{date}: {page}"
     );
 }
@@ -6337,7 +6361,7 @@ fn a_statement_says_who_gave_it_in_the_app_through_an_agent_or_from_the_command_
     // One given through an agent says so where it is listed, without opening it.
     let line = machine_block(retired, "web-1");
     let line = &line[..line.find("</summary>").unwrap()];
-    assert!(line.contains(" UTC, through your agent ·"), "{line}");
+    assert!(line.contains("</time>, through your agent ·"), "{line}");
 }
 
 #[test]
@@ -6655,6 +6679,12 @@ fn the_owners_reason_is_printed_and_shown_escaped_and_kept_as_typed() {
     );
 }
 
+/// A time as the pages write it (`view::when`), up to what it shows: its machine form and its UTC
+/// form in the tooltip. What it shows is the Mac's local time, which a test does not fix.
+fn time_at(iso: &str, utc: &str) -> String {
+    format!("<time datetime=\"{iso}\" title=\"{utc} UTC\">")
+}
+
 /// A machine's block on the page beyond this Mac, or in a part of it, which opens to what was read
 /// on it.
 fn machine_block(page: &str, name: &str) -> String {
@@ -6861,11 +6891,15 @@ fn a_failed_visit_is_reported_with_when_and_why_next_to_the_earlier_reading_whic
 
     let page = view(&h.store());
     let web = machine_block(&page, "web-new");
+    let visited_at = time_at("2026-01-03T04:00:00Z", "2026-01-03 04:00");
+    let read_at = time_at("2026-01-02T03:04:05Z", "2026-01-02 03:04");
     assert!(
         web.contains("<span class=\"badge bad\">could not be opened</span>")
-            && web.contains("· visited 2026-01-03 04:00 UTC · read 2026-01-02 03:04 UTC")
+            && web.contains(&format!("· visited {visited_at}"))
+            && web.contains(&format!("</time> · read {read_at}"))
+            && web.contains(&format!("<p class=\"alert\">The latest visit failed {visited_at}"))
             && web.contains(
-                "<p class=\"alert\">The latest visit failed 2026-01-03 04:00 UTC: <bdi class=\"src\">ssh: connect to host web-new port 22: Operation timed out\\u{202e}</bdi>.</p>"
+                "</time>: <bdi class=\"src\">ssh: connect to host web-new port 22: Operation timed out\\u{202e}</bdi>.</p>"
             )
             && web.contains("<bdi class=\"src\">openssl</bdi>"),
         "{web}"
@@ -6873,9 +6907,10 @@ fn a_failed_visit_is_reported_with_when_and_why_next_to_the_earlier_reading_whic
     let db = machine_block(&page, "db-1");
     assert!(
         db.contains("· nothing read")
-            && db.contains(
-                "<p class=\"alert\">The latest visit failed 2026-01-03 04:00 UTC: <bdi class=\"src\">Permission denied (publickey)</bdi>.</p>"
-            ),
+            && db.contains(&format!(
+                "<p class=\"alert\">The latest visit failed {visited_at}"
+            ))
+            && db.contains("</time>: <bdi class=\"src\">Permission denied (publickey)</bdi>.</p>"),
         "{db}"
     );
 
@@ -7011,7 +7046,8 @@ exit 255",
     );
     assert!(server_row(&printed, "db-1").contains(said), "{printed}");
     assert!(
-        machine_block(&page, "db-1").contains("The latest visit failed 2026-01-03 04:00 UTC: <bdi class=\"src\">Host key verification failed</bdi>. Connect to this server once by hand and check its host key: the sweep never accepts a key for you."),
+        machine_block(&page, "db-1").contains(&format!("The latest visit failed {}", time_at("2026-01-03T04:00:00Z", "2026-01-03 04:00")))
+            && machine_block(&page, "db-1").contains("</time>: <bdi class=\"src\">Host key verification failed</bdi>. Connect to this server once by hand and check its host key: the sweep never accepts a key for you."),
         "{page}"
     );
     let script = std::fs::read_to_string(sweep.join("sweep.sh")).unwrap();
@@ -13753,7 +13789,8 @@ fn the_summary_page_says_what_status_says_with_each_item_in_full_and_no_markup_f
         .1;
     let items = section(this_mac, "startup-items");
     assert!(
-        items.contains("UTC</td><td class=\"nowrap\">2") && !items.contains("not since first seen"),
+        items.contains("</time></td><td class=\"nowrap\"><time datetime=\"")
+            && !items.contains("not since first seen"),
         "{items}"
     );
 

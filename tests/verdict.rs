@@ -1047,7 +1047,8 @@ fn answered_ids(mac: &Mac) -> std::collections::BTreeSet<String> {
         .collect()
 }
 
-/// The findings in each row the page draws, by id: the row's own, then any inside it.
+/// The findings in each row the page draws, by id: the row's own, then every one inside it, each
+/// under its own id.
 fn drawn_rows(page: &str) -> Vec<Vec<String>> {
     let id_of = |s: &str| -> String {
         let id = &s[..s.find('"').unwrap()];
@@ -1062,10 +1063,7 @@ fn drawn_rows(page: &str) -> Vec<Vec<String>> {
         })
         .map(|r| {
             let r = &r[..r.find("</details>").unwrap()];
-            let own = &r[r.find(" id=\"").unwrap() + 5..];
-            std::iter::once(id_of(own))
-                .chain(r.split("<div class=\"also\" id=\"").skip(1).map(&id_of))
-                .collect()
+            r.split(" id=\"").skip(1).map(&id_of).collect()
         })
         .collect()
 }
@@ -5489,19 +5487,16 @@ fn the_page_draws_a_group_as_one_row_of_its_folder_and_counts_each_finding() {
     assert_eq!(answered.len(), 2, "{answered:?}");
     // An answered finding is reached by its answered anchor, as everywhere on the page.
     assert!(
-        page.contains(&format!(
-            "<div class=\"also\" id=\"answered-{}\">",
-            answered[1]
-        )),
+        page.contains(&format!("<li id=\"answered-{}\">", answered[1])),
         "{page}"
     );
     assert!(
-        page.contains("<span class=\"fw\"><bdi class=\"src\">~/dev/shop/.git/hooks</bdi></span><span class=\"fk\">Git hook · added · 2 findings</span>"),
+        page.contains("<span class=\"fw\"><bdi class=\"src\">~/dev/shop/.git/hooks</bdi></span><span class=\"fk\">Git hook · added</span><span class=\"fc\">2 files</span>"),
         "{page}"
     );
     // The folder is data, escaped as every name is.
     assert!(
-        page.contains("<span class=\"fw\"><bdi class=\"src\">~/dev/&lt;i&gt;odd&lt;/i&gt;/.git/hooks</bdi></span><span class=\"fk\">Git hook · changed · 2 findings</span>"),
+        page.contains("<span class=\"fw\"><bdi class=\"src\">~/dev/&lt;i&gt;odd&lt;/i&gt;/.git/hooks</bdi></span><span class=\"fk\">Git hook · changed</span><span class=\"fc\">2 files</span>"),
         "{page}"
     );
     assert!(!page.contains("<i>odd"), "{page}");

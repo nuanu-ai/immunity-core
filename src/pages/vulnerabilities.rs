@@ -11,8 +11,8 @@ use super::{THREAT_DATA_TITLE, anchor, capital, grouped, names, said, top};
 use crate::contract::v1;
 use crate::covered::{self, Found};
 use crate::secrets::{Name, Said};
-use crate::view::{FOOT, Out, counted, esc, utc};
-use std::collections::BTreeMap;
+use crate::view::{FOOT, Out, counted, esc, when};
+use std::collections::HashMap;
 use std::fmt::Write;
 
 /// What the page says first of known vulnerabilities.
@@ -65,12 +65,12 @@ fn gap(v: &v1::Vulnerabilities, t: &v1::VulnerabilityTotals) -> Option<String> {
     })
 }
 
-/// Every known vulnerability in packages the projects use, grouped by project, from the answer of
+/// Every known vulnerability in packages the projects use, a row a record, from the answer of
 /// `immunity vulnerabilities`; the status gives how many projects the store holds.
 pub fn page(v: &v1::Vulnerabilities, r: &v1::Status, now: i64) -> String {
     let mut out = top(
         "Known vulnerabilities in packages your projects use",
-        &format!("This page made {}", utc(now)),
+        &format!("This page made {}", when(now, now)),
     );
     let _ = body(&mut out, v, r);
     out.push_str(FOOT);
@@ -80,7 +80,7 @@ pub fn page(v: &v1::Vulnerabilities, r: &v1::Status, now: i64) -> String {
 fn body(out: &mut String, v: &v1::Vulnerabilities, r: &v1::Status) -> Out {
     writeln!(
         out,
-        "<section id=\"by-project\">\n<h2>Known vulnerabilities by project</h2>\n<p class=\"muted\">{}</p>\n<p class=\"muted\">{}</p>",
+        "<section id=\"by-vulnerability\">\n<h2>By vulnerability</h2>\n<p class=\"muted\">{}</p>\n<p class=\"muted\">{}</p>",
         esc(VULNERABILITIES_SAY),
         esc(&v.declared_note)
     )?;
@@ -116,32 +116,22 @@ fn body(out: &mut String, v: &v1::Vulnerabilities, r: &v1::Status) -> Out {
         writeln!(out, "<p class=\"muted\">{}</p>", esc(&line))?;
     }
     let affected = v.affected.clone().unwrap_or_default();
-    let mut projects: BTreeMap<&str, Vec<&v1::AffectedPackage>> = BTreeMap::new();
+    // One row a record, by its id, in the answer's order, the malicious and those used in
+    // attacks first: every package and project it affects is in its row.
+    let mut records: Vec<Vec<&v1::AffectedPackage>> = Vec::new();
+    let mut at: HashMap<&str, usize> = HashMap::new();
     for a in &affected.items {
-        projects.entry(a.project_text.as_str()).or_default().push(a);
-    }
-    for (project, of) in projects {
-        writeln!(
-            out,
-            "<h3 class=\"mono\">{}</h3>\n<div class=\"scroll\"><table class=\"dense\">",
-            Name::given(project).html()
-        )?;
-        crate::view::thead(out, &["Package", "Label", "Fixed in", "Record"]);
-        for a in of {
-            let record = a.record.clone().unwrap_or_default();
-            let releases: Vec<String> = a.releases.iter().map(|r| r.version_text.clone()).collect();
-            writeln!(
-                out,
-                "<tr><td class=\"mono\">{} {}</td><td>{}</td><td class=\"mono\">{}</td><td class=\"mono\">{} ({})</td></tr>",
-                Name::given(&a.package_text).html(),
-                names(&releases),
-                label_words(&record.label),
-                names(&record.fixed_text),
-                Name::given(&record.id_text).html(),
-                esc(&record.source)
-            )?;
+        let id = a.record.as_ref().map_or("", |r| r.id_text.as_str());
+        match at.get(id) {
+            Some(&n) => records[n].push(a),
+            None => {
+                at.insert(id, records.len());
+                records.push(vec![a]);
+            }
         }
-        out.push_str("</tbody></table></div>\n");
+    }
+    for of in &records {
+        record_row(out, of)?;
     }
     // A list given without `--all` is cut at the contract's length: the total is said.
     let more = affected.total.saturating_sub(affected.items.len() as u64);
@@ -156,6 +146,116 @@ fn body(out: &mut String, v: &v1::Vulnerabilities, r: &v1::Status) -> Out {
     Ok(())
 }
 
+/// One record and everything it affects, as a row that opens in place. Its summary: the packages
+/// and their releases, the record's id and label and what it is fixed in, whether it is used in
+/// attacks, and in how many projects. Opened: the record once, then each package in each project
+/// on a line of its own. Whether it is used in attacks is `PackageRecord.exploited` alone: used
+/// when any of its answers says so, not known when any says nothing, else not listed.
+fn record_row(out: &mut String, of: &[&v1::AffectedPackage]) -> Out {
+    let record = of[0].record.clone().unwrap_or_default();
+    // The packages, each once, with every release of it the record affects.
+    let mut packages: Vec<(&str, Vec<String>)> = Vec::new();
+    for a in of {
+        let n = match packages.iter().position(|(p, _)| *p == a.package_text) {
+            Some(n) => n,
+            None => {
+                packages.push((a.package_text.as_str(), Vec::new()));
+                packages.len() - 1
+            }
+        };
+        for r in &a.releases {
+            if !packages[n].1.contains(&r.version_text) {
+                packages[n].1.push(r.version_text.clone());
+            }
+        }
+    }
+    let thing: Vec<String> = (packages.iter())
+        .map(|(p, versions)| match versions.is_empty() {
+            true => Name::given(p).html(),
+            false => format!(
+                "{} <span class=\"v\">{}</span>",
+                Name::given(p).html(),
+                names(versions)
+            ),
+        })
+        .collect();
+    let exploited: Vec<Option<bool>> = (of.iter())
+        .map(|a| a.record.as_ref().and_then(|r| r.exploited))
+        .collect();
+    // A record used in attacks has its dot and its word in the colour of what needs the person now.
+    let (urgent, used, mark) = if exploited.contains(&Some(true)) {
+        (" urgent", " now", "used in attacks")
+    } else if exploited.contains(&None) {
+        ("", "", "not known if used in attacks")
+    } else {
+        ("", "", "not listed as used in attacks")
+    };
+    // What it is fixed in, said once where every package it affects is fixed in the same.
+    let fixed = (of.iter().map(|a| a.record.as_ref().map(|r| &r.fixed_text)))
+        .all(|f| f == Some(&record.fixed_text))
+        .then_some(&record.fixed_text)
+        .filter(|f| !f.is_empty());
+    let mut projects: Vec<&str> = of.iter().map(|a| a.project_text.as_str()).collect();
+    projects.sort_unstable();
+    projects.dedup();
+    let projects = counted(projects.len() as i64, "project", "projects");
+    writeln!(
+        out,
+        "<details class=\"fr vr{}\"><summary><span class=\"fw\">{}</span><span class=\"fk\"><span class=\"mono\">{}</span> {}{}</span><span class=\"att{used}\">{mark}</span><span class=\"fc\">{projects}</span><span class=\"fch\" aria-hidden=\"true\"></span></summary>\n<div class=\"fx\">",
+        urgent,
+        thing.join(", "),
+        Name::given(&record.id_text).html(),
+        label_words(&record.label),
+        fixed.map_or(String::new(), |f| format!(
+            " <span class=\"t2\">· fixed in <span class=\"mono\">{}</span></span>",
+            names(f)
+        )),
+    )?;
+    out.push_str("<div><dl class=\"facts\">");
+    let mut facts: Vec<(&str, String)> = vec![
+        ("Record", Name::given(&record.id_text).html()),
+        ("Source", esc(&record.source)),
+        ("Label", esc(label_words(&record.label))),
+    ];
+    if !record.aliases_text.is_empty() {
+        facts.insert(1, ("Also known as", names(&record.aliases_text)));
+    }
+    if let Some(f) = fixed {
+        facts.push(("Fixed in", names(f)));
+    }
+    for (k, v) in facts {
+        write!(out, "<dt>{k}</dt><dd>{v}</dd>")?;
+    }
+    out.push_str("</dl></div>\n<div>");
+    if let Some(summary) = &record.summary_text {
+        writeln!(
+            out,
+            "<p class=\"wsh2\">{} said</p><p class=\"said\">{}</p>",
+            esc(&record.source),
+            Said::given(summary).html()
+        )?;
+    }
+    writeln!(
+        out,
+        "</div>\n<div class=\"in\"><p class=\"wsh2\">In {projects}</p>\n<ul>"
+    )?;
+    for a in of {
+        let versions: Vec<String> = a.releases.iter().map(|r| r.version_text.clone()).collect();
+        let own_fix = (a.record.as_ref().map(|r| &r.fixed_text))
+            .filter(|f| fixed.is_none() && !f.is_empty())
+            .map_or(String::new(), |f| format!(" · fixed in {}", names(f)));
+        writeln!(
+            out,
+            "<li><span class=\"p\">{}</span><span class=\"c\">{} {}{own_fix}</span></li>",
+            Name::given(&a.project_text).html(),
+            Name::given(&a.package_text).html(),
+            names(&versions),
+        )?;
+    }
+    out.push_str("</ul></div>\n</div>\n</details>\n");
+    Ok(())
+}
+
 /// What the list of vulnerabilities used in attacks is, why it is short, and what the program
 /// does with it, in words a person without security training follows.
 const CATALOGUE_IS: &str = "A list kept by CISA, a US government agency, of vulnerabilities that attackers are known to have used in real attacks. It is short because most published vulnerabilities are never seen used in one. When a package your projects use has one of them, the program shows it as something that needs a look.";
@@ -166,7 +266,10 @@ const CATALOGUE_IS: &str = "A list kept by CISA, a US government agency, of vuln
 /// holds, when it was read and whether that is current, and what it is compared with here. A
 /// source never read or not current says so, and nothing says it was compared.
 pub fn threat_data(r: &v1::Status, now: i64) -> String {
-    let mut out = top(THREAT_DATA_TITLE, &format!("This page made {}", utc(now)));
+    let mut out = top(
+        THREAT_DATA_TITLE,
+        &format!("This page made {}", when(now, now)),
+    );
     let _ = threats(&mut out, r, now);
     out.push_str(FOOT);
     out
@@ -240,7 +343,7 @@ fn threats(out: &mut String, r: &v1::Status, now: i64) -> Out {
             out,
             "<p class=\"facts\"><strong>{}</strong> on the list · last read {}{}</p>",
             grouped(n as i64),
-            esc(&utc(at)),
+            when(at, now),
             if current { " · current" } else { "" }
         )?,
         _ if failed => out.push_str("<p class=\"quiet\">Never read in full, so which vulnerabilities attackers use is not known here.</p>\n"),
@@ -301,7 +404,7 @@ fn threats(out: &mut String, r: &v1::Status, now: i64) -> Out {
                     "malicious package",
                     "malicious packages"
                 ),
-                esc(&utc(at)),
+                when(at, now),
                 if f.current { " · current" } else { "" }
             )?;
         }
@@ -425,6 +528,87 @@ mod tests {
             !said.contains(&token) && said.contains("a tool answered"),
             "{said}"
         );
+    }
+
+    /// Every record of the answer is one row, with every project and package it affects on a line
+    /// of its own. Whether it is used in attacks is the record's `exploited` alone: used where any
+    /// of its answers says so, not known where any says nothing, not listed only where every one
+    /// says no, whatever its label or its other ids.
+    #[test]
+    fn every_record_is_one_row_with_every_project_it_is_in_and_used_in_attacks_is_its_word_alone() {
+        let item =
+            |project: &str, package: &str, id: &str, exploited, fixed: &str| v1::AffectedPackage {
+                project_text: project.to_string(),
+                ecosystem: "npm".to_string(),
+                package_text: package.to_string(),
+                releases: vec![v1::PackageRelease {
+                    version_text: "1.0.0".to_string(),
+                    ..Default::default()
+                }],
+                record: Some(v1::PackageRecord {
+                    id_text: id.to_string(),
+                    aliases_text: vec!["CVE-2099-0001".to_string()],
+                    label: "high".to_string(),
+                    exploited,
+                    fixed_text: vec![fixed.to_string()],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+        let items = vec![
+            item("~/dev/one", "left-pad", "GHSA-a", Some(true), "2.0.0"),
+            item("~/dev/two", "left-pad", "GHSA-a", None, "2.0.0"),
+            item("~/dev/one", "right-pad", "GHSA-b", None, "2.0.0"),
+            item("~/dev/one", "up-pad", "GHSA-b", None, "2.0.0"),
+            item("~/dev/three", "evil-pad", "MAL-c", Some(false), "2.0.0"),
+            item("~/dev/two", "left-pad", "GHSA-d", Some(false), "1.0.1"),
+            item("~/dev/three", "other-pad", "GHSA-d", Some(false), "3.0.0"),
+        ];
+        let page = drawn(&v1::Vulnerabilities {
+            totals: Some(totals(4)),
+            affected: Some(v1::AffectedPackages { total: 7, items }),
+            ..Default::default()
+        });
+        let rows: Vec<&str> = page.split("<details class=\"fr vr").skip(1).collect();
+        assert_eq!(rows.len(), 4, "{page}");
+        // Each record: its id, the projects of its lines, how many projects, and its mark.
+        let expect: [(&str, &[&str], i64, &str); 4] = [
+            ("GHSA-a", &["one", "two"], 2, "used in attacks"),
+            ("GHSA-b", &["one", "one"], 1, "not known if used in attacks"),
+            ("MAL-c", &["three"], 1, "not listed as used in attacks"),
+            (
+                "GHSA-d",
+                &["two", "three"],
+                2,
+                "not listed as used in attacks",
+            ),
+        ];
+        for (row, (id, lines, n, mark)) in rows.iter().zip(expect) {
+            assert!(row.contains(&format!(">{id}</bdi>")), "{row}");
+            assert!(row.contains(&format!("\">{mark}</span>")), "{row}");
+            assert_eq!(row.starts_with(" urgent\""), id == "GHSA-a", "{row}");
+            let count = counted(n, "project", "projects");
+            assert!(
+                row.contains(&format!("<span class=\"fc\">{count}</span>")),
+                "{row}"
+            );
+            let drawn: Vec<&str> = (row.split("<li><span class=\"p\"><bdi class=\"src\">~/dev/"))
+                .skip(1)
+                .map(|l| &l[..l.find('<').unwrap()])
+                .collect();
+            assert_eq!(drawn, lines, "{row}");
+        }
+        // What a record is fixed in is said once where every package is fixed in the same, and
+        // on each line where they differ.
+        assert!(rows[0].contains("· fixed in <span class=\"mono\"><bdi class=\"src\">2.0.0"));
+        assert!(
+            !rows[3].contains("<span class=\"t2\">· fixed in"),
+            "{}",
+            rows[3]
+        );
+        for fixed in ["1.0.1", "3.0.0"] {
+            assert!(rows[3].contains(&format!(" · fixed in <bdi class=\"src\">{fixed}")));
+        }
     }
 
     /// The catalogue is current by the one rule the answers rest on, over when it was last read

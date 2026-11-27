@@ -8,7 +8,7 @@
 use super::{RULES_TITLE, capital, top};
 use crate::contract::v1;
 use crate::secrets::Name;
-use crate::view::{FOOT, esc, utc};
+use crate::view::{FOOT, esc, when};
 
 /// The two places of a rule this version checks, as the rules page names them: its anchor
 /// there, its heading, and what being there means. A rule that cannot be checked is not on the
@@ -88,7 +88,11 @@ pub fn page(m: &v1::Rules, status: &v1::Status, now: i64) -> String {
         .collect();
     let mut out = top(
         RULES_TITLE,
-        &format!("From {} · this page made {}", from.join("; "), utc(now)),
+        &format!(
+            "From {} · this page made {}",
+            esc(&from.join("; ")),
+            when(now, now)
+        ),
     );
     let mut w = |s: String| out.push_str(&s);
     let shipped = crate::sigma::Rules::shipped();

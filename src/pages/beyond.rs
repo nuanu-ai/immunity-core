@@ -12,7 +12,7 @@
 use super::{names, said, top};
 use crate::contract::{unescape, v1};
 use crate::secrets::{Name, Said};
-use crate::view::{FOOT, MachineOf, Out, badge, esc, thead, utc, utc_age, utc_or};
+use crate::view::{FOOT, MachineOf, Out, badge, esc, thead, when, when_age};
 use crate::{servers, tailnet};
 use std::error::Error;
 use std::fmt::Write;
@@ -54,7 +54,7 @@ fn full(c: &v1::Coverage) -> bool {
 
 /// What a list cannot claim, from the readings `Statements.machines_not_read` names: `None`
 /// when it names none, so the list says it is empty only then.
-fn gap(not_read: &[&v1::Coverage]) -> Option<String> {
+fn gap(not_read: &[&v1::Coverage], now: i64) -> Option<String> {
     if not_read.is_empty() {
         return None;
     }
@@ -67,7 +67,7 @@ fn gap(not_read: &[&v1::Coverage]) -> Option<String> {
             let last = c
                 .last_full_at
                 .map_or("never read in full".to_string(), |at| {
-                    format!("last read in full {}", utc(at))
+                    format!("last read in full {}", when(at, now))
                 });
             let why = match (c.observed_at, &c.reason_text) {
                 (None, _) => return format!("{} (never read)", esc(&c.kind)),
@@ -106,8 +106,8 @@ pub fn page(
         "Beyond this Mac",
         &format!(
             "Last full check {} · this page made {}",
-            utc_or(checked_at, "never"),
-            utc(now)
+            checked_at.map_or("never".to_string(), |at| when(at, now)),
+            when(now, now)
         ),
     );
     // A kind this build does not know is read as a server.
@@ -122,7 +122,7 @@ pub fn page(
     let private: Vec<&v1::Coverage> = (all.iter().copied())
         .filter(|c| c.reader == tailnet::READER)
         .collect();
-    let (all, private) = (gap(&all), gap(&private));
+    let (all, private) = (gap(&all, now), gap(&private, now));
 
     let servers = of(v1::MachineKind::Server);
     out.push_str("<section id=\"servers\">\n<h2>Servers</h2>\n<p class=\"muted\">Machines you log in to over SSH, as your SSH settings, the list of machines SSH has connected to and the server check name them, and those your private network shows as yours. They are checked only when you run the server check; this program never connects to them by itself. Open one to see what was read on it.</p>\n");
@@ -134,8 +134,8 @@ pub fn page(
             "<p class=\"alert\">You said {} is {} on {}, and it was seen alive after that, {}: {}. It is counted as a server again and still not offered for the server check.</p>",
             Name::given(&w.machine_text).html(),
             esc(&w.said),
-            utc(w.at),
-            utc(seen.at),
+            when(w.at, now),
+            when(seen.at, now),
             Name::given(&seen.what_text).html()
         )?;
     }
@@ -277,7 +277,7 @@ fn block(
             .then(|| format!(", {}", crate::finding_text::given_by(w.via)));
         meta.push(format!(
             "you said so {}{}",
-            utc(w.at),
+            when(w.at, now),
             agent.unwrap_or_default()
         ));
     }
@@ -342,10 +342,10 @@ fn block(
         .and_then(|c| c.observed_at)
         .filter(|at| Some(*at) != read_at)
     {
-        meta.push(format!("visited {}", utc(at)));
+        meta.push(format!("visited {}", when(at, now)));
     }
     meta.push(match read_at {
-        Some(at) => format!("read {}", utc_age(at, now)),
+        Some(at) => format!("read {}", when_age(at, now)),
         None => "nothing read".to_string(),
     });
     writeln!(
@@ -374,7 +374,7 @@ fn block(
         write!(
             out,
             "<p class=\"alert\">The latest visit failed {}: {}.",
-            utc(c.observed_at.unwrap_or_default()),
+            when(c.observed_at.unwrap_or_default(), now),
             Said::of(reason.trim_end_matches('.')).html()
         )?;
         // Never asked of a machine the person said is retired or not theirs.
@@ -419,7 +419,7 @@ fn block(
                 write!(
                     out,
                     " <span class=\"muted nowrap\">{}</span>",
-                    utc_age(at, now)
+                    when_age(at, now)
                 )?;
             }
             out.push_str("</li>\n");
@@ -616,7 +616,7 @@ mod tests {
             reading("system release", C::None, Some(NOW)),
         ]);
         assert!(
-            earlier.contains(&format!("read {}", utc(NOW - 86_400))),
+            earlier.contains(&format!("read {}", when(NOW - 86_400, NOW))),
             "{earlier}"
         );
         // A full visit whose readings of substance read nothing read nothing of the server.
@@ -625,7 +625,7 @@ mod tests {
             reading(servers::VISIT, C::Full, Some(NOW)),
         ]);
         assert!(
-            empty.contains(&format!("visited {} · nothing read", utc(NOW))),
+            empty.contains(&format!("visited {} · nothing read", when(NOW, NOW))),
             "{empty}"
         );
     }
@@ -660,7 +660,7 @@ mod tests {
         assert!(
             page.contains(&format!(
                 "known hosts (not read at the latest check; last read in full {})",
-                utc(NOW - 7200)
+                when(NOW - 7200, NOW)
             )),
             "{page}"
         );
@@ -707,7 +707,7 @@ mod tests {
             !aside.contains("never checked</span>")
                 && summary(aside).contains(&format!(
                     "<span class=\"badge good\">not mine</span> <span class=\"muted\">· you said so {}, through your agent ·",
-                    utc(NOW - 3600)
+                    when(NOW - 3600, NOW)
                 ))
                 && aside.contains(
                     "You said it is not mine, through your agent. Why: <bdi class=\"src\">A client&#39;s server</bdi>."
@@ -722,7 +722,7 @@ mod tests {
         let page = drawn(&s, Some(known(Vec::new())));
         let line = summary(&page[page.find("<section id=\"retired\"").unwrap()..]);
         assert!(
-            line.contains(&format!("· you said so {} ·", utc(NOW - 3600))),
+            line.contains(&format!("· you said so {} ·", when(NOW - 3600, NOW))),
             "{line}"
         );
         // Without an answer about the machine, the statement is still drawn whole.
@@ -733,7 +733,7 @@ mod tests {
         let page = drawn(&s, None);
         let aside = &page[page.find("<section id=\"retired\"").unwrap()..];
         assert!(
-            summary(aside).contains(&format!("you said so {}, through your agent", utc(NOW - 3600)))
+            summary(aside).contains(&format!("you said so {}, through your agent", when(NOW - 3600, NOW)))
                 && aside.contains("You said it is not mine, through your agent. Why: <bdi class=\"src\">A client&#39;s server</bdi>.")
                 && aside.contains("gives no answer about it"),
             "{aside}"
@@ -778,7 +778,7 @@ mod tests {
             reading(servers::VISIT, C::Full, Some(NOW)),
         ]);
         assert!(
-            !full.contains("visited") && full.contains(&format!("· read {}", utc(NOW))),
+            !full.contains("visited") && full.contains(&format!("· read {}", when(NOW, NOW))),
             "{full}"
         );
         let failed = line(vec![
@@ -788,8 +788,8 @@ mod tests {
         assert!(
             failed.contains(&format!(
                 "· visited {} · read {}",
-                utc(NOW),
-                utc(NOW - 86_400)
+                when(NOW, NOW),
+                when(NOW - 86_400, NOW)
             )),
             "{failed}"
         );
