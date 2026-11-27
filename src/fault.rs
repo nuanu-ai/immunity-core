@@ -29,9 +29,9 @@
 //!    same kind, never the last one.
 
 use crate::baseline::{self, Unit};
+use crate::covered::Latest;
 use crate::covered::{self, Cause, Example, Uncovered};
 use crate::store;
-use crate::view::Latest;
 use crate::watched;
 use rusqlite::Connection;
 use std::collections::BTreeSet;
@@ -266,7 +266,7 @@ mod tests {
 
     /// The names of what is read before and not read now.
     fn lost_ids(conn: &Connection) -> Vec<String> {
-        let latest = crate::view::latest_coverage(conn).unwrap();
+        let latest = crate::covered::latest_coverage(conn).unwrap();
         lost(conn, &latest)
             .unwrap()
             .into_iter()
@@ -277,7 +277,7 @@ mod tests {
     /// The items of the causes of what was not read, each with its count and whether it is a
     /// fault; the state of this Mac; and the headline.
     fn sorted(conn: &Connection) -> (Vec<(&'static str, usize, bool)>, &'static str, &'static str) {
-        let latest = crate::view::latest_coverage(conn).unwrap();
+        let latest = crate::covered::latest_coverage(conn).unwrap();
         let p = crate::status::problems(conn, &latest).unwrap();
         let ids = [
             NO_LONGER_READ.id,
@@ -367,7 +367,7 @@ mod tests {
             project: true,
             of: (watched::READER.to_string(), watched::HOOK_KIND.to_string()),
         };
-        let latest = crate::view::latest_coverage(&conn).unwrap();
+        let latest = crate::covered::latest_coverage(&conn).unwrap();
         assert!(lost(&conn, &latest).unwrap().contains(&hook));
         // Told among the projects once nothing of this Mac's own places stands beside them.
         let scope = |conn: &Connection| {

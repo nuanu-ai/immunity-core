@@ -764,7 +764,9 @@ fn a_finding_found_again_after_seen_names_the_earlier_one_its_answer_and_reason_
     let quote = &page[page.find(&voice).expect(&voice)..];
     let quote = &quote[quote.find("<blockquote").unwrap()..quote.find("</blockquote>").unwrap()];
     assert!(
-        quote.starts_with("<blockquote class=\"quote\">the installer of a &lt;i&gt;tool&lt;/i&gt;"),
+        quote.starts_with(
+            "<blockquote class=\"quote\"><bdi class=\"src\">the installer of a &lt;i&gt;tool&lt;/i&gt;"
+        ),
         "{quote}"
     );
     assert!(!page.contains(FORGED) && !page.contains("\n→ immunity finding f0"));
@@ -1052,7 +1054,7 @@ fn the_page_of_code_changed_outside_an_app_names_each_file_escaped() {
     assert!(text.contains("app/main.js") && text.contains("\"app/vendor/\" (2 files)"));
     let page = e.pages();
     // Each kind's label once, on its first entry, as the text gives it.
-    let mono = |path: &str| format!("<span class=\"mono\">{path}</span>");
+    let mono = |path: &str| format!("<span class=\"mono\"><bdi class=\"src\">{path}</bdi></span>");
     for (label, said) in [
         ("Added", mono("app/&lt;img src=x onerror=alert(1)&gt;.js")),
         (
@@ -1436,8 +1438,8 @@ fn a_launch_agent_added_names_the_program_the_store_ties_to_it_in_force_with_its
     }
     let page = e.pages();
     for fact in [
-        "<dt>Runs</dt><dd><span class=\"mono\">/usr/local/bin/runner</span> <span class=\"w\">held since the reading of</span> ".to_string(),
-        format!("<dt>Signer</dt><dd><span class=\"mono\">{TRUE_SIGNER}</span></dd>"),
+        "<dt>Runs</dt><dd><span class=\"mono\"><bdi class=\"src\">/usr/local/bin/runner</bdi></span> <span class=\"w\">held since the reading of</span> ".to_string(),
+        format!("<dt>Signer</dt><dd><span class=\"mono\"><bdi class=\"src\">{TRUE_SIGNER}</bdi></span></dd>"),
     ] {
         assert!(page.contains(&fact), "{fact}\n{page}");
     }
@@ -1505,7 +1507,7 @@ fn a_login_hook_removed_names_the_script_the_store_last_tied_to_it_as_retracted_
     // Nor that the hook runs it: no line of the finding, its advice among them, says so.
     assert!(text.lines().all(|l| !l.contains("it runs")), "{text}");
     assert!(e.pages().contains(
-        "<dd><span class=\"mono\">/usr/local/bin/hook.sh</span> <span class=\"w\">held until the reading of</span> "
+        "<dd><span class=\"mono\"><bdi class=\"src\">/usr/local/bin/hook.sh</bdi></span> <span class=\"w\">held until the reading of</span> "
     ));
 }
 
@@ -1605,9 +1607,9 @@ fn a_startup_program_changed_names_every_item_that_runs_it_and_its_signer_before
     }
     let page = e.pages();
     for fact in [
-        format!("<dt>Signer before</dt><dd><span class=\"mono\">{TRUE_SIGNER}</span> <span class=\"w\">until the reading of</span> "),
-        "<dt>Signer after</dt><dd><span class=\"mono\">unsigned</span> <span class=\"w\">from the reading of</span> ".to_string(),
-        format!("<dt>Run by</dt><dd><span class=\"mono\">{b_place}</span> "),
+        format!("<dt>Signer before</dt><dd><span class=\"mono\"><bdi class=\"src\">{TRUE_SIGNER}</bdi></span> <span class=\"w\">until the reading of</span> "),
+        "<dt>Signer after</dt><dd><span class=\"mono\"><bdi class=\"src\">unsigned</bdi></span> <span class=\"w\">from the reading of</span> ".to_string(),
+        format!("<dt>Run by</dt><dd><span class=\"mono\"><bdi class=\"src\">{b_place}</bdi></span> "),
     ] {
         assert!(page.contains(&fact), "{fact}\n{page}");
     }

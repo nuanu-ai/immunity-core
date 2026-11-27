@@ -566,10 +566,9 @@ fn a_watcher_already_running_never_makes_a_store_in_a_file_whose_schema_is_gone(
 }
 
 #[test]
-fn a_watchers_reading_shows_in_the_view_as_what_it_is_and_not_as_a_run_that_did_not_finish() {
-    // The owner reads the list of changes: a watcher's reading never writes `run_finished`,
-    // and calling it unfinished would say its changes are unknown when they are known. Nor
-    // is a server it never reads "not read in this run": it is not a run of every reader.
+fn a_watchers_reading_never_reads_in_the_view_as_a_check_that_did_not_finish() {
+    // A watcher's reading never writes `run_finished`, and calling it a check that never
+    // finished would say nothing it read is in the store when it is.
     let mac = Mac::new("view");
     mac.put(".zshrc", "one\n");
     let servers = mac.root.join("servers");
@@ -587,12 +586,7 @@ fn a_watchers_reading_shows_in_the_view_as_what_it_is_and_not_as_a_run_that_did_
     w.until("read", |v| count(v, "changed") == 1);
     drop(w);
     let pages = mac.view();
-    assert!(!pages.contains("did not finish"), "{pages}");
-    // Named by what it read, the place the change was in.
-    let shown =
-        "watcher&#39;s reading of shell profiles of zsh and bash: +0 added, 1 changed, 0 removed";
-    assert!(pages.contains(shown), "{pages}");
-    assert!(!pages.contains("were not read in this run"), "{pages}");
+    assert!(!pages.contains("never finished"), "{pages}");
 }
 
 #[test]
@@ -3765,7 +3759,7 @@ fn a_watched_file_its_permissions_keep_closed_leaves_this_mac_watched_in_part_an
     let state = &state[..state.find("</section>").unwrap()];
     assert!(
         state.contains(
-            "<p class=\"sub fault\">! Could not read: <span class=\"said\">&quot;~/.zprofile&quot;"
+            "<p class=\"sub fault\">! Could not read: <span class=\"said\"><bdi class=\"src\">&quot;~/.zprofile&quot;"
         ) && !state.contains("--green"),
         "{state}"
     );
@@ -3898,11 +3892,11 @@ fn pages_asked_for_are_written_again_when_one_is_gone_or_they_are_an_hour_old() 
     basis["made_at"] = (now() + 600).into();
     std::fs::write(&made, basis.to_string()).unwrap();
     assert!(mac.view_if_stale().starts_with("<!doctype html>"));
-    let changes = mac.root.join("store/view/changes.html");
+    let coverage = mac.root.join("store/view/coverage.html");
     std::fs::write(&summary, "as it was").unwrap();
-    std::fs::remove_file(&changes).unwrap();
+    std::fs::remove_file(&coverage).unwrap();
     assert!(mac.view_if_stale().starts_with("<!doctype html>"));
-    assert!(changes.is_file());
+    assert!(coverage.is_file());
     // Another program writes its own pages.
     std::fs::write(&summary, "as it was").unwrap();
     let other = mac.root.join("immunity-copy");
@@ -3934,12 +3928,12 @@ fn after_new_program_starts_a_page_asked_for_writes_again_the_summary_and_the_ru
     let made = page("view/made.json");
     let w = mac.watch_with(&["--events-every", "1"]).started();
     mac.view_if_stale();
-    std::fs::write(page("view/changes.html"), "as it was").unwrap();
+    std::fs::write(page("view/coverage.html"), "as it was").unwrap();
     mac.exec(1);
     let found = until_row(&mac, "SELECT id FROM finding WHERE rule LIKE 'sigma:%'");
     mac.view_if_stale();
     assert!(
-        std::fs::read_to_string(page("view/changes.html"))
+        std::fs::read_to_string(page("view/coverage.html"))
             .unwrap()
             .starts_with("<!doctype html>")
     );
@@ -3949,7 +3943,7 @@ fn after_new_program_starts_a_page_asked_for_writes_again_the_summary_and_the_ru
             .contains("\"view/live.js?\"")
     );
     let as_made = std::fs::read_to_string(&made).unwrap();
-    for name in ["view.html", "view/rules.html", "view/changes.html"] {
+    for name in ["view.html", "view/rules.html", "view/coverage.html"] {
         std::fs::write(page(name), "as it was").unwrap();
     }
     mac.exec(2);
@@ -3965,7 +3959,7 @@ fn after_new_program_starts_a_page_asked_for_writes_again_the_summary_and_the_ru
             .starts_with("<!doctype html>")
     );
     assert_eq!(
-        std::fs::read_to_string(page("view/changes.html")).unwrap(),
+        std::fs::read_to_string(page("view/coverage.html")).unwrap(),
         "as it was"
     );
     let after: Value = serde_json::from_str(&std::fs::read_to_string(&made).unwrap()).unwrap();
@@ -3989,7 +3983,7 @@ fn after_new_program_starts_a_page_asked_for_writes_again_the_summary_and_the_ru
     assert!(out.status.success());
     assert!(mac.view_if_stale().starts_with("<!doctype html>"));
     assert!(
-        std::fs::read_to_string(page("view/changes.html"))
+        std::fs::read_to_string(page("view/coverage.html"))
             .unwrap()
             .starts_with("<!doctype html>")
     );
@@ -4080,11 +4074,6 @@ fn a_sample_that_opens_a_finding_says_so_in_one_line_and_a_quiet_sample_says_not
             && body.contains("<p class=\"fg open now\">Needs you now</p>"),
         "{body}"
     );
-    // The pages name the sample among the runs. It reads only programs: it is not a run that
-    // left out the server the full run read.
-    let changes = std::fs::read_to_string(mac.root.join("store/view/changes.html")).unwrap();
-    assert!(changes.contains("sample of running programs and their connections"));
-    assert!(!changes.contains("were not read in this run"), "{changes}");
     assert!(said["at"].as_str().unwrap().ends_with('Z'), "{said}");
     // Two more samples of the same process are quiet: two seconds at one a second.
     let run = "SELECT last_seen_run FROM tracked_process";
@@ -4113,11 +4102,6 @@ fn a_sample_that_opens_a_finding_says_so_in_one_line_and_a_quiet_sample_says_not
         ),
         ["sampled"]
     );
-    // The pages name the sample among the latest runs.
-    let page = mac.view();
-    assert!(page.contains("sample of running programs and their connections"));
-    // A sample reads only programs: it is not a run that left the other readings out.
-    assert!(!page.contains("were not read in this run"), "{page}");
     let r = mac.status().clone();
     assert_eq!(r["this_mac"]["state"], "watched", "{r:#}");
     let sampled = r["this_mac"]["watched"]
@@ -4156,6 +4140,7 @@ fn a_sample_that_opens_a_finding_says_so_in_one_line_and_a_quiet_sample_says_not
     );
     // The page of what is watched says when the latest sample was taken and how many programs
     // it saw, as the status counts them, and that a watcher samples them: no list is kept.
+    let page = mac.view();
     let at = page
         .find("<section id=\"running-programs-and-their-connections\">")
         .unwrap();
@@ -4322,9 +4307,6 @@ fn a_mac_checked_every_hour_keeps_no_more_readings_after_a_month_than_after_a_da
     // the last of what is older. From then on a run adds as many as it folds.
     assert!(counts[..22].windows(2).all(|w| w[0] < w[1]), "{counts:?}");
     assert!(counts[21..].iter().all(|n| *n == counts[21]), "{counts:?}");
-    // The changes page still lists the runs kept whole as having read everything.
-    let pages = mac.view();
-    assert!(!pages.contains("were not read in this run"), "{pages}");
 }
 
 #[test]

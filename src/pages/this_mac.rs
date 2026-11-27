@@ -4,15 +4,16 @@
 //! `immunity machine` answers for this Mac (`Known`) and from the status: whether a list may say
 //! that nothing is there is the status's word for its kind (`WatchedKind.coverage` and `fresh`,
 //! `IntegrityReading`), never an empty list's. The readings `Known` gives name what was not read,
-//! their reasons cut on the page (`view::said`, `Said::of`).
+//! their reasons given whole and cut on the page (`Said::of`). Every name and reason from the Mac
+//! is printed through `secrets::Name` and `secrets::Said`.
 
 use super::{FOOT, NOT_READ, NOT_READ_TITLE, THIS_MAC_TITLE, VULNERABILITIES, anchor, capital};
 use super::{coverage_of_list, grouped, installed_whole, said, top, uncovered, unread};
 use crate::contract::{self, v1};
-use crate::covered::{self, Count};
+use crate::covered::{self, Count, Latest};
 use crate::findings::{self, This};
-use crate::secrets::Name;
-use crate::view::{self, Latest, Out, cell, counted, esc, utc, utc_or};
+use crate::secrets::{Name, Said};
+use crate::view::{self, Out, cell, counted, esc, utc, utc_or};
 use crate::{autorun, integrity, watched};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
@@ -115,16 +116,15 @@ impl Mac<'_> {
             .is_some_and(|f| !f.all && v1::Cause::try_from(f.cause) == Ok(v1::Cause::NotGiven))
     }
 
-    /// Why the projects may not all be found, by a reading that failed; also when the status
-    /// gives no answer about them, which is never "all".
+    /// Why the projects may not all be found, by a reading that failed, in the core's words as
+    /// safe HTML; also when the status gives no answer about them, which is never "all".
     fn failed_walk(&self) -> Option<String> {
         match self.found {
             Some(f) if f.all || self.not_entered() => None,
-            Some(f) => Some(
-                f.why
-                    .clone()
-                    .unwrap_or_else(|| "projects were not all found".into()),
-            ),
+            Some(f) => Some(esc(f
+                .why
+                .as_deref()
+                .unwrap_or("projects were not all found"))),
             None => Some("projects have not been looked for yet".to_string()),
         }
     }
@@ -580,12 +580,13 @@ fn ways(out: &mut String, s: &Mac) -> Out {
     // Why the counts of ways in projects may be short: the reading of which ways each project
     // holds, or the search for projects, less the folders this version does not enter.
     let present = s.readings(watched::READER, &[autorun::PRESENT_KIND.to_string()]);
+    // As safe HTML: a reading's reason, given whole, through the printer; the status's why is
+    // the core's words.
     let gap = match s.not_entered() {
         true => None,
-        false => (present
-            .iter()
-            .find_map(|r| r.reason.as_deref().map(view::said)))
-        .or_else(|| s.found.and_then(|f| f.why.clone())),
+        false => (present.iter())
+            .find_map(|r| r.reason.as_deref().map(|r| Said::of(r).html()))
+            .or_else(|| s.found.and_then(|f| f.why.as_deref().map(esc))),
     };
     for home in [false, true] {
         let (id, heading, intro, column) = match home {
@@ -715,23 +716,9 @@ mod tests {
         // itself takes it from the table: a row read here that one of them missed would be
         // read and never told, or told and never watched live.
         use crate::autorun;
-        let dir = crate::common::Scratch::at(
-            std::env::temp_dir().join(format!("immunity-ways-{}", std::process::id())),
-        );
-        std::fs::create_dir_all(&dir).unwrap();
-        let conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
         let mut page = String::new();
         let known = v1::Known::default();
         ways(&mut page, &mac(&known, None)).unwrap();
-        let registered: Vec<String> = conn
-            .prepare("SELECT name FROM coverage_kind")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        drop(conn);
-        let _ = std::fs::remove_dir_all(&dir);
         for (p, way) in autorun::ways() {
             let cell = format!("<td class=\"mono\">{}</td>", esc(&p.name()));
             // The page lists the ways that are read, and no way that is only known.
@@ -769,7 +756,6 @@ mod tests {
                 assert_eq!(live, p.hourly().is_none(), "{path}");
                 assert!(!live || !path.contains('*'), "{path}");
             }
-            assert!(registered.contains(&p.kind()), "{}", p.kind());
             assert!(autorun::kinds_of(as_).contains(&p.kind()));
             assert!(
                 covered::watched()
@@ -1119,5 +1105,31 @@ mod tests {
         ] {
             assert!(!section(&r, &empty, kegs).contains(NONE_FOUND));
         }
+    }
+
+    #[test]
+    fn why_the_counts_of_ways_may_be_short_is_what_the_reading_said_cut_where_it_is_shown() {
+        // A reading's reason is its source's words, whole in the message: on the page a secret
+        // in it is cut, and the words stand apart as a source's.
+        let token = ["gh", "p_", "Q7mZ2xK9pL4vR8nT3wY6bH1cJ5dF0gS2aE7u"].concat();
+        let known = v1::Known {
+            coverage: vec![v1::Coverage {
+                reader: watched::READER.to_string(),
+                kind: autorun::PRESENT_KIND.to_string(),
+                scope_text: MAC.to_string(),
+                completeness: v1::Completeness::Partial as i32,
+                reason_text: Some(format!("could not list ?t={token}")),
+                observed_at: Some(NOW - 30),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let page = page(&status(vec![], vec![]), Some(&known), NOW);
+        let ways = &page[page.find("<section id=\"ways-code-runs\">").unwrap()..];
+        assert!(
+            ways.contains("may be short: <bdi class=\"src\">could not list ?t=\\cut{"),
+            "{ways}"
+        );
+        assert!(!page.contains(&token), "{page}");
     }
 }

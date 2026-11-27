@@ -731,8 +731,9 @@ fn shown_said(rows: &[Row]) -> String {
 
 /// One technique's square. Its id, name and state are its title, which a browser shows without
 /// the script, and its accessible name; the same and MITRE's first sentence of what the
-/// technique is are data the script's pop-up sets as text. `now`: its finding needs the person
-/// now.
+/// technique is are data the script's pop-up sets as text. MITRE's words are written in the
+/// printer's attribute form (`Name::attr`), the state in the core's. `now`: its finding needs the
+/// person now.
 fn square(
     out: &mut String,
     class: &str,
@@ -740,7 +741,8 @@ fn square(
     said: &str,
     now: bool,
 ) -> Out {
-    let (tech, name, about, said) = (esc(tech), esc(name), esc(about), esc(said));
+    let attr = |s: &str| Name::of(s).attr();
+    let (tech, name, about, said) = (attr(tech), attr(name), attr(about), esc(said));
     write!(
         out,
         "<span class=\"m {class}\" title=\"{tech} {name}: {said}\" role=\"img\" aria-label=\"{tech} {name}: {said}\" data-t=\"{tech}\" data-n=\"{name}\" data-d=\"{about}\" data-s=\"{said}\"{}></span>",
@@ -802,7 +804,7 @@ fn cover(out: &mut String, rules: &[Drawn], found: &v1::Findings) -> Out {
         write!(
             out,
             "<div class=\"tactic\"><span class=\"tn2\">{}</span><span class=\"sq\">",
-            esc(&tactic.name)
+            Name::of(&tactic.name).html()
         )?;
         for (tech, s) in squares {
             let name = attack.names.get(*tech).map_or("", String::as_str);
@@ -833,18 +835,21 @@ fn cover(out: &mut String, rules: &[Drawn], found: &v1::Findings) -> Out {
     let listed: BTreeSet<&str> = attack.names.keys().map(String::as_str).collect();
     let all = named(rules, |_| true);
     let outside: Vec<&str> = all.difference(&listed).copied().collect();
-    let mut said = "Each square is one ATT&CK technique for macOS that a published rule watches now, grouped by what an attacker is trying to do.".to_string();
+    // The techniques the rules name are the rules' words: each through the printer.
+    let mut said = esc(
+        "Each square is one ATT&CK technique for macOS that a published rule watches now, grouped by what an attacker is trying to do.",
+    );
     if !outside.is_empty() {
+        let named: Vec<String> = outside.iter().map(|t| Name::given(t).html()).collect();
         said.push_str(&format!(
-            " Named by the rules but not listed by ATT&CK for macOS: {}.",
-            outside.join(", ")
+            " Named by the rules but not listed by ATT&amp;CK for macOS: {}.",
+            named.join(", ")
         ));
     }
     writeln!(
         out,
-        "<p class=\"meta\">{}</p>\n<p class=\"meta\">Techniques from MITRE ATT&amp;CK {}. {}</p>\n</div>",
-        esc(&said),
-        esc(&attack.release),
+        "<p class=\"meta\">{said}</p>\n<p class=\"meta\">Techniques from MITRE ATT&amp;CK {}. {}</p>\n</div>",
+        Name::of(&attack.release).html(),
         esc(MITRE)
     )?;
     Ok(())
@@ -1662,6 +1667,13 @@ print(JSON.stringify(out));
         out.clear();
         square(&mut out, "look", ("T1", "N", "D."), "s", true).unwrap();
         assert!(out.ends_with("data-s=\"s\" data-now></span>"), "{out}");
+        // MITRE's words are in the printer's form: a hidden character or a backslash is seen.
+        out.clear();
+        square(&mut out, "look", ("T1", "N\u{202e}", "D\\."), "s", false).unwrap();
+        assert!(
+            out.contains("data-n=\"N\\u{202e}\" data-d=\"D\\u{5c}.\""),
+            "{out}"
+        );
     }
 
     #[test]

@@ -219,10 +219,11 @@ pub fn page(m: &v1::Rules, status: &v1::Status, now: i64) -> String {
                 w(format!("<li>Author: {}</li>\n", Name::given(a).html()));
             }
             w(without.concat());
+            // Its status and its file are its set's words, through the printer.
             w(format!(
                 "<li>Published as {}, in <span class=\"mono\">{}</span></li>\n</ul>\n</details>\n</article>\n",
-                esc(s.status.as_deref().unwrap_or("")),
-                esc(&s.file)
+                Name::of(s.status.as_deref().unwrap_or("")).html(),
+                Name::of(&s.file).html()
             ));
         }
         w("</section>\n".to_string());

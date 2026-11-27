@@ -11,7 +11,7 @@
 use super::{COPY, capital};
 use crate::contract::v1;
 use crate::secrets::{Name, Said};
-use crate::view::{self, Answers, counted, esc, esc_said};
+use crate::view::{self, Answers, counted, esc};
 use std::error::Error;
 use std::fmt::Write;
 
@@ -86,6 +86,9 @@ impl FindingRow<'_> {
     }
 }
 
+/// The rule a finding of `verdict.suspicious` is about, by the finding's id.
+type Subject<'s> = dyn Fn(&str) -> Result<Option<String>, Box<dyn Error>> + 's;
+
 /// The rows, open first in the list's order, then the answered, the latest answer first. A
 /// finding of `verdict.suspicious` is drawn in the row of the core's finding of the rule its
 /// verdicts were about and of the same thing, once, and is not a row of its own; one with no
@@ -93,8 +96,8 @@ impl FindingRow<'_> {
 /// that rule for a finding of `verdict.suspicious`.
 fn finding_rows<'a>(
     all: &[Listed<'a>],
-    subject: &dyn Fn(&str) -> rusqlite::Result<Option<String>>,
-) -> rusqlite::Result<Vec<FindingRow<'a>>> {
+    subject: &Subject,
+) -> Result<Vec<FindingRow<'a>>, Box<dyn Error>> {
     let verdict = |f: &Listed| f.r.rule.as_deref() == Some(crate::verdict::RULE);
     let mut nested = std::collections::BTreeSet::new();
     let mut under: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
@@ -160,7 +163,7 @@ pub(super) fn table(out: &mut String, a: &Answers, now: i64) -> Result<(), Box<d
             false => at(y).cmp(&at(x)).then_with(|| x.r.id.cmp(&y.r.id)),
         })
     });
-    let subject = |id: &str| -> rusqlite::Result<Option<String>> {
+    let subject = |id: &str| -> Result<Option<String>, Box<dyn Error>> {
         use v1::evidence::Body;
         Ok((a.finding)(id)?.and_then(|f| match f.evidence?.body? {
             Body::VerdictGiven(v) => Some(v.rule),
@@ -444,7 +447,7 @@ fn finding_body(
             write!(
                 out,
                 "\n<blockquote class=\"quote\">{}</blockquote>\n",
-                esc_said(q)
+                Said::given(q).html()
             )?;
         }
         out.push_str("</div>");
@@ -469,7 +472,7 @@ fn finding_body(
 }
 
 /// One voice of "Who said what": who, what they said and a quieter line, all safe HTML, and a
-/// quote of their own words, escaped when it is written.
+/// quote of their own words, cut as the message gives it, printed when it is written.
 struct Voice {
     name: String,
     said: String,
@@ -477,16 +480,21 @@ struct Voice {
     quote: Option<String>,
 }
 
-/// Text from the Mac as data, in an element of its own.
-fn data(s: &str) -> String {
-    format!("<span class=\"mono\">{}</span>", esc(s))
+/// What a source said as data, as a field of the message gives it cut, in an element of its own.
+fn said_data(s: &str) -> String {
+    format!("<span class=\"mono\">{}</span>", Said::given(s).html())
+}
+
+/// A number of the core's as data.
+fn number(n: impl std::fmt::Display) -> String {
+    format!("<span class=\"mono\">{n}</span>")
 }
 
 /// Arguments as they come cut, each apart.
 fn arguments(args: &[String]) -> String {
     let args: Vec<String> = args
         .iter()
-        .map(|a| format!("<span class=\"arg\">{}</span>", esc_said(a)))
+        .map(|a| format!("<span class=\"arg\">{}</span>", Said::given(a).html()))
         .collect();
     format!("<span class=\"mono\">{}</span>", args.join(" "))
 }
@@ -503,23 +511,23 @@ fn event_facts(e: &v1::Event, now: i64) -> Vec<(&'static str, String)> {
                 facts.push(("When", view::when(at, now)));
             }
             if let Some(p) = &s.process {
-                facts.push(("Program", data(&p.executable_text)));
+                facts.push(("Program", named(&p.executable_text)));
             }
             if !s.args_text.is_empty() {
                 facts.push(("Arguments", arguments(&s.args_text)));
             }
             if let Some(wd) = &s.working_directory_text {
-                facts.push(("Folder", data(wd)));
+                facts.push(("Folder", named(wd)));
             }
             if let Some(p) = &s.instigator {
-                facts.push(("Started by", data(&p.executable_text)));
+                facts.push(("Started by", named(&p.executable_text)));
             }
         }
         Some(Body::FileEvent(f)) => {
             if let Some(at) = f.happened_at {
                 facts.push(("When", view::when(at, now)));
             }
-            facts.push(("File", data(&f.path_text)));
+            facts.push(("File", named(&f.path_text)));
             let action = match v1::FileAction::try_from(f.action) {
                 Ok(v1::FileAction::Create) => "created",
                 Ok(v1::FileAction::Rename) => "renamed",
@@ -527,10 +535,10 @@ fn event_facts(e: &v1::Event, now: i64) -> Vec<(&'static str, String)> {
             };
             facts.push(("Done", action.to_string()));
             if let Some(from) = &f.source_text {
-                facts.push(("From", data(from)));
+                facts.push(("From", named(from)));
             }
             if let Some(p) = &f.instigator {
-                facts.push(("By", data(&p.executable_text)));
+                facts.push(("By", named(&p.executable_text)));
             }
         }
         None => {}
@@ -554,7 +562,7 @@ fn dl(out: &mut String, facts: &[(&str, String)]) {
 /// it.
 fn process_facts(p: &v1::DetachedProcess, facts: &mut Vec<(&str, String)>, now: i64) {
     if let Some(pid) = p.pid {
-        facts.push(("Process id", data(&pid.to_string())));
+        facts.push(("Process id", number(pid)));
     }
     if let Some(start) = p.start_micros {
         facts.push(("Started", view::when(start.div_euclid(1_000_000), now)));
@@ -563,7 +571,7 @@ fn process_facts(p: &v1::DetachedProcess, facts: &mut Vec<(&str, String)>, now: 
         facts.push(("Arguments", arguments(&p.args_text)));
     }
     if let Some(wd) = &p.working_directory_text {
-        facts.push(("Folder", data(wd)));
+        facts.push(("Folder", named(wd)));
     }
     for (label, l) in [
         ("Parent", &p.parent),
@@ -575,9 +583,9 @@ fn process_facts(p: &v1::DetachedProcess, facts: &mut Vec<(&str, String)>, now: 
                 .signed_by_text
                 .as_deref()
                 .map_or("signer not known".to_string(), |s| {
-                    format!("signed by {}", data(s))
+                    format!("signed by {}", named(s))
                 });
-            let said = format!("{}, pid {}, {signed}", data(&l.executable_text), l.pid);
+            let said = format!("{}, pid {}, {signed}", named(&l.executable_text), l.pid);
             facts.push((label, said));
         }
     }
@@ -619,15 +627,18 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
                     .take_while(|b| Some(b.run_id.as_str()) == latest)
                     .find(|b| b.entry == "not_read")
                     .and_then(|b| b.new_value_text.as_deref());
-                facts.push(("Why", why.map_or(word("the store gives no reason"), data)));
+                facts.push((
+                    "Why",
+                    why.map_or(word("the store gives no reason"), said_data),
+                ));
             }
             let runs = p.runs.iter().map(|t| ("Runs", t));
             for (label, t) in runs.chain(p.started_by.iter().map(|t| ("Run by", t))) {
                 let said = word(crate::finding_text::tie_said(t.state));
                 let when = view::when(t.recorded_at, now);
-                facts.push((label, format!("{} {said} {when}", data(&t.path_text))));
+                facts.push((label, format!("{} {said} {when}", named(&t.path_text))));
                 if let Some(signer) = &t.signed_by_text {
-                    facts.push(("Signer", data(signer)));
+                    facts.push(("Signer", said_data(signer)));
                 }
             }
             if let Some(b) = crate::finding_text::signer_entry(f) {
@@ -638,19 +649,20 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
                     ("Signer after", from, &b.new_value_text),
                 ] {
                     if let Some(value) = value {
-                        facts.push((label, format!("{} {} {when}", data(value), word(said))));
+                        let value = said_data(value);
+                        facts.push((label, format!("{value} {} {when}", word(said))));
                     }
                 }
             }
             for b in f.rests_on.iter().filter(|b| b.entry == "place_first_read") {
                 if let Some(place) = &b.subject_text {
-                    facts.push(("First read", data(place)));
+                    facts.push(("First read", named(place)));
                 }
             }
         }
         Some(Body::ChangedInPlace(p)) => {
             match (&p.became_text, &p.files) {
-                (Some(value), _) => facts.push(("It became", data(value))),
+                (Some(value), _) => facts.push(("It became", named(value))),
                 // The files that changed, as the text names them; where a folder changed whole,
                 // its path is from the Mac and its number of files is Immunity Core's.
                 (None, Some(files)) => {
@@ -661,9 +673,9 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
                             true => {
                                 let n = i64::try_from(x.files).unwrap_or(i64::MAX);
                                 let n = word(&format!("({})", counted(n, "file", "files")));
-                                format!("{} {n}", data(&format!("{}/", x.path_text)))
+                                format!("{} {n}", named(&format!("{}/", x.path_text)))
                             }
-                            false => data(&x.path_text),
+                            false => named(&x.path_text),
                         };
                         facts.push((label, shown));
                     }
@@ -674,11 +686,11 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
                     }) {
                         facts.push((
                             "Digest before",
-                            data(b.old_value_text.as_deref().unwrap_or("not known")),
+                            (b.old_value_text.as_deref()).map_or(word("not known"), named),
                         ));
                         facts.push((
                             "Digest after",
-                            data(b.new_value_text.as_deref().unwrap_or("not known")),
+                            (b.new_value_text.as_deref()).map_or(word("not known"), named),
                         ));
                     }
                 }
@@ -686,10 +698,10 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
         }
         Some(Body::IndicatorMatched(p)) => {
             if let Some(value) = &p.indicators_text {
-                facts.push(("Matched", data(value)));
+                facts.push(("Matched", named(value)));
             }
             if let Some(port) = p.port {
-                facts.push(("Port", data(&port.to_string())));
+                facts.push(("Port", number(port)));
             }
             if let Some(transport) = &p.transport {
                 facts.push(("Transport", word(transport)));
@@ -709,20 +721,21 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
                 }
             }
             if let Some(name) = &p.package_text {
-                facts.push(("Package", data(name)));
+                facts.push(("Package", named(name)));
             }
             for r in &p.releases {
-                facts.push(("Version", data(&r.version_text)));
-                facts.push(("Declared at", data(&r.at_text)));
+                facts.push(("Version", named(&r.version_text)));
+                facts.push(("Declared at", named(&r.at_text)));
             }
             for r in &p.records {
-                facts.push(("Record", data(&r.id_text)));
+                facts.push(("Record", named(&r.id_text)));
                 if !r.fixed_text.is_empty() {
-                    facts.push(("Fixed in", data(&r.fixed_text.join(", "))));
+                    let fixed = super::names(&r.fixed_text);
+                    facts.push(("Fixed in", format!("<span class=\"mono\">{fixed}</span>")));
                 }
                 voices.push(Voice {
                     name: esc(&r.source),
-                    said: r.summary_text.as_deref().map_or(String::new(), data),
+                    said: r.summary_text.as_deref().map_or(String::new(), said_data),
                     detail: String::new(),
                     quote: None,
                 });
@@ -742,7 +755,7 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
             }
             voices.push(Voice {
                 name: format!("Published rule · {}", esc(&rule.set)),
-                said: format!("<span class=\"src\">{}</span>", esc(&rule.title_text)),
+                said: Name::given(&rule.title_text).html(),
                 detail: if rule.level == v1::Level::NotStated as i32 {
                     String::new()
                 } else {
@@ -755,7 +768,10 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
             });
         }
         Some(Body::VerdictGiven(v)) => {
-            facts.push(("About the rule", data(&v.rule)));
+            facts.push((
+                "About the rule",
+                format!("<span class=\"mono\">{}</span>", Name::of(&v.rule).html()),
+            ));
             for e in &v.events {
                 facts.extend(event_facts(e, now));
             }
@@ -987,7 +1003,12 @@ mod tests {
             }),
             rests_on: vec![
                 signed(first, "apple", "first signer"),
-                signed(latest, "second before", "second after"),
+                // The mark the core made where it cut a secret stays its own.
+                signed(
+                    latest,
+                    "second before",
+                    "second after \\cut{gitleaks:github-pat 40}",
+                ),
             ],
             ..Default::default()
         };
@@ -998,7 +1019,7 @@ mod tests {
                 view::utc(latest)
             ),
             format!(
-                "                 from the reading of {}: \"second after\"\n",
+                "                 from the reading of {}: \"second after \\cut{{gitleaks:github-pat 40}}\"\n",
                 view::utc(latest)
             ),
         ] {
@@ -1017,15 +1038,13 @@ mod tests {
                 (
                     "Signer before",
                     format!(
-                        "{} <span class=\"w\">until the reading of</span> {at}",
-                        data("second before")
+                        "<span class=\"mono\"><bdi class=\"src\">second before</bdi></span> <span class=\"w\">until the reading of</span> {at}"
                     )
                 ),
                 (
                     "Signer after",
                     format!(
-                        "{} <span class=\"w\">from the reading of</span> {at}",
-                        data("second after")
+                        "<span class=\"mono\"><bdi class=\"src\">second after \\cut{{gitleaks:github-pat 40}}</bdi></span> <span class=\"w\">from the reading of</span> {at}"
                     )
                 ),
             ]

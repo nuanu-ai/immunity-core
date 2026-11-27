@@ -1992,7 +1992,7 @@ fn totals_of(conn: &Connection, now: i64, t: &Totals) -> rusqlite::Result<v1::Vu
 /// that speaks of the projects as a whole, in the totals, for one id and on the page, speaks
 /// only for the projects found while not.
 pub fn projects_found(conn: &Connection) -> rusqlite::Result<v1::ProjectsFound> {
-    let latest = crate::view::latest_coverage(conn)?;
+    let latest = crate::covered::latest_coverage(conn)?;
     let this = crate::covered::this_machine(conn)?;
     Ok(crate::covered::projects_found(&latest, this.as_deref()))
 }
