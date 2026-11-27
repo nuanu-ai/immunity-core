@@ -34,8 +34,10 @@ absent "a library target, whose tests neither half of ./check runs" -nF '[lib]' 
 # The pages are drawn from what the commands answer: no file that draws a page reads the store or
 # takes the state the status is built from. Left out, as in the rule below, is a test module: a
 # test may make a store to build the messages a page is drawn from.
-if pages=$(git -c core.quotePath=false ls-files src/view.rs src/happens.rs src/not_read_here.rs \
-  src/pages.rs 'src/pages/*.rs') && [ -n "$pages" ]; then
+pages=$(git -c core.quotePath=false ls-files src/view.rs src/happens.rs src/not_read_here.rs \
+  src/pages.rs 'src/pages/*.rs') ||
+  fail "could not list the files that draw a page, which are checked for the store"
+if [ -n "$pages" ]; then
   if store=$(printf '%s\n' "$pages" | /usr/bin/tr '\n' '\0' | /usr/bin/xargs -0 /usr/bin/awk '
     skip { if ($0 ~ /^}/) skip = 0; next }
     test { test = 0; if ($0 ~ /^(pub(\([a-z]+\))? )?mod [a-z0-9_]+ \{$/) { skip = 1; next } }
@@ -45,8 +47,6 @@ if pages=$(git -c core.quotePath=false ls-files src/view.rs src/happens.rs src/n
   else
     fail "could not read the files that draw a page, which are checked for the store"
   fi
-else
-  fail "could not list the files that draw a page, which are checked for the store"
 fi
 
 # Every file the core reads is opened one way, by src/open.rs. Left out: the store (SQLite and
