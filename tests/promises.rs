@@ -14366,7 +14366,9 @@ fn on_a_mac_where_nothing_was_found_and_no_watcher_ran_every_rule_is_on_the_page
     );
     let running = section(this_mac, "running-programs-and-their-connections");
     assert!(
-        running.contains("<ul class=\"rules\">") && running.contains("No sample is counted now"),
+        running.contains("<ul class=\"rules\">")
+            && running.contains("No sample has been taken yet.")
+            && running.contains("No watcher samples them now."),
         "{running}"
     );
     // The page of what is watched says the same, with no empty table.

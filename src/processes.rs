@@ -932,11 +932,6 @@ fn cover(
     Ok(())
 }
 
-/// How many programs the latest sample read, or `None` when no sample was taken here.
-pub fn last_sampled(conn: &rusqlite::Connection) -> rusqlite::Result<Option<i64>> {
-    Ok(last_sample(conn)?.map(|(_, programs, _)| programs))
-}
-
 /// When the latest sample was taken, and how many programs and connections it read.
 pub fn last_sample(conn: &rusqlite::Connection) -> rusqlite::Result<Option<(i64, i64, i64)>> {
     conn.query_row(

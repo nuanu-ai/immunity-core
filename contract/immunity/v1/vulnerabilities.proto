@@ -52,7 +52,8 @@ message Vulnerabilities {
 // The places, a project's lockfiles of one ecosystem, that were not all read: what they declare
 // is not all known, so no answer about them is "does not affect".
 message UnreadPlaces {
-  // One per project and ecosystem, at most 200, by project.
+  // One per project and ecosystem, at most 200 or every one with `--all` (since 1.40.0), by
+  // project.
   repeated UnreadPlace items = 1;
   // How many there are.
   uint64 total = 2;
@@ -70,6 +71,9 @@ message UnreadPlace {
   // version knows of was found in it, with the ecosystem `any`. A project with any such place
   // is never answered "does not affect" for any record, since the store does not keep every
   // ecosystem a record names. One with `none_found` is counted, never answered for a record.
+  // A reading of lockfiles not full that left no other place, such as one that met a lockfile
+  // of no ecosystem a record names, is a place with the ecosystem `none`: the projects' list is
+  // not whole, and no record's answer changes for it. Since 1.40.0.
   string lockfiles = 3;
   // Why, as the reading of lockfiles gave it, or for `no_reader` the kinds by name. Whole.
   optional string why_text = 4;
@@ -77,7 +81,8 @@ message UnreadPlace {
 
 // The packages of projects for which it cannot be told whether a record affects them.
 message UnknownPackages {
-  // One per package in a project, each under the first of its reasons, at most 200, by project.
+  // One per package in a project, each under the first of its reasons, at most 200 or every one
+  // with `--all` (since 1.40.0), by project.
   repeated UnknownPackage items = 1;
   // How many there are.
   uint64 total = 2;
@@ -96,7 +101,7 @@ message UnknownPackage {
 
 // The packages of projects that a record affects.
 message AffectedPackages {
-  // One per package and record, at most 200.
+  // One per package and record, at most 200 or every one with `--all` (since 1.40.0).
   repeated AffectedPackage items = 1;
   // How many there are.
   uint64 total = 2;

@@ -35,14 +35,7 @@ pub fn watched_readings(
     latest_run: Option<i64>,
     now: i64,
 ) -> Vec<WatchedReadings> {
-    let here = |scope: &str| {
-        this.is_some_and(|t| {
-            let checkout = scope
-                .strip_prefix("checkout:")
-                .and_then(|s| s.strip_prefix(t));
-            on_this_mac(scope, t) || checkout.is_some_and(|rest| rest.starts_with('/'))
-        })
-    };
+    let here = |scope: &str| this.is_some_and(|t| on_this_mac_or_in(scope, t));
     let mine: Vec<&Latest> = (latest.iter())
         .filter(|r| r.reader == watched::READER && here(&r.scope))
         .collect();
@@ -165,23 +158,33 @@ pub fn watched_message(
     }
 }
 
-/// The kinds of watched place some readings, each a reader, a kind and a scope, speak for, each
-/// once. The reading of a watched file's content speaks for the kind the file is watched as.
+/// The kinds of watched place on this Mac, `this`, that some readings, each a reader, a kind and
+/// a scope, speak for, each once; a reading of another machine speaks for none. The reading of a
+/// watched file's content speaks for every kind the file is watched as now, or for a file no
+/// longer watched, the kind it was last watched as.
 pub fn kinds_read_by<'a>(
     conn: &Connection,
     readings: impl Iterator<Item = (&'a str, &'a str, &'a str)>,
+    this: Option<&str>,
 ) -> rusqlite::Result<Vec<&'static str>> {
     let mut out: Vec<&'static str> = Vec::new();
     let mut watched_as = conn.prepare(
         "SELECT object FROM assertion WHERE subject = ?1 AND predicate = 'watched_as'
-         ORDER BY layer = 'live' DESC, id DESC LIMIT 1",
+           AND (layer = 'live' OR NOT EXISTS (SELECT 1 FROM assertion l WHERE l.subject = ?1
+                AND l.predicate = 'watched_as' AND l.layer = 'live')
+                AND id = (SELECT MAX(o.id) FROM assertion o
+                          WHERE o.subject = ?1 AND o.predicate = 'watched_as'))",
     )?;
     for (reader, kind, scope) in readings {
+        if !this.is_some_and(|this| on_this_mac_or_in(scope, this)) {
+            continue;
+        }
         let kinds = match reader == watched::READER && kind == watched::CONTENT {
             true => {
-                let of: Option<String> = watched_as.query_row([scope], |r| r.get(0)).optional()?;
+                let of: Vec<String> = (watched_as.query_map([scope], |r| r.get(0))?)
+                    .collect::<rusqlite::Result<_>>()?;
                 (watched_files().into_iter().map(|(as_, _)| as_))
-                    .filter(|as_| of.as_deref() == Some(*as_))
+                    .filter(|as_| of.iter().any(|o| o == as_))
                     .collect()
             }
             false => kinds_of_reading(reader, kind),

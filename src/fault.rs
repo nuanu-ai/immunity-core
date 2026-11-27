@@ -160,6 +160,7 @@ pub const NO_LONGER_READ: Cause = Cause {
 pub fn item(
     conn: &Connection,
     latest: &[Latest],
+    this: Option<&str>,
     place: impl Fn(&str) -> String,
 ) -> rusqlite::Result<Option<Uncovered>> {
     let lost = lost(conn, latest)?;
@@ -170,7 +171,7 @@ pub fn item(
     let of = lost
         .iter()
         .map(|l| (l.of.0.as_str(), l.of.1.as_str(), l.id.as_str()));
-    let kinds = covered::kinds_read_by(conn, of)?;
+    let kinds = covered::kinds_read_by(conn, of, this)?;
     Ok((!lost.is_empty()).then(|| Uncovered {
         scope,
         examples: lost.iter().map(|l| Example::named(place(&l.id))).collect(),

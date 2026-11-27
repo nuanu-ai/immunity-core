@@ -138,8 +138,8 @@ pub fn pages(
     // --files-anywhere` does.
     let this = (result.this_mac.as_ref()).and_then(|m| m.id_text.as_deref());
     let machine = match this {
-        Some(id) => (answers.machine)(id, true)?.unwrap_or_default(),
-        None => Default::default(),
+        Some(id) => (answers.machine)(id, true)?,
+        None => None,
     };
     let vulnerabilities = answers.vulnerabilities.clone().unwrap_or_default();
     let mut pages = vec![
@@ -149,7 +149,7 @@ pub fn pages(
         ),
         (
             format!("{DETAILS}/{}.html", crate::pages::THIS_MAC),
-            crate::pages::this_mac::page(result, &machine, now),
+            crate::pages::this_mac::page(result, machine.as_ref(), now),
         ),
         (
             format!("{DETAILS}/{}.html", crate::pages::BEYOND),

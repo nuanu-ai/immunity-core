@@ -169,6 +169,9 @@ pub struct ThisMac {
     pub machine: Option<String>,
     /// Its name now, as the latest full check kept it (`store::held_mac`); `None` before one.
     pub name: Option<String>,
+    /// When the latest sample of running programs was taken, and how many programs and
+    /// connections it saw (`processes::last_sample`); `None` before any.
+    pub sample: Option<(i64, i64, i64)>,
 }
 
 impl ThisMac {
@@ -192,6 +195,7 @@ impl ThisMac {
             failed: Vec::new(),
             machine: None,
             name: None,
+            sample: None,
         }
     }
 }
@@ -227,6 +231,14 @@ fn on_this_mac(scope: &str, this: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
+/// Whether a scope is this Mac, `this`, a file on it or one of its checkouts.
+pub(crate) fn on_this_mac_or_in(scope: &str, this: &str) -> bool {
+    let checkout = scope
+        .strip_prefix("checkout:")
+        .and_then(|s| s.strip_prefix(this));
+    on_this_mac(scope, this) || checkout.is_some_and(|rest| rest.starts_with('/'))
+}
+
 /// Whether a reading failed: one not full whose cause is `failed`, or that kept none, as the
 /// schema says of a class it does not know (`status::class`). Every one is a fault.
 pub(crate) fn failed(r: &Latest) -> bool {
@@ -245,10 +257,12 @@ pub fn this_mac(conn: &Connection, latest: &[Latest], live: bool) -> rusqlite::R
     let this = this_machine(conn)?;
     let checked_at = status::latest_check(conn)?.and_then(|r| r.finished_at);
     let live_read_at = crate::watch::last_read(conn)?;
+    let sample = crate::processes::last_sample(conn)?;
     let Some(this) = this else {
         return Ok(ThisMac {
             checked_at,
             live_read_at,
+            sample,
             ..ThisMac::unchecked(live)
         });
     };
@@ -310,7 +324,7 @@ pub fn this_mac(conn: &Connection, latest: &[Latest], live: bool) -> rusqlite::R
         })
         .collect();
     // Running programs are sampled only while a watcher runs.
-    if live && let Some(n) = crate::processes::last_sampled(conn)? {
+    if live && let Some((_, n, _)) = sample {
         watched.push((SAMPLED, n, "sampled"));
     }
     Ok(ThisMac {
@@ -323,6 +337,7 @@ pub fn this_mac(conn: &Connection, latest: &[Latest], live: bool) -> rusqlite::R
         machine: Some(this),
         // The id `this_machine` gave first is the one kept with this name.
         name: crate::store::held_mac(conn)?.map(|(_, name)| name),
+        sample,
     })
 }
 
@@ -1098,7 +1113,7 @@ pub fn not_covered(
         });
     }
 
-    out.extend(crate::fault::item(conn, latest, place)?);
+    out.extend(crate::fault::item(conn, latest, this, place)?);
 
     let served = crate::events::served_readings(level, latest, this);
     // Readings that failed: those kept closed by permissions, which the owner can open, and
@@ -1144,7 +1159,7 @@ pub fn not_covered(
         let of = list
             .iter()
             .map(|r| (r.reader.as_str(), r.kind.as_str(), r.scope.as_str()));
-        let kinds = kinds_read_by(conn, of)?;
+        let kinds = kinds_read_by(conn, of, this)?;
         out.push(Uncovered {
             scope: first_scope(list.iter().map(|r| r.scope.as_str()), this),
             since: list.iter().map(|r| r.at).max(),

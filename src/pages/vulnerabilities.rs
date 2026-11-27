@@ -1,7 +1,8 @@
 //! The page of known vulnerabilities in the packages the projects use, drawn from what
 //! `immunity vulnerabilities` answers, and the page of threat data, drawn from the status. "None
 //! is known" rests on the totals (`text::Matched::all_compared` and `affected_records`), never on
-//! the list being empty, since the list is cut at the contract's `vulnerabilities::SHOWN`. The
+//! the list being empty. The pages ask with `--all`, so the list is whole, and a list a client
+//! was given cut is said to be cut. The
 //! catalogue is said to be current by the one rule the answers rest on
 //! (`vulnerabilities::catalogue_current_at` over `Threats.read_at`), never by the latest
 //! attempt's outcome.
@@ -142,7 +143,7 @@ fn body(out: &mut String, v: &v1::Vulnerabilities, r: &v1::Status) -> Out {
         }
         out.push_str("</tbody></table></div>\n");
     }
-    // The list is cut at the contract's length: the total is said.
+    // A list given without `--all` is cut at the contract's length: the total is said.
     let more = affected.total.saturating_sub(affected.items.len() as u64);
     if more > 0 {
         writeln!(

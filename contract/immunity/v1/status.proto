@@ -351,6 +351,17 @@ message ThisMac {
   // 1.38.0.
   optional string id_text = 9;
   optional string name_text = 10;
+  // The latest sample of running programs, whether or not a watcher samples them now: `watched`
+  // holds `running programs and their connections` only while one does. Absent when no sample
+  // was ever taken. Since 1.40.0.
+  LatestSample latest_sample = 11;
+}
+
+// One sample of the programs running under this user, as counts: no list is kept.
+message LatestSample {
+  int64 at = 1;
+  uint64 programs = 2;
+  uint64 connections = 3;
 }
 
 // Whether this Mac is watched. `UNSPECIFIED`, or a value the reader does not know, is read as

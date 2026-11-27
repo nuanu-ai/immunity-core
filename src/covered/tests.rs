@@ -501,10 +501,12 @@ fn a_reading_names_the_kinds_of_watched_place_it_speaks_for_and_no_other() {
     // A row of what is watched is drawn as a fault by these words alone: a reading of a kind of
     // watched files names that kind, one of installed software its kind, a lockfile's the
     // packages, the search for projects every kind kept in projects and the packages, and a
-    // reading of nothing watched names nothing.
+    // reading of nothing watched names nothing. A reading of another machine names nothing of
+    // this Mac's.
     let (_dir, conn) = store_of("covered-kinds-read-by");
-    let of =
-        |readings: &[(&str, &str, &str)]| kinds_read_by(&conn, readings.iter().copied()).unwrap();
+    let of = |readings: &[(&str, &str, &str)]| {
+        kinds_read_by(&conn, readings.iter().copied(), Some(MAC)).unwrap()
+    };
     assert_eq!(
         of(&[(watched::READER, watched::PROFILE_KIND, MAC)]),
         [watched::PROFILE]
@@ -517,29 +519,66 @@ fn a_reading_names_the_kinds_of_watched_place_it_speaks_for_and_no_other() {
         of(&[(crate::lockfiles::READER, "any kind", MAC)]),
         [DEPENDENCIES]
     );
-    // The content of a watched file speaks for the kind the file is watched as.
+    assert!(of(&[(watched::READER, watched::PROFILE_KIND, "machine:other")]).is_empty());
+    // The content of a watched file speaks for every kind the file is watched as.
     let file = format!("file:{MAC}/.zshrc");
     let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Deferred)
         .unwrap();
     store::put_entity(&tx, &file).unwrap();
     tx.commit().unwrap();
-    conn.execute(
-        "INSERT INTO assertion (layer, subject, predicate, object, reader, scope, kind,
-                                source_ref, basis, observed_at, run_id)
-         VALUES ('live', ?1, 'watched_as', ?2, ?3, ?4, ?5, 'invented:1', 'observed', 1, 'run-1')",
-        params![
-            file,
-            watched::PROFILE,
-            watched::READER,
-            MAC,
-            watched::PROFILE_KIND
-        ],
-    )
-    .unwrap();
+    let watched_as = |layer: &str, as_: &str| {
+        conn.execute(
+            "INSERT INTO assertion (layer, subject, predicate, object, reader, scope, kind,
+                                    source_ref, basis, observed_at, run_id, retracted_at,
+                                    retracted_by)
+             VALUES (?1, ?2, 'watched_as', ?3, ?4, ?5, ?6, 'invented:1', 'observed',
+                     1, 'run-1', CASE ?1 WHEN 'retracted' THEN 2 END,
+                     CASE ?1 WHEN 'retracted' THEN 'run-2' END)",
+            params![
+                layer,
+                file,
+                as_,
+                watched::READER,
+                MAC,
+                watched::PROFILE_KIND
+            ],
+        )
+        .unwrap()
+    };
+    watched_as("retracted", watched::SSH);
+    watched_as("live", watched::PROFILE);
     assert_eq!(
         of(&[(watched::READER, watched::CONTENT, &file)]),
         [watched::PROFILE]
     );
+    // Live under a second kind, as a shell startup file a project's Git settings name as its
+    // hooks file: the reading speaks for both, and both rows show its fault.
+    watched_as("live", watched::HOOK);
+    let both = of(&[(watched::READER, watched::CONTENT, &file)]);
+    assert!(
+        both.len() == 2 && both.contains(&watched::PROFILE) && both.contains(&watched::HOOK),
+        "{both:?}"
+    );
+    // A file watched no longer speaks for the kind it was last watched as.
+    conn.execute(
+        "UPDATE assertion SET layer = 'retracted', retracted_at = 3, retracted_by = 'run-3'
+         WHERE subject = ?1 AND object = ?2",
+        params![file, watched::HOOK],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE assertion SET layer = 'retracted', retracted_at = 3, retracted_by = 'run-3'
+         WHERE subject = ?1 AND object = ?2",
+        params![file, watched::PROFILE],
+    )
+    .unwrap();
+    assert_eq!(
+        of(&[(watched::READER, watched::CONTENT, &file)]),
+        [watched::HOOK]
+    );
+    // A file of another machine, under the same kinds, speaks for none of this Mac's.
+    let theirs = file.replace(MAC, "machine:other");
+    assert!(of(&[(watched::READER, watched::CONTENT, &theirs)]).is_empty());
     assert!(of(&[(watched::READER, watched::CONTENT, "file:machine:none")]).is_empty());
     let (by, kind) = crate::project::FOUND_BY[0];
     let found = of(&[(by, kind, MAC), (by, kind, MAC)]);

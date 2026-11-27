@@ -1144,6 +1144,7 @@
     "fresh": true,
     "fresh_for_seconds": 7200,
     "id_text": "machine:mac",
+    "latest_sample": null,
     "live": true,
     "live_read_at": null,
     "name_text": "mac",

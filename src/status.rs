@@ -1297,6 +1297,13 @@ fn this_mac_message(m: &crate::covered::ThisMac, now: i64) -> crate::contract::v
         fresh_for_seconds: n(FRESH_FOR),
         id_text: m.machine.as_deref().map(crate::known::whole),
         name_text: m.named().map(crate::known::whole),
+        latest_sample: m
+            .sample
+            .map(|(at, programs, connections)| v1::LatestSample {
+                at,
+                programs: n(programs),
+                connections: n(connections),
+            }),
     }
 }
 

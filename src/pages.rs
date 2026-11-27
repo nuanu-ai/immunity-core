@@ -410,13 +410,10 @@ fn watched_table(out: &mut String, r: &v1::Status, faults: &[&v1::Uncovered], no
         let of: Vec<&&v1::Uncovered> = (faults.iter())
             .filter(|u| u.watched_kinds.iter().any(|k| k == key))
             .collect();
+        // A fault counts the places of its cause, of every kind, so the row gives no number.
         let mut faulted: Vec<Standing> = Vec::new();
         if !of.is_empty() {
-            let things: u64 = of.iter().map(|u| u.count.max(1)).sum();
-            faulted.push(told(
-                &of,
-                format!("{} can't be read now", grouped(things as i64)),
-            ));
+            faulted.push(told(&of, "not all can be read now".to_string()));
         }
         let mut things = n.map_or("—".to_string(), grouped);
         // The packages' own state, and beside it what the comparison found.
@@ -1431,9 +1428,15 @@ mod tests {
         assert_eq!(
             with(fault("nothing", &[crate::watched::PROFILE])),
             format!(
-                "<span class=\"dot off look\"></span><a href=\"{DETAILS}/{THIS_MAC}.html#{NOT_READ}\" aria-label=\"{NOT_READ_TITLE}: 2 can&#39;t be read now\">2 can&#39;t be read now</a>"
+                "<span class=\"dot off look\"></span><a href=\"{DETAILS}/{THIS_MAC}.html#{NOT_READ}\" aria-label=\"{NOT_READ_TITLE}: not all can be read now\">not all can be read now</a>"
             )
         );
+        // A cause of ten places, one of them of this kind: the row says no number of them.
+        let wide = v1::Uncovered {
+            count: 10,
+            ..fault("nothing", &[crate::watched::PROFILE, crate::watched::SSH])
+        };
+        assert!(!with(wide.clone()).contains("10"), "{}", with(wide));
         assert!(
             with(fault(YOU, &[crate::watched::PROFILE])).contains("href=\"#you-can-fix\""),
             "{}",

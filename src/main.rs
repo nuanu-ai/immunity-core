@@ -142,6 +142,8 @@ struct VulnerabilityArgs {
     store: PathBuf,
     form: answer::Form,
     id: Option<String>,
+    /// `--all`: every answer, unknown package and unread place, not the first `SHOWN` of each.
+    all: bool,
 }
 
 /// `immunity findings`: every finding as the contract's message, in the form named; for a person
@@ -589,11 +591,15 @@ fn parse_args(
         }
         "vulnerabilities" | "vulnerability" => {
             let mut words = Vec::new();
+            let mut all = false;
             options.read(it, |arg, _| {
-                if arg.starts_with("--") {
+                if arg == "--all" && cmd == "vulnerabilities" {
+                    all = true;
+                } else if arg.starts_with("--") {
                     return Err(format!("unexpected argument: {arg}"));
+                } else {
+                    words.push(arg);
                 }
-                words.push(arg);
                 Ok(())
             })?;
             let (store, form) = (options.store()?, options.form());
@@ -602,11 +608,13 @@ fn parse_args(
                     store,
                     form,
                     id: None,
+                    all,
                 })),
                 ("vulnerability", [id]) => Ok(Cmd::Vulnerability(VulnerabilityArgs {
                     store,
                     form,
                     id: Some(id.clone()),
+                    all: false,
                 })),
                 ("vulnerability", _) => Err(
                     "immunity vulnerability takes one record id or CVE id, as in: immunity vulnerability CVE-2023-4863"
@@ -1355,7 +1363,7 @@ fn vulnerabilities_cmd(args: &VulnerabilityArgs) -> ExitCode {
     };
     let now = now_secs();
     match &args.id {
-        None => match read_or_none(&args.store, |c| vulnerabilities::list(c, now)) {
+        None => match read_or_none(&args.store, |c| vulnerabilities::list(c, args.all, now)) {
             Ok(m) => answer::print(op, args.form, &m, |m| {
                 answers_text::vulnerabilities(m, &screen::Screen::of_stdout())
             }),
@@ -1596,7 +1604,7 @@ fn write_view(store: &Path, if_stale: bool) -> Result<Vec<PathBuf>, Box<dyn Erro
         let (state, result) = status_read(tx, store, now)?;
         let found = findings::all(tx, now)?;
         let level = state.event_level.as_ref();
-        // Where every page is written, `immunity vulnerabilities` too.
+        // Where every page is written, `immunity vulnerabilities --all` too: a page lists every row.
         let all = !matches!(current, Current::Events(_));
         let answers = view::Answers {
             findings: finding_answer::list_of(tx, &found, now)?,
@@ -1607,7 +1615,7 @@ fn write_view(store: &Path, if_stale: bool) -> Result<Vec<PathBuf>, Box<dyn Erro
                 Ok(machine::answer(tx, Some(id), &home_folder, files_anywhere, now)?.ok())
             }),
             vulnerabilities: all
-                .then(|| vulnerabilities::list(Some(tx), now))
+                .then(|| vulnerabilities::list(Some(tx), true, now))
                 .transpose()?,
         };
         let pages = match current {

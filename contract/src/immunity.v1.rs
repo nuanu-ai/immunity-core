@@ -2825,7 +2825,8 @@ pub struct Vulnerabilities {
 #[serde(default)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UnreadPlaces {
-    /// One per project and ecosystem, at most 200, by project.
+    /// One per project and ecosystem, at most 200 or every one with `--all` (since 1.40.0), by
+    /// project.
     #[prost(message, repeated, tag = "1")]
     pub items: ::prost::alloc::vec::Vec<UnreadPlace>,
     /// How many there are.
@@ -2849,6 +2850,9 @@ pub struct UnreadPlace {
     /// version knows of was found in it, with the ecosystem `any`. A project with any such place
     /// is never answered "does not affect" for any record, since the store does not keep every
     /// ecosystem a record names. One with `none_found` is counted, never answered for a record.
+    /// A reading of lockfiles not full that left no other place, such as one that met a lockfile
+    /// of no ecosystem a record names, is a place with the ecosystem `none`: the projects' list is
+    /// not whole, and no record's answer changes for it. Since 1.40.0.
     #[prost(string, tag = "3")]
     pub lockfiles: ::prost::alloc::string::String,
     /// Why, as the reading of lockfiles gave it, or for `no_reader` the kinds by name. Whole.
@@ -2860,7 +2864,8 @@ pub struct UnreadPlace {
 #[serde(default)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UnknownPackages {
-    /// One per package in a project, each under the first of its reasons, at most 200, by project.
+    /// One per package in a project, each under the first of its reasons, at most 200 or every one
+    /// with `--all` (since 1.40.0), by project.
     #[prost(message, repeated, tag = "1")]
     pub items: ::prost::alloc::vec::Vec<UnknownPackage>,
     /// How many there are.
@@ -2889,7 +2894,7 @@ pub struct UnknownPackage {
 #[serde(default)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AffectedPackages {
-    /// One per package and record, at most 200.
+    /// One per package and record, at most 200 or every one with `--all` (since 1.40.0).
     #[prost(message, repeated, tag = "1")]
     pub items: ::prost::alloc::vec::Vec<AffectedPackage>,
     /// How many there are.
@@ -3651,6 +3656,23 @@ pub struct ThisMac {
     pub id_text: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag = "10")]
     pub name_text: ::core::option::Option<::prost::alloc::string::String>,
+    /// The latest sample of running programs, whether or not a watcher samples them now: `watched`
+    /// holds `running programs and their connections` only while one does. Absent when no sample
+    /// was ever taken. Since 1.40.0.
+    #[prost(message, optional, tag = "11")]
+    pub latest_sample: ::core::option::Option<LatestSample>,
+}
+/// One sample of the programs running under this user, as counts: no list is kept.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LatestSample {
+    #[prost(int64, tag = "1")]
+    pub at: i64,
+    #[prost(uint64, tag = "2")]
+    pub programs: u64,
+    #[prost(uint64, tag = "3")]
+    pub connections: u64,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]

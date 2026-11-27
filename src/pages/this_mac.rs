@@ -100,6 +100,8 @@ struct Mac<'a> {
     facts: BTreeMap<String, Vec<&'a v1::Fact>>,
     /// When the latest full check began: a reading before it speaks for no list.
     latest_run: Option<i64>,
+    /// That check's id, as `Coverage.run_id` names runs.
+    latest_run_id: Option<&'a str>,
     /// Whether projects were looked for everywhere but where this version does not enter, and
     /// why not when a reading failed (`covered::projects_found`, as the status gives it).
     found: Option<&'a v1::ProjectsFound>,
@@ -132,7 +134,11 @@ impl Mac<'_> {
         let this = self.this.as_ref().map(|t| t.id.as_str());
         (self.m.coverage.iter())
             .filter(|c| c.reader == reader && kinds.contains(&c.kind))
-            .filter(|c| this.is_some_and(|t| on_mac(&contract::unescape(&c.scope_text), t)))
+            .filter(|c| {
+                this.is_some_and(|t| {
+                    covered::on_this_mac_or_in(&contract::unescape(&c.scope_text), t)
+                })
+            })
             .map(latest_of)
             .collect()
     }
@@ -162,17 +168,6 @@ impl Mac<'_> {
     }
 }
 
-/// Whether a scope is this Mac's: the machine, a file or a checkout on it.
-fn on_mac(scope: &str, this: &str) -> bool {
-    scope == this
-        || ["file:", "checkout:"].iter().any(|p| {
-            (scope
-                .strip_prefix(p)
-                .and_then(|rest| rest.strip_prefix(this)))
-            .is_some_and(|rest| rest.starts_with('/'))
-        })
-}
-
 /// A reading of the answer as `unread` reads one: its reason taken whole, cut where it is said.
 fn latest_of(c: &v1::Coverage) -> Latest {
     let completeness = v1::Completeness::try_from(c.completeness).map_or("none", |c| match c {
@@ -193,31 +188,20 @@ fn latest_of(c: &v1::Coverage) -> Latest {
 }
 
 /// What is watched on this Mac, one section per kind with the things of that kind, the ways code
-/// runs by itself, the projects, and in full each fault nothing the person does changes.
-pub fn page(r: &v1::Status, m: &v1::Known, now: i64) -> String {
+/// runs by itself, the projects, and in full each fault nothing the person does changes. Without
+/// an answer of `immunity machine` about this Mac it says so, and no list is drawn.
+pub fn page(r: &v1::Status, m: Option<&v1::Known>, now: i64) -> String {
     let mac = r.this_mac.clone().unwrap_or_default();
     let this = (mac.id_text.as_deref()).map(|id| This {
         id: contract::unescape(id),
         name: mac.name_text.as_deref().map(contract::unescape),
     });
-    let mut facts: BTreeMap<String, Vec<&v1::Fact>> = BTreeMap::new();
-    for f in &m.facts {
-        facts.entry(f.subject_text.clone()).or_default().push(f);
-    }
-    let latest_run = (r.last_finished_run.as_ref())
-        .and_then(|f| f.check.as_ref())
-        .map(|c| c.started_at);
+    let check = (r.last_finished_run.as_ref()).and_then(|f| f.check.as_ref());
+    let latest_run = check.map(|c| c.started_at);
     let found = r
         .vulnerabilities
         .as_ref()
         .and_then(|v| v.projects_found.as_ref());
-    let s = Mac {
-        m,
-        this,
-        facts,
-        latest_run,
-        found,
-    };
     let mut out = top(
         THIS_MAC_TITLE,
         &format!(
@@ -226,10 +210,27 @@ pub fn page(r: &v1::Status, m: &v1::Known, now: i64) -> String {
             utc(now)
         ),
     );
-    let _ = kinds(&mut out, &s, r, now);
-    let _ = also(&mut out, &s);
-    let _ = ways(&mut out, &s);
-    let _ = projects(&mut out, &s, now);
+    match m {
+        None => out.push_str(NO_ANSWER),
+        Some(m) => {
+            let mut facts: BTreeMap<String, Vec<&v1::Fact>> = BTreeMap::new();
+            for f in &m.facts {
+                facts.entry(f.subject_text.clone()).or_default().push(f);
+            }
+            let s = Mac {
+                m,
+                this,
+                facts,
+                latest_run,
+                latest_run_id: check.map(|c| c.id.as_str()),
+                found,
+            };
+            let _ = kinds(&mut out, &s, r, now);
+            let _ = also(&mut out, &s);
+            let _ = ways(&mut out, &s);
+            let _ = projects(&mut out, &s, now);
+        }
+    }
     // What could not be read on this Mac, each thing in full, where the summary's line leads.
     let failed: Vec<&v1::Uncovered> = (r.not_covered.iter())
         .filter(|u| u.fault && u.who != covered::YOU)
@@ -319,16 +320,23 @@ fn kinds(out: &mut String, s: &Mac, r: &v1::Status, now: i64) -> Out {
         crate::watch::SAMPLE.as_secs()
     )?;
     told(out, &covered::rules_about(covered::SAMPLED))?;
-    match mac.watched.iter().find(|w| w.what == covered::SAMPLED) {
-        Some(w) => writeln!(
+    // Three states apart: never sampled, the latest sample with its time and counts, and
+    // whether a watcher samples them now.
+    match &mac.latest_sample {
+        Some(l) => writeln!(
             out,
-            "<p>The latest sample saw {}.</p>",
-            counted(w.count as i64, "running program", "running programs")
+            "<p>The latest sample, taken {}, saw {} and {}.</p>",
+            utc(l.at),
+            counted(l.programs as i64, "running program", "running programs"),
+            counted(l.connections as i64, "connection", "connections")
         )?,
-        None => out.push_str(
-            "<p class=\"muted\">No sample is counted now: a watcher counts them while it runs.</p>\n",
-        ),
+        None => out.push_str("<p class=\"muted\">No sample has been taken yet.</p>\n"),
     }
+    let now_sampled = mac.watched.iter().any(|w| w.what == covered::SAMPLED);
+    out.push_str(match now_sampled {
+        true => "<p class=\"muted\">A watcher samples them now.</p>\n",
+        false => "<p class=\"muted\">No watcher samples them now.</p>\n",
+    });
     out.push_str("</section>\n");
     Ok(())
 }
@@ -340,10 +348,18 @@ fn also(out: &mut String, s: &Mac) -> Out {
     told(out, &rule_with(INDICATOR_RULE))?;
     let list = (s.m.coverage.iter())
         .find(|c| c.reader == crate::indicators::READER && c.kind == crate::indicators::LIST_KIND);
-    let said = match list.map(|c| c.completeness == v1::Completeness::Full as i32) {
-        Some(true) => "A list was read at the last check.",
-        Some(false) => "A list was given but could not be read at the last check.",
-        None => "No list has been given, so nothing is compared.",
+    // "At the last check" only of a reading that check made; an earlier one says when it was.
+    let full = |c: &v1::Coverage| c.completeness == v1::Completeness::Full as i32;
+    let said = match list {
+        None => "No list has been given, so nothing is compared.".to_string(),
+        Some(c) if c.run_id.is_some() && c.run_id.as_deref() == s.latest_run_id => match full(c) {
+            true => "A list was read at the last check.".to_string(),
+            false => "A list was given but could not be read at the last check.".to_string(),
+        },
+        Some(c) => format!(
+            "The last check read no list. One was last read in full {}.",
+            utc_or(c.last_full_at, "never")
+        ),
     };
     writeln!(
         out,
@@ -353,6 +369,9 @@ fn also(out: &mut String, s: &Mac) -> Out {
     out.push_str("</section>\n");
     Ok(())
 }
+
+/// What the page says without an answer of `immunity machine` about this Mac.
+const NO_ANSWER: &str = "<section id=\"no-answer\">\n<p class=\"muted\">There is no answer about this Mac yet, so nothing is said of what is on it.</p>\n</section>\n";
 
 /// The rule about a match of a list of indicators, which is about no one kind.
 const INDICATOR_RULE: &str = "indicator.match";
@@ -679,6 +698,7 @@ mod tests {
             this: None,
             facts: BTreeMap::new(),
             latest_run: None,
+            latest_run_id: None,
             found,
         }
     }
@@ -797,7 +817,11 @@ mod tests {
 
     /// The page of what is watched for a status and an answer that hold nothing.
     fn this_mac_page() -> String {
-        page(&v1::Status::default(), &v1::Known::default(), 1_791_000_000)
+        page(
+            &v1::Status::default(),
+            Some(&v1::Known::default()),
+            1_791_000_000,
+        )
     }
 
     /// Each section of a kind of watched thing on the page, by its anchor, up to its end.
@@ -871,7 +895,7 @@ mod tests {
 
     /// The section of a kind of watched thing on this Mac's page.
     fn section(r: &v1::Status, m: &v1::Known, what: &str) -> String {
-        let p = page(r, m, NOW);
+        let p = page(r, Some(m), NOW);
         let at = p
             .find(&format!("<section id=\"{}\">", anchor(what)))
             .unwrap();
@@ -891,6 +915,7 @@ mod tests {
             }),
             last_finished_run: Some(v1::FinishedCheck {
                 check: Some(v1::CheckMark {
+                    id: "run-2".to_string(),
                     started_at: NOW - 60,
                     ..Default::default()
                 }),
@@ -906,6 +931,95 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    /// Running programs: never sampled, the latest sample with its time and counts, and whether a
+    /// watcher samples them now are told apart, as the status gives them.
+    #[test]
+    fn the_running_programs_say_whether_a_sample_was_taken_and_whether_one_is_taken_now() {
+        let running = |sample: Option<v1::LatestSample>, now_sampled: bool| {
+            let mut r = status(vec![], vec![]);
+            let mac = r.this_mac.as_mut().unwrap();
+            mac.latest_sample = sample;
+            if now_sampled {
+                mac.watched.push(v1::WatchedThing {
+                    what: covered::SAMPLED.to_string(),
+                    count: 2,
+                    how: "sampled".to_string(),
+                });
+            }
+            section(&r, &v1::Known::default(), covered::SAMPLED)
+        };
+        let never = running(None, false);
+        assert!(
+            never.contains("No sample has been taken yet.")
+                && never.contains("No watcher samples them now."),
+            "{never}"
+        );
+        let taken = v1::LatestSample {
+            at: NOW - 600,
+            programs: 2,
+            connections: 1,
+        };
+        let earlier = running(Some(taken), false);
+        assert!(
+            earlier.contains(&format!(
+                "The latest sample, taken {}, saw 2 running programs and 1 connection.",
+                utc(NOW - 600)
+            )) && earlier.contains("No watcher samples them now."),
+            "{earlier}"
+        );
+        assert!(running(Some(taken), true).contains("A watcher samples them now."));
+    }
+
+    /// No false calm: without an answer of `immunity machine` about this Mac the page says so,
+    /// and no list says nothing is there, whatever the status says of its kinds.
+    #[test]
+    fn without_an_answer_about_this_mac_no_list_says_none_found_here() {
+        let whole = v1::WatchedKind {
+            kind: watched::PROFILE.to_string(),
+            coverage: Some(v1::Completeness::Full as i32),
+            fresh: true,
+            ..Default::default()
+        };
+        let p = page(&status(vec![whole], vec![]), None, NOW);
+        assert!(
+            p.contains("There is no answer about this Mac yet") && !p.contains(NONE_FOUND),
+            "{p}"
+        );
+    }
+
+    /// The list of signs of a known attack is said read "at the last check" only by a reading
+    /// that check made (`Coverage.run_id`); one an earlier check made says when it was read.
+    #[test]
+    fn the_list_of_signs_is_said_read_at_the_last_check_only_by_a_reading_of_that_check() {
+        let also = |run: &str| {
+            let read = v1::Known {
+                coverage: vec![v1::Coverage {
+                    reader: crate::indicators::READER.to_string(),
+                    kind: crate::indicators::LIST_KIND.to_string(),
+                    scope_text: MAC.to_string(),
+                    completeness: v1::Completeness::Full as i32,
+                    observed_at: Some(NOW - 86_400),
+                    last_full_at: Some(NOW - 86_400),
+                    run_id: Some(run.to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            let p = page(&status(vec![], vec![]), Some(&read), NOW);
+            p[p.find("<section id=\"also\">").unwrap()..].to_string()
+        };
+        assert!(also("run-2").contains("A list was read at the last check."));
+        let earlier = also("run-1");
+        assert!(
+            !earlier.contains("at the last check.")
+                && earlier.contains(&format!(
+                    "The last check read no list. One was last read in full {}.",
+                    utc(NOW - 86_400)
+                )),
+            "{earlier}"
+        );
     }
 
     /// No false calm: an empty list of this Mac's page says "None found here." only where the
