@@ -333,7 +333,8 @@ CREATE TABLE rule_evidence (
     user_id           INTEGER,
     signing_id        TEXT,
     team_id           TEXT,
-    platform_binary   INTEGER
+    platform_binary   INTEGER,
+    who               TEXT NOT NULL   -- the rest of who the processes are, `Who` as JSON
 );
 -- File events: whether the collector installed here is established to record them, why not,
 -- and the latest sequence number of each kind read, NULL before any.
@@ -367,7 +368,7 @@ CREATE TABLE event_file_count (
     unreadable   INTEGER NOT NULL   -- file events that could not be made out
 );
 -- The file events a finding from a published rule rests on, the first, which raised it, and
--- the latest five: the file, the program and who signed it, as the line gave them.
+-- the latest five: the file, the program, who it is and who signed it, as the line gave them.
 CREATE TABLE rule_file_evidence (
     finding         TEXT NOT NULL REFERENCES finding (id),
     read_at         INTEGER NOT NULL,
@@ -378,7 +379,9 @@ CREATE TABLE rule_file_evidence (
     executable      TEXT NOT NULL,  -- the program that did it
     signing_id      TEXT,
     team_id         TEXT,
-    platform_binary INTEGER
+    platform_binary INTEGER,
+    codesigning_flags INTEGER,
+    instigator      TEXT NOT NULL   -- who the program is, `Identity` as JSON
 );
 -- What the lines read say of each of `KEEPS`, by kind of event (`MARKS`): a row once a line of
 -- the kind was read, none before.
@@ -465,7 +468,12 @@ pub struct ProcessStart {
 ///
 /// The users and groups, the responsible process, the process group and the signer of the
 /// process before the `exec` are handed to the response layer and given to no rule.
-#[derive(Clone, Debug, Default, PartialEq)]
+///
+/// A finding's evidence keeps it whole as JSON (`rule_evidence.who`), so a start read back from
+/// the store is the start the line gave, but for its arguments.
+/// The names of its fields, and of `Identity`'s and `Users`', are what the store holds: a
+/// renamed field is a change of the store's shape.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Who {
     pub pid_version: Option<i64>,
     /// When the process started, as eslogger writes it.
@@ -490,7 +498,7 @@ pub struct Who {
 /// Who a process is, as far as a line of the log says: its pid and the pid's version, from an
 /// audit token, when it started, and the users and groups of its audit token. Each is absent
 /// where the line does not give it, or gives it in a shape this reader does not know.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Identity {
     pub pid: Option<i64>,
     pub pid_version: Option<i64>,
@@ -502,7 +510,7 @@ pub struct Identity {
 
 /// The real user id and the effective and real group ids of an audit token, `ruid`, `egid` and
 /// `rgid`, each absent where the line does not give it as a whole number.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Users {
     pub real_user_id: Option<i64>,
     pub group_id: Option<i64>,
@@ -2965,8 +2973,8 @@ pub fn keep<'a>(
             Evidence::Start(s) => tx.execute(
                 "INSERT INTO rule_evidence (finding, read_at, timestamp, executable, args,
                          parent_executable, working_directory, pid, parent_pid, user_id,
-                         signing_id, team_id, platform_binary)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                         signing_id, team_id, platform_binary, who)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
                 params![
                     finding,
                     now,
@@ -2981,13 +2989,15 @@ pub fn keep<'a>(
                     s.user_id,
                     s.signing_id,
                     s.team_id,
-                    s.platform_binary
+                    s.platform_binary,
+                    json!(s.who).to_string()
                 ],
             )?,
             Evidence::File(f) => tx.execute(
                 "INSERT INTO rule_file_evidence (finding, read_at, timestamp, action, path,
-                         source, executable, signing_id, team_id, platform_binary)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                         source, executable, signing_id, team_id, platform_binary,
+                         codesigning_flags, instigator)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
                     finding,
                     now,
@@ -2998,7 +3008,9 @@ pub fn keep<'a>(
                     f.executable,
                     f.signing_id,
                     f.team_id,
-                    f.platform_binary
+                    f.platform_binary,
+                    f.codesigning_flags,
+                    json!(f.instigator).to_string()
                 ],
             )?,
         };
