@@ -3321,8 +3321,11 @@ pub struct Status {
     /// is no store.
     #[prost(string, optional, tag = "3")]
     pub store_id: ::core::option::Option<::prost::alloc::string::String>,
-    /// A full check is in progress now. Everything else describes the latest one that finished.
-    /// False once the latest check that started has finished, while it still tidies the store.
+    /// A check `immunity run` started is in progress now, a full check or one narrowed with
+    /// `--checkouts-root`: the latest start the journal holds, while that run still holds its lock.
+    /// False once that check has written its end, while it still tidies the store. The rest of the
+    /// message is of the store as committed: `last_run` is the latest check that started, and
+    /// `last_finished_run` the latest that finished.
     #[prost(bool, tag = "4")]
     pub running: bool,
     /// The store's file, and whether it exists. Without a store every section but `cannot_judge`,
@@ -4906,8 +4909,9 @@ pub enum ThisMacState {
     /// A place of its own is there and was not read whole: a reading of it failed, or one read here
     /// before is not read now (`read-before-not-read-now`); or the event
     /// level is installed and records no program start (refused, failing or silent); or it runs and
-    /// lost part of what it was to record in a reading since the latest finished full check, or at
-    /// any time when none has finished: starts or file events missing from the numbering, a
+    /// lost part of what it was to record in a reading since the latest finished full check, or,
+    /// when none has finished, in a reading still kept, which is one since the first check started
+    /// or one of the last two days: starts or file events missing from the numbering, a
     /// restart, lines it could not read, a log file deleted before it was read. A log file the cap
     /// deleted after it was read is no loss. `not_covered`, or the counts `since_check` of
     /// `event_level`, say which.

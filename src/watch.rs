@@ -22,7 +22,7 @@
 //! reached by a link spelled in another case or Unicode form, or by a hard link, is not told by
 //! it. So after any reading of some places every place is read at the next look at what to
 //! watch, a minute later at most, unless one was read since: the place a change names is read
-//! within seconds, every other within about a minute.
+//! within seconds, every other within about a minute, while no check holds the store.
 //!
 //! Every start reads every place at once, whatever the store holds: what changed while no
 //! watcher ran, and whatever one that stopped still owed, is read then, and nothing a watcher

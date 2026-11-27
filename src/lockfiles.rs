@@ -385,8 +385,9 @@ fn walk(checkout: &Path, prefix: &str, limit: usize, say: Say) -> Walk {
                 continue;
             }
             // Neither gone into nor opened, whatever the reason: a folder never entered, a link
-            // of any kind, which is not followed, or an entry of another kind. What was known
-            // under it is kept; a lockfile that is a link is also said.
+            // of any kind, which is not followed, or an entry of another kind. Indicator matches
+            // under it are kept; the packages read there before are let go, and the reading stays
+            // full. A lockfile that is a link is also said.
             out.look.aside(unit(&format!("{rel}{name}")));
             if link {
                 files.extend(kind.map(|kind| (name, kind, Where::Linked)));
@@ -733,8 +734,8 @@ enum Parsed {
     Failed,
 }
 
-/// npm's public registry. An entry is from it when it names no `resolved` address, as a
-/// bundled entry does, or names one here. An address here is the package's own only as
+/// npm's public registry. An entry is from it when its address is here; one that names no
+/// address is from an unrecorded index. An address here is the package's own only as
 /// `registry_tarball` says; any other is not its package. A mirror counts as another registry.
 const NPM_REGISTRY: &str = "https://registry.npmjs.org/";
 

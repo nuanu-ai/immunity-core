@@ -52,7 +52,10 @@ fn npm_entry(
     let link = entry.get("link").and_then(|l| l.as_bool()) == Some(true);
     let source = match resolved {
         _ if link => Source::Path,
-        None => Source::Registry,
+        // No address. A bundled dependency comes inside its parent's file; an entry of a
+        // lockfile written with `omit-lockfile-registry-resolved` is fetched from whatever
+        // registry npm is set up with. In neither does the file say it is the public registry's.
+        None => Source::UnrecordedIndex,
         Some(r) if r.starts_with(NPM_REGISTRY) => Source::Registry,
         Some(r) if GIT.iter().any(|p| r.starts_with(p)) => Source::Git,
         Some(r) if r.starts_with("file:") => Source::Path,
@@ -101,7 +104,8 @@ mod tests {
     fn an_npm_entry_is_named_by_the_package_it_is_and_says_where_it_comes_from() {
         // An alias installed as `string-width-cjs` is string-width, and only an entry from the
         // public registry carries the bare name an advisory gives: a package from git, a file,
-        // a link or another registry is a component of its own, never the registry's one.
+        // a link or another registry is a component of its own, never the registry's one, and
+        // so is a bundled one, which names no address.
         let dir = Dir::new("npm", &[("package-lock.json", NPM)]);
         let (o, said) = dir.read();
         let at = "dev/shop/package-lock.json#node_modules";
@@ -110,8 +114,12 @@ mod tests {
             format!("npm/@jrichman/ink|has_version|6.4.6|{at}/ink"),
             format!("npm/@shop/ui (path)|part_of|checkout|{at}/@shop/ui"),
             format!("npm/@shop/ui (path)|has_version|0.1.0|{at}/@shop/ui"),
-            format!("npm/abbrev|part_of|checkout|{at}/npm-bundler/node_modules/abbrev"),
-            format!("npm/abbrev|has_version|1.1.1|{at}/npm-bundler/node_modules/abbrev"),
+            format!(
+                "npm/abbrev (unrecorded index)|part_of|checkout|{at}/npm-bundler/node_modules/abbrev"
+            ),
+            format!(
+                "npm/abbrev (unrecorded index)|has_version|1.1.1|{at}/npm-bundler/node_modules/abbrev"
+            ),
             format!("npm/left-pad (git)|part_of|checkout|{at}/left-pad"),
             format!("npm/left-pad (git)|has_version|1.3.0|{at}/left-pad"),
             format!("npm/local-tool (path)|part_of|checkout|{at}/local-tool"),

@@ -243,7 +243,7 @@ fn prepare(mac: &Mac) -> String {
     mac.put("home/dev/shop/.git/HEAD", "ref: refs/heads/main\n");
     mac.put(
         "home/dev/shop/package-lock.json",
-        r#"{"lockfileVersion": 3, "packages": {"": {"name": "shop"}, "node_modules/ansi-regex": {"version": "6.2.1"}}}"#,
+        r#"{"lockfileVersion": 3, "packages": {"": {"name": "shop"}, "node_modules/ansi-regex": {"version": "6.2.1", "resolved": "https://registry.npmjs.org/ansi-regex/-/ansi-regex-6.2.1.tgz"}}}"#,
     );
     mac.put(
         "system/opt/homebrew/Cellar/tool/1.0/bin/tool",
