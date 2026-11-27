@@ -3323,9 +3323,9 @@ pub struct Status {
     pub store_id: ::core::option::Option<::prost::alloc::string::String>,
     /// A check `immunity run` started is in progress now, a full check or one narrowed with
     /// `--checkouts-root`: the latest start the journal holds, while that run still holds its lock.
-    /// False once that check has written its end, while it still tidies the store. The rest of the
-    /// message is of the store as committed: `last_run` is the latest check that started, and
-    /// `last_finished_run` the latest that finished.
+    /// False once that check has written its end, while it still tidies the store. `last_run` is
+    /// the latest check that started, `last_finished_run` the latest that finished, and
+    /// `check_stage` the stage the running one noted.
     #[prost(bool, tag = "4")]
     pub running: bool,
     /// The store's file, and whether it exists. Without a store every section but `cannot_judge`,
@@ -4910,11 +4910,11 @@ pub enum ThisMacState {
     /// before is not read now (`read-before-not-read-now`); or the event
     /// level is installed and records no program start (refused, failing or silent); or it runs and
     /// lost part of what it was to record in a reading since the latest finished full check, or,
-    /// when none has finished, in a reading still kept, which is one since the first check started
-    /// or one of the last two days: starts or file events missing from the numbering, a
-    /// restart, lines it could not read, a log file deleted before it was read. A log file the cap
-    /// deleted after it was read is no loss. `not_covered`, or the counts `since_check` of
-    /// `event_level`, say which.
+    /// when none has finished, in a reading still kept, which is one of the last two days or one
+    /// since the start of a check that has not finished: starts or file events missing from the
+    /// numbering, a restart, lines it could not read, a log file deleted before it was read. A log
+    /// file the cap deleted after it was read is no loss. `not_covered`, or the counts `since_check`
+    /// of `event_level`, say which.
     #[serde(rename = "watched_in_part")]
     WatchedInPart = 3,
 }

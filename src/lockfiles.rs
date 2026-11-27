@@ -386,8 +386,8 @@ fn walk(checkout: &Path, prefix: &str, limit: usize, say: Say) -> Walk {
             }
             // Neither gone into nor opened, whatever the reason: a folder never entered, a link
             // of any kind, which is not followed, or an entry of another kind. Indicator matches
-            // under it are kept; the packages read there before are let go, and the reading stays
-            // full. A lockfile that is a link is also said.
+            // under it are kept. It leaves the reading full, so the packages read there before are
+            // let go unless something else makes this reading of the project partial. A lockfile that is a link is also said.
             out.look.aside(unit(&format!("{rel}{name}")));
             if link {
                 files.extend(kind.map(|kind| (name, kind, Where::Linked)));
