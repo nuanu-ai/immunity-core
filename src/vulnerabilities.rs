@@ -2819,26 +2819,47 @@ pub fn finding_detail(list: &[Affecting], about: &str) -> Option<(String, String
             }
         }
     }
-    let records: Vec<String> = mine
-        .iter()
-        .map(|a| {
-            let mut s = format!("{} from {}", a.advisory, source_name(&a.advisory));
-            if let Some(summary) = &a.summary {
+    let records: Vec<RecordSaid> = (mine.iter())
+        .map(|a| RecordSaid {
+            id: &a.advisory,
+            source: source_name(&a.advisory),
+            summary: a.summary.as_deref(),
+            fixed: &a.fixed,
+        })
+        .collect();
+    let releases: Vec<&str> = releases.iter().map(String::as_str).collect();
+    Some((
+        at.join(", "),
+        package_value(&first.package, &releases, &records),
+    ))
+}
+
+/// One record as a vulnerable package's value says it: its id, its source, its summary and the
+/// releases that fix it.
+pub struct RecordSaid<'a> {
+    pub id: &'a str,
+    pub source: &'a str,
+    pub summary: Option<&'a str>,
+    pub fixed: &'a [String],
+}
+
+/// A vulnerable package's value, as its finding gives it (`Finding.value_text`): the package, its
+/// releases and each record. The one writer of it: the pages make it again from a finding's
+/// evidence to tell whether the evidence sets out every word of it.
+pub fn package_value(package: &str, releases: &[&str], records: &[RecordSaid]) -> String {
+    let records: Vec<String> = (records.iter())
+        .map(|r| {
+            let mut s = format!("{} from {}", r.id, r.source);
+            if let Some(summary) = r.summary {
                 s.push_str(&format!(": {summary}"));
             }
-            if !a.fixed.is_empty() {
-                s.push_str(&format!(" (fixed in {})", a.fixed.join(", ")));
+            if !r.fixed.is_empty() {
+                s.push_str(&format!(" (fixed in {})", r.fixed.join(", ")));
             }
             s
         })
         .collect();
-    let value = format!(
-        "{} {}; {}",
-        first.package,
-        releases.into_iter().collect::<Vec<_>>().join(", "),
-        records.join("; ")
-    );
-    Some((at.join(", "), value))
+    format!("{package} {}; {}", releases.join(", "), records.join("; "))
 }
 
 #[cfg(test)]

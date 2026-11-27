@@ -4290,9 +4290,10 @@ fn none_said(view: &str) -> Vec<String> {
         let kind = row.split("<span>").nth(1)?.split("</span>").next()?;
         row.contains("</span>none here").then(|| kind.to_string())
     });
-    let fold = "<strong>None here, read in full:</strong> ";
+    let fold = "<strong>None here, read in full";
     let folded = (view.split(fold).skip(1))
-        .flat_map(|l| l[..l.find("</p>").unwrap()].split(" · "))
+        .map(|l| &l[l.find("</strong> ").unwrap() + "</strong> ".len()..l.find("</p>").unwrap()])
+        .flat_map(|names| names.split(" · "))
         .map(str::to_string);
     rows.chain(folded).collect()
 }

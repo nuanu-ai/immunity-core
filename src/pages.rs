@@ -254,7 +254,8 @@ pub(crate) struct Band {
 ///   line of its own, `!` and the text's words, what its source said and its command;
 /// - a reading that failed (a cause the status calls a fault, the event level and what it lost,
 ///   a download) is counted on one line, `!` and a link to "Could not be read", which tells each
-///   whole (`not_read::NotRead`), with how many of them the person can fix.
+///   whole (`not_read::line`): as many as the things it is about, a cause of a hundred servers a
+///   hundred, with how many of them the person can fix.
 ///
 /// So the band says less than the text of nothing and reads no calmer than a line for each: every
 /// state and fault of its own work in its words, every reading that failed in the count, each
@@ -274,16 +275,8 @@ pub(crate) fn band(r: &v1::Status) -> Band {
             )
         })
         .collect();
-    let n = not_read::NotRead::of(r);
-    let unread = (n.len() > 0).then(|| {
-        format!(
-            "<p class=\"sub fault\">! <a href=\"#{NOT_READ}\">{}</a></p>",
-            esc(&n.counted(
-                ("thing could not be read", "things could not be read"),
-                ", "
-            ))
-        )
-    });
+    let unread = not_read::line(r, &format!("#{NOT_READ}"))
+        .map(|line| format!("<p class=\"sub fault\">{line}</p>"));
     Band {
         state,
         faults,
@@ -449,7 +442,8 @@ fn watched_row(out: &mut String, row: &Row, now: i64) -> Out {
 
 /// The table of what is read, group by group: under its group's name each row that says more than
 /// that there is none here, then the rows that say only that, folded into one line of their names
-/// (`Row::none_here`).
+/// (`Row::none_here`) with when they were read, as their rows' last read: one time, or from the
+/// oldest to the latest, so a fold never hides that a reading is old.
 fn read_table(out: &mut String, rows: &[Row], now: i64) -> Out {
     out.push_str("<div class=\"wt\">\n<div class=\"wr wh\" aria-hidden=\"true\"><span>Kind of place</span><span>How often</span><span class=\"wn\">Things</span><span>State</span><span class=\"wl\">Last read</span></div>\n");
     for group in [ON_THIS_MAC, IN_PROJECTS, BEYOND_THIS_MAC] {
@@ -464,9 +458,17 @@ fn read_table(out: &mut String, rows: &[Row], now: i64) -> Out {
         }
         if !none.is_empty() {
             let names: Vec<String> = (none.iter()).map(|r| esc(&r.kind)).collect();
+            let times: BTreeSet<i64> = none.iter().filter_map(|r| r.last).collect();
+            let at = match (times.first(), times.last()) {
+                (Some(a), Some(b)) if a == b => format!(" at {}", view::when(*a, now)),
+                (Some(a), Some(b)) => {
+                    format!(" from {} to {}", view::when(*a, now), view::when(*b, now))
+                }
+                _ => String::new(),
+            };
             writeln!(
                 out,
-                "<p class=\"kn\"><span class=\"dot\"></span><strong>None here, read in full:</strong> {}</p>",
+                "<p class=\"kn\"><span class=\"dot\"></span><strong>None here, read in full{at}:</strong> {}</p>",
                 names.join(" · ")
             )?;
         }
@@ -1216,11 +1218,15 @@ mod tests {
                 let (words, ..) = f.parts();
                 assert!(!page.contains(&esc(words)), "{words}: {page}");
             }
-            let yours = (s.not_covered.iter())
-                .filter(|u| u.fault && u.who == YOU)
-                .count();
+            // Counted by the things: a cause as many as its title counts, at least one, and each
+            // other reading one.
+            let things = |u: &&v1::Uncovered| u.count.max(1);
+            let causes: Vec<&v1::Uncovered> = s.not_covered.iter().filter(|u| u.fault).collect();
+            let readings = (failed.iter().filter(|f| f.about() == Of::Reading)).count() as u64;
+            let n = causes.iter().map(things).sum::<u64>() + readings;
+            let yours: u64 = (causes.iter().filter(|u| u.who == YOU)).map(things).sum();
             let wanted = (!failed.is_empty()).then(|| {
-                let n = counted(failed.len() as i64, "thing", "things");
+                let n = counted(n as i64, "thing", "things");
                 let yours = match yours {
                     0 => String::new(),
                     y => format!(", {y} you can fix"),
@@ -1745,6 +1751,49 @@ mod tests {
             ..Default::default()
         }];
         assert!(!drawn(&r, profile));
+    }
+
+    /// A folded line carries its time: when its kinds were read, as their rows' last read would
+    /// say it, once when they were read at the same time and from the oldest to the latest when
+    /// not, so a day-old reading never reads as one of now.
+    #[test]
+    fn a_folded_line_carries_when_its_kinds_were_read() {
+        let now = 1_800_000_000;
+        let kind = |as_: &str, at: i64| v1::WatchedKind {
+            kind: as_.to_string(),
+            coverage: Some(v1::Completeness::Full as i32),
+            fresh: true,
+            read_at: Some(at),
+            ..Default::default()
+        };
+        let fold = |old: i64| {
+            let r = watched_status(
+                &[("shell startup files", 0), ("SSH files", 0)],
+                vec![
+                    kind(crate::watched::PROFILE, old),
+                    kind(crate::watched::SSH, now - 40),
+                ],
+            );
+            let mut out = String::new();
+            read_table(&mut out, &rows(&r, &Links::summary(), now), now).unwrap();
+            let line = out.lines().find(|l| l.starts_with("<p class=\"kn\">"));
+            line.unwrap_or_else(|| panic!("{out}")).to_string()
+        };
+        let (old, new) = (view::when(now - 86_400, now), view::when(now - 40, now));
+        assert!(
+            fold(now - 40).contains(&format!(
+                "<strong>None here, read in full at {new}:</strong>"
+            )),
+            "{}",
+            fold(now - 40)
+        );
+        assert!(
+            fold(now - 86_400).contains(&format!(
+                "<strong>None here, read in full from {old} to {new}:</strong>"
+            )),
+            "{}",
+            fold(now - 86_400)
+        );
     }
 
     /// The page of this Mac opens with what is read on it and in its projects: the summary's own

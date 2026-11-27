@@ -33,14 +33,20 @@ impl<'a> NotRead<'a> {
         NotRead { causes, readings }
     }
 
-    pub(super) fn len(&self) -> usize {
-        self.causes.len() + self.readings.len()
+    /// How many things could not be read: each cause the things it counts (`Uncovered.count`, the
+    /// number its title says), one where it counts none, and each other reading one, since it
+    /// carries no number.
+    pub(super) fn len(&self) -> u64 {
+        let causes: u64 = self.causes.iter().map(|u| things(u)).sum();
+        causes + self.readings.len() as u64
     }
 
     /// How many things could not be read, in `words`, one and many, and after `and` how many of
-    /// them the person can fix.
-    pub(super) fn counted(&self, (one, many): (&str, &str), and: &str) -> String {
-        let yours = self.causes.iter().filter(|u| u.who == YOU).count();
+    /// them the person can fix, counted the same way.
+    fn counted(&self, (one, many): (&str, &str), and: &str) -> String {
+        let yours: u64 = (self.causes.iter().filter(|u| u.who == YOU))
+            .map(|u| things(u))
+            .sum();
         let n = counted(self.len() as i64, one, many);
         match yours {
             0 => n,
@@ -49,13 +55,36 @@ impl<'a> NotRead<'a> {
     }
 }
 
+/// The things a cause is about, as its title counts them, and one where it counts none.
+fn things(u: &v1::Uncovered) -> u64 {
+    u.count.max(1)
+}
+
+/// The words of the line that counts what could not be read, while something could not: `!` and
+/// a link to `href`, where "Could not be read" tells each thing. The band and the page of this Mac
+/// draw these words, each in its own line, so the two never count apart.
+pub(super) fn line(r: &v1::Status, href: &str) -> Option<String> {
+    let n = NotRead::of(r);
+    (n.len() > 0).then(|| {
+        format!(
+            "! <a href=\"{href}\">{}</a>",
+            esc(&n.counted(
+                ("thing could not be read", "things could not be read"),
+                ", "
+            ))
+        )
+    })
+}
+
 /// Every thing that could not be read, each once, where the band's count leads (`NotRead`): a
 /// cause by its own message (`uncovered`), and any other reading that failed as the text says
 /// it, its words, what its source said and its command. Drawn only while something could not be
-/// read, so it never says that everything was.
+/// read, so it never says that everything was; else only its anchor stands, with no words, where
+/// the link `store.view_sections` names for it lands.
 pub(super) fn section(out: &mut String, r: &v1::Status) -> Out {
     let n = NotRead::of(r);
     if n.len() == 0 {
+        writeln!(out, "<div id=\"{NOT_READ}\"></div>")?;
         return Ok(());
     }
     writeln!(
@@ -123,7 +152,8 @@ mod tests {
     /// person's own first and marked, and every other reading that failed, of the event level or
     /// a download, as the text says it, its words, what its source said and its command. With
     /// nothing that could not be read there is neither the section nor the count, so neither says
-    /// that everything was read.
+    /// that everything was read; only the section's anchor stands, with no words, so the link
+    /// `store.view_sections` names lands in place.
     #[test]
     fn what_could_not_be_read_is_told_whole_once_where_the_band_s_count_leads() {
         let now = 1_800_000_000;
@@ -135,7 +165,9 @@ mod tests {
         let page = summary(&calm);
         let body = &page[page.find("</style>").unwrap()..];
         assert!(
-            !body.contains(&format!("id=\"{NOT_READ}\"")) && !body.contains("could not be read"),
+            body.matches(&format!("id=\"{NOT_READ}\"")).count() == 1
+                && body.contains(&format!("<div id=\"{NOT_READ}\"></div>"))
+                && !body.contains("could not be read"),
             "{body}"
         );
         // A reading that failed of each kind: the event level records nothing, it lost program
@@ -240,5 +272,91 @@ mod tests {
                 assert!(cause.contains(piece), "{piece}: {cause}");
             }
         }
+    }
+
+    /// The count says how many things could not be read, not how many causes: a cause about a
+    /// hundred servers is a hundred, as its title says, in the band and in the section alike, and
+    /// a cause that counts nothing is one.
+    #[test]
+    fn a_cause_of_a_hundred_servers_is_counted_as_a_hundred() {
+        let now = 1_800_000_000;
+        let mut r = v1::Status {
+            answered_at: now,
+            ..crate::headline::tests::calm()
+        };
+        r.not_covered = vec![
+            v1::Uncovered {
+                id: "servers-not-opened".to_string(),
+                who: YOU.to_string(),
+                title: "100 servers could not be opened at the last server check.".to_string(),
+                fault: true,
+                count: 100,
+                ..Default::default()
+            },
+            v1::Uncovered {
+                id: "counts-nothing".to_string(),
+                who: "nothing".to_string(),
+                fault: true,
+                ..Default::default()
+            },
+        ];
+        let page = summary(&r, &view::Answers::none(), now).unwrap();
+        assert!(
+            page.contains(&format!(
+                "<a href=\"#{NOT_READ}\">101 things could not be read, 100 you can fix</a>"
+            )) && section_of(&page, NOT_READ)
+                .contains("<span class=\"n\">101 things · 100 you can fix</span>"),
+            "{page}"
+        );
+    }
+
+    /// The page of this Mac says that something could not be read, counted as the band counts it
+    /// and leading to where the summary tells it, also when no kind's row on it does: a list of
+    /// vulnerabilities not updated and program starts that were lost are about no kind of place.
+    /// With nothing that could not be read it says nothing of it.
+    #[test]
+    fn the_page_of_this_mac_says_what_could_not_be_read_when_no_kind_s_row_does() {
+        let now = 1_800_000_000;
+        let calm = v1::Status {
+            answered_at: now,
+            ..crate::headline::tests::calm()
+        };
+        let this_mac = |r: &v1::Status| {
+            let pages = view::pages(r, &view::Answers::none(), now).unwrap();
+            let name = format!("{}/{}.html", view::DETAILS, super::super::THIS_MAC);
+            pages.into_iter().find(|(n, _)| *n == name).unwrap().1
+        };
+        assert!(!this_mac(&calm).contains("<p class=\"meta fault\">"));
+        let mut r = calm.clone();
+        r.not_covered = vec![v1::Uncovered {
+            id: "vulnerability-data-old".to_string(),
+            who: "nothing".to_string(),
+            fault: true,
+            count: 1,
+            ..Default::default()
+        }];
+        r.event_level = Some(v1::EventLevel {
+            state: v1::CollectorState::Running as i32,
+            lost: Some(v1::Span {
+                since_check: 4,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let page = this_mac(&r);
+        let band = summary(&r, &view::Answers::none(), now).unwrap();
+        assert!(
+            band.contains(&format!(
+                "<p class=\"sub fault\">! <a href=\"#{NOT_READ}\">2 things could not be read</a></p>"
+            )),
+            "{band}"
+        );
+        assert!(
+            page.contains(&format!(
+                "<p class=\"meta fault\">! <a href=\"../{}#{NOT_READ}\">2 things could not be read</a></p>",
+                view::SUMMARY
+            )),
+            "{page}"
+        );
     }
 }

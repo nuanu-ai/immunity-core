@@ -1,14 +1,15 @@
 //! The page of what is watched on this Mac, kind by kind: first an index of what is read, the
 //! summary's rows for this Mac and its projects (`read_index`); then what each kind is and which
 //! rule tells of a change in it, its things, the ways a project or the home folder runs code by
-//! itself and the projects found. What could not be read is told on the summary. Drawn from what
-//! `immunity machine` answers for this Mac (`Known`) and from the status: whether a list may say
-//! that nothing is there is the status's word for its kind (`WatchedKind.coverage` and `fresh`,
-//! `IntegrityReading`), never an empty list's. The readings `Known` gives name what was not read,
-//! their reasons given whole and cut on the page (`Said::of`). Every name and reason from the Mac
-//! is printed through `secrets::Name` and `secrets::Said`.
+//! itself and the projects found. What could not be read is counted under the title, as the band
+//! counts it, and told on the summary. Drawn from what `immunity machine` answers for this Mac
+//! (`Known`) and from the status: whether a list may say that nothing is there is the status's
+//! word for its kind (`WatchedKind.coverage` and `fresh`, `IntegrityReading`), never an empty
+//! list's. The readings `Known` gives name what was not read, their reasons given whole and cut on
+//! the page (`Said::of`). Every name and reason from the Mac is printed through `secrets::Name`
+//! and `secrets::Said`.
 
-use super::{FOOT, THIS_MAC_TITLE, VULNERABILITIES, anchor, capital};
+use super::{FOOT, NOT_READ, THIS_MAC_TITLE, VULNERABILITIES, anchor, capital};
 use super::{coverage_of_list, grouped, installed_whole, said, top, unread};
 use crate::contract::{self, v1};
 use crate::covered::{self, Count, Latest};
@@ -212,7 +213,12 @@ pub fn page(r: &v1::Status, m: Option<&v1::Known>, now: i64) -> String {
             when(now, now)
         ),
     );
-    // First what is read here, kind by kind, each leading to its section.
+    // What could not be read, counted as the band counts it, where the summary tells each thing:
+    // a thing of no kind's row has no other place on this page.
+    if let Some(line) = super::not_read::line(r, &format!("../{}#{NOT_READ}", view::SUMMARY)) {
+        let _ = writeln!(out, "<p class=\"meta fault\">{line}</p>");
+    }
+    // Then what is read here, kind by kind, each leading to its section.
     let _ = super::read_index(&mut out, r, now);
     match m {
         None => out.push_str(NO_ANSWER),

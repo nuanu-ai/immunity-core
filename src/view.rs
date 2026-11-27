@@ -596,6 +596,7 @@ footer.licence { margin-top: 32px; }
 /* What could not be read, counted on a line of its own in the band's main colour, leading to
    where each is told. */
 #this-mac .fault { color: var(--t1); margin-top: 8px; }
+.meta.fault { color: var(--t1); margin: 0 0 16px; }
 #this-mac .cmd { white-space: nowrap; }
 
 /* Findings: the tabs, a group for each, one row per thing that opens in place. */

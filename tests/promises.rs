@@ -14478,12 +14478,14 @@ fn on_a_mac_where_nothing_was_found_and_no_watcher_ran_every_rule_is_on_the_page
 
 /// How the table of what is read begins the line of the kinds it folds, each with nothing in
 /// it, read in full.
-const NONE_HERE: &str = "<strong>None here, read in full:</strong> ";
+const NONE_HERE: &str = "<strong>None here, read in full";
 
-/// The kinds the table of what is read folds into its lines of none here.
+/// The kinds the table of what is read folds into its lines of none here, the names after the
+/// line's label and when they were read.
 fn folded(table: &str) -> Vec<String> {
     (table.split(NONE_HERE).skip(1))
-        .flat_map(|l| l[..l.find("</p>").unwrap()].split(" · "))
+        .map(|l| &l[l.find("</strong> ").unwrap() + "</strong> ".len()..l.find("</p>").unwrap()])
+        .flat_map(|names| names.split(" · "))
         .map(str::to_string)
         .collect()
 }
