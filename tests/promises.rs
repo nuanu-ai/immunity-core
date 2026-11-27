@@ -328,12 +328,6 @@ fn section<'a>(page: &'a str, id: &str) -> &'a str {
     &page[start..end]
 }
 
-/// What could not be read on this Mac: the section of the page of what is watched that the
-/// summary's one line links to. It is there only while a reading failed.
-fn not_read(pages: &[(PathBuf, String)]) -> &str {
-    section(page_named(pages, "this-mac.html"), "not-read")
-}
-
 /// One page `immunity view` wrote, by its file name.
 fn page_named<'a>(pages: &'a [(PathBuf, String)], name: &str) -> &'a str {
     &pages
@@ -5302,7 +5296,7 @@ fn no_list_on_any_page_says_nothing_is_there_when_what_fills_it_was_not_read_in_
     );
     let pages = view(&store);
     assert!(pages.contains("None found here."), "{pages}");
-    assert!(pages.contains("</span>none here"), "{pages}");
+    assert!(pages.contains(NONE_HERE), "{pages}");
     Connection::open(&store)
         .unwrap()
         .execute(
@@ -5321,6 +5315,7 @@ fn no_list_on_any_page_says_nothing_is_there_when_what_fills_it_was_not_read_in_
         "None known.",
         "None is known.",
         "</span>none here",
+        NONE_HERE,
         "</span>read in full",
         "</span>compared at every check",
         "None is known in the packages",
@@ -13038,8 +13033,8 @@ fn a_name_and_what_its_source_said_stay_apart_as_data_and_a_secret_in_what_it_sa
     for out in [serde_json::to_string(&item).unwrap(), printed, whole] {
         assert!(!out.contains(password), "{out}");
     }
-    let you_can_fix = section(&page, "you-can-fix");
-    assert!(!you_can_fix.contains(password), "{you_can_fix}");
+    let not_read = section(&page, "not-read");
+    assert!(!not_read.contains(password), "{not_read}");
 }
 
 #[test]
@@ -13638,9 +13633,10 @@ fn the_summary_page_says_what_status_says_with_each_item_in_full_and_no_markup_f
         "{body}"
     );
     // It opens with whether this Mac is watched: its name as data and the last full check right
-    // there, and no watcher as the fault the terminal says; then the findings, open and answered; then what is watched; then
-    // what happens as it happens; then what the owner can fix; last, collapsed, what this version
-    // does not read here.
+    // there, no watcher as the fault the terminal says, and under it how many things could not
+    // be read. Then the findings, open and answered; then what is read; then what happens as it
+    // happens; then each thing that could not be read; last, collapsed, what this version does
+    // not read here.
     let this_mac = section(page, "this-mac");
     assert!(
         this_mac.contains("<bdi class=\"src\">mac</bdi> · last check <time datetime=\"2")
@@ -13659,7 +13655,7 @@ fn the_summary_page_says_what_status_says_with_each_item_in_full_and_no_markup_f
         "findings",
         "watched-here",
         "as-it-happens",
-        "you-can-fix",
+        "not-read",
         "not-read-here",
     ];
     assert!(order.windows(2).all(|w| at(w[0]) < at(w[1])), "{page}");
@@ -13673,13 +13669,10 @@ fn the_summary_page_says_what_status_says_with_each_item_in_full_and_no_markup_f
         .map(|u| u["id"].as_str().unwrap())
         .collect();
     assert_eq!(yours, ["program-starts-not-seen"]);
-    // Each cause is told once where it belongs, by the status's `fault`: a fault the owner can
-    // fix on the summary, any other fault on the page the summary's one line links to, and a
-    // limit in the summary's last section, its title in one line.
-    let fix = section(page, "you-can-fix");
-    let not_read = not_read(&pages);
+    // Each cause is told once where it belongs, by the status's `fault`: a fault under "Could not
+    // be read" on the summary, and a limit in its last section, its title in one line.
+    let not_read = section(page, "not-read");
     let limits = section(page, "not-read-here");
-    let failed_here = |u: &serde_json::Value| u["who"] != "you" && u["fault"] == true;
     for u in r["not_covered"].as_array().unwrap() {
         let id = u["id"].as_str().unwrap();
         let told: usize = pages
@@ -13695,13 +13688,9 @@ fn the_summary_page_says_what_status_says_with_each_item_in_full_and_no_markup_f
             );
             continue;
         }
-        let (held, tag) = if u["who"] == "you" {
-            (fix, format!("<article class=\"fixc\" id=\"{id}\">"))
-        } else {
-            (not_read, format!("<article class=\"item\" id=\"{id}\">"))
-        };
-        let start = held.find(&tag).unwrap_or_else(|| panic!("{id}: {held}"));
-        let article = &held[start..start + held[start..].find("</article>").unwrap()];
+        let tag = format!("<article class=\"item\" id=\"{id}\">");
+        let start = (not_read.find(&tag)).unwrap_or_else(|| panic!("{id}: {not_read}"));
+        let article = &not_read[start..start + not_read[start..].find("</article>").unwrap()];
         for part in ["title", "meaning", "advice"] {
             // As the page writes it: an ampersand and an apostrophe are escaped.
             let written = u[part]
@@ -13718,19 +13707,21 @@ fn the_summary_page_says_what_status_says_with_each_item_in_full_and_no_markup_f
         ),
         "{not_read}"
     );
-    // The summary links to it, counting what it names.
+    // The band counts every thing it tells, each fault among them, and leads to it.
     let failed = r["not_covered"]
         .as_array()
         .unwrap()
         .iter()
-        .filter(|u| failed_here(u))
+        .filter(|u| u["fault"] == true)
         .count();
-    assert!(failed > 1 && failed < r["not_covered"].as_array().unwrap().len());
+    let told = not_read.matches("<article class=\"item\"").count();
+    assert!(failed > 1 && told >= failed, "{not_read}");
+    assert!(failed < r["not_covered"].as_array().unwrap().len());
     assert!(
-        section(page, "watched-here").contains(&format!(
-            "<a href=\"view/this-mac.html#not-read\">{failed} things on this Mac could not be read</a>"
+        this_mac.contains(&format!(
+            "<p class=\"sub fault\">! <a href=\"#not-read\">{told} things could not be read</a></p>"
         )),
-        "{page}"
+        "{this_mac}"
     );
     for item in looks(&r).as_array().unwrap() {
         let id = item["id"].as_str().unwrap();
@@ -13956,7 +13947,7 @@ fn each_link_on_the_summary_shows_what_its_label_says_first_thing_on_arrival() {
     let pages = view_pages(&w.store());
     let (main, page) = &pages[0];
     let folder = main.parent().unwrap();
-    assert!(page.contains(" id=\"you-can-fix\""), "{page}");
+    assert!(page.contains(" id=\"not-read\""), "{page}");
     // What a person lands on first is in his words, not the program's. What a source said,
     // listed apart under its item, is data. The rules' own words are a person's words where
     // they are written, and "an app you build yourself" is not about this program's build. A
@@ -14436,7 +14427,7 @@ fn on_a_mac_where_nothing_was_found_and_no_watcher_ran_every_rule_is_on_the_page
     // The pages say what the owner is told about. A rule about a thing appearing matters most
     // when there is none yet: a kind the last check looked for and found none of is still on
     // the page of what is watched with its rules, and running programs with theirs while no
-    // sample is there; the summary says "none here" of it.
+    // sample is there; the summary says "none here" of it, among the kinds folded into one line.
     let w = Watch::new("view-rules-empty");
     w.run();
     let pages = view_pages(&w.store());
@@ -14450,13 +14441,7 @@ fn on_a_mac_where_nothing_was_found_and_no_watcher_ran_every_rule_is_on_the_page
     }
     let told = section(&pages[0].1, "watched-here");
     assert!(
-        told.contains(
-            "<div class=\"wr\"><span>Editor tasks that run when a project is opened</span>"
-        ) && told[told.find("Editor tasks that run").unwrap()..]
-            .split("</div>")
-            .next()
-            .unwrap()
-            .contains("</span>none here"),
+        folded(told).contains(&"Editor tasks that run when a project is opened".to_string()),
         "{told}"
     );
     let running = section(this_mac, "running-programs-and-their-connections");
@@ -14485,11 +14470,27 @@ fn on_a_mac_where_nothing_was_found_and_no_watcher_ran_every_rule_is_on_the_page
         .next()
         .unwrap();
     assert!(!startup.contains("</span>none here"), "{startup}");
+    assert!(
+        !folded(told).contains(&"Startup items".to_string()),
+        "{told}"
+    );
+}
+
+/// How the table of what is read begins the line of the kinds it folds, each with nothing in
+/// it, read in full.
+const NONE_HERE: &str = "<strong>None here, read in full:</strong> ";
+
+/// The kinds the table of what is read folds into its lines of none here.
+fn folded(table: &str) -> Vec<String> {
+    (table.split(NONE_HERE).skip(1))
+        .flat_map(|l| l[..l.find("</p>").unwrap()].split(" · "))
+        .map(str::to_string)
+        .collect()
 }
 #[test]
 fn a_section_of_the_summary_can_be_opened_from_outside_as_a_file() {
-    // The app's rows "You can fix" and "Limits of this version" opened the summary at its
-    // top: macOS lost the `#section` of the file URL on its way to the browser. Each
+    // The app's rows of what could not be read and of the limits of this version opened the
+    // summary at its top: macOS lost the `#section` of the file URL on its way to the browser. Each
     // section the status names has a file of its own that sends the browser on to the
     // summary that was written, at an anchor that is there.
     let w = Watch::new("view-sections");
@@ -14508,8 +14509,8 @@ fn a_section_of_the_summary_can_be_opened_from_outside_as_a_file() {
         [
             "watched-here",
             "vulnerabilities",
-            "you-can-fix",
-            "limits",
+            "not-read",
+            "not-read-here",
             "answered",
             "as-it-happens"
         ]

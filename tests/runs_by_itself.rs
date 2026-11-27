@@ -4282,17 +4282,19 @@ fn every_way_read_is_on_the_page_and_the_status_counts_as_many_read_and_those_pr
     );
 }
 
-/// The kinds the summary's table of what is watched says none of: each row whose state is
-/// "none here".
+/// The kinds the summary's table of what is read says none of: each row whose state is "none
+/// here", and each kind folded into a line of none here, read in full.
 fn none_said(view: &str) -> Vec<String> {
-    view.split("<div class=\"wr\"")
-        .skip(1)
-        .filter_map(|row| {
-            let row = &row[..row.find("</div>")?];
-            let kind = row.split("<span>").nth(1)?.split("</span>").next()?;
-            row.contains("</span>none here").then(|| kind.to_string())
-        })
-        .collect()
+    let rows = view.split("<div class=\"wr\"").skip(1).filter_map(|row| {
+        let row = &row[..row.find("</div>")?];
+        let kind = row.split("<span>").nth(1)?.split("</span>").next()?;
+        row.contains("</span>none here").then(|| kind.to_string())
+    });
+    let fold = "<strong>None here, read in full:</strong> ";
+    let folded = (view.split(fold).skip(1))
+        .flat_map(|l| l[..l.find("</p>").unwrap()].split(" · "))
+        .map(str::to_string);
+    rows.chain(folded).collect()
 }
 
 /// The section of the page of this Mac about a kind, by its anchor.

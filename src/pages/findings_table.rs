@@ -466,15 +466,15 @@ fn said(i: Listed, f: Option<&v1::Finding>, now: i64) -> (Vec<Fact>, Vec<Voice>)
     if i.l.kind == crate::findings::KEPT_KIND {
         facts.push(("Rule", named(i.r.rule.as_deref().unwrap_or_default())));
     }
-    // What the source said, as data beside the sentences, cut as it is printed.
-    if let Some(value) = f.and_then(|f| f.value_text.as_deref()) {
+    let (mut evidenced, mut voices) = (Vec::new(), Vec::new());
+    let set_out = f.is_some_and(|f| evidence(f, &mut evidenced, &mut voices, now));
+    // What the source said, as data beside the sentences, cut as it is printed; said once, by the
+    // evidence, where the evidence sets out every part of it.
+    if let Some(value) = f.and_then(|f| f.value_text.as_deref()).filter(|_| !set_out) {
         let said = Said::of(&crate::contract::unescape(value)).html();
         facts.push(("Source said", format!("<span class=\"said\">{said}</span>")));
     }
-    let mut voices: Vec<Voice> = Vec::new();
-    if let Some(f) = f {
-        evidence(f, &mut facts, &mut voices, now);
-    }
+    facts.extend(evidenced);
     if let Some(t) = f.and_then(|f| f.technique_text.as_deref()) {
         facts.push(("ATT&amp;CK", named(t)));
     }
@@ -774,9 +774,18 @@ fn process_facts(p: &v1::DetachedProcess, facts: &mut Vec<(&str, String)>, now: 
 /// A finding's evidence as `immunity finding <id>` gives it, from the same message: what it rests
 /// on by its kind as facts, and as voices the rule's authors, the response layer's verdicts with
 /// their reasons quoted, and the person's answer with who gave it and why. Every value from the
-/// Mac is escaped and set apart.
-fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<Voice>, now: i64) {
+/// Mac is escaped and set apart. True when it sets out every part of what the finding's source
+/// said (`Finding.value_text`): a vulnerable package's value is its package, its releases and each
+/// record with its source, summary and fixes (`vulnerabilities::finding_detail`), all here while
+/// the evidence names its records.
+fn evidence(
+    f: &v1::Finding,
+    facts: &mut Vec<(&str, String)>,
+    voices: &mut Vec<Voice>,
+    now: i64,
+) -> bool {
     use v1::evidence::Body;
+    let mut set_out = false;
     let word = |s: &str| format!("<span class=\"w\">{}</span>", esc(s));
     match f.evidence.as_ref().and_then(|e| e.body.as_ref()) {
         Some(Body::PlaceChanged(p)) => {
@@ -907,6 +916,7 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
                 facts.push(("Version", named(&r.version_text)));
                 facts.push(("Declared at", named(&r.at_text)));
             }
+            set_out = !p.records.is_empty();
             for r in &p.records {
                 facts.push(("Record", named(&r.id_text)));
                 if !r.fixed_text.is_empty() {
@@ -1008,6 +1018,7 @@ fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<V
             quote: a.reason_text.clone(),
         });
     }
+    set_out
 }
 
 #[cfg(test)]
@@ -1322,6 +1333,46 @@ mod tests {
                     .collect()
             })
             .collect()
+    }
+
+    /// What a source said is said once in an opened row. A vulnerable package's value is its
+    /// package, releases and records, each with its source's own words: while the evidence names
+    /// its records, the value is not drawn again beside them; with none named it is, as for any
+    /// other finding.
+    #[test]
+    fn what_a_source_said_is_drawn_once_and_beside_the_evidence_only_where_the_evidence_lacks_it() {
+        let summary = "left-pad lets an invented input run code";
+        let whole = |records: &[v1::PackageRecord]| v1::Finding {
+            value_text: Some(format!(
+                "left-pad 1.0.0; GHSA-x from GitHub Advisory Database: {summary}"
+            )),
+            evidence: Some(v1::Evidence {
+                body: Some(v1::evidence::Body::VulnerablePackage(
+                    v1::VulnerablePackage {
+                        package_text: Some("left-pad".to_string()),
+                        records: records.to_vec(),
+                        ..Default::default()
+                    },
+                )),
+            }),
+            ..Default::default()
+        };
+        let record = v1::PackageRecord {
+            id_text: "GHSA-x".to_string(),
+            source: "GitHub Advisory Database".to_string(),
+            summary_text: Some(summary.to_string()),
+            ..Default::default()
+        };
+        for (records, beside) in [(vec![record], false), (vec![], true)] {
+            let all = vec![package("f1", "dev/cart"), package("f2", "dev/shop")];
+            let wholes = vec![
+                ("f1".to_string(), whole(&records)),
+                ("f2".to_string(), whole(&records)),
+            ];
+            let page = drawn_with(all, wholes);
+            assert_eq!(page.contains("<dt>Source said</dt>"), beside, "{page}");
+            assert_eq!(page.matches(summary).count(), 1, "{page}");
+        }
     }
 
     #[test]

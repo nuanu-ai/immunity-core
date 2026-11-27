@@ -1,14 +1,15 @@
-//! The page of what is watched on this Mac, kind by kind: what each kind is and which rule tells
-//! of a change in it, its things, the ways a project or the home folder runs code by itself, the
-//! projects found, and in full each fault nothing the person does changes. Drawn from what
+//! The page of what is watched on this Mac, kind by kind: first an index of what is read, the
+//! summary's rows for this Mac and its projects (`read_index`); then what each kind is and which
+//! rule tells of a change in it, its things, the ways a project or the home folder runs code by
+//! itself and the projects found. What could not be read is told on the summary. Drawn from what
 //! `immunity machine` answers for this Mac (`Known`) and from the status: whether a list may say
 //! that nothing is there is the status's word for its kind (`WatchedKind.coverage` and `fresh`,
 //! `IntegrityReading`), never an empty list's. The readings `Known` gives name what was not read,
 //! their reasons given whole and cut on the page (`Said::of`). Every name and reason from the Mac
 //! is printed through `secrets::Name` and `secrets::Said`.
 
-use super::{FOOT, NOT_READ, NOT_READ_TITLE, THIS_MAC_TITLE, VULNERABILITIES, anchor, capital};
-use super::{coverage_of_list, grouped, installed_whole, said, top, uncovered, unread};
+use super::{FOOT, THIS_MAC_TITLE, VULNERABILITIES, anchor, capital};
+use super::{coverage_of_list, grouped, installed_whole, said, top, unread};
 use crate::contract::{self, v1};
 use crate::covered::{self, Count, Latest};
 use crate::findings::{self, This};
@@ -187,9 +188,9 @@ fn latest_of(c: &v1::Coverage) -> Latest {
     }
 }
 
-/// What is watched on this Mac, one section per kind with the things of that kind, the ways code
-/// runs by itself, the projects, and in full each fault nothing the person does changes. Without
-/// an answer of `immunity machine` about this Mac it says so, and no list is drawn.
+/// What is watched on this Mac: the index of what is read, then one section per kind with the
+/// things of that kind, the ways code runs by itself and the projects. Without an answer of
+/// `immunity machine` about this Mac it says so, and no list is drawn.
 pub fn page(r: &v1::Status, m: Option<&v1::Known>, now: i64) -> String {
     let mac = r.this_mac.clone().unwrap_or_default();
     let this = (mac.id_text.as_deref()).map(|id| This {
@@ -211,6 +212,8 @@ pub fn page(r: &v1::Status, m: Option<&v1::Known>, now: i64) -> String {
             when(now, now)
         ),
     );
+    // First what is read here, kind by kind, each leading to its section.
+    let _ = super::read_index(&mut out, r, now);
     match m {
         None => out.push_str(NO_ANSWER),
         Some(m) => {
@@ -231,21 +234,6 @@ pub fn page(r: &v1::Status, m: Option<&v1::Known>, now: i64) -> String {
             let _ = ways(&mut out, &s);
             let _ = projects(&mut out, &s, now);
         }
-    }
-    // What could not be read on this Mac, each thing in full, where the summary's line leads.
-    let failed: Vec<&v1::Uncovered> = (r.not_covered.iter())
-        .filter(|u| u.fault && u.who != covered::YOU)
-        .collect();
-    if !failed.is_empty() {
-        let _ = writeln!(
-            out,
-            "<section id=\"{NOT_READ}\">\n<h2>{NOT_READ_TITLE}</h2>\n<p class=\"muted\">{} could not be read at the last check. Each is tried again at every check.</p>",
-            capital(&counted(failed.len() as i64, "thing", "things"))
-        );
-        for u in failed {
-            let _ = uncovered(&mut out, u);
-        }
-        out.push_str("</section>\n");
     }
     out.push_str(FOOT);
     out
