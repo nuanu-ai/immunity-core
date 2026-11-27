@@ -1013,10 +1013,12 @@ fn sample_cmd(args: &SampleArgs) -> ExitCode {
 
 /// The event level at a full run: program starts as Apple's eslogger recorded them, judged by
 /// the published rules, see `events.rs`. A reading that failed is coverage with its reason,
-/// never a failed run. Returns how many findings the rules opened.
+/// never a failed run. Returns how many findings the rules opened. It is read and judged at the
+/// time it is read, not when the check began: the downloads before it can take minutes, and the
+/// collector writes meanwhile. What is since the check goes by the journal (`Since::Check`).
 fn read_events(run: &mut Run, args: &Args) -> Result<usize, Box<dyn Error>> {
     let root = &args.system_root;
-    let outcome = events::read(run.tx, run.run_id, run.machine, root, run.at, None)?;
+    let outcome = events::read(run.tx, run.run_id, run.machine, root, now_secs(), None)?;
     if outcome.state != events::NOT_INSTALLED {
         run.readers += 1;
     }
