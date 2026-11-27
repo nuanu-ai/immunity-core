@@ -1195,9 +1195,10 @@ fn a_known_project_under_a_link_stays_held_and_named_at_every_walk_and_goes_once
 }
 
 #[test]
-fn a_folder_the_walk_listed_before_and_cannot_list_now_is_named_once_a_narrower_walk_is_full() {
-    // While the walk fails it tells the folder itself; a walk pointed elsewhere is full and
-    // does not look at it, and the folder is named by itself.
+fn a_folder_the_walk_cannot_list_is_still_named_after_a_narrower_walk_whether_it_was_listed_before_or_not()
+ {
+    // While the walk fails it tells the folders itself, once each; a walk pointed elsewhere
+    // does not look at them and keeps the failure, so a person is still told both.
     let e = Estate::new("walk-unlisted");
     e.checkout("dev/shop");
     let (old, new) = (e.home().join("dev/old"), e.home().join("dev/new"));
@@ -1209,11 +1210,20 @@ fn a_folder_the_walk_listed_before_and_cannot_list_now_is_named_once_a_narrower_
     e.run();
     let told = lost(&e);
     e.run_in(&e.home().join("dev/shop"));
-    let named = lost(&e);
+    let status = said(&e).1;
     mode(&old, 0o755);
     mode(&new, 0o755);
     assert!(told.is_empty(), "{told:?}");
-    assert_eq!(named, ["~/dev/old"]);
+    let items = status["not_covered"].as_array().unwrap();
+    let closed = items.iter().find(|u| u["id"] == "not-permitted").unwrap();
+    let reason = closed["examples"][0]["reason_text"].as_str().unwrap();
+    for folder in ["dev/new", "dev/old"] {
+        assert!(
+            reason.contains(&format!("{folder} (Permission denied")),
+            "{reason}"
+        );
+    }
+    assert!(lost(&e).is_empty(), "{:?}", lost(&e));
 }
 
 /// The units the baseline marks not read now, of every reader and kind, as `unit` or
