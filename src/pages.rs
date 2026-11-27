@@ -442,8 +442,8 @@ fn watched_row(out: &mut String, row: &Row, now: i64) -> Out {
 
 /// The table of what is read, group by group: under its group's name each row that says more than
 /// that there is none here, then the rows that say only that, folded into one line of their names
-/// (`Row::none_here`) with when they were read, as their rows' last read: one time, or from the
-/// oldest to the latest, so a fold never hides that a reading is old.
+/// (`Row::none_here`) with their rows' last read, as the column says it: one time, or the oldest
+/// to the latest, so a fold never hides that a reading is old.
 fn read_table(out: &mut String, rows: &[Row], now: i64) -> Out {
     out.push_str("<div class=\"wt\">\n<div class=\"wr wh\" aria-hidden=\"true\"><span>Kind of place</span><span>How often</span><span class=\"wn\">Things</span><span>State</span><span class=\"wl\">Last read</span></div>\n");
     for group in [ON_THIS_MAC, IN_PROJECTS, BEYOND_THIS_MAC] {
@@ -460,9 +460,13 @@ fn read_table(out: &mut String, rows: &[Row], now: i64) -> Out {
             let names: Vec<String> = (none.iter()).map(|r| esc(&r.kind)).collect();
             let times: BTreeSet<i64> = none.iter().filter_map(|r| r.last).collect();
             let at = match (times.first(), times.last()) {
-                (Some(a), Some(b)) if a == b => format!(" at {}", view::when(*a, now)),
+                (Some(a), Some(b)) if a == b => format!(", last read {}", view::when(*a, now)),
                 (Some(a), Some(b)) => {
-                    format!(" from {} to {}", view::when(*a, now), view::when(*b, now))
+                    format!(
+                        ", last read {} to {}",
+                        view::when(*a, now),
+                        view::when(*b, now)
+                    )
                 }
                 _ => String::new(),
             };
@@ -1753,9 +1757,9 @@ mod tests {
         assert!(!drawn(&r, profile));
     }
 
-    /// A folded line carries its time: when its kinds were read, as their rows' last read would
-    /// say it, once when they were read at the same time and from the oldest to the latest when
-    /// not, so a day-old reading never reads as one of now.
+    /// A folded line carries its time: its kinds' last read, as their rows' column says it, once
+    /// when it is the same and from the oldest to the latest when not, so a day-old reading never
+    /// reads as one of now.
     #[test]
     fn a_folded_line_carries_when_its_kinds_were_read() {
         let now = 1_800_000_000;
@@ -1782,14 +1786,14 @@ mod tests {
         let (old, new) = (view::when(now - 86_400, now), view::when(now - 40, now));
         assert!(
             fold(now - 40).contains(&format!(
-                "<strong>None here, read in full at {new}:</strong>"
+                "<strong>None here, read in full, last read {new}:</strong>"
             )),
             "{}",
             fold(now - 40)
         );
         assert!(
             fold(now - 86_400).contains(&format!(
-                "<strong>None here, read in full from {old} to {new}:</strong>"
+                "<strong>None here, read in full, last read {old} to {new}:</strong>"
             )),
             "{}",
             fold(now - 86_400)
