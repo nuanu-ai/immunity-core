@@ -41,22 +41,107 @@ fn class_words(class: i32) -> &'static str {
 }
 
 /// Whether the page may say that every reading was full. All of these hold: a full check has
-/// finished; the summary counts at least one reading and every one is full without a note; no
-/// machine could not be reached and no reading is implied by one; no group of readings is
-/// listed or counted; and the latest finished check made again every reading an earlier one
-/// made. Anything else, an empty summary or a class this build does not know among them, is
-/// never calm.
+/// finished; the summary counts at least one reading, none partial and none that read nothing,
+/// and its counts agree: the readings full without a note and those that had nothing to read,
+/// which is a full answer, are every reading; no machine could not be reached and no reading is implied by one; every group
+/// listed is of readings that had nothing to read and none is left unlisted; and the latest
+/// finished check made again every reading an earlier one made. Anything else, an empty summary
+/// or a class this build does not know among them, is never calm.
 fn all_full(r: &v1::Status, c: &v1::CoverageSummary) -> bool {
     let checked = r.this_mac.as_ref().is_some_and(|m| m.checked_at.is_some());
+    let nothing = v1::ReadingClass::ReadNothing as i32;
     checked
         && c.readings > 0
-        && c.full == c.readings
+        && c.partial == 0
+        && c.none == 0
+        && c.full + c.read_nothing == c.readings
         && c.unreached_total == 0
         && c.unreached.is_empty()
         && c.implied_by_unreached == 0
-        && c.problems.is_empty()
-        && c.problems_total == 0
+        && c.problems.iter().all(|g| g.class == nothing)
+        && c.problems_total == c.problems.len() as u64
         && not_repeated(r) == 0
+}
+
+/// How many readings were not full: the partial and those that read nothing, or, where the
+/// counts disagree, the readings not counted as full or as having nothing to read when they are
+/// more. Where the counts agree the two are the same.
+fn not_full(c: &v1::CoverageSummary) -> u64 {
+    (c.partial + c.none).max(c.readings.saturating_sub(c.full + c.read_nothing))
+}
+
+/// How many readings there were and how they ended: how many were full, with how many of
+/// those had nothing to read; then how many were not, and of what kinds, when the kinds add up
+/// to that number. A kind with none is left out. Partial readings are each of a kind too, and
+/// the line after this one says how many there were.
+fn counts(c: &v1::CoverageSummary) -> String {
+    let n = |k: u64| grouped(k as i64);
+    let verb =
+        |k: u64, one: &str, many: &str| format!("{} {}", n(k), if k == 1 { one } else { many });
+    let mut said = format!(
+        "{} at their latest run. {}",
+        counted(c.readings as i64, "reading", "readings"),
+        verb(c.full + c.read_nothing, "was full", "were full"),
+    );
+    if c.read_nothing > 0 {
+        said.push_str(&format!(
+            "; {} of those had nothing to read, which is a full answer",
+            n(c.read_nothing)
+        ));
+    }
+    said.push('.');
+    let not = not_full(c);
+    if not == 0 {
+        return said;
+    }
+    said.push_str(&format!(" {}", verb(not, "was not", "were not")));
+    let machines = counted(
+        c.unreached_total as i64,
+        "machine that could not be reached",
+        "machines that could not be reached",
+    );
+    let kinds: Vec<(u64, String)> = [
+        (c.failed, verb(c.failed, "failed", "failed")),
+        (
+            c.no_reader,
+            verb(
+                c.no_reader,
+                "has no reader in this version",
+                "have no reader in this version",
+            ),
+        ),
+        (
+            c.not_given,
+            verb(
+                c.not_given,
+                "was not given by its source",
+                "were not given by their source",
+            ),
+        ),
+        (
+            c.implied_by_unreached,
+            format!(
+                "{} on {machines}",
+                verb(c.implied_by_unreached, "is", "are")
+            ),
+        ),
+    ]
+    .into_iter()
+    .filter(|(k, _)| *k > 0)
+    .collect();
+    if kinds.iter().map(|(k, _)| k).sum::<u64>() != not {
+        said.push('.');
+        return said;
+    }
+    let mut kinds: Vec<String> = kinds.into_iter().map(|(_, s)| s).collect();
+    let last = kinds.pop().unwrap_or_default();
+    let listed = match kinds.len() {
+        0 => last,
+        1 => format!("{} and {last}", kinds[0]),
+        _ => format!("{}, and {last}", kinds.join(", ")),
+    };
+    said.push_str(&format!(": {listed}."));
+    said
 }
 
 /// How many readings an earlier check made that the latest finished one did not make again.
@@ -94,24 +179,7 @@ fn body(out: &mut String, r: &v1::Status) -> Out {
         )?;
         return Ok(());
     };
-    writeln!(
-        out,
-        "<p>{} at their latest run: {} full, {} partial and {} that read nothing. Of those not plainly full, {} failed, {} have no reader in this version, {} were not given by their source, {} had nothing to read, and {} failed on {}.</p>",
-        counted(c.readings as i64, "reading", "readings"),
-        grouped(c.full as i64),
-        grouped(c.partial as i64),
-        grouped(c.none as i64),
-        grouped(c.failed as i64),
-        grouped(c.no_reader as i64),
-        grouped(c.not_given as i64),
-        grouped(c.read_nothing as i64),
-        grouped(c.implied_by_unreached as i64),
-        counted(
-            c.unreached_total as i64,
-            "machine that could not be reached",
-            "machines that could not be reached"
-        ),
-    )?;
+    writeln!(out, "<p>{}</p>", esc(&counts(c)))?;
     let checked = r.this_mac.as_ref().is_some_and(|m| m.checked_at.is_some());
     if all_full(r, c) {
         out.push_str("<p class=\"ok\">Every reading was full at its latest run.</p>\n");
@@ -123,12 +191,13 @@ fn body(out: &mut String, r: &v1::Status) -> Out {
         out.push_str(
             "<p class=\"alert\">The status counts no reading, so what was read is not known.</p>\n",
         );
-    } else if c.full < c.readings {
+    } else if not_full(c) > 0 {
         writeln!(
             out,
-            "<p class=\"alert\">{} of {} were not plainly full at their latest run. What they cover may be out of date or missing.</p>",
-            grouped((c.readings - c.full) as i64),
+            "<p class=\"alert\">{} of {} {} not full at their latest run. What they cover may be out of date or missing.</p>",
+            grouped(not_full(c) as i64),
             counted(c.readings as i64, "reading", "readings"),
+            if not_full(c) == 1 { "was" } else { "were" }
         )?;
     } else {
         out.push_str("<p class=\"alert\">Not every reading is known to be full and current.</p>\n");
@@ -219,7 +288,8 @@ fn groups(out: &mut String, c: &v1::CoverageSummary) -> Out {
             }
             match examples.is_empty() {
                 true => cell(out, "", "the status names no place")?,
-                false => cell(out, "mono", &examples.join(", "))?,
+                // Each on a line of its own, so no comma is left alone at the start of one.
+                false => cell(out, "mono", &examples.join("<br>"))?,
             }
             cell(out, "", &reason(g.reason_text.as_deref()))?;
             out.push_str("</tr>\n");
@@ -333,7 +403,7 @@ mod tests {
         );
         // Each group listed: its examples through the printer, how many more, and why.
         assert!(
-            page.contains("<bdi class=\"src\">machine:mac/place-1</bdi>, and 1 more")
+            page.contains("<bdi class=\"src\">machine:mac/place-1</bdi><br>and 1 more")
                 && page.contains("<bdi class=\"src\">invented reason 1</bdi>")
                 && page.contains("<bdi class=\"src\">machine:server-0</bdi>"),
             "{page}"
@@ -375,21 +445,35 @@ mod tests {
             r.coverage.as_mut().unwrap()
         }
         assert!(said(&|_| {}).contains(FULL));
+        // A reading that had nothing to read is a full answer: every Mac lacks some source.
+        let empty = said(&|r| {
+            (c(r).readings, c(r).read_nothing, c(r).problems_total) = (5, 2, 1);
+            c(r).problems = vec![v1::ReadingGroup {
+                class: v1::ReadingClass::ReadNothing as i32,
+                count: 2,
+                ..Default::default()
+            }];
+        });
+        assert!(empty.contains(FULL), "{empty}");
         let failed = v1::ReadingGroup {
             class: v1::ReadingClass::Failed as i32,
             count: 1,
             ..Default::default()
         };
         type Change<'a> = &'a dyn Fn(&mut v1::Status);
-        let cases: [(&str, Change); 11] = [
-            ("not plainly full", &|r| c(r).full = 2),
-            ("a group listed", &|r| c(r).problems = vec![failed.clone()]),
+        let cases: [(&str, Change); 14] = [
+            ("counts that disagree", &|r| c(r).full = 2),
+            ("a group listed", &|r| {
+                c(r).problems = vec![failed.clone()];
+                c(r).problems_total = 1;
+            }),
             ("a group counted", &|r| c(r).problems_total = 1),
             ("an unknown class", &|r| {
                 c(r).problems = vec![v1::ReadingGroup {
                     class: 99,
                     ..failed.clone()
-                }]
+                }];
+                c(r).problems_total = 1;
             }),
             ("a machine counted", &|r| c(r).unreached_total = 1),
             ("a machine listed", &|r| {
@@ -410,13 +494,33 @@ mod tests {
                     ..Default::default()
                 })
             }),
+            ("one partial", &|r| (c(r).full, c(r).partial) = (2, 1)),
+            ("one that read nothing", &|r| {
+                (c(r).full, c(r).none) = (2, 1)
+            }),
+            ("a group of nothing to read left unlisted", &|r| {
+                c(r).problems = vec![v1::ReadingGroup {
+                    class: v1::ReadingClass::ReadNothing as i32,
+                    ..Default::default()
+                }];
+                c(r).problems_total = 2;
+            }),
         ];
         for (case, change) in cases {
             let page = said(change);
             assert!(!page.contains(FULL), "{case}: {page}");
         }
         // What each says instead.
-        assert!(said(&|r| c(r).full = 2).contains("1 of 3 readings were not plainly full"));
+        // The alert counts the readings that were not full.
+        assert!(said(cases[11].1).contains("1 of 3 readings was not full at their latest run."));
+        assert!(said(cases[12].1).contains("1 of 3 readings was not full at their latest run."));
+        assert!(said(&|r| c(r).full = 2).contains("1 of 3 readings was not full"));
+        // Counts that add up to more than the readings still count each that was not full.
+        let over: [Change; 2] = [&|r| c(r).partial = 1, &|r| c(r).none = 1];
+        for change in over {
+            let page = said(change);
+            assert!(page.contains("1 of 3 readings was not full"), "{page}");
+        }
         assert!(
             said(&|r| r.this_mac = None)
                 .contains("No full check has finished, so what was read is not known.")
@@ -450,6 +554,56 @@ mod tests {
             !none.contains(FULL) && none.contains("is not known"),
             "{none}"
         );
+    }
+
+    #[test]
+    fn the_counts_say_how_many_were_full_and_how_many_were_not_and_of_what_kinds() {
+        // A person reads first how many were full, those with nothing to read among them, then
+        // how many were not and why; a breakdown that does not add up is not printed.
+        let mut c = v1::CoverageSummary {
+            readings: 192,
+            full: 114,
+            read_nothing: 67,
+            none: 11,
+            failed: 1,
+            no_reader: 1,
+            not_given: 3,
+            implied_by_unreached: 6,
+            unreached_total: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            counts(&c),
+            "192 readings at their latest run. 181 were full; 67 of those had nothing to read, which is a full answer. 11 were not: 1 failed, 1 has no reader in this version, 3 were not given by their source, and 6 are on 1 machine that could not be reached."
+        );
+        let mut r = calm();
+        r.coverage = Some(c.clone());
+        assert!(page(&r, 1_800_000_100).contains("11 of 192 readings were not full"));
+        c.failed = 2;
+        assert_eq!(
+            counts(&c),
+            "192 readings at their latest run. 181 were full; 67 of those had nothing to read, which is a full answer. 11 were not."
+        );
+        let one = v1::CoverageSummary {
+            readings: 2,
+            full: 1,
+            none: 1,
+            no_reader: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            counts(&one),
+            "2 readings at their latest run. 1 was full. 1 was not: 1 has no reader in this version."
+        );
+        let two = v1::CoverageSummary {
+            failed: 1,
+            not_given: 1,
+            no_reader: 0,
+            none: 2,
+            readings: 3,
+            ..one
+        };
+        assert!(counts(&two).ends_with("2 were not: 1 failed and 1 was not given by its source."));
     }
 
     #[test]
