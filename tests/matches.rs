@@ -656,6 +656,44 @@ fn a_match_hands_over_the_signer_of_the_process_that_acted_as_the_line_gives_it(
 }
 
 #[test]
+fn a_finding_gives_the_event_its_match_gives_for_the_same_line_whole() {
+    // The response layer may pause the process behind an event, and a pid alone is reused. The
+    // event a finding keeps is the one its match hands over, every field, for a program start and
+    // for a file event: who each process is, its users and groups, the script and every signer.
+    let dir = Dir::new("finding-event");
+    dir.install();
+    dir.run();
+    let target = json!(["com.example.dd", "TARGET1234", true, 570522304]);
+    let before = json!(["com.example.tool", "EXAMPLE123", false, 570522385]);
+    let signer = |v: &Value| -> [Value; 4] { v.as_array().unwrap().clone().try_into().unwrap() };
+    let exec = json!({
+        "schema_version": 1, "version": 10, "seq_num": 1, "global_seq_num": 1, "time": T0,
+        "process": signed(owned("/bin/sh", 402, 9401, [503, 22, 504, 23]), signer(&before)),
+        "event": {"exec": {
+            "env": ["INVENTED=1"], "args": DD, "cwd": {"path": CWD},
+            "script": {"path": "/Users/example/pad.sh", "path_truncated": false},
+            "target": signed(owned("/bin/dd", 402, 9402, [501, 20, 502, 21]), signer(&target)),
+        }},
+    });
+    let create = json!({
+        "schema_version": 1, "version": 10, "seq_num": 1, "global_seq_num": 2, "time": T0,
+        "process": signed(owned("/usr/local/bin/node", 500, 9500, [501, 20, 502, 21]),
+            signer(&before)),
+        "event": {"create": {"destination_type": 0, "destination": {"existing_file": {"path": "/private/tmp/6202033", "path_truncated": false}}}},
+    });
+    dir.append(H00, &filtered(&[exec, create]));
+    dir.run();
+    let m = dir.matches(&[]);
+    assert_eq!(rules_of(&m), [PADDING, AXIOS]);
+    for (i, rule) in [PADDING, AXIOS].into_iter().enumerate() {
+        let [id] = <[String; 1]>::try_from(dir.findings_of(rule)).unwrap();
+        let finding = dir.report(&["finding", &id]);
+        let events = &finding["evidence"]["published_rule_matched"]["events"];
+        assert_eq!(events, &json!([m["matches"][i]["event"]]), "{rule}");
+    }
+}
+
+#[test]
 fn a_signer_value_of_the_wrong_shape_is_absent_and_the_line_is_still_read_judged_and_handed_over() {
     // No false calm. A line the filter did not shape, or a value it let through that the reader
     // cannot hold, leaves only that value absent: a number where a text belongs, a text where

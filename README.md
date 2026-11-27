@@ -1,8 +1,12 @@
-# Immunity Core
+# Immunity Core, the detection core of Artificial Immunity
 
-Immunity Core is a detection core for one Mac. It watches the Mac for signs of attack, keeps what it found and what it could not see, and answers when it is asked. It notifies no one by itself. You, your AI coding agent or another program ask it with a command, and an app or a layer that responds to a finding is built on those commands. It is for a person who builds software with AI agents on their own Mac and has no security team behind them.
+**Immunity Core** is an open-source detection core for one Mac. It watches the Mac for signs of attack, keeps what it found and what it could not see, and answers when it is asked. It notifies no one by itself. You, your AI coding agent or another program ask it with a command, and an app or a layer that responds to a finding is built on those commands. It is for a person who builds software with AI agents on their own Mac and has no security team behind them.
 
 Immunity Core is the detection core of [Artificial Immunity](https://immunity.bot), a project of [Nuanu AI Lab](https://nuanu.ai). This repository holds the core and its commands. A menu-bar app for a person is built outside it, on the same commands.
+
+Apple Silicon, macOS 15 or later · Rust · MIT licence · answers in JSON or protobuf for AI coding agents · no model inside, nothing about the Mac is sent anywhere
+
+[First run](#first-run) · [What it does not judge](#what-it-does-not-judge) · [For AI agents](#for-ai-agents) · [Docs](docs/README.md) · [Website](https://immunity.bot)
 
 <p align="center">
   <img src="docs/img/page-dark.png" width="760" alt="The top of the page immunity view writes: five findings that need the person now and two to look at, each with the thing it is about, what happened to it and the verdict a response layer gave">
@@ -10,7 +14,21 @@ Immunity Core is the detection core of [Artificial Immunity](https://immunity.bo
 
 The picture is the top of the page `immunity view` writes, here for an invented Mac.
 
-Immunity Core finds what you have on the Mac: projects and their dependencies, installed apps and packages, the places where persistence lives, the servers your SSH configuration knows. It matches dependencies against published vulnerability data from OSV and CISA, and checks program starts and new files against published rules for macOS from SigmaHQ and Elastic. Each finding says how bad it would be and how sure Immunity Core is, as two separate values, and every answer says what Immunity Core could not see. There is no model inside, and nothing about your Mac is sent anywhere.
+Immunity Core reads the settings, hooks and MCP server lists of coding agents such as Claude Code and Cursor, because those can make a tool run code by itself, and the sessions of Claude Code and Codex CLI, to find your projects. It finds what you have on the Mac: projects and their dependencies, installed apps and packages, the places where persistence lives, the servers your SSH configuration knows. It matches dependencies against published vulnerability data from OSV and CISA, and checks program starts and new files against published rules for macOS from SigmaHQ and Elastic. Each finding says how bad it would be and how sure Immunity Core is, as two separate values, and every answer says what Immunity Core could not see. There is no model inside, and nothing about your Mac is sent anywhere.
+
+## What you can ask it
+
+| You want to know | Command |
+|---|---|
+| Is anything wrong on this Mac, and what was not covered | `immunity status` |
+| Every finding, and one finding in full | `immunity findings`, `immunity finding <id>` |
+| Which known vulnerabilities affect the packages in your lockfiles | `immunity vulnerabilities`, `immunity vulnerability <id>` |
+| Which published rules watch, and how often each matched | `immunity rules` |
+| What a project, a program or this Mac looks like to the core | `immunity project`, `immunity program`, `immunity machine` |
+| A page to look at, instead of text | `immunity view` |
+| A full check right now | `immunity run` |
+
+Every command is in [the reference](docs/reference.md#commands). Your AI coding agent can run them too: see [For AI agents](#for-ai-agents).
 
 ## Events, matches and findings
 

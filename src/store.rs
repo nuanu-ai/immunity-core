@@ -891,6 +891,49 @@ pub fn read<T>(path: &Path, f: impl FnOnce(&Connection) -> Res<T>) -> Result<T, 
     f(&tx).map_err(Outcome::from)
 }
 
+/// One short write of the store, as every command that writes a little writes it: an answer, a
+/// verdict, a statement about a machine, the entry of `immunity off`, a sample, a check's start.
+/// A store that is there is checked first, read-only (`read`), so one this build refuses is told
+/// at once and never as a skip. Then the run lock is taken, waited for up to `wait`, and `open`
+/// opens the store under it: `open_or_make` for a command that makes the store where there is
+/// none. `f` runs in one transaction, which takes the write lock as it begins, and is committed
+/// only when `f` returns `Ok`. The check, the lock and the opening fail with their `Outcome`;
+/// SQLite's error at the transaction's start or commit is given as SQLite gave it, for the
+/// caller's mapping (`outcome::of`), as `f`'s own errors are.
+pub fn write<T, E: From<Outcome> + From<rusqlite::Error>>(
+    path: &Path,
+    wait: Duration,
+    open: fn(&Path) -> Result<Connection, Outcome>,
+    f: impl FnOnce(&Transaction) -> Result<T, E>,
+) -> Result<T, E> {
+    if exists(path).map_err(Outcome::from)? {
+        read(path, |_| Ok(()))?;
+    }
+    let _lock = lock_run_waiting(&crate::home(path), wait)
+        .map_err(|e| crate::outcome::of(&e))?
+        .ok_or_else(|| Outcome::new(Code::RunLockHeld, ""))?;
+    committed(open(path)?, f)
+}
+
+/// A write by the watcher, which holds the run lock across its steps, in one transaction as
+/// `write` runs it.
+pub fn write_held<T, E: From<Outcome> + From<rusqlite::Error>>(
+    path: &Path,
+    f: impl FnOnce(&Transaction) -> Result<T, E>,
+) -> Result<T, E> {
+    committed(open(path)?, f)
+}
+
+fn committed<T, E: From<Outcome> + From<rusqlite::Error>>(
+    mut conn: Connection,
+    f: impl FnOnce(&Transaction) -> Result<T, E>,
+) -> Result<T, E> {
+    let tx = conn.transaction()?;
+    let done = f(&tx)?;
+    tx.commit()?;
+    Ok(done)
+}
+
 /// Opens an existing store so that nothing can be written to it. A command that only reads the
 /// store reads it through `read`.
 ///
@@ -1153,9 +1196,9 @@ fn differs(want: &Shape, got: &Shape) -> Option<String> {
         .map(|object| format!("it holds a {object} this format does not"))
 }
 
-/// How long a run waits for the run lock before it says another run is in progress. A
-/// `immunity status` holds the lock shared for a moment only; another run holds it for minutes.
-const LOCK_WAIT: Duration = Duration::from_secs(2);
+/// How long a command waits for the run lock before it says another holds it. A `immunity
+/// status` holds the lock shared for a moment only; a check holds it for minutes.
+pub const LOCK_WAIT: Duration = Duration::from_secs(2);
 
 /// Takes the run lock on the store's folder, for as long as the handle returned stays open,
 /// or `None` when another run holds it. The lock is flock(2) on the folder: on macOS flock
@@ -1233,10 +1276,10 @@ pub fn watch_in_progress(folder: &Path) -> std::io::Result<bool> {
 /// the store for 12 s.
 pub const CHECK_WAIT: Duration = Duration::from_secs(60);
 
-/// The run lock for a full run, which holds the lock on the downloads (`osv::lock_fetch`), so
-/// whoever holds the run lock is a reading or a command, never another full run, and nothing
-/// holding it waits for the downloads: it is waited out for up to `wait`, then `None`.
-pub fn lock_run_for_check(folder: &Path, wait: Duration) -> std::io::Result<Option<File>> {
+/// The run lock, waited for up to `wait`, then `None`: `LOCK_WAIT` for a command, `CHECK_WAIT`
+/// for a full run. A full run holds the lock on the downloads (`osv::lock_fetch`), so whoever
+/// holds the run lock it waits for is a reading or a command, never another full run.
+pub fn lock_run_waiting(folder: &Path, wait: Duration) -> std::io::Result<Option<File>> {
     let start = Instant::now();
     loop {
         if let Some(lock) = lock_run(folder)? {
@@ -2861,8 +2904,9 @@ mod tests {
             k.run(true, &[("brew", MAC, BREW, FULL)]);
         }
         // The owner said the server was retired at 150: the reading at 300 contradicts it.
+        let tx = k.conn.transaction().unwrap();
         crate::owner::say(
-            &mut k.conn,
+            &tx,
             server,
             &[server.to_string()],
             "retired",
@@ -2872,6 +2916,7 @@ mod tests {
             "owner-1",
         )
         .unwrap();
+        tx.commit().unwrap();
         let answers = |k: &Kept| {
             let last_full = crate::view::latest_coverage(&k.conn)
                 .unwrap()
