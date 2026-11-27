@@ -228,6 +228,16 @@ pub fn service_cmd(args: &ServiceArgs) -> ExitCode {
 /// login, so `$HOME`, which any caller sets, is not where its files are. None when the account
 /// has no entry or no home.
 fn account_home(uid: libc::uid_t) -> Option<PathBuf> {
+    let dir = user_database(uid, |e| e.pw_dir)?;
+    Some(PathBuf::from(OsStr::from_bytes(&dir)))
+}
+
+/// One text of the account `uid`'s entry in the system's user database, getpwuid_r(3), as
+/// `field` picks it from the entry. None when the account has no entry or the entry no such text.
+pub(crate) fn user_database(
+    uid: libc::uid_t,
+    field: fn(&libc::passwd) -> *mut libc::c_char,
+) -> Option<Vec<u8>> {
     let mut buffer = vec![0 as libc::c_char; 4096];
     loop {
         // SAFETY: an all-zero passwd is a valid value for getpwuid_r to fill in.
@@ -248,12 +258,15 @@ fn account_home(uid: libc::uid_t) -> Option<PathBuf> {
             buffer.resize(buffer.len() * 2, 0);
             continue;
         }
-        if rc != 0 || found.is_null() || entry.pw_dir.is_null() {
+        if rc != 0 || found.is_null() {
             return None;
         }
-        // SAFETY: getpwuid_r succeeded, so pw_dir points to a string ending in NUL in `buffer`.
-        let dir = unsafe { CStr::from_ptr(entry.pw_dir) };
-        return Some(PathBuf::from(OsStr::from_bytes(dir.to_bytes())));
+        let text = field(&entry);
+        if text.is_null() {
+            return None;
+        }
+        // SAFETY: getpwuid_r succeeded, so the entry's texts end in NUL in `buffer`.
+        return Some(unsafe { CStr::from_ptr(text) }.to_bytes().to_vec());
     }
 }
 

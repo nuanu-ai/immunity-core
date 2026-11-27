@@ -2926,7 +2926,8 @@ mod tests {
     /// was checked on: the program's name is the last part of its path, the arguments one text
     /// with each between NULs and absent when there are none, their count a number, a file's
     /// name and extension from its path, the kind of event and its action Elastic Defend's
-    /// words, and every text folded too.
+    /// words, the user's name from the user database, a file event's outcome a success, and
+    /// every text folded too.
     #[test]
     fn an_event_is_given_to_elastic_s_rules_under_elastic_s_names() {
         let layout = Layout::new(&ECS);
@@ -2960,6 +2961,7 @@ mod tests {
             ("process.parent.name", "zsh"),
             ("process.working_directory", "/Users/example"),
             ("user.id", "0"),
+            ("user.name", "root"),
         ]
         .into_iter()
         .flat_map(|(n, v)| {
@@ -2982,6 +2984,7 @@ mod tests {
             "process.parent.name",
             "process.working_directory",
             "user.id",
+            "user.name",
         ] {
             assert_eq!(none[absent], None, "{absent}");
         }
@@ -3026,6 +3029,7 @@ mod tests {
         let names = [
             "event.type",
             "event.action",
+            "event.outcome",
             "file.path",
             "file.name",
             "file.extension",
@@ -3041,6 +3045,7 @@ mod tests {
             some(&[
                 "creation",
                 "creation",
+                "success",
                 "/opt/a/B.Class",
                 "B.Class",
                 "Class",
@@ -3053,6 +3058,7 @@ mod tests {
         let mut want = some(&[
             "change",
             "rename",
+            "success",
             "/Users/example/.bashrc",
             ".bashrc",
             "",
@@ -3061,10 +3067,10 @@ mod tests {
             ".bashrc",
             "",
         ]);
-        want[4] = None;
-        want[8] = None;
+        want[5] = None;
+        want[9] = None;
         assert_eq!(pick(&renamed, &names), want);
-        assert_eq!(created.len(), 8 + 8);
+        assert_eq!(created.len(), 9 + 9);
         for (path, extension) in [
             ("/tmp/notes.", None),
             ("/tmp/a.tar.gz", Some("gz")),
@@ -3072,6 +3078,77 @@ mod tests {
         ] {
             let f = given(Subject::File(&file("/bin/cp", path, None)), Kind::File);
             assert_eq!(f["file.extension"].as_deref(), extension, "{path}");
+        }
+    }
+
+    /// Two fields Elastic's rules read that need nothing more collected, judged on lines as the
+    /// collector writes them. A file created or renamed is reported after it happened, so its
+    /// `event.outcome` is `success`. `user.name` is the name of the effective user, `user.id`'s,
+    /// from the user database: user id 0 is `root`. A user id with no account gives no name, so
+    /// a rule that asks for one does not match, and an id past what a user id holds is never
+    /// taken for another by wrapping round to 0.
+    #[test]
+    fn a_file_event_succeeded_and_a_program_start_names_its_user() {
+        let rule = |detection: &str, category: &str| {
+            let rules = Rules::load_as(
+                &ELASTIC,
+                &[(
+                    "invented.yml",
+                    translated(
+                        &format!("  s1: {{{detection}}}\n  condition: s1\n"),
+                        category,
+                        "",
+                    ),
+                )],
+            );
+            assert_eq!(
+                rules.rules[0].placement,
+                Placement::Evaluated,
+                "{detection}"
+            );
+            rules
+        };
+        let read = |line: &str| crate::events::line(line.as_bytes()).unwrap();
+        for kind in [
+            r#""create":{"destination":"/Users/example/a""#,
+            r#""rename":{"source":"/Users/example/b","destination":"/Users/example/a""#,
+        ] {
+            let crate::events::Line::File {
+                event: Some(event), ..
+            } = read(&format!(
+                r#"{{"schema_version":1,"seq_num":1,"time":"2026-10-04T00:00:03Z","process":{{"executable":{{"path":"/usr/bin/touch"}}}},"event":{{{kind}}}}}}}"#
+            ))
+            else {
+                panic!("{kind}")
+            };
+            for (outcome, fired) in [("success", 1), ("failure", 0)] {
+                let rules = rule(
+                    &format!("\"event.outcome|cased\": [\"{outcome}\"]"),
+                    FILE_CATEGORY,
+                );
+                assert_eq!(rules.evaluate(&*event).len(), fired, "{kind} {outcome}");
+            }
+        }
+        let root = rule("\"user.name|cased\": [\"root\"]", CATEGORY);
+        let start = |euid: u64| {
+            let crate::events::Line::Exec { start, .. } = read(&format!(
+                r#"{{"schema_version":1,"version":10,"seq_num":1,"global_seq_num":1,"time":"2026-10-04T00:00:02Z","process":{{"executable":{{"path":"/bin/zsh"}}}},"event":{{"exec":{{"args":["tool-x"],"target":{{"executable":{{"path":"/Users/example/bin/tool-x"}},"audit_token":{{"pid":501,"euid":{euid},"pidversion":7}},"ppid":401}}}}}}}}"#
+            )) else {
+                panic!("{euid}")
+            };
+            start
+        };
+        assert_eq!(root.evaluate(&*start(0)).len(), 1);
+        // No account has user id 4,000,000,000, and 2^32 wraps round to 0 as a `uid_t`.
+        for other in [501, 4_000_000_000, 1 << 32] {
+            assert_eq!(root.evaluate(&*start(other)).len(), 0, "{other}");
+        }
+        let layout = Layout::new(&ECS);
+        let at = layout.field(Kind::Process, "user.name").unwrap();
+        for nobody in [4_000_000_000, 1 << 32] {
+            let s = start(nobody);
+            assert_eq!(s.user_id, Some(nobody as i64));
+            assert_eq!(layout.forms(Subject::Start(&s))[0][at], None, "{nobody}");
         }
     }
 

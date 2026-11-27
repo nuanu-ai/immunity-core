@@ -184,7 +184,9 @@ Elastic's translated rules read the Elastic Common Schema's names, filled from t
 | `process.parent.executable`, `process.parent.name` | the image before the `exec`, as `ParentImage`, and the last part of its path |
 | `process.working_directory` | `event.exec.cwd.path` |
 | `user.id` | the effective user id, as text |
+| `user.name` | the short name of the same user in the user database (`pw_name` of getpwuid_r(3)), looked up when the log is read; absent when no account has that id |
 | `event.type`, `event.action` | `start` and `exec` for a program start; `creation` for both on a file created, `change` and `rename` for one renamed |
+| `event.outcome` | `success` on a file event, since `eslogger` reports a file created or renamed after it happened |
 | `file.path`, `file.name`, `file.extension` | the file created or a rename's destination, its last part, and what follows the last dot of that |
 | `process.code_signature.signing_id` | on a file event, the `signing_id` of the program that did it. On a program start it is not given: no translated rule reads it there, and the field is kept for the response layer |
 
@@ -247,12 +249,12 @@ The fields those 23 wait for, with how many of them name each, and what the log 
 | `process.parent.code_signature.exists` | 3 | the signer and code-signing flags of the image before the `exec`; each of the 3 also reads `trusted` |
 | `process.code_signature.signing_id` | 2 | given, on file events; both also read `trusted` |
 | `process.code_signature.exists` | 1 | the code-signing flags of the program started; the rule also reads `trusted` |
-| `user.name` | 1 | the effective and real user ids; a name would be looked up when the log is read. The rule asks for `root`, uid 0 |
-| `event.outcome` | 1 | nothing to keep: `eslogger` reports a file created or renamed after it happened, so each is a success. The rule also reads files opened and modified, which the collector does not record |
+| `user.name` | 1 | given, from the effective user id. The rule asks for `root`, uid 0 |
+| `event.outcome` | 1 | given: `eslogger` reports a file created or renamed after it happened, so each is a success. The rule also reads files opened and modified, which the collector does not record |
 | `process.pe.original_file_name` | 1 | nothing: a field of Windows executables |
 | `process.env_vars` | 1 | nothing: the environment is never written |
 
-So no further field from these events would open one of the 23. Giving `user.name` from the user id, and `event.outcome` as `success`, would open 2 of them without collecting anything more.
+So no further field from these events would open one of the 23. `user.name` and `event.outcome` are now given without collecting anything more, and the 2 rules that wait for them stay among the 23 until the translator takes them.
 
 What the 66 translated rules rest on, beyond the checked translation:
 
