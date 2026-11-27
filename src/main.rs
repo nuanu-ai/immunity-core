@@ -1365,7 +1365,7 @@ fn vulnerabilities_cmd(args: &VulnerabilityArgs) -> ExitCode {
     match &args.id {
         None => match read_or_none(&args.store, |c| vulnerabilities::list(c, args.all, now)) {
             Ok(m) => answer::print(op, args.form, &m, |m| {
-                answers_text::vulnerabilities(m, &screen::Screen::of_stdout())
+                answers_text::vulnerabilities(m, args.all, &screen::Screen::of_stdout())
             }),
             Err(o) => failed(o),
         },

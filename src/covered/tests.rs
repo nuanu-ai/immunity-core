@@ -522,11 +522,13 @@ fn a_reading_names_the_kinds_of_watched_place_it_speaks_for_and_no_other() {
     assert!(of(&[(watched::READER, watched::PROFILE_KIND, "machine:other")]).is_empty());
     // The content of a watched file speaks for every kind the file is watched as.
     let file = format!("file:{MAC}/.zshrc");
+    let theirs = file.replace(MAC, "machine:other");
     let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Deferred)
         .unwrap();
     store::put_entity(&tx, &file).unwrap();
+    store::put_entity(&tx, &theirs).unwrap();
     tx.commit().unwrap();
-    let watched_as = |layer: &str, as_: &str| {
+    let watched_as_of = |file: &str, layer: &str, as_: &str| {
         conn.execute(
             "INSERT INTO assertion (layer, subject, predicate, object, reader, scope, kind,
                                     source_ref, basis, observed_at, run_id, retracted_at,
@@ -545,6 +547,7 @@ fn a_reading_names_the_kinds_of_watched_place_it_speaks_for_and_no_other() {
         )
         .unwrap()
     };
+    let watched_as = |layer: &str, as_: &str| watched_as_of(&file, layer, as_);
     watched_as("retracted", watched::SSH);
     watched_as("live", watched::PROFILE);
     assert_eq!(
@@ -576,8 +579,9 @@ fn a_reading_names_the_kinds_of_watched_place_it_speaks_for_and_no_other() {
         of(&[(watched::READER, watched::CONTENT, &file)]),
         [watched::HOOK]
     );
-    // A file of another machine, under the same kinds, speaks for none of this Mac's.
-    let theirs = file.replace(MAC, "machine:other");
+    // A file of another machine, watched live as a kind of this Mac's, speaks for none of them:
+    // only the scope keeps it out.
+    watched_as_of(&theirs, "live", watched::PROFILE);
     assert!(of(&[(watched::READER, watched::CONTENT, &theirs)]).is_empty());
     assert!(of(&[(watched::READER, watched::CONTENT, "file:machine:none")]).is_empty());
     let (by, kind) = crate::project::FOUND_BY[0];

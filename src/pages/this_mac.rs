@@ -346,20 +346,26 @@ fn kinds(out: &mut String, s: &Mac, r: &v1::Status, now: i64) -> Out {
 fn also(out: &mut String, s: &Mac) -> Out {
     out.push_str("<section id=\"also\">\n<h2>Also told</h2>\n<h3>A list of signs of a known attack, when you give one</h3>\n");
     told(out, &rule_with(INDICATOR_RULE))?;
-    let list = (s.m.coverage.iter())
-        .find(|c| c.reader == crate::indicators::READER && c.kind == crate::indicators::LIST_KIND);
-    // "At the last check" only of a reading that check made; an earlier one says when it was.
-    let full = |c: &v1::Coverage| c.completeness == v1::Completeness::Full as i32;
-    let said = match list {
-        None => "No list has been given, so nothing is compared.".to_string(),
-        Some(c) if c.run_id.is_some() && c.run_id.as_deref() == s.latest_run_id => match full(c) {
-            true => "A list was read at the last check.".to_string(),
-            false => "A list was given but could not be read at the last check.".to_string(),
-        },
-        Some(c) => format!(
+    let lists: Vec<&v1::Coverage> = (s.m.coverage.iter())
+        .filter(|c| c.reader == crate::indicators::READER && c.kind == crate::indicators::LIST_KIND)
+        .collect();
+    // "At the last check" only when a reading of the list is of that check, whichever comes
+    // first in the answer; else when one was last read in full.
+    let of_last: Vec<&&v1::Coverage> = (lists.iter())
+        .filter(|c| c.run_id.is_some() && c.run_id.as_deref() == s.latest_run_id)
+        .collect();
+    let full = |c: &&&v1::Coverage| c.completeness == v1::Completeness::Full as i32;
+    let said = if lists.is_empty() {
+        "No list has been given, so nothing is compared.".to_string()
+    } else if of_last.is_empty() {
+        format!(
             "The last check read no list. One was last read in full {}.",
-            utc_or(c.last_full_at, "never")
-        ),
+            utc_or(lists.iter().filter_map(|c| c.last_full_at).max(), "never")
+        )
+    } else if of_last.iter().any(full) {
+        "A list was read at the last check.".to_string()
+    } else {
+        "A list was given but could not be read at the last check.".to_string()
     };
     writeln!(
         out,
@@ -993,25 +999,33 @@ mod tests {
     /// that check made (`Coverage.run_id`); one an earlier check made says when it was read.
     #[test]
     fn the_list_of_signs_is_said_read_at_the_last_check_only_by_a_reading_of_that_check() {
-        let also = |run: &str| {
+        let also = |runs: &[&str]| {
             let read = v1::Known {
-                coverage: vec![v1::Coverage {
-                    reader: crate::indicators::READER.to_string(),
-                    kind: crate::indicators::LIST_KIND.to_string(),
-                    scope_text: MAC.to_string(),
-                    completeness: v1::Completeness::Full as i32,
-                    observed_at: Some(NOW - 86_400),
-                    last_full_at: Some(NOW - 86_400),
-                    run_id: Some(run.to_string()),
-                    ..Default::default()
-                }],
+                coverage: (runs.iter())
+                    .map(|run| v1::Coverage {
+                        reader: crate::indicators::READER.to_string(),
+                        kind: crate::indicators::LIST_KIND.to_string(),
+                        scope_text: format!("{MAC} {run}"),
+                        completeness: v1::Completeness::Full as i32,
+                        observed_at: Some(NOW - 86_400),
+                        last_full_at: Some(NOW - 86_400),
+                        run_id: Some(run.to_string()),
+                        ..Default::default()
+                    })
+                    .collect(),
                 ..Default::default()
             };
             let p = page(&status(vec![], vec![]), Some(&read), NOW);
             p[p.find("<section id=\"also\">").unwrap()..].to_string()
         };
-        assert!(also("run-2").contains("A list was read at the last check."));
-        let earlier = also("run-1");
+        assert!(also(&["run-2"]).contains("A list was read at the last check."));
+        // A reading of the last check behind an older one of another scope is still of it.
+        let both = also(&["run-1", "run-2"]);
+        assert!(
+            both.contains("A list was read at the last check."),
+            "{both}"
+        );
+        let earlier = also(&["run-1"]);
         assert!(
             !earlier.contains("at the last check.")
                 && earlier.contains(&format!(

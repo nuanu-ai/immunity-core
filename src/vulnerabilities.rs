@@ -1806,8 +1806,9 @@ pub fn totals(conn: &Connection, now: i64) -> rusqlite::Result<Totals> {
         .map(|((c, e, p), r)| (c, e, p, REASONS.get(r).copied().unwrap_or_default()))
         .collect();
     // A project counts as compared where a place of it was read in full against data current
-    // at the check and now, it has no place not wholly read, and none of its packages is
-    // "don't know", whatever the reason: one such package and it was not compared in full.
+    // at the check and now, it has no place not wholly read, of the ecosystem `none` too, and
+    // none of its packages is "don't know", whatever the reason: one such package and it was
+    // not compared in full.
     let untold_package: HashSet<&str> = t.unknown_packages.iter().map(|u| u.0.as_str()).collect();
     let mut compared: BTreeMap<String, bool> = BTreeMap::new();
     for (c, e, lockfiles, feed) in conn
@@ -1827,7 +1828,9 @@ pub fn totals(conn: &Connection, now: i64) -> rusqlite::Result<Totals> {
     }
     t.projects_compared = compared
         .into_iter()
-        .filter(|(c, whole)| *whole && !untold.contains(c) && !untold_package.contains(c.as_str()))
+        .filter(|(c, whole)| {
+            *whole && !unread.iter().any(|p| &p.0 == c) && !untold_package.contains(c.as_str())
+        })
         .count();
     t.unread_places = unread;
     t.informational = conn.query_row(
@@ -3445,26 +3448,44 @@ mod tests {
 
     #[test]
     fn asked_for_all_the_answer_lists_every_row_past_those_it_lists_by_itself() {
-        // The pages ask with `--all`, so every affected package is on them, as before.
+        // The pages ask with `--all`, so every affected package, package that cannot be told
+        // and place not read is on them, as before.
         let dir = crate::common::Scratch::new("listed-whole");
         let mut conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
         let tx = conn.transaction().unwrap();
         let at = "package-lock.json#node_modules/left-pad";
-        let projects: Vec<String> = (0..=SHOWN).map(|i| format!("shop{i}")).collect();
+        // Projects that hold a release the record affects, read in part, and as many that hold
+        // a release that cannot be compared.
+        let projects: Vec<(String, &[&str])> = (0..=SHOWN)
+            .flat_map(|i| {
+                [
+                    (format!("shop{i}"), &["1.2.0"][..]),
+                    (format!("odd{i}"), &["x"][..]),
+                ]
+            })
+            .collect();
         let entries: Vec<_> = (projects.iter())
-            .map(|p| (p.as_str(), Source::Registry, &["1.2.0"][..], at))
+            .map(|(p, releases)| (p.as_str(), Source::Registry, *releases, at))
             .collect();
         by_hand(&tx, "left-pad", &entries, &[(LEFT_PAD, LEFT_PAD_RANGES)]);
         match_all(&tx, "r1", NOW).unwrap();
+        let part = "UPDATE coverage SET completeness = 'partial', reason = 'a lockfile not read'
+                    WHERE scope LIKE '%shop%'";
+        tx.execute(part, []).unwrap();
         crate::store::journal_note(&tx, NOW, "r1", "run_finished", "").unwrap();
         let listed = |all| {
-            let a = list(Some(&tx), all, NOW).unwrap().affected.unwrap();
-            (a.items.len(), a.total)
+            let m = list(Some(&tx), all, NOW).unwrap();
+            let (a, u, r) = (m.affected.unwrap(), m.unknown.unwrap(), m.unread.unwrap());
+            [
+                (a.items.len(), a.total),
+                (u.items.len(), u.total),
+                (r.items.len(), r.total),
+            ]
         };
         let total = SHOWN as u64 + 1;
         assert_eq!(
             (listed(false), listed(true)),
-            ((SHOWN, total), (SHOWN + 1, total))
+            ([(SHOWN, total); 3], [(SHOWN + 1, total); 3])
         );
     }
 
