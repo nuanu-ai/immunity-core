@@ -116,16 +116,26 @@ fn body(out: &mut String, v: &v1::Vulnerabilities, r: &v1::Status) -> Out {
         writeln!(out, "<p class=\"muted\">{}</p>", esc(&line))?;
     }
     let affected = v.affected.clone().unwrap_or_default();
-    // One row a record, by its id, in the answer's order, the malicious and those used in
-    // attacks first: every package and project it affects is in its row.
+    // One row a record, in the answer's order, the malicious and those used in attacks first:
+    // every package and project it affects is in its row. The row says the record once, so
+    // entries share it only where all it says of the record is the same: two feeds can hold
+    // copies of one id that differ, and a row never says less than one of its entries.
+    let none = v1::PackageRecord::default();
     let mut records: Vec<Vec<&v1::AffectedPackage>> = Vec::new();
-    let mut at: HashMap<&str, usize> = HashMap::new();
+    let mut at: HashMap<_, usize> = HashMap::new();
     for a in &affected.items {
-        let id = a.record.as_ref().map_or("", |r| r.id_text.as_str());
-        match at.get(id) {
+        let r = a.record.as_ref().unwrap_or(&none);
+        let said = (
+            &r.id_text,
+            &r.source,
+            &r.label,
+            &r.aliases_text,
+            &r.summary_text,
+        );
+        match at.get(&said) {
             Some(&n) => records[n].push(a),
             None => {
-                at.insert(id, records.len());
+                at.insert(said, records.len());
                 records.push(vec![a]);
             }
         }
@@ -149,8 +159,10 @@ fn body(out: &mut String, v: &v1::Vulnerabilities, r: &v1::Status) -> Out {
 /// One record and everything it affects, as a row that opens in place. Its summary: the packages
 /// and their releases, the record's id and label and what it is fixed in, whether it is used in
 /// attacks, and in how many projects. Opened: the record once, then each package in each project
-/// on a line of its own. Whether it is used in attacks is `PackageRecord.exploited` alone: used
-/// when any of its answers says so, not known when any says nothing, else not listed.
+/// on a line of its own. Its entries give the record the same id, source, label, other ids and
+/// summary; what it is fixed in and whether it is used in attacks are each entry's own. Used in
+/// attacks is `PackageRecord.exploited` alone: used when any of its answers says so, not known
+/// when any says nothing, else not listed.
 fn record_row(out: &mut String, of: &[&v1::AffectedPackage]) -> Out {
     let record = of[0].record.clone().unwrap_or_default();
     // The packages, each once, with every release of it the record affects.
@@ -532,8 +544,8 @@ mod tests {
 
     /// Every record of the answer is one row, with every project and package it affects on a line
     /// of its own. Whether it is used in attacks is the record's `exploited` alone: used where any
-    /// of its answers says so, not known where any says nothing, not listed only where every one
-    /// says no, whatever its label or its other ids.
+    /// of its answers says so, the first or a later one, not known where any says nothing, not
+    /// listed only where every one says no, whatever its label or its other ids.
     #[test]
     fn every_record_is_one_row_with_every_project_it_is_in_and_used_in_attacks_is_its_word_alone() {
         let item =
@@ -563,16 +575,18 @@ mod tests {
             item("~/dev/three", "evil-pad", "MAL-c", Some(false), "2.0.0"),
             item("~/dev/two", "left-pad", "GHSA-d", Some(false), "1.0.1"),
             item("~/dev/three", "other-pad", "GHSA-d", Some(false), "3.0.0"),
+            item("~/dev/two", "down-pad", "GHSA-e", None, "2.0.0"),
+            item("~/dev/three", "down-pad", "GHSA-e", Some(true), "2.0.0"),
         ];
         let page = drawn(&v1::Vulnerabilities {
-            totals: Some(totals(4)),
-            affected: Some(v1::AffectedPackages { total: 7, items }),
+            totals: Some(totals(5)),
+            affected: Some(v1::AffectedPackages { total: 9, items }),
             ..Default::default()
         });
         let rows: Vec<&str> = page.split("<details class=\"fr vr").skip(1).collect();
-        assert_eq!(rows.len(), 4, "{page}");
+        assert_eq!(rows.len(), 5, "{page}");
         // Each record: its id, the projects of its lines, how many projects, and its mark.
-        let expect: [(&str, &[&str], i64, &str); 4] = [
+        let expect: [(&str, &[&str], i64, &str); 5] = [
             ("GHSA-a", &["one", "two"], 2, "used in attacks"),
             ("GHSA-b", &["one", "one"], 1, "not known if used in attacks"),
             ("MAL-c", &["three"], 1, "not listed as used in attacks"),
@@ -582,11 +596,13 @@ mod tests {
                 2,
                 "not listed as used in attacks",
             ),
+            ("GHSA-e", &["two", "three"], 2, "used in attacks"),
         ];
         for (row, (id, lines, n, mark)) in rows.iter().zip(expect) {
             assert!(row.contains(&format!(">{id}</bdi>")), "{row}");
             assert!(row.contains(&format!("\">{mark}</span>")), "{row}");
-            assert_eq!(row.starts_with(" urgent\""), id == "GHSA-a", "{row}");
+            let urgent = ["GHSA-a", "GHSA-e"].contains(&id);
+            assert_eq!(row.starts_with(" urgent\""), urgent, "{row}");
             let count = counted(n, "project", "projects");
             assert!(
                 row.contains(&format!("<span class=\"fc\">{count}</span>")),
@@ -608,6 +624,87 @@ mod tests {
         );
         for fixed in ["1.0.1", "3.0.0"] {
             assert!(rows[3].contains(&format!(" · fixed in <bdi class=\"src\">{fixed}")));
+        }
+    }
+
+    /// No false calm: a row says its record once, so entries share a row only where all it says
+    /// of the record is the same. Two feeds can hold copies of one id that differ, one read later
+    /// than the other: each copy is a row of its own, with its own label, source, other ids or
+    /// summary, its own project lines and its own count of projects.
+    #[test]
+    fn copies_of_one_record_id_that_differ_are_a_row_each_and_no_row_says_less_than_its_entries() {
+        let entry = |project: &str, record: &v1::PackageRecord| v1::AffectedPackage {
+            project_text: project.to_string(),
+            ecosystem: "npm".to_string(),
+            package_text: "lantern".to_string(),
+            record: Some(record.clone()),
+            ..Default::default()
+        };
+        let low = v1::PackageRecord {
+            id_text: "GHSA-lantern".to_string(),
+            source: "GitHub Advisory Database".to_string(),
+            label: "low".to_string(),
+            aliases_text: vec!["CVE-2099-0001".to_string()],
+            summary_text: Some("the wick runs short".to_string()),
+            exploited: Some(false),
+            ..Default::default()
+        };
+        // What the other copy says that the first does not, as the page prints it.
+        let other = [
+            (
+                "<dd>Critical</dd>",
+                v1::PackageRecord {
+                    label: "critical".to_string(),
+                    ..low.clone()
+                },
+            ),
+            (
+                "<dd>OSV</dd>",
+                v1::PackageRecord {
+                    source: "OSV".to_string(),
+                    ..low.clone()
+                },
+            ),
+            (
+                "CVE-2099-0002",
+                v1::PackageRecord {
+                    aliases_text: vec!["CVE-2099-0002".to_string()],
+                    ..low.clone()
+                },
+            ),
+            (
+                "the wick burns out",
+                v1::PackageRecord {
+                    summary_text: Some("the wick burns out".to_string()),
+                    ..low.clone()
+                },
+            ),
+        ];
+        for (said, copy) in other {
+            let items = vec![
+                entry("~/dev/one", &low),
+                entry("~/dev/two", &low),
+                entry("~/dev/three", &copy),
+            ];
+            let page = drawn(&v1::Vulnerabilities {
+                totals: Some(totals(2)),
+                affected: Some(v1::AffectedPackages { total: 3, items }),
+                ..Default::default()
+            });
+            let rows: Vec<&str> = page.split("<details class=\"fr vr").skip(1).collect();
+            assert_eq!(rows.len(), 2, "{said}: {page}");
+            assert!(!rows[0].contains(said) && rows[1].contains(said), "{page}");
+            for (row, lines, n) in [(rows[0], &["one", "two"][..], 2), (rows[1], &["three"], 1)] {
+                assert!(row.contains(">GHSA-lantern</bdi>"), "{row}");
+                let count = counted(n, "project", "projects");
+                assert!(row.contains(&format!("<span class=\"fc\">{count}</span>")));
+                let drawn: Vec<&str> = (row
+                    .split("<li><span class=\"p\"><bdi class=\"src\">~/dev/"))
+                .skip(1)
+                .map(|l| &l[..l.find('<').unwrap()])
+                .collect();
+                assert_eq!(drawn, lines, "{row}");
+            }
         }
     }
 
