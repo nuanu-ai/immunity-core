@@ -2570,6 +2570,9 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     read_threats(&run, catalogue)?;
     read_feeds(&run, feeds)?;
     opened += match_dependencies(&run)?;
+    // A mark that ended is judged after the last matcher: one on a package that left in this
+    // check opens now, as a read of the finding says it is (`findings::detect`).
+    findings::detect(run.tx, run.run_id, run.at, &[])?;
     let narrowed = narrowed(&start);
     if let Some(what) = &narrowed {
         run.notes
@@ -4086,38 +4089,6 @@ fn read_watched(
             checkouts: Vec::new(),
         });
     }
-    // What the startup items just read name as the programs they start: at a check only, since
-    // a watcher neither subscribes to them nor reads them.
-    let targets = if only.is_none() && !run_id.starts_with(watch::RUN_PREFIX) {
-        let all: Vec<&look::Look> = placed.iter().map(|p| &p.look).collect();
-        let items: Vec<&look::Look> = (placed.iter())
-            .filter(|p| targets::runs_of(p.watched_as).is_some())
-            .map(|p| &p.look)
-            .collect();
-        let (look, read) = targets::read(run.tx, &machine, &roots, &items, &all)?;
-        // What each startup item runs, told or not, is a unit of its own (`fault.rs`).
-        let (tx, kind) = (run.tx, targets::KIND);
-        baseline::record(tx, watched::READER, kind, &run_id, run.at, &read.told, &[])?;
-        for unit in &read.untold {
-            baseline::judged_unread(tx, watched::READER, kind, unit, &run_id)?;
-        }
-        let (completeness, reason, gap) = read.coverage(&look);
-        for (item, why) in &read.rows {
-            rows.push(not_read_row(targets::TARGET, item, "", why));
-        }
-        placed.push(Placed {
-            scope: machine.clone(),
-            watched_as: targets::TARGET,
-            kind: targets::KIND.to_string(),
-            look,
-            elsewhere: None,
-            coverage: Some((completeness, reason, gap.cause)),
-            checkouts: Vec::new(),
-        });
-        Some((read, gap))
-    } else {
-        None
-    };
     let homes = watched::homes(&args.home);
     let homes = [homes[0].as_path(), homes[1].as_path()];
     let given_root = args.checkouts_root.as_ref().and_then(|root| {
@@ -4239,6 +4210,40 @@ fn read_watched(
     // A file that could not be read is weighed by everything this pass read, before any row.
     let mut looks: Vec<&mut look::Look> = placed.iter_mut().map(|p| &mut p.look).collect();
     closed::settle(run.tx, &machine, &roots, &mut looks, &[])?;
+    // What the startup items name as the programs they start, read once every other kind is read
+    // and settled: a program another kind reads is that kind's alone, and what this pass read is
+    // evidence for one that could not be opened (`targets::read`). At a check only, since a
+    // watcher neither subscribes to them nor reads them.
+    let targets = if only.is_none() && !run_id.starts_with(watch::RUN_PREFIX) {
+        let all: Vec<&look::Look> = placed.iter().map(|p| &p.look).collect();
+        let items: Vec<&look::Look> = (placed.iter())
+            .filter(|p| targets::runs_of(p.watched_as).is_some())
+            .map(|p| &p.look)
+            .collect();
+        let (look, read) = targets::read(run.tx, &machine, &roots, &items, &all)?;
+        // What each startup item runs, told or not, is a unit of its own (`fault.rs`).
+        let (tx, kind) = (run.tx, targets::KIND);
+        baseline::record(tx, watched::READER, kind, &run_id, run.at, &read.told, &[])?;
+        for unit in &read.untold {
+            baseline::judged_unread(tx, watched::READER, kind, unit, &run_id)?;
+        }
+        let (completeness, reason, gap) = read.coverage(&look);
+        for (item, why) in &read.rows {
+            rows.push(not_read_row(targets::TARGET, item, "", why));
+        }
+        placed.push(Placed {
+            scope: machine.clone(),
+            watched_as: targets::TARGET,
+            kind: targets::KIND.to_string(),
+            look,
+            elsewhere: None,
+            coverage: Some((completeness, reason, gap.cause)),
+            checkouts: Vec::new(),
+        });
+        Some((read, gap))
+    } else {
+        None
+    };
     // The raw copy: kind, path, checksum and link target, one line per entry; never content.
     let mut raw = String::new();
     let mut lines: Vec<Vec<usize>> = Vec::new();
@@ -4700,11 +4705,22 @@ fn read_watched(
         .iter()
         .flat_map(|p| p.look.guarded.iter().cloned())
         .collect();
-    guarded.sort();
-    guarded.dedup();
     // Which folders macOS asks permission for the reader met is said by a reading of every
-    // place: one of some places did not meet those the others lead into.
+    // place: one of some places did not meet those the others lead into. A watcher reads no
+    // program the startup items run, so a folder only a program led into stays named until a
+    // check reads the programs again.
     if only.is_none() {
+        if targets.is_none() {
+            let latest =
+                "SELECT MAX(id) FROM coverage WHERE reader = ?1 AND scope = ?2 AND kind = ?3";
+            let named = [watched::READER, machine.as_str(), guarded::KIND];
+            let latest: Option<i64> = run.tx.query_row(latest, named, |r| r.get(0))?;
+            let rows = store::unread_of(run.tx, &Vec::from_iter(latest))?;
+            let paths = rows.into_iter().flatten().filter_map(|u| u.path);
+            guarded.extend(paths.map(|path| args.home.join(path)));
+        }
+        guarded.sort();
+        guarded.dedup();
         not_looked_into_when_met(run, watched::READER, &guarded, &args.home)?;
     }
     if placed.iter().any(|p| {

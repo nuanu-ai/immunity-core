@@ -3676,6 +3676,39 @@ fn a_watched_place_linked_into_documents_is_neither_entered_nor_subscribed_to_an
 }
 
 #[test]
+fn a_folder_only_a_program_a_startup_item_runs_led_into_stays_named_after_a_watchers_reading() {
+    // A watcher reads no program a startup item runs, so its reading of every place never
+    // takes back a folder macOS asks permission for that only such a program led into.
+    let mac = Mac::new("target-guarded");
+    mac.put("Documents/runner", "#!/bin/sh\n");
+    let linked = mac.sys().join("usr/local/bin/runner");
+    std::fs::create_dir_all(linked.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(mac.home().join("Documents/runner"), &linked).unwrap();
+    mac.put(
+        "Library/LaunchAgents/org.example.a.plist",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict>\
+         <key>ProgramArguments</key><array><string>/usr/local/bin/runner</string></array>\
+         </dict></plist>\n",
+    );
+    let said = "SELECT completeness || '|' || reason FROM coverage
+                WHERE reader = 'watched-places' AND kind = 'folders macOS asks permission for'
+                ORDER BY id DESC LIMIT 1";
+    mac.run();
+    assert_eq!(mac.rows(said), ["none|not looked into: ~/Documents"]);
+    let mut w = mac.watch();
+    w.next("read");
+    assert!(w.stop().success());
+    assert_eq!(mac.rows(said), ["none|not looked into: ~/Documents"]);
+    // A check reads the programs again and says what it met, which is no such folder now.
+    std::fs::remove_file(&linked).unwrap();
+    mac.run();
+    assert_eq!(
+        mac.rows(&said.replace("completeness || '|' || reason", "completeness")),
+        ["full"]
+    );
+}
+
+#[test]
 fn a_watched_file_its_permissions_keep_closed_leaves_this_mac_watched_in_part_and_is_the_owners_to_fix()
  {
     // A watched place that is there and cannot be read because of its permissions is the
