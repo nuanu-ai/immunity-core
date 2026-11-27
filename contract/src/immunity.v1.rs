@@ -1825,6 +1825,11 @@ pub struct Finding {
     /// first time. Since 1.34.0.
     #[prost(message, optional, tag = "26")]
     pub earlier: ::core::option::Option<EarlierOccurrence>,
+    /// What a source said of it, as `LookFinding.value_text` in `status.proto` gives it: such as
+    /// what an application's seal became, or a published rule's title with its authors. Whole.
+    /// Absent when no source said anything. Since 1.38.0.
+    #[prost(string, optional, tag = "27")]
+    pub value_text: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// An earlier occurrence of a finding, as it stands now. Since 1.34.0.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -3518,6 +3523,14 @@ pub struct ThisMac {
     pub stale_reason: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(uint64, tag = "8")]
     pub fresh_for_seconds: u64,
+    /// This Mac's id in the store, an entity id such as `machine:<name>`, and its name now: the one
+    /// the latest full check kept, which differs from the name in the id once the Mac was renamed,
+    /// else the name in the id. Whole. Both absent before anything of this Mac was read. Since
+    /// 1.38.0.
+    #[prost(string, optional, tag = "9")]
+    pub id_text: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "10")]
+    pub name_text: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -5031,6 +5044,11 @@ pub struct ShippedRule {
     pub matches_last_day: ::core::option::Option<u64>,
     #[prost(uint64, optional, tag = "14")]
     pub matches_last_week: ::core::option::Option<u64>,
+    /// Its `description` as published: what it looks for, in its authors' words, each run of white
+    /// space written as one space. Whole. Absent for a rule that gives none and for one that could
+    /// not be read. Since 1.38.0.
+    #[prost(string, optional, tag = "15")]
+    pub description_text: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]

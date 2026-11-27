@@ -1096,20 +1096,29 @@ fn rules_cmd(args: &RulesArgs) -> ExitCode {
             return answer::fail("rules", args.form, error, o.exit());
         }
     };
-    let mut m = sigma::Rules::shipped().message(
-        level
-            .as_ref()
-            .map(|l| (&l.matches_last_day, &l.matches_last_week)),
-    );
+    let m = rules_answer(level.as_ref(), store_id, args.store.exists(), now);
+    answer::print("rules", args.form, &m, |m| {
+        lists::rules(m, args.all, &screen::Screen::of_stdout())
+    })
+}
+
+/// The answer of `immunity rules` from the event level as a store's read left it: the pages are
+/// drawn from it too.
+fn rules_answer(
+    level: Option<&events::Level>,
+    store_id: Option<String>,
+    store_exists: bool,
+    now: i64,
+) -> contract::v1::Rules {
+    let mut m =
+        sigma::Rules::shipped().message(level.map(|l| (&l.matches_last_day, &l.matches_last_week)));
     m.format = 1;
     m.answered_at = now;
     m.store_id = store_id;
-    m.now = Some(status::rules_now(level.as_ref()));
-    m.matches_last_week = level
-        .as_ref()
-        .map(|l| l.matches_last_week.values().sum::<i64>().max(0) as u64);
+    m.now = Some(status::rules_now(level));
+    m.matches_last_week = level.map(|l| l.matches_last_week.values().sum::<i64>().max(0) as u64);
     if level.is_none() {
-        let reason = if args.store.exists() {
+        let reason = if store_exists {
             "program starts have not been looked for yet; the next check does"
         } else {
             store::NO_STORE_REASON
@@ -1122,9 +1131,7 @@ fn rules_cmd(args: &RulesArgs) -> ExitCode {
     // Every rule of the core's own and every cause of what is not covered, with its words, for an
     // agent to learn what each can say.
     m.catalogue = Some(findings::catalogue());
-    answer::print("rules", args.form, &m, |m| {
-        lists::rules(m, args.all, &screen::Screen::of_stdout())
-    })
+    m
 }
 
 /// `immunity rules --over-log`: the rules evaluated over the event log on disk now, from the start
@@ -1592,11 +1599,23 @@ fn write_view(store: &Path, if_stale: bool) -> Result<Vec<PathBuf>, Box<dyn Erro
         // watcher's lock, so the pages hold at least what it names and a watcher that stops
         // meanwhile moves the basis of the next look.
         let (basis, events_basis) = (view::basis(tx, &folder)?, events::basis(tx)?);
-        // The summary is built from what `immunity status --json` answers, read the same way.
+        // The pages are drawn from what the commands answer, built here from this one read:
+        // `immunity status`, `immunity findings` with each finding a page opens as `immunity
+        // finding` gives it, and `immunity rules` of the event level the status rests on.
         let (state, result) = status_read(tx, store, now)?;
+        let found = findings::all(tx, now)?;
+        let level = state.event_level.as_ref();
+        let answers = view::Answers {
+            findings: finding_answer::list_of(tx, &found, now)?,
+            finding: Box::new(|id| finding_answer::of(tx, &found, id, now)),
+            rules: rules_answer(level, result.store_id.clone(), true, now),
+        };
         let pages = match current {
-            Current::Events(_) => view::event_pages(tx, &state, &result, now)?,
-            _ => view::pages(tx, &state, &result, &store.display().to_string(), now)?,
+            Current::Events(_) => view::event_pages(tx, &state, &result, &answers, now)?,
+            _ => {
+                let store = store.display().to_string();
+                view::pages(tx, &state, &result, &answers, &store, now)?
+            }
         };
         // The time until which the headline drawn can stand: the status is fresh until its
         // check is older than `FRESH_FOR`. One already stale stays so.

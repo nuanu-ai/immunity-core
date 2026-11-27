@@ -83,6 +83,7 @@
   "technique_text": "T1195.001",
   "thing": null,
   "title": "A project on this Mac depends on a package that is known to be malicious.",
+  "value_text": "ansi-regex 6.2.1; MAL-2025-46966 from OpenSSF malicious packages: Malicious code in ansi-regex (npm)",
   "verdicts": null,
   "where_text": "~/dev/shop/package-lock.json#node_modules/ansi-regex"
 }

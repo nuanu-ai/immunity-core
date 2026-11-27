@@ -13382,7 +13382,7 @@ fn the_summary_page_says_what_status_says_with_each_item_in_full_and_no_markup_f
     // does not read here.
     let this_mac = section(page, "this-mac");
     assert!(
-        this_mac.contains("<span class=\"name\">mac</span> · last check <time datetime=\"2")
+        this_mac.contains("<bdi class=\"src\">mac</bdi> · last check <time datetime=\"2")
             && this_mac.contains("<p class=\"sub fault\">! No watcher runs: "),
         "{this_mac}"
     );
@@ -13934,11 +13934,8 @@ fn every_published_rule_is_listed_once_in_its_place_and_none_is_said_to_watch_wh
         section(page, "evaluated").matches(quiet).count(),
         n(&r["evaluated"]) - n(&r["file_rules"]) - 1
     );
-    // Every rule in part but the one for file events, which does not watch here.
-    assert_eq!(
-        section(page, "in-part").matches(quiet).count(),
-        n(&r["in_part"]) - 1
-    );
+    // No rule checked in part: it is never counted as watching.
+    assert_eq!(section(page, "in-part").matches(quiet).count(), 0);
     // The rules of a set that states no level are listed under their own heading, as a group
     // after every level and not as one.
     let evaluated = section(page, "evaluated");

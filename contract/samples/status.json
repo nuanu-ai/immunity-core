@@ -1603,8 +1603,10 @@
     "checked_at": 1795677917,
     "fresh": true,
     "fresh_for_seconds": 7200,
+    "id_text": "machine:mac",
     "live": false,
     "live_read_at": null,
+    "name_text": "mac",
     "stale_reason": null,
     "state": "watched",
     "watched": [

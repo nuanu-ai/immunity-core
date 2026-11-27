@@ -4110,6 +4110,43 @@ impl Level {
     }
 }
 
+/// Which events the level records now, and so which rules evaluated in full watch: those for
+/// program starts while it runs, those for file events while it runs and its collector
+/// records them, and of those only the ones that read nothing which does not arrive. The one
+/// predicate of a rule watching now: the status counts and names by it
+/// (`status::rules_now`), and the pages draw what the status names.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Watching {
+    pub starts: bool,
+    pub files: bool,
+    /// What of `KEEPS` does not arrive while the level runs.
+    pub missing: Keeps,
+}
+
+impl Watching {
+    /// As the level's latest reading left it.
+    pub fn of(level: Option<&Level>) -> Watching {
+        let running = level.filter(|l| l.state == RUNNING);
+        Watching {
+            starts: running.is_some(),
+            files: running.is_some_and(Level::files_watched),
+            missing: running.map_or(0, Level::not_arriving),
+        }
+    }
+
+    /// Whether this rule watches now: evaluated in full, about events the level records, and
+    /// reading nothing that does not arrive.
+    pub fn watches(self, l: &crate::sigma::Loaded) -> bool {
+        l.placement == crate::sigma::Placement::Evaluated
+            && !l.silenced_by(self.missing)
+            && match l.kind {
+                Some(crate::sigma::Kind::Process) => self.starts,
+                Some(crate::sigma::Kind::File) => self.files,
+                None => false,
+            }
+    }
+}
+
 /// How many hours the series by hour counts: the last day.
 pub const HOURS: usize = 24;
 /// How many minutes the series by minute counts: the last hour.

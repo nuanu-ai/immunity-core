@@ -170,6 +170,7 @@
   "technique_text": "T1027.001",
   "thing": null,
   "title": "A program started on this Mac in a way that a published detection rule marks as high risk.",
+  "value_text": "Binary Padding - MacOS, by Igor Fits, Mikhail Larin, oscd.community",
   "verdicts": null,
   "where_text": "mac"
 }

@@ -22,7 +22,12 @@ const FORMAT: u32 = 1;
 
 /// Every finding the store holds, in every state, the most severe first.
 pub fn list(conn: &Connection, now: i64) -> rusqlite::Result<v1::Findings> {
-    let found = findings::all(conn, now)?;
+    list_of(conn, &findings::all(conn, now)?, now)
+}
+
+/// `list`, of every finding already read: the pages take it with each finding they open whole
+/// (`of`) from one reading.
+pub fn list_of(conn: &Connection, found: &[Found], now: i64) -> rusqlite::Result<v1::Findings> {
     let mut items: Vec<Item> = found.iter().map(findings::item).collect();
     findings::order(&mut items);
     let store_id = Some(store::id(conn)?);
@@ -124,6 +129,7 @@ pub fn of(
         meaning: i.words.meaning.to_string(),
         advice: i.words.advice.to_string(),
         technique_text: i.technique.map(whole),
+        value_text: i.value.as_deref().map(whole),
         where_text: whole(&f.place),
         first_seen_at: f.first_seen.0,
         last_seen_at: f.last_seen.0,

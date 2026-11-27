@@ -62,6 +62,7 @@
   "technique_text": "T1554",
   "thing": null,
   "title": "Files of an installed command-line tool or package were changed in place, while its version stayed the same.",
+  "value_text": null,
   "verdicts": {
     "listed": [
       {

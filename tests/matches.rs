@@ -2335,7 +2335,7 @@ fn every_listing_of_rules_tells_two_rules_of_the_same_title_apart_by_their_set()
     let summary = &pages[0].1;
     for page in [summary, rules_page] {
         for (_, set) in XCSSET_SETS {
-            let label = format!("{XCSSET} ({set})").replace('\'', "&#39;");
+            let label = format!("{XCSSET}</bdi> ({set})").replace('\'', "&#39;");
             assert_eq!(page.matches(&label).count(), 1, "{label}");
         }
     }

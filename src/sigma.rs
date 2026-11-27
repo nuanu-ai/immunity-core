@@ -803,11 +803,6 @@ impl Level {
     }
 }
 
-/// What a person reads for a rule's level: its name, or that it states none.
-pub fn level_said(level: Option<Level>) -> &'static str {
-    level.map_or(NO_LEVEL, Level::as_str)
-}
-
 /// The words for a rule whose set states no level.
 pub const NO_LEVEL: &str = "no level stated";
 
@@ -895,19 +890,6 @@ impl Meta {
     pub fn level_name(&self) -> Option<&'static str> {
         self.level.map(Level::as_str)
     }
-
-    /// The rule as a person reads it in a listing: its title, then its set in words. Rules of
-    /// different sets can have the same title, so every listing for a person names a rule by
-    /// this, and a machine reads the set in the fields `source` and `set`.
-    pub fn label(&self) -> String {
-        label(&self.title, self.source)
-    }
-}
-
-/// A title and the set it is of, for a person: `Meta::label`, and the file of a rule that could
-/// not be read in place of its title.
-pub fn label(title: &str, source: &Source) -> String {
-    format!("{title} ({})", source.set)
 }
 
 /// What this level does with a rule. Whether a rule it can evaluate watches this Mac now is
@@ -1271,6 +1253,8 @@ impl Rules {
                 set: l.source.set.to_string(),
                 status: l.meta.as_ref().map(|m| m.status.as_str().to_string()),
                 events: l.kind.map(|k| k.category().to_string()),
+                description_text: (l.meta.as_ref().and_then(|m| m.description.as_deref()))
+                    .map(|d| whole(&d.split_whitespace().collect::<Vec<_>>().join(" "))),
                 ..Default::default()
             };
             match &l.placement {
@@ -1424,14 +1408,6 @@ impl Rules {
             }
         }
         groups
-    }
-}
-
-/// What gives a rule's fields, for a person: "a program start" or "a file event".
-pub fn given_by(kind: Option<Kind>) -> &'static str {
-    match kind {
-        Some(Kind::File) => "a file event",
-        _ => "a program start",
     }
 }
 
@@ -3291,6 +3267,30 @@ mod tests {
         assert!(notice.contains(COMMIT));
         assert!(notice.contains("https://github.com/SigmaHQ/Detection-Rule-License"));
         assert!(notice.contains("Detection Rule License (DRL) 1.1"));
+    }
+
+    /// A rule's description is given as its words, its white space one space: the line breaks
+    /// of a YAML block are not part of what it says, and the rules page draws it as one line.
+    #[test]
+    fn a_rule_s_description_is_given_as_its_words_on_one_line() {
+        let m = Rules::shipped().message(None);
+        let amos = (m.evaluated.iter().chain(&m.in_part))
+            .find(|s| {
+                (s.rule.as_ref())
+                    .is_some_and(|r| r.id_text == "e710a880-1f18-4417-b6a0-b5afdf7e33da")
+            })
+            .and_then(|s| s.description_text.as_deref())
+            .unwrap();
+        assert!(
+            amos.starts_with(
+                "Detects suspicious activity associated with Atomic MacOS Stealer (Amos) campaigns,"
+            ),
+            "{amos}"
+        );
+        assert!(
+            amos.ends_with("which are key indicators of Amos infostealer activity."),
+            "{amos}"
+        );
     }
 
     /// The drill. Atomic Red Team's tests ffe2346c-abd5-4b45-a713-bf5f1ebd573a and

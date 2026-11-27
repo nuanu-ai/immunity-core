@@ -52,6 +52,7 @@
   "technique_text": "T1546.004",
   "thing": null,
   "title": "A file your terminal runs every time it starts was added, changed or removed.",
+  "value_text": null,
   "verdicts": null,
   "where_text": "~/.zshrc"
 }
