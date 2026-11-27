@@ -513,19 +513,27 @@ fn rule_count(conn: &Connection, finding: &str) -> rusqlite::Result<Option<u64>>
 }
 
 /// The events a published rule's finding keeps, newest first, as `immunity matches` gives an
-/// event: the rows are made back into what the collector's reading made them from.
+/// event: the rows are made back into what the collector's reading made them from, whole but
+/// for a start's arguments, and printed by the same code.
 fn rule_events(
     conn: &Connection,
     finding: &str,
     kind: sigma::Kind,
 ) -> rusqlite::Result<Vec<v1::Event>> {
     // A row's arguments are read back cut, and cut again, so a set newer than the one that kept
-    // them applies; the start made from the row holds none.
+    // them applies; the start made from the row holds none. Who the processes are is kept as
+    // JSON, read back with the same derive that wrote it.
+    fn json<T: serde::de::DeserializeOwned + Default>(
+        r: &rusqlite::Row,
+        i: usize,
+    ) -> rusqlite::Result<T> {
+        Ok(serde_json::from_str(&r.get::<_, String>(i)?).unwrap_or_default())
+    }
     let read: Vec<(Evidence, Args)> = match kind {
         sigma::Kind::Process => conn
             .prepare(
                 "SELECT timestamp, executable, args, parent_executable, working_directory, pid,
-                        parent_pid, user_id, signing_id, team_id, platform_binary
+                        parent_pid, user_id, signing_id, team_id, platform_binary, who
                  FROM rule_evidence WHERE finding = ?1 ORDER BY rowid DESC",
             )?
             .query_map([finding], |r| {
@@ -542,6 +550,7 @@ fn rule_events(
                     signing_id: r.get(8)?,
                     team_id: r.get(9)?,
                     platform_binary: r.get(10)?,
+                    who: Box::new(json(r, 11)?),
                     ..ProcessStart::default()
                 });
                 Ok((start, Args::stored(&args)))
@@ -549,7 +558,8 @@ fn rule_events(
             .collect::<rusqlite::Result<_>>()?,
         sigma::Kind::File => conn
             .prepare(
-                "SELECT timestamp, action, path, source, executable
+                "SELECT timestamp, action, path, source, executable, signing_id, team_id,
+                        platform_binary, codesigning_flags, instigator
                  FROM rule_file_evidence WHERE finding = ?1 ORDER BY rowid DESC",
             )?
             .query_map([finding], |r| {
@@ -566,6 +576,11 @@ fn rule_events(
                     path: r.get(2)?,
                     source: r.get(3)?,
                     executable: r.get(4)?,
+                    signing_id: r.get(5)?,
+                    team_id: r.get(6)?,
+                    platform_binary: r.get(7)?,
+                    codesigning_flags: r.get(8)?,
+                    instigator: json(r, 9)?,
                     ..FileEvent::default()
                 });
                 Ok((event, Args(Vec::new())))
