@@ -150,6 +150,11 @@ message VulnerabilityTotals {
   // count here speaks only for the projects found. Absent from an older core, and then read as
   // not known, never as `all`. Since 1.21.0.
   ProjectsFound projects_found = 20;
+  // Records that affect something and that the catalogue of exploited vulnerabilities lists as
+  // used in attacks, each counted once, however old the catalogue. Zero says none is listed;
+  // whether none is used in attacks rests on the catalogue being current, which `Threats` in the
+  // status says. Since 1.39.0.
+  uint64 affected_exploited = 21;
 }
 
 // Whether the projects found are every project in the places this version looks for them in.

@@ -18,13 +18,15 @@
 
 pub(crate) mod findings_table;
 pub(crate) mod rules;
+pub(crate) mod this_mac;
+pub(crate) mod vulnerabilities;
 
 use crate::contract::v1;
-use crate::covered::{self, Count, Uncovered, YOU};
-use crate::secrets::Name;
+use crate::covered::{self, Count, YOU};
+use crate::secrets::{Name, Said};
 use crate::view::{self, DETAILS, FOOT, Latest, Out, counted, esc, esc_said, utc, utc_or};
-use crate::{beyond, findings, integrity, servers, watched};
-use rusqlite::{Connection, params};
+use crate::{beyond, servers};
+use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::Write;
@@ -74,65 +76,27 @@ fn grouped(n: i64) -> String {
     counted(n, "", "").trim_end().to_string()
 }
 
-/// What each kind of watched thing is, in a line.
-fn about(what: &str) -> &'static str {
-    match what {
-        "startup items" => {
-            "Programs macOS starts by itself when you log in or the Mac starts: the usual way for something unwanted to stay on a Mac."
-        }
-        covered::LOGIN_HOOKS => {
-            "Scripts the login window runs with full control at every login and logout, a way Apple replaced years ago."
-        }
-        "shell startup files" => "Files your terminal runs every time it opens a shell.",
-        "SSH files" => "Your SSH settings, and the keys allowed to log in to this Mac.",
-        covered::LOGIN_MODULES => {
-            "The rules and plugins that decide how you log in, unlock and approve an administrator action, and how your password is checked."
-        }
-        "git hooks in projects" => {
-            "Scripts git runs by itself in your projects, for example before a commit."
-        }
-        "applications" => "Applications in the Applications folders, with who signed each.",
-        "Homebrew packages" => "What Homebrew installed in /opt/homebrew or /usr/local.",
-        "npm packages" => {
-            "Packages npm installed for every project at once in /opt/homebrew/lib/node_modules or /usr/local/lib/node_modules."
-        }
-        "app code kept outside the app" => {
-            "Code that applications not made by Apple keep in your Library folder, outside the application itself."
-        }
-        covered::DEPENDENCIES => {
-            "Packages your projects list in their crates.io, npm and PyPI lockfiles, compared at every check with the known vulnerabilities and malicious packages of those ecosystems."
-        }
-        _ => crate::autorun::about(what),
-    }
-}
-
 /// The summary page, a report read from the top: the state in the panel's words, with one line
 /// on what it rests on; the findings as a table, open, answered and all, each row opening in
 /// place to its evidence as `immunity finding` gives it; what is watched, area by area, with its
 /// state and when it was last read; "As it happens", every program start checked against
 /// published rules (`happens.rs`); the faults the person can fix; once, collapsed, what this
 /// version does not read here (`not_read_here.rs`); and a line of links to the other pages.
-/// Built from the state and the result
-/// `immunity status --json` gives, so the two agree.
+/// Drawn from what the commands answer alone, the status first, so the two agree.
 pub fn summary(
-    conn: &Connection,
-    st: &crate::status::State,
     r: &v1::Status,
     answers: &view::Answers,
     now: i64,
 ) -> Result<String, Box<dyn Error>> {
     let mut out = view::head("What needs a look").replacen("<body>", "<body class=\"summary\">", 1);
-    let latest = view::latest_coverage(conn)?;
-    let map = crate::map::read(conn, st, &latest)?;
-    let (faults, limits) = sorted(st, r);
-    let fixable = fixable(&faults);
-    // The scope of the answer, said once as a link to where each thing is named.
+    // Whether a thing not covered is a fault or a limit is the status's word.
+    let (faults, limits): (Vec<&v1::Uncovered>, Vec<&v1::Uncovered>) =
+        r.not_covered.iter().partition(|u| u.fault);
     state(&mut out, r, now)?;
     findings_table::table(&mut out, answers, now)?;
-    let failed = failed_here(&faults).len();
-    watched_table(conn, &mut out, st, &map, &latest, &faults, failed, now)?;
+    watched_table(&mut out, r, &faults, now)?;
     crate::happens::draw(&mut out, r, &answers.rules, &answers.findings, now)?;
-    you_can_fix(&mut out, &fixable)?;
+    you_can_fix(&mut out, &fixable(&faults))?;
     crate::not_read_here::section(&mut out, &limits)?;
     links(&mut out, r, now)?;
     out.push_str(FOOT);
@@ -366,54 +330,35 @@ fn watched_row(
     Ok(())
 }
 
-/// Whether any record that affects a project is one attackers are using, counted from the same
-/// tables the findings are raised from.
-fn any_used(conn: &Connection) -> rusqlite::Result<bool> {
-    Ok(crate::vulnerabilities::affecting(conn)?
-        .iter()
-        .any(|a| a.exploited))
-}
-
-/// The latest reading time among some readings.
-fn last_read(readings: &[&Latest]) -> Option<i64> {
-    readings.iter().map(|r| r.at).max()
-}
-
 /// What is watched, as a table by kind of place, grouped as on this Mac, in your projects and
 /// beyond this Mac: how often each is looked at, how many things, its state and when it was last
-/// read, from the latest readings in the store. A row's state is one of three: the faults of the
-/// message that name it, linked to where they are told, and only they are drawn as faults; else
-/// how it was read, "read in full" and "none here" only where every reading that fills the row is
-/// full, "read" where something left it short, and "not checked yet" with no reading of it; else
-/// a plain count. A limit is never a row's fault: it is told once, at the end. Then one line: how
-/// many faults on this Mac nothing the person does changes, as a link to the page that names each.
-#[allow(clippy::too_many_arguments)]
-fn watched_table(
-    conn: &Connection,
-    out: &mut String,
-    st: &crate::status::State,
-    map: &crate::map::Map,
-    latest: &[Latest],
-    faults: &[&Uncovered],
-    failed: usize,
-    now: i64,
-) -> Out {
-    let m = &st.this_mac;
-    let this = covered::this_machine(conn)?;
-    let mac = findings::This::of(conn, this.clone())?;
-    let place = |scope: &str| findings::place(scope, mac.as_ref());
-    // What the faults name, each a place's name alone (`covered::Example`), so it is matched
-    // whole; and those of them the person can fix.
-    let named = |list: &[&Uncovered]| -> BTreeSet<String> {
-        (list.iter())
-            .flat_map(|u| u.examples.iter().map(|e| e.name.clone()))
-            .collect()
-    };
-    let (at_fault, can_fix) = (named(faults), named(&fixable(faults)));
+/// read, from the status alone. A row's state is one of three: the faults of the status that name
+/// its kind (`Uncovered.watched_kinds`), linked to where they are told, and only they are drawn as
+/// faults; else how it was read, "read in full" and "none here" only where the status says its
+/// kind was read in full and fresh (`WatchedKind.coverage` and `fresh`, `IntegrityReading`), and
+/// "not checked yet" with no reading of it; else a plain count. A limit is never a row's fault:
+/// it is told once, at the end. Then one line: how many faults on this Mac nothing the person
+/// does changes, as a link to the page that names each.
+fn watched_table(out: &mut String, r: &v1::Status, faults: &[&v1::Uncovered], now: i64) -> Out {
+    let m = r.this_mac.clone().unwrap_or_default();
+    let kinds = r.watched.as_ref().map_or(&[][..], |w| &w.kinds[..]);
+    let full = v1::Completeness::Full as i32;
+    let t = r.vulnerabilities.clone();
+    // Whether projects were looked for everywhere, or everywhere but in the folders this version
+    // does not enter, when what is said of projects is said of the projects found.
+    let found = t.as_ref().and_then(|t| t.projects_found.as_ref());
+    let not_entered =
+        |f: &v1::ProjectsFound| v1::Cause::try_from(f.cause) == Ok(v1::Cause::NotGiven);
+    let walked = found.is_some_and(|f| f.all || not_entered(f));
+    let in_found = found.is_some_and(|f| !f.all && not_entered(f));
+    // The latest full check, whose readings of installed software the status gives.
+    let check = (r.last_finished_run.as_ref())
+        .and_then(|f| f.check.as_ref())
+        .map(|c| c.started_at);
     // Where a fault is told in full: "You can fix", or the page of what could not be read, its
     // label naming that place before what the row says.
-    let told = |fixable: bool, said: String| {
-        let (href, at) = match fixable {
+    let told = |of: &[&&v1::Uncovered], said: String| {
+        let (href, at) = match of.iter().all(|u| u.who == YOU) {
             true => ("#you-can-fix".to_string(), "You can fix"),
             false => (
                 format!("{DETAILS}/{THIS_MAC}.html#{NOT_READ}"),
@@ -425,132 +370,122 @@ fn watched_table(
             "<a href=\"{href}\" aria-label=\"{at}: {said}\">{said}</a>"
         ))
     };
+    // The faults of some causes, as one state of a row.
+    let by = |ids: &[&str], said: &str| {
+        let of: Vec<&&v1::Uncovered> = faults
+            .iter()
+            .filter(|u| ids.contains(&u.id.as_str()))
+            .collect();
+        (!of.is_empty()).then(|| told(&of, said.to_string()))
+    };
     writeln!(
         out,
         "<section id=\"watched-here\">\n<div class=\"wsh\"><h2>What is watched</h2><span class=\"n\">on this Mac, in your projects and beyond</span></div>\n<div class=\"wt\">\n<div class=\"wr wh\" aria-hidden=\"true\"><span>Kind of place</span><span>How often</span><span class=\"wn\">Things</span><span>State</span><span class=\"wl\">Last read</span></div>"
     )?;
     let mut on_mac = String::new();
     let mut in_projects = String::new();
-    for (count, what, fast) in covered::watched() {
-        let how = if m.live && fast {
-            "within seconds"
-        } else {
-            "at full checks"
+    for (count, what, _) in covered::watched() {
+        let thing = m.watched.iter().find(|w| w.what == what);
+        let how = match thing.is_some_and(|w| w.how == "live") {
+            true => "within seconds",
+            false => "at full checks",
         };
-        let readings = readings_of(count, latest);
-        let n = m.watched.iter().find(|w| w.0 == what).map(|w| w.1);
-        // Its things a fault names: a reading of it that failed, the walk that finds the
-        // projects it is kept in, or a watched file.
-        let walks = (latest.iter()).filter(|r| {
-            covered::in_projects(count)
-                && (crate::project::FOUND_BY.iter())
-                    .any(|(by, kind)| r.reader == *by && r.kind == *kind)
-        });
-        let mut cannot: BTreeSet<String> = (readings.iter().copied().chain(walks))
-            .filter(|r| covered::failed(r))
-            .map(|r| place(&r.scope))
-            .filter(|p| at_fault.contains(p))
+        let n = thing.map(|w| w.count as i64);
+        let key = match count {
+            Count::Files(as_) => as_,
+            Count::Installed(kind) => kind,
+            Count::Dependencies => covered::DEPENDENCIES,
+        };
+        // The faults that name its kind; a fault that names none stays in its section alone.
+        let of: Vec<&&v1::Uncovered> = (faults.iter())
+            .filter(|u| u.watched_kinds.iter().any(|k| k == key))
             .collect();
-        if let Count::Files(as_) = count {
-            let files: Vec<String> = conn
-                .prepare(
-                    "SELECT DISTINCT subject FROM assertion
-                     WHERE layer = 'live' AND reader = ?1 AND predicate = 'watched_as'
-                       AND object = ?2 ORDER BY subject",
-                )?
-                .query_map(params![watched::READER, as_], |r| r.get::<_, String>(0))?
-                .collect::<rusqlite::Result<Vec<String>>>()?;
-            cannot.extend((files.iter().map(|f| place(f))).filter(|p| at_fault.contains(p)));
-        }
-        // Read in full only where every reading of it is full and not dated ahead of the clock,
-        // the walk that finds its projects was whole, and for the packages the vulnerability
-        // data is current. Whatever of that is short is a fault only by the message's word.
-        let mut walk = walk_gap(count, latest, this.as_deref());
-        if let Count::Dependencies = count {
-            walk.extend(old_feeds(conn, now)?);
-        }
-        let whole = walk.is_empty()
-            && (readings.iter())
-                .all(|r| r.completeness == "full" && crate::store::age(r.at, now).is_some());
         let mut faulted: Vec<Standing> = Vec::new();
-        if !cannot.is_empty() {
-            let fixable = cannot.iter().all(|p| can_fix.contains(p));
-            let said = format!("{} can't be read now", grouped(cannot.len() as i64));
-            faulted.push(told(fixable, said));
+        if !of.is_empty() {
+            let things: u64 = of.iter().map(|u| u.count.max(1)).sum();
+            faulted.push(told(
+                &of,
+                format!("{} can't be read now", grouped(things as i64)),
+            ));
         }
-        // The faults of what the packages are compared with, by the message's items.
-        let by = |ids: &[&str], said: &str| {
-            let of: Vec<&&Uncovered> = (faults.iter())
-                .filter(|u| ids.contains(&u.cause.id))
-                .collect();
-            (!of.is_empty()).then(|| told(of.iter().all(|u| u.cause.who == YOU), said.into()))
-        };
+        let mut things = n.map_or("—".to_string(), grouped);
+        // The packages' own state, and beside it what the comparison found.
+        let (mut read, mut beside, mut last) = (None, Vec::new(), None);
         if let Count::Dependencies = count {
             let data = [
                 covered::VULNERABILITY_DATA_OLD.id,
                 covered::VULNERABILITY_DATA_FIXABLE.id,
             ];
             faulted.extend(by(&data, "vulnerability data not current"));
-        }
-        let mut things = n.map_or("—".to_string(), grouped);
-        // The packages' own state, and beside it what the comparison found.
-        let (mut read, mut beside) = (None, Vec::new());
-        if let Count::Dependencies = count {
+            let t = t.clone().unwrap_or_default();
             if let Some(n) = n {
                 things = grouped(n);
             }
-            let t = crate::vulnerabilities::totals(conn, now)?;
-            // At every check only where every project was compared in full; why one was not is
-            // a fault above or a limit at the end.
-            // And compared at all only where a project was: with none, nothing is said read.
-            let all = whole && map.projects_open() == 0;
-            read = Some(match (t.matched, t.projects_compared, all) {
+            // At every check only where every project was compared in full, against data
+            // current now, and projects were looked for everywhere; why one was not is a fault
+            // above or a limit at the end.
+            let current = (t.feeds.iter()).filter(|f| f.matched).all(|f| f.current);
+            let all = crate::text::Matched::of(&t).all_compared() && walked && current;
+            read = Some(match (t.matched_this_store, t.projects_compared, all) {
                 (false, ..) => Standing::never("not compared yet"),
                 (true, 0, _) => Standing::never("no project compared"),
                 (true, _, true) => Standing::read("compared at every check"),
                 (true, _, false) => Standing::read("compared"),
             });
-            if t.matched {
-                let known: usize = t
-                    .records_by_label
-                    .iter()
-                    .filter(|(label, _)| *label != "malicious")
-                    .map(|(_, n)| n)
-                    .sum();
-                if known > 0 {
-                    beside.push(Standing::none(format!(
-                        "<a href=\"{DETAILS}/{VULNERABILITIES}.html\">{}</a>",
-                        esc(&counted(
-                            known as i64,
-                            "known vulnerability",
-                            "known vulnerabilities"
-                        ))
-                    )));
-                    // "None used in attacks" rests on a current list of them
-                    // (`vulnerabilities::exploited`); one that is used is a finding, in the
-                    // table of findings. Its fault is the list's download, by the message's items.
-                    if !any_used(conn)? {
-                        let list = [covered::THREATS_UNREAD.id, covered::THREATS_FIXABLE.id];
-                        let unknown = "whether any is used in attacks is not known";
-                        let current = crate::vulnerabilities::catalogue_current(conn, now)?;
-                        beside.push(match current {
+            last = check.filter(|_| t.matched_this_store);
+            let known: u64 = (t.affected_records_by_label.iter())
+                .filter(|c| c.name != "malicious")
+                .map(|c| c.count)
+                .sum();
+            if t.matched_this_store && known > 0 {
+                beside.push(Standing::none(format!(
+                    "<a href=\"{DETAILS}/{VULNERABILITIES}.html\">{}</a>",
+                    esc(&counted(
+                        known as i64,
+                        "known vulnerability",
+                        "known vulnerabilities"
+                    ))
+                )));
+                // "None used in attacks" rests on none being on the catalogue's list and the
+                // catalogue being current, by the one rule the answers rest on; one that is used
+                // is a finding, in the table of findings. Its fault is the list's download.
+                if t.affected_exploited == 0 {
+                    let read_at = r.threats.as_ref().and_then(|c| c.read_at);
+                    let list = [covered::THREATS_UNREAD.id, covered::THREATS_FIXABLE.id];
+                    let unknown = "whether any is used in attacks is not known";
+                    beside.push(
+                        match crate::vulnerabilities::catalogue_current_at(read_at, now) {
                             false => {
                                 by(&list, unknown).unwrap_or_else(|| Standing::none(esc(unknown)))
                             }
                             true => Standing::read("none is known to be used in attacks"),
-                        });
-                    }
+                        },
+                    );
                 }
             }
         }
         let read = read.unwrap_or_else(|| {
+            // Whole only by the status's word for its kind; a kind kept in projects also needs
+            // the projects looked for.
+            let (whole, at) = match count {
+                Count::Files(as_) => match kinds.iter().find(|k| k.kind == as_) {
+                    Some(k) => (k.coverage == Some(full) && k.fresh, k.read_at),
+                    None => (false, None),
+                },
+                Count::Installed(kind) => match installed_whole(r, kind) {
+                    Some(whole) => (whole, check),
+                    None => (false, None),
+                },
+                Count::Dependencies => (false, None),
+            };
+            last = at;
             // With no reading of it, a count proves nothing read.
-            if readings.is_empty() {
+            if at.is_none() {
                 return Standing::never("not checked yet");
             }
-            // Of a kind kept in projects, while projects were not looked for everywhere:
-            // what was read is the projects found.
-            let found = covered::in_projects(count) && not_entered(latest, this.as_deref());
+            let in_projects = covered::in_projects(count);
+            let whole = whole && (!in_projects || walked);
+            let found = in_projects && in_found;
             match (n.unwrap_or(0) == 0, found, whole) {
                 (true, true, true) => Standing::none("none in the projects found".to_string()),
                 (true, false, true) => Standing::none("none here".to_string()),
@@ -577,7 +512,7 @@ fn watched_table(
             (&capital(what), how),
             (&things, n.is_some().then_some(href.as_str())),
             &states,
-            last_read(&readings),
+            last,
             now,
         )?;
     }
@@ -588,36 +523,34 @@ fn watched_table(
     }
     // Servers, checked only when the person runs the server check. A person with no servers is
     // not told about servers at all. Its faults are the status's: servers that could not be
-    // opened, and those the last server check did not finish on. Else "checked" rests on every
-    // server's latest visit having read it in full, whatever findings rest on it.
-    if !map.servers.is_empty() || map.on_servers > 0 {
-        let mut states = Vec::new();
-        for (cause, words) in [
-            (&covered::SERVERS_NOT_OPENED, "could not be opened"),
-            (&covered::SERVERS_NOT_CHECKED, "not checked last time"),
-        ] {
-            let n: usize = (faults.iter().filter(|u| u.cause.id == cause.id))
-                .map(|u| u.count)
-                .sum();
-            if n > 0 {
-                let said = format!("{} {words}", grouped(n as i64));
-                states.push(told(cause.who == YOU, said));
-            }
+    // opened, and those the last server check did not finish on. Else "checked" rests on the
+    // status's count of servers the last server check read in full.
+    let e = r.estate.clone().unwrap_or_default();
+    let server_faults = [
+        (&covered::SERVERS_NOT_OPENED, "could not be opened"),
+        (&covered::SERVERS_NOT_CHECKED, "not checked last time"),
+    ];
+    let mut states: Vec<Standing> = Vec::new();
+    for (cause, words) in server_faults {
+        let n: u64 = (faults.iter().filter(|u| u.id == cause.id))
+            .map(|u| u.count)
+            .sum();
+        if n > 0 {
+            let of: Vec<&&v1::Uncovered> = faults.iter().filter(|u| u.id == cause.id).collect();
+            states.push(told(&of, format!("{} {words}", grouped(n as i64))));
         }
+    }
+    if e.servers > 0 || !states.is_empty() {
         if states.is_empty() {
-            states.push(match map.servers_checked {
+            states.push(match e.servers_checked_in_last_check {
                 0 => Standing::never("not checked yet"),
-                n if n == map.servers.len() => Standing::read("checked at the last server check"),
+                n if n == e.servers => Standing::read("checked at the last server check"),
                 n => Standing::none(esc(&format!(
                     "{} checked at the last server check",
                     grouped(n as i64)
                 ))),
             });
         }
-        let visits: Vec<&Latest> = latest
-            .iter()
-            .filter(|r| r.reader == servers::READER && r.kind == servers::VISIT)
-            .collect();
         out.push_str("<p class=\"wg\">Beyond this Mac</p>\n");
         let listed = format!("{DETAILS}/{BEYOND}.html#servers");
         watched_row(
@@ -627,13 +560,14 @@ fn watched_table(
                 "Servers you log in to over SSH",
                 "when you run the server check",
             ),
-            (&grouped(map.servers.len() as i64), Some(listed.as_str())),
+            (&grouped(e.servers as i64), Some(listed.as_str())),
             &states,
-            last_read(&visits),
+            None,
             now,
         )?;
     }
     out.push_str("</div>\n");
+    let failed = failed_here(faults).len();
     if failed > 0 {
         writeln!(
             out,
@@ -645,55 +579,35 @@ fn watched_table(
     Ok(())
 }
 
+/// Whether the latest full check read a kind of installed software in full, by the status's
+/// readings of it: `None` with no reading of it, else whether every one is full.
+fn installed_whole(r: &v1::Status, kind: &str) -> Option<bool> {
+    let of: Vec<&v1::IntegrityReading> = (r.integrity.iter().flat_map(|i| &i.readings))
+        .filter(|i| i.kind == kind)
+        .collect();
+    let full = v1::Completeness::Full as i32;
+    (!of.is_empty()).then(|| of.iter().all(|i| i.completeness == full))
+}
+
 /// The anchor of what could not be read on this Mac, on the page of what is watched.
 pub const NOT_READ: &str = "not-read";
 /// Its heading.
 const NOT_READ_TITLE: &str = "Could not be read on this Mac";
 
-/// Every thing not covered, as the faults and the limits, each in the order of the status: whether
-/// one is a fault is the message's word (`Uncovered.fault`), item for item, since the message is
-/// made from the same list (`status::uncovered_message`). One the message does not hold as the
-/// same cause is a fault, so nothing is quieted by a message that differs.
-fn sorted<'a>(
-    st: &'a crate::status::State,
-    r: &v1::Status,
-) -> (Vec<&'a Uncovered>, Vec<&'a Uncovered>) {
-    let fault = |i: usize, u: &Uncovered| {
-        (r.not_covered.get(i))
-            .filter(|m| m.id == u.cause.id)
-            .is_none_or(|m| m.fault)
-    };
-    let (faults, limits): (Vec<_>, Vec<_>) = st
-        .not_covered
-        .iter()
-        .enumerate()
-        .partition(|(i, u)| fault(*i, u));
-    let items = |list: Vec<(usize, &'a Uncovered)>| list.into_iter().map(|(_, u)| u).collect();
-    (items(faults), items(limits))
-}
-
 /// The faults the person can do something about, told under "You can fix".
-fn fixable<'a>(faults: &[&'a Uncovered]) -> Vec<&'a Uncovered> {
-    faults
-        .iter()
-        .copied()
-        .filter(|u| u.cause.who == YOU)
-        .collect()
+fn fixable<'a>(faults: &[&'a v1::Uncovered]) -> Vec<&'a v1::Uncovered> {
+    faults.iter().copied().filter(|u| u.who == YOU).collect()
 }
 
 /// The faults nothing the person does changes, such as a reading or a download that failed, told
 /// under "Could not be read on this Mac". With `fixable`, every fault, each once.
-fn failed_here<'a>(faults: &[&'a Uncovered]) -> Vec<&'a Uncovered> {
-    faults
-        .iter()
-        .copied()
-        .filter(|u| u.cause.who != YOU)
-        .collect()
+fn failed_here<'a>(faults: &[&'a v1::Uncovered]) -> Vec<&'a v1::Uncovered> {
+    faults.iter().copied().filter(|u| u.who != YOU).collect()
 }
 
-/// The faults the person can fix, one cause beside another: what it is, every example as data,
-/// and Immunity Core's advice. A limit with advice is told among the limits.
-fn you_can_fix(out: &mut String, fixable: &[&Uncovered]) -> Out {
+/// The faults the person can fix, one cause beside another: what it is, the examples the status
+/// gives as data, and Immunity Core's advice. A limit with advice is told among the limits.
+fn you_can_fix(out: &mut String, fixable: &[&v1::Uncovered]) -> Out {
     writeln!(
         out,
         "<section id=\"you-can-fix\">\n<div class=\"wsh\"><h2>You can fix</h2><span class=\"n\">{}</span></div>",
@@ -707,8 +621,8 @@ fn you_can_fix(out: &mut String, fixable: &[&Uncovered]) -> Out {
             writeln!(
                 out,
                 "<article class=\"fixc\" id=\"{}\">\n<p class=\"fct\">{}</p>",
-                esc(u.cause.id),
-                esc(&u.title())
+                esc(&u.id),
+                esc(&u.title)
             )?;
             let apart = apart(u);
             if !apart.is_empty() {
@@ -721,8 +635,8 @@ fn you_can_fix(out: &mut String, fixable: &[&Uncovered]) -> Out {
             writeln!(
                 out,
                 "<p class=\"fad\">{}</p>\n<p class=\"fad\">{}</p>\n</article>",
-                esc(&u.meaning()),
-                esc(u.cause.advice)
+                esc(&u.meaning),
+                esc(&u.advice)
             )?;
         }
         out.push_str("</div>\n");
@@ -746,410 +660,58 @@ fn links(out: &mut String, r: &v1::Status, now: i64) -> Out {
     Ok(())
 }
 
-/// A kind of thing that is listed as watched and that no rule speaks about.
-const KEPT_AS_LIST: &str = "Kept as a list. Nothing tells you about a change here in this version.";
-/// The mark of a rule whose findings notify at once.
-const NOTIFIES: &str = "Sends a notification";
-/// The rule about a match of a list of indicators, which is about no one kind.
-const INDICATOR_RULE: &str = "indicator.match";
-/// The rule about places read for the first time, which is about every watched kind.
-const FIRST_READ_RULE: &str = "watched.first-read";
-
-/// What the owner is told about: each rule's title and what it means, marked where its
-/// findings notify at once; for no rule, that the thing is only kept as a list. The page of
-/// what is watched says it under each kind.
-fn told(out: &mut String, rules: &[findings::Rule]) -> Out {
-    if rules.is_empty() {
-        writeln!(out, "<p class=\"muted\">{}</p>", esc(KEPT_AS_LIST))?;
-        return Ok(());
-    }
-    out.push_str("<ul class=\"rules\">\n");
-    for r in rules {
-        let mark = if findings::urgent(r.severity, Some(r.confidence)) {
-            format!(" <span class=\"badge notify\">{NOTIFIES}</span>")
-        } else {
-            String::new()
-        };
-        writeln!(
-            out,
-            "<li>{}{mark}<br><span class=\"muted\">{}</span></li>",
-            esc(r.words.title),
-            esc(r.words.meaning)
-        )?;
-    }
-    out.push_str("</ul>\n");
-    Ok(())
-}
-
-/// The rules with one id, as `told` takes them.
-fn rule_with(id: &str) -> Vec<findings::Rule> {
-    findings::rules()
-        .into_iter()
-        .filter(|r| r.id == id)
-        .collect()
-}
-
-/// Whether a list of indicators was read at the last full check: `Some(true)` read in full,
-/// `Some(false)` given and not read, `None` not given.
-fn indicator_list(conn: &Connection) -> rusqlite::Result<Option<bool>> {
-    let Some(run) = crate::status::latest_finished(conn)? else {
-        return Ok(None);
-    };
-    conn.query_row(
-        "SELECT MAX(completeness = 'full') FROM coverage
-         WHERE run_id = ?1 AND reader = ?2 AND kind = ?3",
-        params![
-            run.id,
-            crate::indicators::READER,
-            crate::indicators::LIST_KIND
-        ],
-        |r| r.get::<_, Option<bool>>(0),
-    )
-}
-
-/// On the page of what is watched, after the kinds: the rules about no one kind, so that every
-/// rule the owner can be told by is named on that page.
-fn also(conn: &Connection, out: &mut String) -> Result<(), Box<dyn Error>> {
-    out.push_str("<section id=\"also\">\n<h2>Also told</h2>\n<h3>A list of signs of a known attack, when you give one</h3>\n");
-    told(out, &rule_with(INDICATOR_RULE))?;
-    let said = match indicator_list(conn)? {
-        Some(true) => "A list was read at the last check.",
-        Some(false) => "A list was given but could not be read at the last check.",
-        None => "No list has been given, so nothing is compared.",
-    };
-    writeln!(
-        out,
-        "<p class=\"muted\">{said}</p>\n<h3>Every watched place</h3>"
-    )?;
-    told(out, &rule_with(FIRST_READ_RULE))?;
-    out.push_str("</section>\n");
-    Ok(())
-}
-
-/// What the summary says first of known vulnerabilities.
-const VULNERABILITIES_SAY: &str = "These are published weaknesses in packages your projects depend on. They are listed, not alarmed: most matter only under particular conditions. A package known to be malicious, or a vulnerability attackers are using, is shown at the top as something that needs a look.";
-/// A label as a person reads it.
-fn label_words(label: &str) -> &'static str {
-    match label {
-        "malicious" => "Malicious package",
-        "critical" => "Critical",
-        "high" => "High",
-        "moderate" => "Moderate",
-        "low" => "Low",
-        _ => "No label",
-    }
-}
-
-/// One known vulnerability as a row: package and release, project, label, fixed release,
-/// record with its source. Text from the record is escaped by `td`.
-fn vulnerability_row(
-    out: &mut String,
-    a: &crate::vulnerabilities::Affecting,
-    project: bool,
-    this: Option<&findings::This>,
-) -> Out {
-    let releases: Vec<String> = a.affected().into_iter().map(|(v, _)| v).collect();
-    out.push_str("<tr>");
-    view::td(
-        out,
-        "mono",
-        &format!("{} {}", a.package, releases.join(", ")),
-    )?;
-    if project {
-        view::td(out, "mono", &findings::place(&a.checkout, this))?;
-    }
-    view::td(out, "", label_words(a.label))?;
-    view::td(out, "mono", &a.fixed.join(", "))?;
-    view::td(
-        out,
-        "mono",
-        &format!(
-            "{} ({})",
-            a.advisory,
-            crate::vulnerabilities::source_name(&a.advisory)
-        ),
-    )?;
-    out.push_str("</tr>\n");
-    Ok(())
-}
-
-/// Every known vulnerability in packages the projects use, grouped by project.
-pub fn vulnerabilities(conn: &Connection, now: i64) -> Result<String, Box<dyn Error>> {
-    let mut out = top(
-        "Known vulnerabilities in packages your projects use",
-        &format!("This page made {}", utc(now)),
-    );
-    writeln!(
-        out,
-        "<section id=\"by-project\">\n<h2>Known vulnerabilities by project</h2>\n<p class=\"muted\">{}</p>\n<p class=\"muted\">{}</p>",
-        esc(VULNERABILITIES_SAY),
-        esc(crate::vulnerabilities::DECLARED)
-    )?;
-    let this = findings::This::of(conn, covered::this_machine(conn)?)?;
-    let list = crate::vulnerabilities::affecting(conn)?;
-    let gap = vulnerability_gap(conn, now)?;
-    // Of the projects found, while not all were. Which folders this version does not enter is
-    // a limit of the version, which the commands say; a search that failed is said here.
-    let (found, scope) = covered::Found::of(Some(&crate::vulnerabilities::projects_found(conn)?));
-    let scope = scope.filter(|_| found == covered::Found::LookedAt);
-    let none = match found {
-        covered::Found::All => "None is known.".to_string(),
-        f => format!("None is known in {}.", f.projects()),
-    };
-    // "None" only when every project was compared; else the status's own sentence, by count.
-    let matched = crate::text::Matched::of_totals(&crate::vulnerabilities::totals(conn, now)?);
-    let all = matched.all_compared();
-    coverage_of_list(&mut out, gap.as_deref(), all && list.is_empty(), &none);
-    if !all {
-        writeln!(
-            out,
-            "<p class=\"muted\">{}.</p>",
-            esc(&capital(&matched.said(
-                found,
-                u64::try_from(crate::store::checkouts(conn)?).ok()
-            )))
-        )?;
-    }
-    if let Some(line) = scope {
-        writeln!(out, "<p class=\"muted\">{}</p>", esc(&line))?;
-    }
-    let mut projects: BTreeMap<&str, Vec<&crate::vulnerabilities::Affecting>> = BTreeMap::new();
-    for a in &list {
-        projects.entry(a.checkout.as_str()).or_default().push(a);
-    }
-    for (checkout, of) in projects {
-        writeln!(
-            out,
-            "<h3 class=\"mono\">{}</h3>\n<div class=\"scroll\"><table class=\"dense\">",
-            esc(&findings::place(checkout, this.as_ref()))
-        )?;
-        view::thead(&mut out, &["Package", "Label", "Fixed in", "Record"]);
-        for a in of {
-            vulnerability_row(&mut out, a, false, this.as_ref())?;
-        }
-        out.push_str("</tbody></table></div>\n");
-    }
-    out.push_str("</section>\n");
-    out.push_str(FOOT);
-    Ok(out)
-}
-
-/// One example of a thing not covered, as safe HTML: its name, and beside it what its source said
-/// of it. What a source said is prose from it: cut, as every such text is where it is printed,
-/// and escaped apart from the name.
-fn example(name: &str, reason: Option<&str>) -> String {
-    match reason {
-        Some(r) => format!("{}: {}", esc(name), esc_said(&view::said(r))),
-        None => esc(name),
-    }
-}
-
-/// What is told apart from a thing's words, as safe HTML: every example with what its source
-/// said, then the value, what sources said of it, such as why a download failed, cut where it
-/// was put together (`covered::Uncovered::value`).
-pub(crate) fn apart(u: &Uncovered) -> Vec<String> {
-    let mut out: Vec<String> = u
-        .examples
-        .iter()
-        .map(|e| example(&e.name, e.reason.as_deref()))
+/// What is told apart from a thing's words, as safe HTML: each example the status gives with what
+/// its source said, cut as the status gives it, then what sources said of it, such as why a
+/// download failed; and last, how many things it names past those examples, as the terminal
+/// counts them.
+pub(crate) fn apart(u: &v1::Uncovered) -> Vec<String> {
+    let mut out: Vec<String> = (u.examples.iter())
+        .map(|e| {
+            let name = Name::given(&e.name_text).html();
+            match &e.reason_text {
+                Some(r) => format!("{name}: {}", Said::given(r).html()),
+                None => name,
+            }
+        })
         .collect();
-    out.extend(u.value.as_deref().map(esc_said));
+    out.extend(u.value_text.as_deref().map(|v| Said::given(v).html()));
+    let more = u.count.saturating_sub(u.examples.len() as u64);
+    if !u.examples.is_empty() && more > 0 {
+        out.push(format!(
+            "<span class=\"muted\">and {} more</span>",
+            grouped(more as i64)
+        ));
+    }
     out
 }
 
-/// At most this many examples are listed under one thing not covered.
-pub(crate) const EXAMPLES_SHOWN: usize = 20;
-
 /// One thing not covered, in full: its title, where, what it means and what to do.
-fn uncovered(out: &mut String, u: &Uncovered) -> Out {
+fn uncovered(out: &mut String, u: &v1::Uncovered) -> Out {
     writeln!(
         out,
         "<article class=\"item\" id=\"{}\">\n<h3>{}</h3>",
-        esc(u.cause.id),
-        esc(&u.title())
+        esc(&u.id),
+        esc(&u.title)
     )?;
     let apart = apart(u);
     if !apart.is_empty() {
         out.push_str("<ul class=\"readings mono\">\n");
-        for item in apart.iter().take(EXAMPLES_SHOWN) {
+        for item in &apart {
             writeln!(out, "<li>{item}</li>")?;
-        }
-        if apart.len() > EXAMPLES_SHOWN {
-            writeln!(
-                out,
-                "<li class=\"muted\">and {} more</li>",
-                apart.len() - EXAMPLES_SHOWN
-            )?;
         }
         out.push_str("</ul>\n");
     }
     writeln!(
         out,
         "<p>{}</p>\n<p class=\"advice\">{}</p>\n</article>",
-        esc(&u.meaning()),
-        esc(u.cause.advice)
+        esc(&u.meaning),
+        esc(&u.advice)
     )?;
     Ok(())
 }
 
-/// The projects on this Mac, as they are shown, with how many dependencies are known of each.
-fn projects(conn: &Connection, this: Option<&str>) -> rusqlite::Result<Vec<(String, i64)>> {
-    let Some(this) = this else {
-        return Ok(Vec::new());
-    };
-    let mac = findings::This::of(conn, Some(this.to_string()))?;
-    // The dependencies are counted in one pass over them, not once per project: no index
-    // leads from a project to what is part of it.
-    let list: Vec<(String, i64)> = conn
-        .prepare(
-            "SELECT a.subject, COALESCE(p.n, 0)
-             FROM assertion a
-             LEFT JOIN (SELECT object, COUNT(DISTINCT subject) AS n FROM assertion
-                        WHERE layer = 'live' AND predicate = 'part_of' GROUP BY object) p
-               ON p.object = a.subject
-             WHERE a.layer = 'live' AND a.predicate = 'located_on' AND a.object = ?1
-               AND a.subject LIKE 'checkout:%'
-             GROUP BY a.subject ORDER BY a.subject",
-        )?
-        .query_map([this], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    Ok(list
-        .into_iter()
-        .map(|(id, n)| (findings::place(&id, mac.as_ref()), n))
-        .collect())
-}
-
-/// Every source of threat data the summary's tile counts, from the same result the tile is
-/// built from: first the scale, the short list of vulnerabilities used in attacks beside every
-/// record of known vulnerabilities held; then the list, then each set of records, one section
-/// each, saying what it is, how much it holds, when it was read and whether that is current,
-/// and what it is compared with here. A source never read or not current says so, and nothing
-/// says it was compared.
-pub fn threat_data(conn: &Connection, r: &v1::Status, now: i64) -> Result<String, Box<dyn Error>> {
-    let mut out = top(THREAT_DATA_TITLE, &format!("This page made {}", utc(now)));
-    let fresh = r
-        .vulnerabilities
-        .as_ref()
-        .map(|v| v.feeds.clone())
-        .unwrap_or_default();
-    let held = |source: &str| -> v1::FeedState {
-        r.vulnerability_data
-            .as_ref()
-            .and_then(|d| d.feeds.iter().find(|f| f.source == source).cloned())
-            .unwrap_or_default()
-    };
-    let entries = r.threats.as_ref().and_then(|t| t.entries);
-    // The scale: only counts the program has, and none where a source was never read.
-    let read: Vec<(&str, i64)> = fresh
-        .iter()
-        .filter(|f| f.read_at.is_some())
-        .map(|f| {
-            let records = held(&f.source).records.unwrap_or_default();
-            (f.ecosystem.as_str(), records as i64)
-        })
-        .collect();
-    // A count, big, and what it counts beside it.
-    let figure = |n: i64, one: &str, many: &str| {
-        format!(
-            "<p><span class=\"num\">{}</span> <span>{}</span></p>\n",
-            grouped(n),
-            esc(if n == 1 { one } else { many })
-        )
-    };
-    out.push_str("<div class=\"scale\">\n");
-    match entries {
-        Some(n) => out.push_str(&figure(
-            n as i64,
-            "vulnerability known to be used in real attacks",
-            "vulnerabilities known to be used in real attacks",
-        )),
-        None => out.push_str("<p class=\"quiet\">The list of vulnerabilities used in real attacks has not been read.</p>\n"),
-    }
-    if read.is_empty() {
-        out.push_str("<p class=\"quiet\">No record of known vulnerabilities has been read.</p>\n");
-    } else {
-        let names: Vec<&str> = read.iter().map(|(e, _)| *e).collect();
-        let of = format!(
-            "of known vulnerabilities and malicious packages, for {} packages",
-            covered::listed(&names)
-        );
-        out.push_str(&figure(
-            read.iter().map(|(_, n)| n).sum(),
-            &format!("record {of}"),
-            &format!("records {of}"),
-        ));
-    }
-    out.push_str("</div>\n");
-    // The two side by side are explained only where both are counts.
-    if entries.is_some() && !read.is_empty() {
-        out.push_str("<p class=\"muted\">The first is the short list of what attackers are known to use. The second is every record the program holds from OSV, the open database of published vulnerabilities, for the packages named; most of them are never used in an attack.</p>\n");
-    }
-
-    crate::view::catalogue(conn, &mut out, now)?;
-
-    let compared = crate::vulnerabilities::catalogue_compared(conn)?;
-    for f in &fresh {
-        let source = f.source.as_str();
-        let eco = f.ecosystem.as_str();
-        let h = held(source);
-        let asked = crate::osv::FEEDS
-            .iter()
-            .find(|feed| feed.source == source)
-            .map_or("", |feed| feed.asked);
-        writeln!(
-            out,
-            "<section id=\"{}\">\n<h2>Known vulnerabilities in {} packages</h2>\n<p>Records from OSV, the open database of published vulnerabilities, for {} packages, including packages known to be malicious. It is read {}.</p>",
-            anchor(source),
-            esc(eco),
-            esc(eco),
-            esc(asked)
-        )?;
-        let at = f.read_at;
-        // Counts exist only for a feed read whole.
-        if let (Some(at), Some(records)) = (at, h.records) {
-            writeln!(
-                out,
-                "<p class=\"facts\"><strong>{}</strong> {}, {} among them · last read {}{}</p>",
-                grouped(records as i64),
-                if records == 1 { "record" } else { "records" },
-                counted(
-                    h.malicious_records.unwrap_or_default() as i64,
-                    "malicious package",
-                    "malicious packages"
-                ),
-                esc(&utc(at)),
-                if f.current { " · current" } else { "" }
-            )?;
-        }
-        let said = match (at, f.current) {
-            (None, _) => format!(
-                "<p class=\"quiet\">Never read, so none of your {} packages is compared with it.</p>",
-                esc(eco)
-            ),
-            (Some(_), false) => format!(
-                "<p class=\"quiet\">Not current: {}. Until it is read again, a {} package it says nothing about is not known to be clear.</p>",
-                esc(f.not_current_why.as_deref().unwrap_or("no reason given")),
-                esc(eco)
-            ),
-            (Some(_), true) if compared.contains(&eco) => format!(
-                "<p>Compared at the last check with the {} packages in your projects' lockfiles.</p>",
-                esc(eco)
-            ),
-            (Some(_), true) => format!(
-                "<p class=\"quiet\">No {} packages from your projects' lockfiles were compared with it at the last check.</p>",
-                esc(eco)
-            ),
-        };
-        writeln!(out, "{said}\n</section>")?;
-    }
-    out.push_str(FOOT);
-    Ok(out)
-}
-
 /// At most this many readings are named under a list that is not whole.
 const GAPS_SHOWN: usize = 3;
-/// What an empty list says when everything that fills it was read in full and fresh.
-const NONE_FOUND: &str = "None found here.";
 /// The same for the list of servers.
 const NONE_KNOWN: &str = "None known.";
 /// The same for lists of devices seen in the private network.
@@ -1202,94 +764,6 @@ fn unread(
     })
 }
 
-/// What a list of a kind of watched thing rests on beside its own readings: for a kind kept in
-/// projects, the walk that finds them (`covered::projects_gap`), so that no "none" is said of
-/// projects the walk did not find.
-fn walk_gap(count: Count, latest: &[Latest], this: Option<&str>) -> Vec<String> {
-    covered::in_projects(count)
-        .then(|| failed_walk(latest, this))
-        .flatten()
-        .into_iter()
-        .collect()
-}
-
-/// Whether projects were looked for everywhere but in the folders this version does not enter:
-/// what a page then says of projects is said of the projects found.
-fn not_entered(latest: &[Latest], this: Option<&str>) -> bool {
-    let found = covered::projects_found(latest, this);
-    !found.all && v1::Cause::try_from(found.cause) == Ok(v1::Cause::NotGiven)
-}
-
-/// Why the projects a page lists may not be whole: a reading that failed. A folder this
-/// version does not enter is a limit of the version, which the commands say; a page shows
-/// what was read.
-fn failed_walk(latest: &[Latest], this: Option<&str>) -> Option<String> {
-    let found = covered::projects_found(latest, this);
-    (!found.all && !not_entered(latest, this))
-        .then_some(found.why)
-        .flatten()
-}
-
-/// Why the counts of ways in projects may be short, as a page tells it: the reading of which
-/// ways each project holds failed, or the search for projects did (`covered::ways_gap`, less
-/// the folders this version does not enter).
-fn ways_failed(latest: &[Latest], this: Option<&str>) -> Option<String> {
-    if not_entered(latest, this) {
-        return None;
-    }
-    covered::ways_gap(latest, this)
-}
-
-/// What an empty list of a kind kept in projects says while projects were not looked for
-/// everywhere.
-const NONE_IN_FOUND: &str = "None in the projects found.";
-
-/// The readings that fill the list of a kind of watched thing on this Mac: of files, every
-/// kind of place watched as it; of installed things, that kind; of the packages projects
-/// depend on, finding the projects and reading their lockfiles.
-fn readings_of(count: Count, coverage: &[Latest]) -> Vec<&Latest> {
-    let kinds: Vec<String> = match count {
-        Count::Files(as_) => covered::kinds_of(as_),
-        Count::Installed(kind) => vec![kind.to_string()],
-        Count::Dependencies => vec![
-            crate::checkouts::KIND.to_string(),
-            crate::agent_folders::KIND.to_string(),
-        ],
-    };
-    coverage
-        .iter()
-        .filter(|r| {
-            kinds.contains(&r.kind)
-                || (matches!(count, Count::Dependencies) && r.reader == crate::lockfiles::READER)
-        })
-        .collect()
-}
-
-/// What a list of known vulnerabilities rests on and did not have at `now`: the projects'
-/// lockfiles read, and the vulnerability data current.
-fn vulnerability_gap(conn: &Connection, now: i64) -> rusqlite::Result<Option<String>> {
-    let latest = view::latest_coverage(conn)?;
-    let lockfiles: Vec<&Latest> = latest
-        .iter()
-        .filter(|r| r.reader == crate::lockfiles::READER)
-        .collect();
-    let old = old_feeds(conn, now)?;
-    let latest_run = crate::status::latest_finished(conn)?.map(|r| r.started_at);
-    Ok(unread(&lockfiles, latest_run, now, &old))
-}
-
-/// Each matched feed of vulnerability data that is not current, with why, as `unread` names a
-/// gap.
-fn old_feeds(conn: &Connection, now: i64) -> rusqlite::Result<Vec<String>> {
-    Ok(crate::vulnerabilities::matched_freshness(conn, now)?
-        .into_iter()
-        .filter_map(|f| {
-            f.not_current
-                .map(|why| format!("the {} vulnerability data ({why})", f.feed.ecosystem))
-        })
-        .collect())
-}
-
 /// Writes what a list rests on when it is not whole, and, for an empty list, that nothing is
 /// there only when it is (`unread`).
 fn coverage_of_list(out: &mut String, unread: Option<&str>, empty: bool, absent: &str) {
@@ -1319,440 +793,6 @@ fn top(title: &str, meta: &str) -> String {
         esc(meta)
     ));
     out
-}
-
-/// What is watched on this Mac, one section per kind with the things of that kind, the projects,
-/// and in full each fault nothing the person does changes, by the message (`sorted`).
-pub fn this_mac(
-    conn: &Connection,
-    st: &crate::status::State,
-    r: &v1::Status,
-    now: i64,
-) -> Result<String, Box<dyn Error>> {
-    let mut out = top(
-        THIS_MAC_TITLE,
-        &format!(
-            "Last full check {} · this page made {}",
-            utc_or(st.this_mac.checked_at, "never"),
-            utc(now)
-        ),
-    );
-    let this = covered::this_machine(conn)?;
-    let this = this.as_deref();
-    let latest_run = crate::status::latest_finished(conn)?.map(|r| r.started_at);
-    let of_kinds = |kinds: &[&str]| -> Vec<&Latest> {
-        st.coverage
-            .iter()
-            .filter(|r| kinds.contains(&r.kind.as_str()))
-            .collect()
-    };
-    for (count, what, _) in covered::watched() {
-        writeln!(
-            out,
-            "<section id=\"{}\">\n<h2>{}</h2>\n<p class=\"muted\">{}</p>",
-            anchor(what),
-            esc(&capital(what)),
-            esc(about(what))
-        )?;
-        told(&mut out, &covered::rules_about(what))?;
-        match count {
-            Count::Files(as_) => {
-                let walk = walk_gap(count, &st.coverage, this);
-                let gap = unread(&readings_of(count, &st.coverage), latest_run, now, &walk);
-                let found = covered::in_projects(count) && not_entered(&st.coverage, this);
-                let none = if found { NONE_IN_FOUND } else { NONE_FOUND };
-                files(conn, &mut out, as_, this, gap.as_deref(), none)?
-            }
-            Count::Installed(kind) => {
-                let gap = unread(&readings_of(count, &st.coverage), latest_run, now, &[]);
-                installed(conn, &mut out, kind, this, gap.as_deref())?
-            }
-            Count::Dependencies => {
-                let n: i64 = conn.query_row(
-                    "SELECT COUNT(DISTINCT subject) FROM assertion
-                     WHERE layer = 'live' AND reader = ?1 AND predicate = 'part_of'
-                       AND scope LIKE ?2",
-                    params![
-                        crate::lockfiles::READER,
-                        format!("checkout:{}/%", this.unwrap_or_default())
-                    ],
-                    |r| r.get(0),
-                )?;
-                writeln!(
-                    out,
-                    "<p>{} on this Mac depend on {} packages, each counted once per project; each project and its count are under Projects found below. <a href=\"{VULNERABILITIES}.html\">Known vulnerabilities in them</a> are listed by project.</p>",
-                    if not_entered(&st.coverage, this) {
-                        "The projects found"
-                    } else {
-                        "Your projects"
-                    },
-                    grouped(n)
-                )?;
-                // The count is of the projects found: a walk that failed is said under it.
-                let walk = walk_gap(count, &st.coverage, this);
-                let gap = unread(&readings_of(count, &st.coverage), latest_run, now, &walk);
-                coverage_of_list(&mut out, gap.as_deref(), false, "");
-            }
-        }
-        out.push_str("</section>\n");
-    }
-    // Running programs: what the latest sample saw, in numbers. No list is kept.
-    writeln!(
-        out,
-        "<section id=\"{}\">\n<h2>{}</h2>\n<p class=\"muted\">While a watcher runs, it looks at the programs running under your user and where they connect, every {} seconds. Only a program or connection that needs a look is kept; no list of them is.</p>",
-        anchor(covered::SAMPLED),
-        esc(&capital(covered::SAMPLED)),
-        crate::watch::SAMPLE.as_secs()
-    )?;
-    told(&mut out, &covered::rules_about(covered::SAMPLED))?;
-    match crate::processes::last_sample(conn)? {
-        Some((at, programs, connections)) => writeln!(
-            out,
-            "<p>The latest sample, taken {}, saw {} and {}.</p>",
-            utc(at),
-            counted(programs, "running program", "running programs"),
-            counted(connections, "connection", "connections")
-        )?,
-        None => out.push_str("<p class=\"muted\">No sample has been taken yet.</p>\n"),
-    }
-    out.push_str("</section>\n");
-    also(conn, &mut out)?;
-
-    let gap = ways_failed(&st.coverage, this);
-    ways(conn, &mut out, this, gap.as_deref())?;
-
-    writeln!(
-        out,
-        "<section id=\"projects\">\n<h2>Projects found</h2>\n<p class=\"muted\">Folders of code kept with git that were found on this Mac, with how many of their dependencies are known from the files that list them. {}</p>",
-        esc(&crate::checkouts::walked())
-    )?;
-    let list = projects(conn, this)?;
-    let gap = unread(
-        &of_kinds(&[crate::checkouts::KIND, crate::agent_folders::KIND]),
-        latest_run,
-        now,
-        &[],
-    );
-    coverage_of_list(
-        &mut out,
-        gap.as_deref(),
-        list.is_empty(),
-        "None found in the folders looked into.",
-    );
-    if !list.is_empty() {
-        out.push_str("<div class=\"scroll\"><table class=\"dense\">\n");
-        view::thead(&mut out, &["Project", "Dependencies known"]);
-        for (shown, n) in list {
-            out.push_str("<tr>");
-            view::td(&mut out, "mono", &shown)?;
-            view::td(&mut out, "", &grouped(n))?;
-            out.push_str("</tr>\n");
-        }
-        out.push_str("</tbody></table></div>\n");
-    }
-    out.push_str("</section>\n");
-    // What could not be read on this Mac, each thing in full, where the summary's line leads.
-    let failed = failed_here(&sorted(st, r).0);
-    if !failed.is_empty() {
-        writeln!(
-            out,
-            "<section id=\"{NOT_READ}\">\n<h2>{NOT_READ_TITLE}</h2>\n<p class=\"muted\">{} could not be read at the last check. Each is tried again at every check.</p>",
-            capital(&counted(failed.len() as i64, "thing", "things"))
-        )?;
-        for u in failed {
-            uncovered(&mut out, u)?;
-        }
-        out.push_str("</section>\n");
-    }
-    out.push_str(FOOT);
-    Ok(out)
-}
-
-/// What the section of the ways a project runs code by itself says first.
-const WAYS: &str = "Files in a project that make a tool run code by itself during routine work, such as opening the folder or installing its packages. Each one listed is read, and a change in what it says is told, whether it is in your projects now or not.";
-
-/// What the section of the places in the home folder says first.
-const HOME_WAYS: &str = "Files and folders in your home folder where a developer tool keeps its own settings for what it runs by itself, such as the programs a coding agent starts or an editor's extensions. Each one listed is read, and a change in what it says is told, whether it is on this Mac now or not.";
-
-/// The ways a project runs code by itself that this version reads, from the table in
-/// `autorun`: the file, what runs it, whether the tool asks first, when it is read, and in how
-/// many of the projects found it is; then, in a section of their own, the places of the home
-/// folder, and whether this Mac holds each. A way this version does not read is not on the
-/// page: the documents and the commands' machine form name it. While the reading of projects
-/// failed (`gap`, from `ways_failed`), a way no project is known to hold is not counted as none.
-fn ways(conn: &Connection, out: &mut String, this: Option<&str>, gap: Option<&str>) -> Out {
-    use crate::autorun::{self, Part, Scope};
-    // Which subjects hold a way: checkouts of this Mac by the start of their id, or this Mac
-    // itself for the home folder.
-    let holding = |name: &str, home: bool| -> rusqlite::Result<i64> {
-        let this = this.unwrap_or_default();
-        conn.query_row(
-            "SELECT COUNT(DISTINCT subject) FROM assertion
-             WHERE layer = 'live' AND reader = ?1 AND predicate = ?2 AND object = ?3
-               AND CASE WHEN ?5 THEN subject = ?4
-                        ELSE substr(subject, 1, length(?4)) = ?4 END",
-            params![
-                watched::READER,
-                autorun::HOLDS,
-                name,
-                if home {
-                    this.to_string()
-                } else {
-                    format!("checkout:{this}/")
-                },
-                home
-            ],
-            |r| r.get(0),
-        )
-    };
-    for home in [false, true] {
-        let (id, heading, intro, column) = if home {
-            (
-                "home-code-runs",
-                "Places where a developer tool's own settings can make code run by itself",
-                HOME_WAYS,
-                "On this Mac",
-            )
-        } else {
-            (
-                "ways-code-runs",
-                "Ways a project can make code run by itself",
-                WAYS,
-                "Projects found with it",
-            )
-        };
-        writeln!(
-            out,
-            "<section id=\"{id}\">\n<h2>{}</h2>\n<p class=\"muted\">{}</p>",
-            esc(heading),
-            esc(intro)
-        )?;
-        let gap = gap.filter(|_| !home);
-        if let Some(why) = gap {
-            let said =
-                format!("Not every project was looked at, so these counts may be short: {why}.");
-            coverage_of_list(out, Some(&said), false, "");
-        }
-        out.push_str("<div class=\"scroll\"><table class=\"dense\">\n");
-        view::thead(out, &["File", "What runs it", "Asks first", "Read", column]);
-        let read = |p: &autorun::Point| p.part != Part::Present;
-        for (p, way) in autorun::ways().filter(|(p, _)| (p.scope == Scope::Home) == home && read(p))
-        {
-            let words = if home {
-                way.trigger.words_home()
-            } else {
-                way.trigger.words()
-            };
-            let runs = format!("{} ({})", capital(words), way.tool);
-            let read = match p.part {
-                Part::Entries => "Read: every entry",
-                _ if p.hourly().is_some() => "Read at full checks",
-                Part::Folders(_) => "Read: every folder, by name",
-                _ => "Read",
-            };
-            let here = match p.scope {
-                Scope::NamedBy(_) => "—".to_string(),
-                Scope::Checkout | Scope::System => match holding(&p.name(), false)? {
-                    0 if gap.is_some() => "Not known".to_string(),
-                    n => grouped(n),
-                },
-                Scope::Home if holding(&p.name(), true)? > 0 => "Yes".to_string(),
-                Scope::Home => "No".to_string(),
-            };
-            out.push_str("<tr>");
-            view::td(out, "mono", &p.name())?;
-            view::td(out, "", &runs)?;
-            view::td(out, "", way.asks.words())?;
-            view::td(out, "", read)?;
-            view::td(out, "", &here)?;
-            out.push_str("</tr>\n");
-        }
-        out.push_str("</tbody></table></div>\n</section>\n");
-    }
-    Ok(())
-}
-
-/// The watched files of one kind: where each is, when it was first seen and when it last
-/// changed. Only checksums are kept, never content. `gap` is what the list cannot claim
-/// (`unread`). An entry watched only for presence says so instead of when it changed.
-fn files(
-    conn: &Connection,
-    out: &mut String,
-    as_: &str,
-    this: Option<&str>,
-    gap: Option<&str>,
-    none: &str,
-) -> Out {
-    let mac = findings::This::of(conn, this.map(str::to_string))?;
-    let first: Vec<(String, i64)> = conn
-        .prepare(
-            "SELECT subject, MIN(observed_at) FROM assertion
-             WHERE layer = 'live' AND reader = ?1 AND predicate = 'watched_as' AND object = ?2
-             GROUP BY subject ORDER BY subject",
-        )?
-        .query_map(params![watched::READER, as_], |r| {
-            Ok((r.get(0)?, r.get(1)?))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    coverage_of_list(out, gap, first.is_empty(), none);
-    if first.is_empty() {
-        return Ok(());
-    }
-    let presence = watched::presence_only(conn)?;
-    let now = watched::content_now(conn)?;
-    let has_content: BTreeSet<String> = conn
-        .prepare(
-            "SELECT DISTINCT subject FROM assertion
-             WHERE layer = 'live' AND reader = ?1 AND predicate = 'has_content'",
-        )?
-        .query_map([watched::READER], |r| r.get(0))?
-        .collect::<rusqlite::Result<_>>()?;
-    // A file whose content or link target was replaced, and when the current one was seen.
-    let changed: BTreeMap<String, i64> = conn
-        .prepare(
-            "SELECT l.subject, MAX(l.observed_at) FROM assertion l
-             WHERE l.layer = 'live' AND l.reader = ?1 AND l.predicate IN ('has_content', 'links_to')
-               AND EXISTS (SELECT 1 FROM assertion o
-                           WHERE o.layer = 'retracted' AND o.reader = ?1 AND o.subject = l.subject
-                             AND o.predicate IN ('has_content', 'links_to'))
-             GROUP BY l.subject",
-        )?
-        .query_map([watched::READER], |r| Ok((r.get(0)?, r.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    out.push_str("<div class=\"scroll\"><table class=\"dense\">\n");
-    view::thead(out, &["File", "First seen", "Last changed"]);
-    for (id, at) in first {
-        out.push_str("<tr>");
-        view::td(out, "mono", &findings::place(&id, mac.as_ref()))?;
-        view::td(out, "nowrap", &utc(at))?;
-        // Never "unchanged" of what the latest check did not read in full.
-        let (class, last) = if let Some(n) = now.get(&id).filter(|n| !n.read()) {
-            ("", n.not_read())
-        } else if presence.contains(&id) {
-            ("", watched::PRESENCE_ONLY.to_string())
-        } else if let Some(t) = changed.get(&id) {
-            ("nowrap", utc(*t))
-        } else if !has_content.contains(&id) {
-            ("", watched::NEVER_READ.to_string())
-        } else {
-            ("nowrap", "not since first seen".to_string())
-        };
-        view::td_said(out, class, &last)?;
-        out.push_str("</tr>\n");
-    }
-    out.push_str("</tbody></table></div>\n");
-    Ok(())
-}
-
-/// One installed thing as a person reads it.
-#[derive(Default)]
-struct Installed {
-    name: String,
-    signed_by: BTreeSet<String>,
-    version: BTreeSet<String>,
-    at: String,
-}
-
-/// The installed things of one kind, each with its subject, named as a person reads it and in
-/// the order of their names.
-fn installed_list(
-    conn: &Connection,
-    kind: &str,
-    this: Option<&str>,
-) -> rusqlite::Result<Vec<(String, Installed)>> {
-    let mac = findings::This::of(conn, this.map(str::to_string))?;
-    let mut things: BTreeMap<String, Installed> = BTreeMap::new();
-    let mut stmt = conn.prepare(
-        "SELECT subject, predicate, object FROM assertion
-         WHERE layer = 'live' AND reader = ?1 AND kind = ?2",
-    )?;
-    let rows = stmt.query_map(params![integrity::READER, kind], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-        ))
-    })?;
-    for row in rows {
-        let (subject, predicate, object) = row?;
-        let t = things.entry(subject).or_default();
-        match predicate.as_str() {
-            "signed_by" => {
-                t.signed_by.insert(object);
-            }
-            "has_version" => {
-                t.version.insert(object);
-            }
-            "installed_at" => t.at = object,
-            _ => {}
-        }
-    }
-    let mut list: Vec<(String, Installed)> = things
-        .into_iter()
-        .map(|(subject, mut t)| {
-            if t.at.is_empty() {
-                t.at = findings::place(&subject, mac.as_ref());
-            }
-            let path = t.at.trim_end_matches('/');
-            let last = path.rsplit('/').next().unwrap_or(path);
-            t.name = if let Some(app) = last.strip_suffix(".app") {
-                app.to_string()
-            } else if subject.starts_with("component:") {
-                view::component_name(&subject).1.to_string()
-            } else if let Some((_, keg)) = path.split_once("/Cellar/") {
-                // A Homebrew keg, `<name>/<version>`.
-                let (name, version) = keg.split_once('/').unwrap_or((keg, ""));
-                if t.version.is_empty() && !version.is_empty() {
-                    t.version.insert(version.to_string());
-                }
-                name.to_string()
-            } else {
-                last.to_string()
-            };
-            (subject, t)
-        })
-        .collect();
-    list.sort_by_key(|(_, t)| t.name.to_lowercase());
-    Ok(list)
-}
-
-/// The installed things of one kind: name first, who signed it where that is known, version
-/// and where it is. `gap` is what the list cannot claim (`unread`).
-fn installed(
-    conn: &Connection,
-    out: &mut String,
-    kind: &str,
-    this: Option<&str>,
-    gap: Option<&str>,
-) -> Out {
-    let list: Vec<Installed> = installed_list(conn, kind, this)?
-        .into_iter()
-        .map(|(_, t)| t)
-        .collect();
-    coverage_of_list(out, gap, list.is_empty(), NONE_FOUND);
-    if list.is_empty() {
-        return Ok(());
-    }
-    let signed = list.iter().any(|t| !t.signed_by.is_empty());
-    let join = |set: &BTreeSet<String>| set.iter().cloned().collect::<Vec<_>>().join(", ");
-    out.push_str("<div class=\"scroll\"><table class=\"dense\">\n");
-    if signed {
-        view::thead(out, &["Name", "Signed by", "Version", "Where"]);
-    } else {
-        view::thead(out, &["Name", "Version", "Where"]);
-    }
-    for t in &list {
-        out.push_str("<tr>");
-        view::td(out, "", &t.name)?;
-        if signed {
-            view::td(out, "", &join(&t.signed_by))?;
-        }
-        view::td(out, "mono", &join(&t.version))?;
-        view::td(out, "mono", &t.at)?;
-        out.push_str("</tr>\n");
-    }
-    out.push_str("</tbody></table></div>\n");
-    Ok(())
 }
 
 /// What the owner's other devices are, on the summary and on the page beyond this Mac.
@@ -2344,45 +1384,6 @@ mod tests {
     }
 
     #[test]
-    fn a_list_of_watched_places_or_of_ways_read_at_a_time_ahead_of_the_clock_never_says_none_found()
-    {
-        // A time from the future proves nothing, whichever kind of autorun point the list is
-        // of: a kind of watched place, or a way a project runs code.
-        let (run, now) = (1_000_000, 1_000_100);
-        let mcp = crate::autorun::POINTS
-            .iter()
-            .find(|p| p.paths == [".mcp.json"])
-            .unwrap();
-        for (count, kind) in [
-            (
-                Count::Files(watched::PROFILE),
-                watched::PROFILE_KIND.to_string(),
-            ),
-            (Count::Files(crate::autorun::AGENT_START.0), mcp.kind()),
-        ] {
-            let at = |at| Latest {
-                reader: watched::READER.to_string(),
-                scope: "machine:mac".to_string(),
-                kind: kind.clone(),
-                completeness: "full".to_string(),
-                reason: None,
-                cause: None,
-                at,
-                last_full: Some(at),
-                ..Default::default()
-            };
-            let ahead = [at(now + crate::store::AHEAD_ALLOWED + 1)];
-            let said = unread(&readings_of(count, &ahead), Some(run), now, &[]);
-            assert!(said.is_some_and(|s| s.contains(&kind)), "{kind}");
-            let on_time = [at(run)];
-            assert_eq!(
-                unread(&readings_of(count, &on_time), Some(run), now, &[]),
-                None
-            );
-        }
-    }
-
-    #[test]
     fn a_list_says_nothing_is_there_only_when_every_reading_that_fills_it_is_full_and_fresh() {
         // "None found" on a list whose reading failed, was partial, was taken by an earlier
         // check, is dated ahead of the clock, or never ran, is false calm.
@@ -2404,12 +1405,12 @@ mod tests {
                 &mut out,
                 unread(readings, Some(run), now, extra).as_deref(),
                 true,
-                NONE_FOUND,
+                NONE_KNOWN,
             );
             out
         };
         let full = reading("full", run);
-        assert!(said(&[&full], &[]).contains(NONE_FOUND));
+        assert!(said(&[&full], &[]).contains(NONE_KNOWN));
         for not in [
             reading("partial", run),
             reading("none", run),
@@ -2418,13 +1419,13 @@ mod tests {
         ] {
             let out = said(&[&full, &not], &[]);
             assert!(
-                !out.contains(NONE_FOUND)
+                !out.contains(NONE_KNOWN)
                     && out.contains("invented things")
                     && out.contains("last read in full"),
                 "{out}"
             );
         }
-        assert!(!said(&[], &[]).contains(NONE_FOUND));
+        assert!(!said(&[], &[]).contains(NONE_KNOWN));
         // Many gaps are told briefly: the first few and how many more, each kind once.
         let many: Vec<Latest> = (0..5)
             .map(|i| Latest {
@@ -2444,209 +1445,20 @@ mod tests {
         );
         let old = ["the invented data (it is old)".to_string()];
         let out = said(&[&full], &old);
-        assert!(!out.contains(NONE_FOUND) && out.contains(&old[0]), "{out}");
+        assert!(!out.contains(NONE_KNOWN) && out.contains(&old[0]), "{out}");
         // Without any finished check, nothing is fresh.
         let mut out = String::new();
         coverage_of_list(
             &mut out,
             unread(&[&full], None, now, &[]).as_deref(),
             true,
-            NONE_FOUND,
+            NONE_KNOWN,
         );
-        assert!(!out.contains(NONE_FOUND), "{out}");
+        assert!(!out.contains(NONE_KNOWN), "{out}");
         // A list that is not empty is not told as empty either way.
         let mut out = String::new();
-        coverage_of_list(&mut out, None, false, NONE_FOUND);
+        coverage_of_list(&mut out, None, false, NONE_KNOWN);
         assert!(out.is_empty());
-    }
-
-    #[test]
-    fn a_way_read_is_in_every_place_derived_from_the_table_so_adding_a_row_changes_no_code() {
-        // Adding a product is adding a row. Every place that tells or acts on what runs by
-        // itself takes it from the table: a row read here that one of them missed would be
-        // read and never told, or told and never watched live.
-        use crate::autorun;
-        let dir = crate::common::Scratch::at(
-            std::env::temp_dir().join(format!("immunity-ways-{}", std::process::id())),
-        );
-        std::fs::create_dir_all(&dir).unwrap();
-        let conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
-        let mut page = String::new();
-        ways(&conn, &mut page, None, None).unwrap();
-        let registered: Vec<String> = conn
-            .prepare("SELECT name FROM coverage_kind")
-            .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap();
-        drop(conn);
-        let _ = std::fs::remove_dir_all(&dir);
-        for (p, way) in autorun::ways() {
-            let cell = format!("<td class=\"mono\">{}</td>", esc(&p.name()));
-            // The page lists the ways that are read, and no way that is only known.
-            assert_eq!(
-                page.contains(&cell),
-                p.part != autorun::Part::Present,
-                "{}",
-                p.name()
-            );
-            if p.part == autorun::Part::Present {
-                continue;
-            }
-            // A row read only at full checks says so in its reading column.
-            let rest = &page[page.find(&cell).unwrap()..];
-            let line = &rest[..rest.find("</tr>").unwrap()];
-            assert_eq!(
-                line.contains(">Read at full checks<"),
-                p.hourly().is_some(),
-                "{line}"
-            );
-            if !p.read_here() {
-                continue;
-            }
-            let as_ = p.watched_as().unwrap_or_default();
-            let (_, what, line) = p.watched().unwrap_or_default();
-            assert!(!as_.is_empty() && !line.is_empty(), "{}", p.name());
-            // A row not watched live says why; a path with a `*` cannot be watched live.
-            for path in p.paths {
-                let live = match p.scope {
-                    autorun::Scope::Home => {
-                        autorun::home_places().iter().any(|(h, _, _)| h == path)
-                    }
-                    _ => autorun::files().iter().any(|(f, _)| f == path),
-                };
-                assert_eq!(live, p.hourly().is_none(), "{path}");
-                assert!(!live || !path.contains('*'), "{path}");
-            }
-            assert!(registered.contains(&p.kind()), "{}", p.kind());
-            assert!(autorun::kinds_of(as_).contains(&p.kind()));
-            assert!(
-                covered::watched()
-                    .iter()
-                    .any(|w| matches!(w.0, Count::Files(a) if a == as_) && w.1 == what)
-            );
-            assert_eq!(about(what), line);
-            let rules = covered::rules_about(what);
-            assert_eq!(rules.len(), 1, "{}", p.name());
-            assert_eq!(
-                (rules[0].technique, rules[0].severity, rules[0].confidence),
-                (way.technique, way.severity, way.confidence),
-                "{}",
-                p.name()
-            );
-        }
-    }
-
-    #[test]
-    fn every_kind_of_watched_place_says_on_the_page_what_it_is_and_which_rule_tells_of_it() {
-        // A kind listed with no line leaves the owner a name without a meaning, and one no
-        // rule speaks about is watched without anyone being told of a change.
-        for (_, (watched_as, _)) in crate::autorun::places() {
-            let (_, what, _) = covered::watched()
-                .into_iter()
-                .find(|w| matches!(w.0, Count::Files(a) if a == watched_as))
-                .unwrap_or_else(|| panic!("{}", watched_as));
-            assert!(about(what).ends_with('.'), "{what}");
-            assert_eq!(covered::rules_about(what).len(), 1, "{what}");
-        }
-    }
-
-    #[test]
-    fn every_ecosystem_that_is_matched_is_named_in_each_sentence_that_says_what_is_compared() {
-        // These sentences are written by hand; a lockfile reader for a new ecosystem fails this
-        // until each names it, so none says less is compared than is.
-        let sentences = [
-            about(covered::DEPENDENCIES),
-            covered::NOT_COMPARED.meaning,
-            (covered::LIMITS.iter())
-                .find(|(_, c)| c.id == covered::NOT_COMPARED.id)
-                .unwrap()
-                .0,
-        ];
-        for feed in crate::vulnerabilities::matched_feeds() {
-            for said in sentences {
-                assert!(said.contains(feed.ecosystem), "{}: {said}", feed.ecosystem);
-            }
-        }
-    }
-
-    /// The page of what is watched for a store nothing was read into, with a home that does
-    /// not exist; the folder it made goes, also when the test fails.
-    fn this_mac_page() -> String {
-        let dir = crate::common::Scratch::new("told");
-        let conn = crate::store::open_or_make(&dir.0.join("store.db")).unwrap();
-        let st = crate::status::state(&conn, &dir.0.join("no-home"), 1_791_000_000).unwrap();
-        this_mac(&conn, &st, &v1::Status::default(), 1_791_000_000).unwrap()
-    }
-
-    /// Each section of a kind of watched thing on the page, by its anchor, up to its end.
-    fn kinds(page: &str) -> Vec<&str> {
-        covered::watched()
-            .into_iter()
-            .map(|(_, what, _)| what)
-            .chain([covered::SAMPLED])
-            .map(|what| {
-                let at = page
-                    .find(&format!("<section id=\"{}\">", anchor(what)))
-                    .unwrap_or_else(|| panic!("{what}"));
-                &page[at..at + page[at..].find("</section>").unwrap()]
-            })
-            .collect()
-    }
-
-    /// Each line of what is told, as the text of its `<li>`.
-    fn rule_lines(html: &str) -> Vec<&str> {
-        html.split("<ul class=\"rules\">")
-            .skip(1)
-            .flat_map(|list| list[..list.find("</ul>").unwrap()].split("<li>").skip(1))
-            .collect()
-    }
-
-    #[test]
-    fn every_rule_is_on_the_page_of_what_is_watched() {
-        // The owner reads on the page what he is told about. A rule added later and not
-        // placed under a kind or under "Also told" would tell him something the page never
-        // says it does.
-        let page = this_mac_page();
-        for r in findings::rules() {
-            assert!(page.contains(&esc(r.words.title)), "{}: {page}", r.id);
-            assert!(page.contains(&esc(r.words.meaning)), "{}: {page}", r.id);
-        }
-    }
-
-    #[test]
-    fn the_page_never_calls_a_thing_watched_without_saying_what_is_told_about_it() {
-        // False calm: a kind listed as watched that no rule can fire about must say so in
-        // words, or "watched" promises a warning that never comes.
-        let page = this_mac_page();
-        for kind in kinds(&page) {
-            let said = kind.contains("<ul class=\"rules\">\n<li>") || kind.contains(KEPT_AS_LIST);
-            assert!(said, "{kind}");
-        }
-        let mut lone = String::new();
-        told(&mut lone, &[]).unwrap();
-        assert!(lone.contains(KEPT_AS_LIST), "{lone}");
-    }
-
-    #[test]
-    fn a_rule_marked_as_sending_a_notification_is_exactly_an_urgent_one() {
-        // The page tells the owner which changes notify at once; the app notifies for what
-        // is urgent. The two must not disagree.
-        let page = this_mac_page();
-        let lines = rule_lines(&page);
-        for r in findings::rules() {
-            let line = lines
-                .iter()
-                .find(|l| l.starts_with(&esc(r.words.title)))
-                .unwrap_or_else(|| panic!("{} is not on the page", r.id));
-            assert_eq!(
-                line.contains(NOTIFIES),
-                findings::urgent(r.severity, Some(r.confidence)),
-                "{}: {line}",
-                r.id
-            );
-        }
     }
 
     /// The part of a page from the section with `id` to its end, or nothing.
@@ -2659,34 +1471,31 @@ mod tests {
 
     /// Nothing is hidden and nothing is told twice: every thing not covered, for every cause of
     /// the catalogue, is on the pages once, a fault in its own section and a limit in the
-    /// collapsed section at the end, by the message's `fault` alone; a limit's names are there
+    /// collapsed section at the end, by the status's `fault` alone; a limit's names are there
     /// only, and stay text.
     #[test]
     fn every_thing_not_covered_is_on_the_pages_once_a_fault_in_its_section_a_limit_at_the_end() {
         let dir = crate::common::Scratch::new("pages-once");
         let conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
         let now = 1_800_000_000;
-        let mut st = crate::status::state(&conn, &dir, now).unwrap();
-        st.not_covered = (covered::CAUSES.iter())
-            .map(|c| Uncovered {
-                examples: vec![covered::Example::named(format!("<b>{}</b>", c.id))],
-                ..Uncovered::new(c, 1)
-            })
-            .collect();
         let mut r = v1::Status {
             answered_at: now,
-            not_covered: (st.not_covered.iter())
-                .map(crate::status::uncovered_message)
+            not_covered: (covered::CAUSES.iter())
+                .map(|c| {
+                    crate::status::uncovered_message(&covered::Uncovered {
+                        examples: vec![covered::Example::named(format!("<b>{}</b>", c.id))],
+                        ..covered::Uncovered::new(c, 1)
+                    })
+                })
                 .collect(),
             ..Default::default()
         };
-        // Both sorts of every cause: the message's word, then its opposite.
+        // Both sorts of every cause: the status's word, then its opposite.
         for flip in [false, true] {
             for u in &mut r.not_covered {
                 u.fault = (u.class == v1::Cause::Failed as i32) != flip;
             }
-            let pages =
-                view::pages(&conn, &st, &r, &view::Answers::none(), "store.db", now).unwrap();
+            let pages = view::pages(&conn, &r, &view::Answers::none(), "store.db", now).unwrap();
             let page = |name: &str| &pages.iter().find(|(n, _)| n == name).unwrap().1;
             let summary = page(view::SUMMARY);
             let limits = section_of(summary, crate::not_read_here::ANCHOR);
@@ -2725,112 +1534,285 @@ mod tests {
                 "{limits}"
             );
         }
-        // A message that does not hold an item as the same cause makes it a fault, never a limit.
-        let (faults, limits) = sorted(&st, &v1::Status::default());
-        assert_eq!((faults.len(), limits.len()), (covered::CAUSES.len(), 0));
     }
 
-    /// A row of what is watched is drawn as a fault only where a fault of the message names it,
-    /// linked to where it is told, and says "read in full" only over readings all full, with the
-    /// time of its own reading: one short by a limit, or read only at a check before the latest,
-    /// is never drawn as a failure; a row with no reading is "not checked yet" whatever it counts,
-    /// and the programs startup items run are read by their own reading.
+    /// The state and the last read of the row of what is watched whose kind is `what`.
+    fn row(r: &v1::Status, what: &str, now: i64) -> (String, String) {
+        let faults: Vec<&v1::Uncovered> = r.not_covered.iter().filter(|u| u.fault).collect();
+        let mut out = String::new();
+        watched_table(&mut out, r, &faults, now).unwrap();
+        let row = out
+            .lines()
+            .find(|l| l.contains(what))
+            .unwrap_or_else(|| panic!("{what}: {out}"));
+        let cell = &row[row.find("<span class=\"wc\">").unwrap() + 17..];
+        let (state, last) = cell.split_once("</span><span class=\"wl\">").unwrap();
+        (
+            state.to_string(),
+            last.trim_end_matches("</span></div>").to_string(),
+        )
+    }
+
+    /// A status with this Mac's things counted and the status's word for each kind of files.
+    fn watched_status(things: &[(&str, u64)], kinds: Vec<v1::WatchedKind>) -> v1::Status {
+        v1::Status {
+            this_mac: Some(v1::ThisMac {
+                watched: (things.iter())
+                    .map(|(what, count)| v1::WatchedThing {
+                        what: what.to_string(),
+                        count: *count,
+                        how: "hourly".to_string(),
+                    })
+                    .collect(),
+                ..Default::default()
+            }),
+            watched: Some(v1::WatchedPlaces {
+                kinds,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    const CALM: &str = "<span class=\"dot calm\"></span>";
+    const NEVER: &str = "<span class=\"dot off\"></span>";
+
+    /// No false calm: a row of watched files says "read in full" and "none here" only where the
+    /// status says its kind was read in full and fresh (`WatchedKind.coverage` and `fresh`),
+    /// never because it counts nothing, and a kind kept in projects only where projects were
+    /// looked for. A row is drawn as a fault only by a fault of the status that names its kind
+    /// (`Uncovered.watched_kinds`), and then never says it was read in full; the fault is linked
+    /// to where it is told, by who can fix it. A row with no reading is "not checked yet".
     #[test]
-    fn a_row_shows_a_fault_only_by_a_fault_and_read_in_full_only_over_readings_all_full() {
-        let dir = crate::common::Scratch::new("rows-by-faults");
-        let conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
+    fn a_row_says_read_in_full_or_none_here_only_by_its_kind_and_never_beside_a_fault_of_it() {
         let now = 1_800_000_000;
-        crate::store::journal_note(&conn, now - 60, "run-1", "run_started", "").unwrap();
-        crate::store::journal_note(&conn, now - 30, "run-1", "run_finished", "").unwrap();
-        let mut st = crate::status::state(&conn, &dir, now).unwrap();
-        st.this_mac.watched = vec![
-            ("Homebrew packages", 1_234_567, "hourly"),
-            ("programs startup items run", 3, "at checks"),
-        ];
-        let scope = "machine:example-mac";
-        let reading = |completeness: &str, cause: Option<crate::store::Cause>| Latest {
-            reader: integrity::READER.to_string(),
-            scope: scope.to_string(),
-            kind: integrity::KEGS.to_string(),
-            completeness: completeness.to_string(),
-            reason: cause.map(|_| "an invented reason".to_string()),
-            cause: cause.map(|c| c.literal().to_string()),
-            at: now - 40,
-            last_full: Some(now - 40),
+        let what = "Shell startup files";
+        let kind = |coverage: v1::Completeness, fresh: bool| v1::WatchedKind {
+            kind: crate::watched::PROFILE.to_string(),
+            coverage: Some(coverage as i32),
+            fresh,
+            read_at: Some(now - 40),
             ..Default::default()
         };
-        let failed = Uncovered {
-            examples: vec![covered::Example::named(findings::place(scope, None))],
-            ..Uncovered::new(&covered::READING_FAILED, 1)
+        let state = |count: u64, k: Option<v1::WatchedKind>| {
+            let r = watched_status(&[("shell startup files", count)], k.into_iter().collect());
+            row(&r, what, now)
         };
-        // The state and the last read of a row.
-        let row = |latest: &[Latest], faults: &[&Uncovered], what: &str| -> (String, String) {
-            let (mut out, map) = (String::new(), crate::map::Map::default());
-            watched_table(&conn, &mut out, &st, &map, latest, faults, 0, now).unwrap();
-            let row = out.lines().find(|l| l.contains(what)).unwrap();
-            let cell = &row[row.find("<span class=\"wc\">").unwrap() + 17..];
-            let (state, last) = cell.split_once("</span><span class=\"wl\">").unwrap();
+        let full = v1::Completeness::Full;
+        assert_eq!(
+            state(0, Some(kind(full, true))),
             (
-                state.to_string(),
-                last.trim_end_matches("</span></div>").to_string(),
-            )
-        };
-        let state = |latest: &[Latest], faults: &[&Uncovered]| row(latest, faults, "Homebrew").0;
-        let calm = "<span class=\"dot calm\"></span>";
-        assert_eq!(
-            state(&[reading("full", None)], &[]),
-            format!("{calm}read in full")
-        );
-        let limit = [reading("partial", Some(crate::store::Cause::NotGiven))];
-        assert_eq!(state(&limit, &[]), format!("{calm}read"));
-        let broken = [reading("none", Some(crate::store::Cause::Failed))];
-        assert_eq!(
-            state(&broken, &[&failed]),
-            format!(
-                "<span class=\"dot off look\"></span><a href=\"{DETAILS}/{THIS_MAC}.html#{NOT_READ}\" aria-label=\"{NOT_READ_TITLE}: 1 can&#39;t be read now\">1 can&#39;t be read now</a>"
+                "<span class=\"dot\"></span>none here".to_string(),
+                view::when(now - 40, now)
             )
         );
-        // A failure the message does not call a fault is no row's fault either.
-        assert_eq!(state(&broken, &[]), format!("{calm}read"));
-        // Read in full at a check before the latest: no fault of the message, and its own time.
-        let earlier = Latest {
-            at: now - 7200,
-            last_full: Some(now - 7200),
-            ..reading("full", None)
-        };
         assert_eq!(
-            row(std::slice::from_ref(&earlier), &[], "Homebrew"),
-            (format!("{calm}read in full"), view::when(now - 7200, now))
+            state(4, Some(kind(full, true))).0,
+            format!("{CALM}read in full")
         );
-        // A count with no reading of it.
+        for not in [kind(full, false), kind(v1::Completeness::Partial, true)] {
+            assert_eq!(state(0, Some(not.clone())).0, format!("{CALM}read"));
+            assert_eq!(state(4, Some(not)).0, format!("{CALM}read"));
+        }
         assert_eq!(
-            row(&[], &[], "Homebrew"),
+            state(0, None),
             (
-                "<span class=\"dot off\"></span>not checked yet".to_string(),
+                format!("{NEVER}not checked yet"),
                 "<span class=\"none\">—</span>".to_string()
             )
         );
-        // The packages, orange only by a fault of the data they are compared with.
-        let packages = |faults: &[&Uncovered]| row(&[], faults, "Packages your projects").0;
-        assert_eq!(
-            packages(&[]),
-            "<span class=\"dot off\"></span>not compared yet"
-        );
-        let old = Uncovered::new(&covered::VULNERABILITY_DATA_OLD, 1);
-        assert!(
-            packages(&[&old]).starts_with("<span class=\"dot off look\"></span><a href="),
-            "{}",
-            packages(&[&old])
-        );
-        // The programs startup items run, by the reading that reads them.
-        let targets = Latest {
-            reader: watched::READER.to_string(),
-            kind: crate::targets::KIND.to_string(),
-            ..reading("full", None)
+        // A fault of the status that names the kind: the row is that fault, linked to where it
+        // is told; one that names another kind, or none, leaves the row as it was read.
+        let fault = |who: &str, kinds: &[&str]| v1::Uncovered {
+            id: "could-not-read".to_string(),
+            who: who.to_string(),
+            count: 2,
+            fault: true,
+            watched_kinds: kinds.iter().map(|k| k.to_string()).collect(),
+            ..Default::default()
+        };
+        let with = |u: v1::Uncovered| {
+            let mut r = watched_status(&[("shell startup files", 0)], vec![kind(full, true)]);
+            r.not_covered = vec![u];
+            row(&r, what, now).0
         };
         assert_eq!(
-            row(&[targets], &[], "Programs startup items run"),
-            (format!("{calm}read in full"), view::when(now - 40, now))
+            with(fault("nothing", &[crate::watched::PROFILE])),
+            format!(
+                "<span class=\"dot off look\"></span><a href=\"{DETAILS}/{THIS_MAC}.html#{NOT_READ}\" aria-label=\"{NOT_READ_TITLE}: 2 can&#39;t be read now\">2 can&#39;t be read now</a>"
+            )
+        );
+        assert!(
+            with(fault(YOU, &[crate::watched::PROFILE])).contains("href=\"#you-can-fix\""),
+            "{}",
+            with(fault(YOU, &[crate::watched::PROFILE]))
+        );
+        assert_eq!(
+            with(fault("nothing", &[crate::watched::SSH])),
+            "<span class=\"dot\"></span>none here"
+        );
+        assert_eq!(
+            with(fault("nothing", &[])),
+            "<span class=\"dot\"></span>none here"
+        );
+        // A limit names no row.
+        let limit = v1::Uncovered {
+            fault: false,
+            ..fault("nothing", &[crate::watched::PROFILE])
+        };
+        assert_eq!(with(limit), "<span class=\"dot\"></span>none here");
+        // The hooks in projects, read in full and fresh, while the search for projects failed.
+        let hooks = v1::WatchedKind {
+            kind: crate::watched::HOOK.to_string(),
+            ..kind(full, true)
+        };
+        let mut r = watched_status(&[("git hooks in projects", 0)], vec![hooks]);
+        let found = |all, cause: v1::Cause| v1::VulnerabilityTotals {
+            projects_found: Some(v1::ProjectsFound {
+                all,
+                cause: cause as i32,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        r.vulnerabilities = Some(found(false, v1::Cause::Failed));
+        assert_eq!(row(&r, "Git hooks", now).0, format!("{CALM}read"));
+        r.vulnerabilities = Some(found(false, v1::Cause::NotGiven));
+        assert_eq!(
+            row(&r, "Git hooks", now).0,
+            "<span class=\"dot\"></span>none in the projects found"
+        );
+        r.vulnerabilities = Some(found(true, v1::Cause::Unspecified));
+        assert_eq!(
+            row(&r, "Git hooks", now).0,
+            "<span class=\"dot\"></span>none here"
+        );
+    }
+
+    /// A row of installed software is read in full by the status's reading of its kind, last read
+    /// when the latest full check began; and the packages are compared at every check only where
+    /// every project was compared against data current now, orange only by a fault of the data,
+    /// and say none of their known vulnerabilities is used in attacks only while none is on the
+    /// catalogue's list and the catalogue is current by the rule the answers rest on.
+    #[test]
+    fn installed_software_and_the_packages_are_said_read_by_the_status_s_own_counts() {
+        let now = 1_800_000_000;
+        let mut r = watched_status(
+            &[("Homebrew packages", 7), (covered::DEPENDENCIES, 9)],
+            vec![],
+        );
+        r.last_finished_run = Some(v1::FinishedCheck {
+            check: Some(v1::CheckMark {
+                started_at: now - 60,
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        assert_eq!(
+            row(&r, "Homebrew", now).0,
+            format!("{NEVER}not checked yet")
+        );
+        let reading = |c: v1::Completeness| v1::Integrity {
+            readings: vec![v1::IntegrityReading {
+                kind: crate::integrity::KEGS.to_string(),
+                completeness: c as i32,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        r.integrity = Some(reading(v1::Completeness::Full));
+        assert_eq!(
+            row(&r, "Homebrew", now),
+            (format!("{CALM}read in full"), view::when(now - 60, now))
+        );
+        r.integrity = Some(reading(v1::Completeness::Partial));
+        assert_eq!(row(&r, "Homebrew", now).0, format!("{CALM}read"));
+
+        let packages = |r: &v1::Status| row(r, "Packages your projects", now).0;
+        assert_eq!(packages(&r), format!("{NEVER}not compared yet"));
+        let feed = |current| v1::FeedFreshness {
+            matched: true,
+            current,
+            ..Default::default()
+        };
+        let compared = v1::VulnerabilityTotals {
+            matched_this_store: true,
+            projects_compared: 2,
+            projects_found: Some(v1::ProjectsFound {
+                all: true,
+                ..Default::default()
+            }),
+            feeds: vec![feed(true)],
+            affected_records: 3,
+            affected_records_by_label: vec![v1::Count {
+                name: "high".to_string(),
+                count: 3,
+            }],
+            ..Default::default()
+        };
+        r.vulnerabilities = Some(compared.clone());
+        r.threats = Some(v1::Threats {
+            read_at: Some(now - 60),
+            ..Default::default()
+        });
+        let link = format!(
+            "<span class=\"dot\"></span><a href=\"{DETAILS}/{VULNERABILITIES}.html\">3 known vulnerabilities</a>"
+        );
+        assert_eq!(
+            packages(&r),
+            format!(
+                "{CALM}compared at every check · {link} · {CALM}none is known to be used in attacks"
+            )
+        );
+        // A feed not current, a package that cannot be told: compared, not at every check.
+        for t in [
+            v1::VulnerabilityTotals {
+                feeds: vec![feed(true), feed(false)],
+                ..compared.clone()
+            },
+            v1::VulnerabilityTotals {
+                unknown_packages: 1,
+                ..compared.clone()
+            },
+        ] {
+            r.vulnerabilities = Some(t);
+            assert!(
+                packages(&r).starts_with(&format!("{CALM}compared · ")),
+                "{}",
+                packages(&r)
+            );
+        }
+        r.vulnerabilities = Some(compared.clone());
+        // One on the catalogue's list: nothing is said of use in attacks here.
+        r.vulnerabilities = Some(v1::VulnerabilityTotals {
+            affected_exploited: 1,
+            ..compared.clone()
+        });
+        assert!(!packages(&r).contains("attacks"), "{}", packages(&r));
+        // A catalogue not current: not known, whatever its latest attempt said.
+        r.vulnerabilities = Some(compared.clone());
+        r.threats = Some(v1::Threats {
+            read_at: Some(now - crate::threats::CURRENT_FOR - 1),
+            outcome: v1::FeedOutcome::Unchanged as i32,
+            ..Default::default()
+        });
+        assert!(
+            packages(&r).ends_with(
+                "<span class=\"dot\"></span>whether any is used in attacks is not known"
+            ),
+            "{}",
+            packages(&r)
+        );
+        // Orange only by a fault of the data the packages are compared with.
+        r.not_covered = vec![v1::Uncovered {
+            id: covered::VULNERABILITY_DATA_OLD.id.to_string(),
+            fault: true,
+            ..Default::default()
+        }];
+        assert!(
+            packages(&r).starts_with("<span class=\"dot off look\"></span><a href="),
+            "{}",
+            packages(&r)
         );
     }
 }

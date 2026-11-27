@@ -139,7 +139,6 @@ src/findings.rs
 src/lists.rs
 src/main.rs
 src/overview.rs
-src/pages.rs
 src/secrets.rs
 src/sigma.rs
 src/store.rs

@@ -1630,6 +1630,8 @@ mod tests {
             cause: (completeness != v1::Completeness::Full).then_some(v1::Cause::NoReader as i32),
             observed_at: Some(1_794_800_000),
             lacks: Vec::new(),
+            last_full_at: None,
+            run_id: None,
         }
     }
 
@@ -1644,6 +1646,8 @@ mod tests {
             cause: Some(v1::Cause::NotGiven as i32),
             observed_at: None,
             lacks: Vec::new(),
+            last_full_at: None,
+            run_id: None,
         }
     }
 
@@ -1669,6 +1673,7 @@ mod tests {
             thing: thing.then(|| v1::Entity {
                 id_text: "checkout:machine:example-host/dev/shop".to_string(),
                 r#type: "checkout".to_string(),
+                parts_total: None,
             }),
             question: v1::Question::Project as i32,
             latest_run_at: Some(1_794_800_000),
@@ -1975,10 +1980,12 @@ mod tests {
             v1::Entity {
                 id_text: part.to_string(),
                 r#type: "component".to_string(),
+                parts_total: None,
             },
             v1::Entity {
                 id_text: file.to_string(),
                 r#type: "file".to_string(),
+                parts_total: None,
             },
         ];
         let fact = |s: &str, p: &str, o: &str| v1::Fact {
@@ -2023,6 +2030,7 @@ mod tests {
             .map(|i| v1::Entity {
                 id_text: format!("component:{shop}/npm/p{i}"),
                 r#type: "component".to_string(),
+                parts_total: None,
             })
             .collect();
         let text = known(&k, &Screen::pipe());
@@ -2037,10 +2045,12 @@ mod tests {
         mac.thing = Some(v1::Entity {
             id_text: "machine:example-host".to_string(),
             r#type: "machine".to_string(),
+            parts_total: None,
         });
         mac.same_as = vec![v1::Entity {
             id_text: "machine:web-1".to_string(),
             r#type: "machine".to_string(),
+            parts_total: None,
         }];
         let text = known(&mac, &Screen::pipe());
         assert!(
@@ -2058,6 +2068,7 @@ mod tests {
         app.thing = Some(v1::Entity {
             id_text: app.asked_text.clone(),
             r#type: "component".to_string(),
+            parts_total: None,
         });
         let text = known(&app, &Screen::pipe());
         assert!(text.starts_with("Program  \"component:"), "{text}");
@@ -2072,14 +2083,17 @@ mod tests {
         k.thing = Some(v1::Entity {
             id_text: thing.clone(),
             r#type: "checkout".to_string(),
+            parts_total: None,
         });
         k.same_as = vec![v1::Entity {
             id_text: format!("machine:{h}"),
             r#type: "machine".to_string(),
+            parts_total: None,
         }];
         k.parts = vec![v1::Entity {
             id_text: format!("component:{thing}/npm/{h}"),
             r#type: "component".to_string(),
+            parts_total: None,
         }];
         k.facts = vec![v1::Fact {
             subject_text: thing.clone(),
@@ -3090,6 +3104,7 @@ mod tests {
                 "n/".repeat(30)
             ),
             r#type: "file".to_string(),
+            parts_total: None,
         }];
         let screen = Screen::terminal(80, false);
         let text = known(&k, &screen);

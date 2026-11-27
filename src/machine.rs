@@ -76,81 +76,100 @@ pub fn machine_cmd(args: &MachineArgs) -> ExitCode {
         "machine",
         &args.store,
         args.form,
-        |conn, now| {
-            let this = covered::this_machine(conn)?;
-            let asked = args.asked.as_deref().map(contract::unescape);
-            // The machine asked for, and every id the resolver found to be the same machine.
-            let (id, group) = match &asked {
-                None => (this.clone(), this.iter().cloned().collect()),
-                Some(asked) => match owner::find(conn, asked)? {
-                    owner::Found::One(id, group) => (Some(id), group),
-                    owner::Found::Several(groups) => {
-                        return Ok(Err(Refused {
-                            code: "several_machines",
-                            message: "the name fits several machines the store does not know to be one; nothing was answered",
-                            example: "ask for one of them by its id, as in: immunity machine <id> --json",
-                            ids: groups.into_iter().flatten().collect(),
-                        }));
-                    }
-                    // A machine whose every trace was retracted is not among those the store knows
-                    // now, and its id still names it: it is gone, not unknown. The server check never
-                    // visited it, since a machine a reading was ever scoped to stays known.
-                    owner::Found::Unknown => {
-                        // An id of something else the store holds is not a machine it never heard of.
-                        if let Some(ty) = known::type_of(conn, asked)?
-                            && ty != TYPE
-                        {
-                            return Ok(Err(not_a_machine(asked)));
-                        }
-                        let id = if asked.starts_with("machine:") {
-                            asked.clone()
-                        } else {
-                            format!("machine:{asked}")
-                        };
-                        (known::exists(conn, &id)?.then_some(id), Vec::new())
-                    }
-                },
-            };
-            let found_by = known::found_by(conn, id.as_deref(), &FOUND_BY)?;
-            let q = Question {
-                places: &[],
-                question: v1::Question::Machine,
-                asked: args.asked.as_deref().unwrap_or_default(),
-                id: id.as_deref(),
-                // The machine under its other ids is the same machine.
-                also: &group,
-                folder: None,
-                place: None,
-                unread: None,
-                machine: this.as_deref(),
-                found_by: &found_by,
-                inside: &[],
-            };
-            let mut known = known::known_of(conn, &q, &args.home, now)?;
-            if let Some(id) = &id {
-                // Without it a server known only by its name would be answered with every reading
-                // full, and nothing on it read: false calm.
-                if !group.iter().any(|m| Some(m) == this.as_ref()) && !visited(conn, &group)? {
-                    known::by_rule(
-                        &mut known,
-                        servers::READER,
-                        servers::VISIT,
-                        id,
-                        NEVER_VISITED,
-                    );
-                }
-                // A machine with a statement is always found with its group, gone or not.
-                if let Some(s) = owner::standing(conn)?
-                    .iter()
-                    .find(|s| group.iter().any(|m| s.covers(m)))
-                {
-                    known::by_rule(&mut known, servers::READER, SET_ASIDE, id, &set_aside(s));
-                }
-            }
-            Ok(Ok(known))
-        },
+        |conn, now| answer(conn, args.asked.as_deref(), &args.home, false, now),
         |k| crate::answers_text::known(k, &crate::screen::Screen::of_stdout()),
     )
+}
+
+/// What `immunity machine` answers for this Mac, as the pages draw its page from, with every
+/// watched file on it among its parts, those of its projects too (`Question.files_anywhere`). It
+/// names no folder, so no path is read against a home folder.
+pub fn this_mac(conn: &Connection, now: i64) -> rusqlite::Result<v1::Known> {
+    let answer = answer(conn, None, std::path::Path::new("/"), true, now)?;
+    Ok(answer.unwrap_or_default())
+}
+
+/// The answer of `immunity machine [<what>]`: `asked_as` as given, `None` for this Mac, which is
+/// never refused; with `files_anywhere`, every watched file on it among its parts.
+fn answer(
+    conn: &Connection,
+    asked_as: Option<&str>,
+    home: &std::path::Path,
+    files_anywhere: bool,
+    now: i64,
+) -> rusqlite::Result<Result<v1::Known, Refused>> {
+    let this = covered::this_machine(conn)?;
+    let asked = asked_as.map(contract::unescape);
+    // The machine asked for, and every id the resolver found to be the same machine.
+    let (id, group) = match &asked {
+        None => (this.clone(), this.iter().cloned().collect()),
+        Some(asked) => match owner::find(conn, asked)? {
+            owner::Found::One(id, group) => (Some(id), group),
+            owner::Found::Several(groups) => {
+                return Ok(Err(Refused {
+                    code: "several_machines",
+                    message: "the name fits several machines the store does not know to be one; nothing was answered",
+                    example: "ask for one of them by its id, as in: immunity machine <id> --json",
+                    ids: groups.into_iter().flatten().collect(),
+                }));
+            }
+            // A machine whose every trace was retracted is not among those the store knows
+            // now, and its id still names it: it is gone, not unknown. The server check never
+            // visited it, since a machine a reading was ever scoped to stays known.
+            owner::Found::Unknown => {
+                // An id of something else the store holds is not a machine it never heard of.
+                if let Some(ty) = known::type_of(conn, asked)?
+                    && ty != TYPE
+                {
+                    return Ok(Err(not_a_machine(asked)));
+                }
+                let id = if asked.starts_with("machine:") {
+                    asked.clone()
+                } else {
+                    format!("machine:{asked}")
+                };
+                (known::exists(conn, &id)?.then_some(id), Vec::new())
+            }
+        },
+    };
+    let found_by = known::found_by(conn, id.as_deref(), &FOUND_BY)?;
+    let q = Question {
+        places: &[],
+        question: v1::Question::Machine,
+        asked: asked_as.unwrap_or_default(),
+        id: id.as_deref(),
+        // The machine under its other ids is the same machine.
+        also: &group,
+        folder: None,
+        place: None,
+        unread: None,
+        machine: this.as_deref(),
+        found_by: &found_by,
+        inside: &[],
+        files_anywhere,
+    };
+    let mut known = known::known_of(conn, &q, home, now)?;
+    if let Some(id) = &id {
+        // Without it a server known only by its name would be answered with every reading
+        // full, and nothing on it read: false calm.
+        if !group.iter().any(|m| Some(m) == this.as_ref()) && !visited(conn, &group)? {
+            known::by_rule(
+                &mut known,
+                servers::READER,
+                servers::VISIT,
+                id,
+                NEVER_VISITED,
+            );
+        }
+        // A machine with a statement is always found with its group, gone or not.
+        if let Some(s) = owner::standing(conn)?
+            .iter()
+            .find(|s| group.iter().any(|m| s.covers(m)))
+        {
+            known::by_rule(&mut known, servers::READER, SET_ASIDE, id, &set_aside(s));
+        }
+    }
+    Ok(Ok(known))
 }
 
 /// The entity type of a machine.

@@ -7269,12 +7269,12 @@ fn an_entry_the_last_check_did_not_read_is_never_said_unchanged_and_shows_that_r
             assert!(!row.contains("not since first seen"), "{row}");
             assert!(!row.contains("badge good"), "{row}");
         }
-        // The page of this Mac and the technical page each say it, with why.
+        // The page of this Mac says it, with why.
         let said = rows
             .iter()
             .filter(|r| r.contains("not read at the last check") && r.contains(why))
             .count();
-        assert_eq!(said, 2, "{name}: {rows:?}");
+        assert_eq!(said, 1, "{name}: {rows:?}");
     }
 }
 
@@ -7336,7 +7336,7 @@ fn a_part_that_failed_and_was_answered_never_silences_losing_sight_of_the_whole_
         .iter()
         .filter(|r| r.contains("not read at the last check") && r.contains("size cap"))
         .count();
-    assert_eq!(said, 2, "{rows:?}");
+    assert_eq!(said, 1, "{rows:?}");
 }
 
 #[test]

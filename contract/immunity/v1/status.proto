@@ -535,6 +535,12 @@ message Uncovered {
   // such as a file that cannot be read now, or a download that failed. False for a limit, such as
   // a kind of file with no reader. Since 1.33.0.
   bool fault = 15;
+  // The kinds of watched place it is about, each the word of a `WatchedKind.kind` or an
+  // `IntegrityReading.kind`, or `packages your projects depend on` for the projects' lockfiles: a
+  // reading of that kind on this Mac that failed or was not given, the search for projects for
+  // the kinds kept in projects and their packages, or a watched file of that kind read before and
+  // not read now. Empty for a cause about no kind of place. Since 1.39.0.
+  repeated string watched_kinds = 16;
 }
 
 // One thing a cause of what is not covered is about.
@@ -654,6 +660,12 @@ message WatchedKind {
   // Why they were not full, each reason once; on one full reading, its note. Cut as
   // `ReadingGroup.reason_text` is.
   optional string reason_text = 7;
+  // When its latest reading here was taken. Absent when it has no reading. Since 1.39.0.
+  optional int64 read_at = 8;
+  // Every reading of it here was taken by the latest full check and is not dated ahead of this
+  // Mac's clock. False when it has no reading, and before any full check: only a kind read in full
+  // and fresh may be said to hold nothing. Since 1.39.0.
+  bool fresh = 9;
 }
 
 message CompletenessCounts {
@@ -692,6 +704,10 @@ message Threats {
   optional string reason_text = 9;
   // Whether its entries are matched against what the store knows: not yet.
   bool matched = 10;
+  // The ecosystems whose packages in the projects' lockfiles were compared, at the latest
+  // check, with current data whose records the catalogue's entries are linked through: only
+  // through them is an entry compared with anything here. Empty when none was. Since 1.39.0.
+  repeated string compared_ecosystems = 11;
 }
 
 // How the latest reading of a feed went. `UNSPECIFIED`, or a value the reader does not know, is

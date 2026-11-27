@@ -46,7 +46,6 @@ mod lockfiles;
 mod look;
 mod machine;
 mod managers;
-mod map;
 mod matches;
 mod not_read_here;
 mod open;
@@ -1595,17 +1594,21 @@ fn write_view(store: &Path, if_stale: bool) -> Result<Vec<PathBuf>, Box<dyn Erro
         let (state, result) = status_read(tx, store, now)?;
         let found = findings::all(tx, now)?;
         let level = state.event_level.as_ref();
+        // Where every page is written, `immunity machine` for this Mac and `immunity
+        // vulnerabilities` too.
+        let all = !matches!(current, Current::Events(_));
         let answers = view::Answers {
             findings: finding_answer::list_of(tx, &found, now)?,
             finding: Box::new(|id| finding_answer::of(tx, &found, id, now)),
             rules: rules_answer(level, result.store_id.clone(), true, now),
+            machine: all.then(|| machine::this_mac(tx, now)).transpose()?,
+            vulnerabilities: all
+                .then(|| vulnerabilities::list(Some(tx), now))
+                .transpose()?,
         };
         let pages = match current {
-            Current::Events(_) => view::event_pages(tx, &state, &result, &answers, now)?,
-            _ => {
-                let store = store.display().to_string();
-                view::pages(tx, &state, &result, &answers, &store, now)?
-            }
+            Current::Events(_) => view::event_pages(&result, &answers, now)?,
+            _ => view::pages(tx, &result, &answers, &store.display().to_string(), now)?,
         };
         // The time until which the headline drawn can stand: the status is fresh until its
         // check is older than `FRESH_FOR`. One already stale stays so.

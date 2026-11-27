@@ -168,6 +168,7 @@ pub fn program_cmd(args: &ProgramArgs) -> ExitCode {
                 machine: this.as_deref(),
                 found_by: &found_by,
                 inside: &[],
+                files_anywhere: false,
             };
             let mut known = known::known_of(conn, &q, &args.home, now)?;
             // A program the store never heard of may be one a package manager this version does

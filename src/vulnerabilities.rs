@@ -1969,6 +1969,11 @@ fn totals_of(conn: &Connection, now: i64, t: &Totals) -> rusqlite::Result<v1::Vu
         projects_without_lockfile: n(project_counts(&t.unread_places).0),
         projects_compared: n(t.projects_compared),
         projects_found: Some(projects_found(conn)?),
+        affected_exploited: n((affecting(conn)?.iter())
+            .filter(|a| a.exploited)
+            .map(|a| a.advisory.as_str())
+            .collect::<HashSet<&str>>()
+            .len()),
     })
 }
 
@@ -2313,7 +2318,12 @@ pub fn exploited(on_list: bool, current: bool) -> Option<bool> {
 /// current catalogue says a record is off its list.
 pub fn catalogue_current(conn: &Connection, now: i64) -> rusqlite::Result<bool> {
     let read = crate::threats::last_good(conn)?.map(|(at, _)| at);
-    Ok(read_not_current(read, now, crate::threats::CURRENT_FOR).is_none())
+    Ok(catalogue_current_at(read, now))
+}
+
+/// The same rule over when the catalogue was last read whole, as `Threats.read_at` gives it.
+pub fn catalogue_current_at(read_at: Option<i64>, now: i64) -> bool {
+    read_not_current(read_at, now, crate::threats::CURRENT_FOR).is_none()
 }
 
 fn no_store(section: &str) -> v1::NotComputed {

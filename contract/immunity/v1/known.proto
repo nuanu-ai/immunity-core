@@ -111,6 +111,10 @@ message Entity {
   string id_text = 1;
   // Its type, such as `checkout`, `component` or `file`.
   string type = 2;
+  // For a part of the thing asked about, how many things with facts in force are `part_of` it,
+  // such as the packages a checkout's lockfiles declare in `immunity machine`. Absent for the
+  // thing itself and its other ids. Since 1.39.0.
+  optional uint64 parts_total = 3;
 }
 
 // A fact: the statements of one or more readers with the same subject, predicate and object.
@@ -135,6 +139,9 @@ message Assertion {
   // The reading it belongs to, as in `Coverage`: an entity id, whole.
   string scope_text = 5;
   string kind = 6;
+  // The run that first read it, as `Coverage.run_id` names runs: two assertions first read by
+  // one run share it, also where two runs began in the same second. Since 1.39.0.
+  string run_id = 7;
 }
 
 // How the source knows what it says, strongest first. `UNSPECIFIED`, or a value the reader does
@@ -166,6 +173,12 @@ message Coverage {
   optional int64 observed_at = 7;
   // What this build has no reader for, found in this reading.
   repeated Lack lacks = 8;
+  // When this reader last read this scope and kind in full. Absent when it never has, and for a
+  // reading made by rule. Since 1.39.0.
+  optional int64 last_full_at = 9;
+  // The run that took it, as the journal names runs: the readings of one run share it, also
+  // where two runs began in the same second. Absent for a reading made by rule. Since 1.39.0.
+  optional string run_id = 10;
 }
 
 // How much of what was looked for was read. `UNSPECIFIED`, or a value the reader does not know,

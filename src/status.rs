@@ -889,7 +889,7 @@ pub const FRESH_FOR: i64 = 2 * 60 * 60;
 const CONTRACT_FORMAT: u32 = 1;
 
 /// A count as the contract gives it: never below zero.
-fn n<T: TryInto<u64>>(x: T) -> u64 {
+pub(crate) fn n<T: TryInto<u64>>(x: T) -> u64 {
     x.try_into().unwrap_or(0)
 }
 
@@ -1062,10 +1062,11 @@ pub fn message(
                 components: n(t.components),
             });
             match &s.watched {
-                Some(w) => out.watched = Some(watched_message(st, s, w)),
+                Some(w) => out.watched = Some(covered::watched_message(st, s, w, now)),
                 None => absent("watched", "watched places have never been read"),
             }
-            out.threats = Some(threats_message(s.catalogue.as_ref()));
+            let compared = &s.vulnerabilities.catalogue_compared;
+            out.threats = Some(threats_message(s.catalogue.as_ref(), compared));
             let feeds: Vec<v1::FeedState> =
                 s.feeds.iter().map(|f| feed_message(f, &s.run.id)).collect();
             out.vulnerability_data = Some(v1::VulnerabilityData {
@@ -1339,78 +1340,18 @@ pub(crate) fn uncovered_message(u: &crate::covered::Uncovered) -> crate::contrac
                 reason_text: e.reason.as_deref().map(crate::secrets::said),
             })
             .collect(),
+        watched_kinds: u.kinds.iter().map(|k| k.to_string()).collect(),
     }
 }
 
-fn watched_message(st: &State, s: &Summary, w: &Watched) -> crate::contract::v1::WatchedPlaces {
-    use crate::contract::{v1, value_of};
-    use crate::known::whole;
-    let mine: Vec<&Latest> = st
-        .coverage
-        .iter()
-        .filter(|r| r.reader == watched::READER)
-        .collect();
-    let kinds = covered::watched_readings(&st.coverage, st.this_mac.machine.as_deref())
-        .into_iter()
-        .map(|k| {
-            let watched_as = k.watched_as;
-            let presence = st
-                .presence_only
-                .get(watched_as)
-                .copied()
-                .unwrap_or_default();
-            v1::WatchedKind {
-                kind: watched_as.to_string(),
-                files: n(st.files.get(watched_as).copied().unwrap_or_default()),
-                presence_only: n(presence),
-                presence_only_note: (presence > 0).then(|| watched::PRESENCE_ONLY.to_string()),
-                coverage: k.coverage.map(value_of::<v1::Completeness>),
-                readings: Some(v1::CompletenessCounts {
-                    full: n(k.full),
-                    partial: n(k.partial),
-                    none: n(k.none),
-                }),
-                // The readers' reasons, prose from their sources: cut, as every such text.
-                reason_text: k.reason.as_deref().map(crate::secrets::said),
-            }
-        })
-        .collect();
-    v1::WatchedPlaces {
-        files: n(w.files),
-        first_reading: w.first,
-        since_last_reading: (!w.first).then(|| v1::PlaceCounts {
-            new: n(w.new),
-            changed: n(w.changed),
-            gone: n(w.gone),
-        }),
-        kinds,
-        content_not_read: n(mine
-            .iter()
-            .filter(|r| r.kind == watched::CONTENT && r.completeness != "full")
-            .count()),
-        changes: s
-            .changes
-            .iter()
-            .rev()
-            .take(CHANGES_SHOWN)
-            .map(|c| v1::PlaceChange {
-                at: c.at,
-                run_id: c.run_id.clone(),
-                change: crate::finding_answer::change_of(c.change),
-                kind: c.kind.clone(),
-                path_text: whole(&c.path),
-            })
-            .collect(),
-        changes_total: n(s.changes.len()),
-    }
-}
-
-/// The latest reading of the catalogue, as `threats_section` says it.
-fn threats_message(c: Option<&Catalogue>) -> crate::contract::v1::Threats {
+/// The latest reading of the catalogue, as `threats_section` says it, and the ecosystems its
+/// entries were compared with (`vulnerabilities::catalogue_compared`).
+fn threats_message(c: Option<&Catalogue>, compared: &[&str]) -> crate::contract::v1::Threats {
     use crate::contract::v1::{FeedOutcome, Threats};
     let mut t = Threats {
         source: threats::SOURCE.to_string(),
         matched: false,
+        compared_ecosystems: compared.iter().map(|e| e.to_string()).collect(),
         ..Default::default()
     };
     match c {

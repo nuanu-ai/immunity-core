@@ -3739,7 +3739,9 @@ fn a_watched_file_its_permissions_keep_closed_leaves_this_mac_watched_in_part_an
     let fix = &page[page.find("<section id=\"you-can-fix\"").unwrap()..];
     let fix = &fix[..fix.find("</section>").unwrap()];
     assert!(
-        fix.contains("~/.zprofile: Permission denied (os error 13)"),
+        fix.contains(
+            "<bdi class=\"src\">~/.zprofile</bdi>: <bdi class=\"src\">Permission denied (os error 13)</bdi>"
+        ),
         "{fix}"
     );
     // The row of its kind among what is watched says so and leads there.
@@ -4119,14 +4121,14 @@ fn a_sample_that_opens_a_finding_says_so_in_one_line_and_a_quiet_sample_says_not
         ],
         "{r:#}"
     );
-    // The page of what is watched says what the latest sample saw in numbers: no list of
-    // running programs is kept.
+    // The page of what is watched says how many programs the latest sample saw, as the status
+    // counts them: no list of running programs is kept.
     let at = page
         .find("<section id=\"running-programs-and-their-connections\">")
         .unwrap();
     let shown = &page[at..at + page[at..].find("</section>").unwrap()];
     assert!(
-        shown.contains("saw 2 running programs and ") && shown.contains("no list of them is"),
+        shown.contains("saw 2 running programs.") && shown.contains("no list of them is"),
         "{shown}"
     );
     assert!(w.stop().success());

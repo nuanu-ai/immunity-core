@@ -1346,6 +1346,7 @@
         "some kinds of indicator in your list"
       ],
       "fault": false,
+      "watched_kinds": [],
       "holds_on": "this_mac",
       "id": "not-understood",
       "kind": "files this version does not understand yet",
@@ -1363,6 +1364,7 @@
       "examples": [],
       "examples_text": [],
       "fault": false,
+      "watched_kinds": [],
       "holds_on": "every_mac",
       "id": "project-autorun",
       "kind": "ways a project runs code by itself that are not read",
@@ -1380,6 +1382,7 @@
       "examples": [],
       "examples_text": [],
       "fault": false,
+      "watched_kinds": [],
       "holds_on": "every_mac",
       "id": "home-autorun",
       "kind": "places in the home folder where a tool's settings run code by itself that are not read",
@@ -1397,6 +1400,7 @@
       "examples": [],
       "examples_text": [],
       "fault": true,
+      "watched_kinds": [],
       "holds_on": "this_mac",
       "id": "vulnerability-list-not-downloaded",
       "kind": "vulnerability list not downloaded",
@@ -1414,6 +1418,7 @@
       "examples": [],
       "examples_text": [],
       "fault": true,
+      "watched_kinds": [],
       "holds_on": "this_mac",
       "id": "vulnerability-data-old",
       "kind": "list of known vulnerabilities not current",
@@ -1431,6 +1436,7 @@
       "examples": [],
       "examples_text": [],
       "fault": false,
+      "watched_kinds": [],
       "holds_on": "this_mac",
       "id": "vulnerabilities-unknown",
       "kind": "packages whose known vulnerabilities cannot be told",
@@ -1448,6 +1454,7 @@
       "examples": [],
       "examples_text": [],
       "fault": false,
+      "watched_kinds": [],
       "holds_on": "every_mac",
       "id": "autorun-not-checked-on-this-macos",
       "kind": "places where code can be set to run by itself not checked on this version of macOS",
@@ -1465,6 +1472,7 @@
       "examples": [],
       "examples_text": [],
       "fault": false,
+      "watched_kinds": [],
       "holds_on": "every_mac",
       "id": "persistence-not-read",
       "kind": "places where something can be set to start by itself that are not read",
@@ -1482,6 +1490,7 @@
       "examples": [],
       "examples_text": [],
       "fault": false,
+      "watched_kinds": [],
       "holds_on": "every_mac",
       "id": "run-in-turn-not-read",
       "kind": "scripts that a file which starts by itself runs in turn",
@@ -1499,6 +1508,7 @@
       "examples": [],
       "examples_text": [],
       "fault": false,
+      "watched_kinds": [],
       "holds_on": "every_mac",
       "id": "vulnerabilities-not-compared",
       "kind": "vulnerabilities not yet compared with installed software and servers",
@@ -1516,6 +1526,7 @@
       "examples": [],
       "examples_text": [],
       "fault": false,
+      "watched_kinds": [],
       "holds_on": "every_mac",
       "id": "package-managers-elsewhere-not-found",
       "kind": "software of other package managers, and tools installed at other places",
@@ -1648,6 +1659,7 @@
     "first_reading": null,
     "gone": null,
     "matched": false,
+    "compared_ecosystems": [],
     "new": null,
     "outcome": "failed",
     "read_at": null,
@@ -1712,6 +1724,7 @@
       "folders_text": [],
       "why": "only the given folder was walked"
     },
+    "affected_exploited": 0,
     "projects_not_read": 0,
     "projects_without_lockfile": 0,
     "unknown": 1,
@@ -1808,7 +1821,9 @@
           "none": 0,
           "partial": 0
         },
-        "reason_text": null
+        "reason_text": null,
+        "read_at": 1795765269,
+        "fresh": true
       },
       {
         "coverage": "full",
@@ -1821,7 +1836,9 @@
           "none": 0,
           "partial": 0
         },
-        "reason_text": "none of these places is on this machine"
+        "reason_text": "none of these places is on this machine",
+        "read_at": 1795765269,
+        "fresh": true
       },
       {
         "coverage": "full",
@@ -1834,7 +1851,9 @@
           "none": 0,
           "partial": 0
         },
-        "reason_text": null
+        "reason_text": null,
+        "read_at": 1795765269,
+        "fresh": true
       },
       {
         "coverage": "full",
@@ -1847,7 +1866,9 @@
           "none": 0,
           "partial": 0
         },
-        "reason_text": "none of these places is on this machine"
+        "reason_text": "none of these places is on this machine",
+        "read_at": 1795765269,
+        "fresh": true
       },
       {
         "coverage": "full",
@@ -1860,7 +1881,9 @@
           "none": 0,
           "partial": 0
         },
-        "reason_text": "none of these places is on this machine"
+        "reason_text": "none of these places is on this machine",
+        "read_at": 1795765269,
+        "fresh": true
       },
       {
         "coverage": "full",
@@ -1873,7 +1896,9 @@
           "none": 0,
           "partial": 0
         },
-        "reason_text": "the checkout has no hooks"
+        "reason_text": "the checkout has no hooks",
+        "read_at": 1795765269,
+        "fresh": true
       },
       {
         "coverage": "full",
@@ -1886,7 +1911,9 @@
           "none": 0,
           "partial": 0
         },
-        "reason_text": "startup programs named and not there: 2; programs are read at each check and not between checks"
+        "reason_text": "startup programs named and not there: 2; programs are read at each check and not between checks",
+        "read_at": 1795765269,
+        "fresh": true
       }
     ],
     "since_last_reading": {

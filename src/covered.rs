@@ -13,6 +13,9 @@ use crate::{autorun, findings, guarded, integrity, resolver, servers, store, wat
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod watched_kinds;
+pub use watched_kinds::{kinds_read_by, watched_message};
+
 /// What is watched on this Mac, in words a person knows: the kind of thing as the store
 /// counts it, the words, and whether the watcher sees it within seconds. What runs by itself
 /// in projects is one kind per trigger whose ways are read, from the table in `autorun`.
@@ -63,77 +66,6 @@ pub fn kinds_of(watched_as: &str) -> Vec<String> {
     let places = watched::kinds().into_iter().filter(|k| k.0 == watched_as);
     kinds.extend(places.map(|k| k.1.to_string()));
     kinds
-}
-
-/// How the latest readings of one kind of watched files on this Mac went together, as
-/// `watched.kinds` tells it.
-pub struct WatchedReadings {
-    pub watched_as: &'static str,
-    /// Its readings by completeness. A kind of its list with no reading here was not read, and
-    /// counts as a reading of nothing.
-    pub full: usize,
-    pub partial: usize,
-    pub none: usize,
-    /// `None` when it has no reading here at all.
-    pub coverage: Option<&'static str>,
-    /// Why they were not full, each reason once; on one full reading that is all, its note.
-    pub reason: Option<String>,
-}
-
-/// The kinds of watched files with their latest readings on this Mac (`this`), its checkouts'
-/// among them. No false calm: a kind is `full` only when every coverage kind of its list has a
-/// reading here and each is full, and a reading of another machine stands for none of them.
-pub fn watched_readings(latest: &[Latest], this: Option<&str>) -> Vec<WatchedReadings> {
-    let here = |scope: &str| {
-        this.is_some_and(|t| {
-            let checkout = scope
-                .strip_prefix("checkout:")
-                .and_then(|s| s.strip_prefix(t));
-            on_this_mac(scope, t) || checkout.is_some_and(|rest| rest.starts_with('/'))
-        })
-    };
-    let mine: Vec<&Latest> = (latest.iter())
-        .filter(|r| r.reader == watched::READER && here(&r.scope))
-        .collect();
-    let group = |(watched_as, kinds): (&'static str, Vec<String>)| {
-        let rows: Vec<&Latest> = mine
-            .iter()
-            .copied()
-            .filter(|r| kinds.contains(&r.kind))
-            .collect();
-        let count = |c: &str| rows.iter().filter(|r| r.completeness == c).count();
-        let unread = (kinds.iter())
-            .filter(|k| !rows.iter().any(|r| &r.kind == *k))
-            .count();
-        let unread = if rows.is_empty() { 0 } else { unread };
-        let (full, partial, none) = (count("full"), count("partial"), count("none") + unread);
-        let coverage = match (full, partial, none) {
-            (0, 0, 0) => None,
-            (_, 0, 0) => Some("full"),
-            (0, 0, _) => Some("none"),
-            _ => Some("partial"),
-        };
-        let mut reasons: Vec<&str> = Vec::new();
-        for r in rows.iter().filter(|r| r.completeness != "full") {
-            if let Some(reason) = r.reason.as_deref().filter(|x| !reasons.contains(x)) {
-                reasons.push(reason);
-            }
-        }
-        let reason = match (reasons.is_empty(), rows.as_slice()) {
-            (false, _) => Some(reasons.join("; ")),
-            (true, [only]) if unread == 0 => only.reason.clone(),
-            _ => None,
-        };
-        WatchedReadings {
-            watched_as,
-            full,
-            partial,
-            none,
-            coverage,
-            reason,
-        }
-    };
-    watched_files().into_iter().map(group).collect()
 }
 
 /// Scripts the login window runs at every login and logout, in the words for a person.
@@ -951,6 +883,9 @@ pub struct Uncovered {
     /// readings are sorted; a failure of the core's own work, a cause of class `failed` that no
     /// reading holds, otherwise.
     pub fault: bool,
+    /// The kinds of watched place it is about, each once (`kinds_of_reading`): what a row of
+    /// what is watched is drawn as a fault by.
+    pub kinds: Vec<&'static str>,
 }
 
 /// One thing a cause is about: its name as the Mac names it, and apart from it what its source
@@ -986,6 +921,7 @@ impl Uncovered {
             projects: Found::All.projects(),
             every_mac: false,
             fault: cause.class == store::Cause::Failed,
+            kinds: Vec::new(),
         }
     }
 
@@ -1205,10 +1141,15 @@ pub fn not_covered(
                 examples.push(e);
             }
         }
+        let of = list
+            .iter()
+            .map(|r| (r.reader.as_str(), r.kind.as_str(), r.scope.as_str()));
+        let kinds = kinds_read_by(conn, of)?;
         out.push(Uncovered {
             scope: first_scope(list.iter().map(|r| r.scope.as_str()), this),
             since: list.iter().map(|r| r.at).max(),
             examples,
+            kinds,
             ..Uncovered::new(cause, list.len())
         });
     }
