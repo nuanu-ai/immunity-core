@@ -700,24 +700,20 @@ pub fn note_on(tx: &rusqlite::Transaction, at: i64) -> rusqlite::Result<usize> {
     )
 }
 
-/// Writes `turned_off` with the time alone into the job's store, under the run lock as every
-/// writer beside the watcher takes it. A store that is not there, or is not one of this build's
-/// format, is left as it is (`store::open` makes nothing and refuses before it writes). Why it was
-/// not written, by the one mapping of outcomes (`outcome::of`): a skip is `busy`, and any other
-/// failure `store_refused`; `None` when it was written.
+/// Writes `turned_off` with the time alone into the job's store, a short write as every command
+/// that writes a little writes (`store::write`). A store that is not there, or is not one of this
+/// build's format, is left as it is. Why it was not written, by the one mapping of outcomes
+/// (`outcome::of`): a skip is `busy`, and any other failure `store_refused`; `None` when it was
+/// written.
 fn record_off(places: &Places) -> Option<v1::NotRecorded> {
-    use crate::outcome::{Code, Kind, Outcome};
+    use crate::outcome::{Kind, Outcome};
+    use crate::store;
     if !places.store.exists() {
         return Some(v1::NotRecorded::NoStore);
     }
-    let written = (|| -> Result<(), Outcome> {
-        let _lock = crate::store::lock_run(&crate::home(&places.store))
-            .map_err(|e| crate::outcome::of(&e))?
-            .ok_or(Outcome::new(Code::RunLockHeld, ""))?;
-        let conn = crate::store::open(&places.store)?;
-        crate::store::journal_note(&conn, answered_at(), JOURNAL_RUN, "turned_off", "")?;
-        Ok(())
-    })();
+    let written = store::write(&places.store, store::LOCK_WAIT, store::open, |tx| {
+        store::journal_note(tx, answered_at(), JOURNAL_RUN, "turned_off", "").map_err(Outcome::from)
+    });
     written.err().map(|o| match o.kind {
         Kind::Skip => v1::NotRecorded::Busy,
         _ => v1::NotRecorded::StoreRefused,

@@ -34,12 +34,12 @@ use crate::contract::{v1, value_of};
 use crate::events::{self, AtLine, LineAt};
 use crate::findings::{self, CONFIDENCES, Found, SEVERITIES, Words};
 use crate::known::{self, whole};
-use crate::outcome::{self, Code, Outcome};
+use crate::outcome::{self, Outcome};
 use crate::secrets::{Kept, Text, holds};
 use crate::sigma::Rules;
 use crate::{answer, store};
 use prost::Message;
-use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
 use std::io::Read;
@@ -729,16 +729,6 @@ pub fn verdict_cmd(args: &VerdictArgs) -> ExitCode {
     }
 }
 
-/// Opens the store to write as every writing command does: under the run lock, waited for as
-/// they wait, with the write lock taken at the start of the transaction. A store another writer
-/// holds is a skip, asked again, never a broken store.
-pub fn writing(store: &std::path::Path) -> Result<(std::fs::File, Connection), Outcome> {
-    let lock = store::lock_run(&crate::home(store))
-        .map_err(|e| outcome::of(&e))?
-        .ok_or_else(|| Outcome::new(Code::RunLockHeld, ""))?;
-    Ok((lock, store::open(store)?))
-}
-
 /// Reads the verdict, records it in one transaction, and gives what was recorded.
 fn take(args: &VerdictArgs) -> Result<v1::VerdictRecorded, Refusal> {
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
@@ -772,16 +762,27 @@ fn take(args: &VerdictArgs) -> Result<v1::VerdictRecorded, Refusal> {
         }
         check(&read, args, &sent, now)?
     };
-    let (_lock, mut conn) = writing(&args.store)?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // A short write, as every command that writes a little writes.
+    store::write(&args.store, store::LOCK_WAIT, store::open, |tx| {
+        record(tx, &sent, line, now)
+    })
+}
+
+/// Records the verdict in `tx`, under the run lock, and gives what was recorded.
+fn record(
+    tx: &Transaction,
+    sent: &Sent,
+    line: Option<Line>,
+    now: i64,
+) -> Result<v1::VerdictRecorded, Refusal> {
     // Decided again under the write lock: another process may have recorded the same verdict
     // since it was read. The unique index on the id backs this.
     let earlier = match sent.verdict_id {
-        Some(_) => by_id(&tx, &sent)?,
-        None => same(&tx, &sent)?,
+        Some(_) => by_id(tx, sent)?,
+        None => same(tx, sent)?,
     };
     if let Some(earlier) = earlier {
-        return answer(&tx, earlier, true, now);
+        return answer(tx, earlier, true, now);
     }
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -827,13 +828,13 @@ fn take(args: &VerdictArgs) -> Result<v1::VerdictRecorded, Refusal> {
                     (rule, about)
                 }
                 About::Match { rule, .. } => {
-                    let machine = crate::this_machine_or_named(&tx)?;
-                    store::put_entity(&tx, &machine)?;
+                    let machine = crate::this_machine_or_named(tx)?;
+                    store::put_entity(tx, &machine)?;
                     (rule.clone(), machine)
                 }
             };
             let (finding, raised) = findings::occur(
-                &tx,
+                tx,
                 &format!("{PREFIX}{subject}"),
                 &about,
                 "new",
@@ -848,7 +849,7 @@ fn take(args: &VerdictArgs) -> Result<v1::VerdictRecorded, Refusal> {
             }
             // A line no longer in the log gives no event to keep.
             if let Some(Line::Read(e)) = line {
-                events::keep(&tx, &finding, now, 1, &VecDeque::from([*e]))?;
+                events::keep(tx, &finding, now, 1, &VecDeque::from([*e]))?;
             }
             (Some(finding), raised)
         }
@@ -875,9 +876,7 @@ fn take(args: &VerdictArgs) -> Result<v1::VerdictRecorded, Refusal> {
             event_gone
         ],
     )?;
-    let out = answer(&tx, tx.last_insert_rowid(), false, now)?;
-    tx.commit()?;
-    Ok(out)
+    answer(tx, tx.last_insert_rowid(), false, now)
 }
 
 /// A verdict names the store it was judged from: another store's is refused, since a finding's

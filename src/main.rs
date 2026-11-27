@@ -930,26 +930,24 @@ fn store_folder(folder: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot make the store's folder {}: {e}", folder.display()))
 }
 
-/// Takes one sample under the run lock, records what the rule tracks and raises what it finds.
-/// Returns its report and the store's id, read under the same lock before the sample.
+/// Takes one sample, a short write (`store::write`), records what the rule tracks and raises
+/// what it finds. Returns its report and the store's id, read in the same transaction.
 fn sample(args: &SampleArgs) -> Result<(processes::Report, String), Box<dyn Error>> {
-    let home = home(&args.store);
-    store_folder(&home)?;
-    let _lock = store::lock_run(&home)?.ok_or(Outcome::new(Code::RunLockHeld, ""))?;
+    store_folder(&home(&args.store))?;
     // `immunity sample` makes the store where there is none; a watcher's sample only opens it.
-    let id = store::id(&store::open_or_make(&args.store)?).map_err(Outcome::from)?;
-    let (report, _) = sample_held(
-        &args.store,
-        args.input.as_deref(),
-        &mut processes::Signers::default(),
-    )?;
-    Ok((report, id))
+    store::write(&args.store, store::LOCK_WAIT, store::open_or_make, |tx| {
+        let id = store::id(tx).map_err(Outcome::from)?;
+        let input = args.input.as_deref();
+        let (report, _) = sample_held(tx, &args.store, input, &mut Default::default())?;
+        Ok((report, id))
+    })
 }
 
-/// One sample, with the run lock held by the caller: of the system, or of the reading in
+/// One sample in the transaction `tx`, under the run lock: of the system, or of the reading in
 /// `input`. Returns its report and how many things need a look after it. `immunity sample` and
 /// the watcher both take their samples here.
 pub fn sample_held(
+    tx: &rusqlite::Transaction,
     path: &Path,
     input: Option<&Path>,
     signers: &mut processes::Signers,
@@ -961,7 +959,6 @@ pub fn sample_held(
         now.as_secs(),
         now.subsec_nanos()
     );
-    let mut conn = store::open(path)?;
     let took = std::time::Instant::now();
     let reading = match input {
         Some(file) => {
@@ -970,19 +967,17 @@ pub fn sample_held(
         }
         None => processes::read_system(now.as_secs() as i64),
     };
-    let tx = conn.transaction()?;
     // The machine the readings of this Mac are scoped to, so the sample is of the same one.
-    let machine = this_machine_or_named(&tx)?;
-    store::put_entity(&tx, &machine)?;
+    let machine = this_machine_or_named(tx)?;
+    store::put_entity(tx, &machine)?;
     let at = processes::At {
         run_id: &run_id,
         machine: &machine,
         home: &user_home()?,
         folder: &home(path),
     };
-    let report = processes::take(&tx, &at, reading, took, signers)?;
-    let needs = status::needs(&tx, report.sample.at)?.items.len();
-    tx.commit()?;
+    let report = processes::take(tx, &at, reading, took, signers)?;
+    let needs = status::needs(tx, report.sample.at)?.items.len();
     Ok((report, needs))
 }
 
@@ -997,17 +992,19 @@ fn sample_cmd(args: &SampleArgs) -> ExitCode {
             })
         }
         Err(e) => {
-            let (error, exit) = match e.downcast_ref::<Outcome>() {
-                Some(o) => (o.error("sample", "immunity sample --json"), o.exit()),
-                None => (
-                    answer::error(
-                        "sample_failed",
-                        "the sample failed and nothing was committed to the store",
-                        "immunity sample --json",
-                        &e.to_string(),
-                    ),
-                    1,
-                ),
+            // As `not_run`: an outcome the write made itself, and a skip wherever it was met, its
+            // transaction's start and commit included, are said as that outcome.
+            let o = outcome::of(&*e);
+            let (error, exit) = if e.is::<Outcome>() || o.kind == outcome::Kind::Skip {
+                (o.error("sample", "immunity sample --json"), o.exit())
+            } else {
+                let error = answer::error(
+                    "sample_failed",
+                    "the sample failed and nothing was committed to the store",
+                    "immunity sample --json",
+                    &e.to_string(),
+                );
+                (error, 1)
             };
             answer::fail("sample", args.form, error, exit)
         }
@@ -1423,34 +1420,28 @@ fn finding_cmd(args: &FindingArgs) -> ExitCode {
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.subsec_nanos());
     let run_id = format!("owner-{now}-{nanos:09}");
-    // It writes as `immunity verdict` does: under the run lock, with the write lock from the
-    // start of its transaction, and a store another writer holds is asked again.
-    let (lock, mut conn) = match verdict::writing(&args.store) {
-        Ok(held) => held,
-        Err(o) => return store_failed(&o),
-    };
-    // Everything that can refuse is decided in the transaction, and the answer printed is read in
-    // it too, before the commit: a command that is refused, by a check or by the read, has
-    // written nothing, and one that wrote cannot be refused afterwards.
-    let answered = (|| -> Result<Result<contract::v1::Finding, known::Refused>, Box<dyn Error>> {
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    // A short write, as every command that writes a little writes. Everything that can refuse
+    // is decided in the transaction, and the answer printed is read in it too, before the
+    // commit: a command that is refused, by a check or by the read, has written nothing, and one
+    // that wrote cannot be refused afterwards.
+    let answered = store::write(&args.store, store::LOCK_WAIT, store::open, |tx| {
         // With `--with`, the same answer to the other finding of the pair, or to the other
         // findings of one group, in the same transaction: all are recorded or none is. Each keeps
         // its own answer, as one given alone; the shared run id says they were given together.
         // The whole set is read once and checked before anything is written.
         let mut ids = vec![args.id.as_str()];
         ids.extend(args.with.iter().map(String::as_str));
-        let all = findings::all(&tx, now)?;
+        let all = findings::all(tx, now)?;
         let (named, pair) = findings::together(&all, &ids)?;
         // An answer that names what it was read at is refused when anything joined a finding it
         // names since that the answer did not already take in, before it writes anything.
         if let Some(seq) = args.journal_seq {
-            findings::unchanged(&tx, &all, &ids, seq, act)?;
+            findings::unchanged(tx, &all, &ids, seq, act)?;
         }
         for (n, f) in named.into_iter().enumerate() {
             let done = match act {
-                findings::Act::Answer(a) => findings::answer(&tx, f, a, args.via, now, &run_id),
-                findings::Act::Reopen => findings::reopen(&tx, f, args.via, now, &run_id),
+                findings::Act::Answer(a) => findings::answer(tx, f, a, args.via, now, &run_id),
+                findings::Act::Reopen => findings::reopen(tx, f, args.via, now, &run_id),
             };
             done.map_err(|e| {
                 if n == 0 {
@@ -1465,12 +1456,9 @@ fn finding_cmd(args: &FindingArgs) -> ExitCode {
         // write and the read take a finding by the same predicate (`findings::shown`), so a
         // finding the write accepts the read shows. The branch stays so that a later difference
         // between the two refuses with nothing written, never after a commit.
-        let left = finding_answer::one(&tx, &args.id, &ids[1..], pair, now)?;
-        if left.is_ok() {
-            tx.commit()?;
-        }
-        Ok(left)
-    })();
+        let left = finding_answer::one(tx, &args.id, &ids[1..], pair, now)?;
+        left.map_err(Box::<dyn Error>::from)
+    });
     // A refusal about a finding named by `--with` quotes its id, and has the code it would
     // have about the finding the answer is for.
     let refusal = |r: findings::Refused| {
@@ -1544,16 +1532,16 @@ fn finding_cmd(args: &FindingArgs) -> ExitCode {
             text::refusal(f, &next, &screen::Screen::of_stderr())
         })
     };
-    drop(conn);
-    drop(lock);
     match answered {
-        Ok(Ok(m)) => answer::print("finding", args.form, &m, |m| {
+        Ok(m) => answer::print("finding", args.form, &m, |m| {
             finding_text::answered(m, &screen::Screen::of_stdout())
         }),
-        Ok(Err(refused)) => answer::fail("finding", args.form, refused.error(), EXIT_USAGE),
         Err(e) => match e.downcast::<findings::RefusedError>() {
             Ok(r) => refusal(r.0),
-            Err(e) => store_failed(&outcome::of(&*e)),
+            Err(e) => match e.downcast::<known::Refused>() {
+                Ok(refused) => answer::fail("finding", args.form, refused.error(), EXIT_USAGE),
+                Err(e) => store_failed(&outcome::of(&*e)),
+            },
         },
     }
 }
@@ -2181,14 +2169,7 @@ fn owner_cmd(args: &OwnerArgs) -> ExitCode {
     use contract::{v1, value_of};
     // A refusal's message is the core's own words; what was asked, which may hold a secret, is
     // its `detail_text`, cut in every form.
-    let refused = |code: &str, message: &str, example: &str, detail: &str, exit: u8| {
-        answer::fail(
-            "owner",
-            args.form,
-            answer::error(code, message, example, detail),
-            exit,
-        )
-    };
+    let refused = answer::error;
     let failed = |e: &(dyn Error + 'static)| {
         let o = outcome::of(e);
         answer::fail(
@@ -2238,93 +2219,87 @@ fn owner_cmd(args: &OwnerArgs) -> ExitCode {
         });
     };
     let run_id = format!("owner-{}-{:09}", now.as_secs(), now.subsec_nanos());
-    let mut conn = match store::open(store_path) {
-        Ok(c) => c,
-        Err(e) => return failed(&e),
-    };
-    let (entity, machine) = match owner::find(&conn, name) {
-        Ok(owner::Found::One(entity, machine)) => (entity, machine),
-        Ok(owner::Found::Unknown) => {
-            return refused(
-                "unknown_machine",
-                "the store knows no machine by the name asked; nothing was said",
-                "immunity servers lists the machines the store knows",
-                name,
-                EXIT_USAGE,
-            );
-        }
-        Ok(owner::Found::Several(groups)) => {
-            let list: Vec<String> = groups
-                .iter()
-                .map(|g| {
-                    let names: Vec<&str> = g.iter().map(|m| owner::bare(m)).collect();
-                    names.join(" = ")
-                })
-                .collect();
-            return refused(
-                "several_machines",
-                "the name asked fits several machines that are not known to be one; name one of them; nothing was said",
-                "immunity owner <full machine id> retired --reason <text>",
-                &format!("{name} fits: {}", list.join("; ")),
-                EXIT_USAGE,
-            );
-        }
-        Err(e) => return failed(&e),
-    };
-    let mut m = v1::StatementMade {
-        format: 1,
-        answered_at: at,
-        store_id: store::id(&conn).ok(),
-        machine_text: known::whole(owner::bare(&entity)),
-        names_text: machine
-            .iter()
-            .map(|n| known::whole(owner::bare(n)))
-            .collect(),
-        via: value_of::<v1::Via>(args.via.literal()),
-        ..Default::default()
-    };
-    match act {
-        Act::Say(said, reason) => {
-            let (replaced, reason) = match owner::say(
-                &mut conn, &entity, &machine, said, reason, args.via, at, &run_id,
-            ) {
-                Ok(n) => n,
-                Err(e) => return failed(&e),
-            };
-            m.done = Some(v1::statement_made::Done::Said(v1::Said {
-                said: said.to_string(),
-                at,
-                reason_text: reason.said(),
-                reason_cuts: answer::reason_cuts(&reason),
-                replaced: replaced as u64,
-            }));
-        }
-        Act::Withdraw => {
-            let withdrawn = match owner::withdraw(&mut conn, &machine, args.via, at, &run_id) {
-                Ok(w) => w,
-                Err(e) => return failed(&e),
-            };
-            if withdrawn.is_empty() {
-                return refused(
-                    "no_statement",
-                    "no statement stands about the machine asked; nothing was withdrawn",
-                    "immunity owner --json lists the statements that stand",
+    // A short write, as every command that writes a little writes. A refusal is decided before
+    // anything is written.
+    let made = store::write(store_path, store::LOCK_WAIT, store::open, |tx| {
+        let (entity, machine) = match owner::find(tx, name)? {
+            owner::Found::One(entity, machine) => (entity, machine),
+            owner::Found::Unknown => {
+                return Ok(Err(refused(
+                    "unknown_machine",
+                    "the store knows no machine by the name asked; nothing was said",
+                    "immunity servers lists the machines the store knows",
                     name,
-                    EXIT_USAGE,
-                );
+                )));
             }
-            m.done = Some(v1::statement_made::Done::Withdrawn(v1::Withdrawn {
-                statements: withdrawn
+            owner::Found::Several(groups) => {
+                let list: Vec<String> = groups
                     .iter()
-                    .map(|(e, said)| v1::WithdrawnStatement {
-                        machine_text: known::whole(owner::bare(e)),
-                        said: said.clone(),
+                    .map(|g| {
+                        let names: Vec<&str> = g.iter().map(|m| owner::bare(m)).collect();
+                        names.join(" = ")
                     })
-                    .collect(),
-            }));
-        }
-    }
-    drop(conn);
+                    .collect();
+                return Ok(Err(refused(
+                    "several_machines",
+                    "the name asked fits several machines that are not known to be one; name one of them; nothing was said",
+                    "immunity owner <full machine id> retired --reason <text>",
+                    &format!("{name} fits: {}", list.join("; ")),
+                )));
+            }
+        };
+        let mut m = v1::StatementMade {
+            format: 1,
+            answered_at: at,
+            store_id: store::id(tx).ok(),
+            machine_text: known::whole(owner::bare(&entity)),
+            names_text: machine
+                .iter()
+                .map(|n| known::whole(owner::bare(n)))
+                .collect(),
+            via: value_of::<v1::Via>(args.via.literal()),
+            ..Default::default()
+        };
+        m.done = Some(match act {
+            Act::Say(said, reason) => {
+                let (replaced, reason) =
+                    owner::say(tx, &entity, &machine, said, reason, args.via, at, &run_id)?;
+                v1::statement_made::Done::Said(v1::Said {
+                    said: said.to_string(),
+                    at,
+                    reason_text: reason.said(),
+                    reason_cuts: answer::reason_cuts(&reason),
+                    replaced: replaced as u64,
+                })
+            }
+            Act::Withdraw => {
+                let withdrawn = owner::withdraw(tx, &machine, args.via, at, &run_id)?;
+                if withdrawn.is_empty() {
+                    return Ok(Err(refused(
+                        "no_statement",
+                        "no statement stands about the machine asked; nothing was withdrawn",
+                        "immunity owner --json lists the statements that stand",
+                        name,
+                    )));
+                }
+                v1::statement_made::Done::Withdrawn(v1::Withdrawn {
+                    statements: withdrawn
+                        .iter()
+                        .map(|(e, said)| v1::WithdrawnStatement {
+                            machine_text: known::whole(owner::bare(e)),
+                            said: said.clone(),
+                        })
+                        .collect(),
+                })
+            }
+        });
+        Ok::<_, Box<dyn Error>>(Ok(m))
+    });
+    let mut m = match made {
+        Ok(Ok(m)) => m,
+        Ok(Err(error)) => return answer::fail("owner", args.form, error, EXIT_USAGE),
+        Err(e) => return failed(&*e),
+    };
     m.sweep = Some(match rewrite_sweep(&args.servers) {
         Ok(n) => v1::SweepWritten {
             servers: Some(n as u64),
@@ -2422,7 +2397,7 @@ fn last_reading(dir: &Path, names: &[&str]) -> (String, bool) {
 /// store. The check holds the downloads, so whoever still holds the lock after the wait is a
 /// reading or a command: the skip `run_lock_held`, asked again soon.
 fn take_store(home: &Path, wait: std::time::Duration) -> Result<std::fs::File, Box<dyn Error>> {
-    Ok(store::lock_run_for_check(home, wait)?.ok_or(Outcome::new(Code::RunLockHeld, ""))?)
+    Ok(store::lock_run_waiting(home, wait)?.ok_or(Outcome::new(Code::RunLockHeld, ""))?)
 }
 
 /// Runs every reader and returns the report line, and the watched places that changed or
@@ -2451,11 +2426,9 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     let mut stage = |s| check.stage(s, now_secs());
     // The check has started, downloads and all: its start is written now, under the run lock
     // for that write alone, so that a status says from the first minute when it started.
-    {
-        let _lock = take_store(&home, store::CHECK_WAIT)?;
-        let conn = store::open_or_make(&args.store)?;
-        store::journal_note(&conn, at, &run_id, "run_started", "")?;
-    }
+    store::write(&args.store, store::CHECK_WAIT, store::open_or_make, |tx| {
+        Ok::<_, Box<dyn Error>>(store::journal_note(tx, at, &run_id, "run_started", "")?)
+    })?;
     stage(CheckStage::Downloading);
     let feeds = get_feeds(read_only.as_ref(), args, &home, at)?;
     let catalogue = get_catalogue(read_only.as_ref(), args)?;

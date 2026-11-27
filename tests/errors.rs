@@ -273,12 +273,14 @@ fn a_store_another_process_holds_is_one_to_ask_again_in_every_form_and_never_unr
     db.execute_batch("PRAGMA locking_mode = EXCLUSIVE; BEGIN EXCLUSIVE")
         .unwrap();
     // Each command waits out SQLite's busy timeout of five seconds, so they wait side by side.
-    let asked: [&[&str]; 10] = [
+    let asked: [&[&str]; 12] = [
         &["status", "--json"],
         &["findings", "--proto"],
         &["vulnerabilities"],
         &["vulnerability", "CVE-2023-4863", "--json"],
         &["owner", "--json"],
+        &["owner", "box", "retired", "--reason", "invented", "--json"],
+        &["finding", "f0123456789", "seen", "--json"],
         &["rules", "--json"],
         &["matches", "--json", "--system-root", "."],
         &["sample", "--json", "--sample-input", "bad.json"],
@@ -333,7 +335,7 @@ fn no_store_and_a_store_of_another_format_are_worded_once_across_every_command()
     let e = Estate::new("wording");
     // What answers without a store says so, exit 0; what needs one fails, exit 3, `view` among
     // them, which is no command of the contract.
-    let no_store: [(&[&str], i32); 12] = [
+    let no_store: [(&[&str], i32); 13] = [
         (&["status"], 0),
         (&["vulnerabilities"], 0),
         (&["vulnerability", "CVE-2023-4863"], 0),
@@ -345,6 +347,7 @@ fn no_store_and_a_store_of_another_format_are_worded_once_across_every_command()
         (&["program", "jq"], 3),
         (&["machine"], 3),
         (&["owner"], 3),
+        (&["owner", "box", "retired", "--reason", "invented"], 3),
         (&["view", "--no-open"], 3),
     ];
     for (args, exit) in no_store {
@@ -355,7 +358,7 @@ fn no_store_and_a_store_of_another_format_are_worded_once_across_every_command()
         assert!(said.contains(NO_STORE_FIX), "{args:?}: {said}");
     }
     assert!(!e.none().exists());
-    let older: [(&[&str], i32); 14] = [
+    let older: [(&[&str], i32); 15] = [
         (&["status"], 3),
         (&["findings"], 3),
         (&["finding", "f0123456789"], 3),
@@ -365,6 +368,7 @@ fn no_store_and_a_store_of_another_format_are_worded_once_across_every_command()
         (&["program", "jq"], 3),
         (&["machine"], 3),
         (&["owner"], 3),
+        (&["owner", "box", "retired", "--reason", "invented"], 3),
         (&["vulnerabilities"], 3),
         (&["rules"], 3),
         (&["sample", "--sample-input", "/nonexistent/sample.json"], 3),
@@ -382,6 +386,25 @@ fn no_store_and_a_store_of_another_format_are_worded_once_across_every_command()
             "{args:?}: {said}"
         );
     }
+}
+
+#[test]
+fn a_command_that_writes_refuses_a_store_of_another_format_at_once_while_another_holds_the_run_lock()
+ {
+    let e = Estate::new("refused-first");
+    let folder = std::fs::File::open(e.dir()).unwrap();
+    folder.lock().unwrap();
+    let writes: [&[&str]; 3] = [
+        &["finding", "f0123456789", "seen"],
+        &["owner", "box", "retired", "--reason", "invented"],
+        &["sample", "--sample-input", "/nonexistent/sample.json"],
+    ];
+    for args in writes {
+        let out = e.on(&e.older(), args);
+        assert_eq!(out.status.code(), Some(3), "{args:?}: {}", stderr(&out));
+        assert!(stderr(&out).starts_with(OTHER_FORMAT), "{args:?}");
+    }
+    common::release(folder);
 }
 
 #[test]

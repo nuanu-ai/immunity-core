@@ -1257,11 +1257,10 @@ impl Watcher<'_> {
         let Some(_lock) = self.lock_for(SAMPLED)? else {
             return Ok(None);
         };
-        let sampled = crate::sample_held(
-            &self.args.store,
-            self.args.sample_input.as_deref(),
-            &mut self.signers,
-        );
+        let (store, input) = (&self.args.store, self.args.sample_input.as_deref());
+        let sampled = store::write_held(store, |tx| {
+            crate::sample_held(tx, store, input, &mut self.signers)
+        });
         self.mark_reading(SAMPLED, to_mark(&sampled, |_| None));
         let (report, needs) = sampled?;
         Ok(Some((report.findings_opened, needs)))
@@ -1370,16 +1369,17 @@ fn to_mark<T>(
 /// the run lock. It is recorded now, and never before `since`, when the watcher started: the
 /// status reads no failure older than that, and a clock set back must not hide one.
 fn mark(store: &Path, what: &str, failed: Option<&str>, since: i64) -> Result<(), Box<dyn Error>> {
-    let conn = store::open(store)?;
-    match failed {
-        Some(detail) => conn.execute(
-            "INSERT INTO watcher_failed (what, at, detail) VALUES (?1, ?2, ?3)
-             ON CONFLICT (what) DO UPDATE SET at = excluded.at, detail = excluded.detail",
-            params![what, crate::now_secs().max(since), detail],
-        )?,
-        None => conn.execute("DELETE FROM watcher_failed WHERE what = ?1", [what])?,
-    };
-    Ok(())
+    store::write_held(store, |tx| {
+        match failed {
+            Some(detail) => tx.execute(
+                "INSERT INTO watcher_failed (what, at, detail) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (what) DO UPDATE SET at = excluded.at, detail = excluded.detail",
+                params![what, crate::now_secs().max(since), detail],
+            )?,
+            None => tx.execute("DELETE FROM watcher_failed WHERE what = ?1", [what])?,
+        };
+        Ok(())
+    })
 }
 
 /// One reading of the watched places under the run lock the caller holds, as a small run of
