@@ -128,8 +128,8 @@ impl Dir {
     /// A full run that reads nothing real but the event level under the temporary root.
     fn run(&self) -> String {
         self.run_text();
-        // The run's line, as the journal keeps it and the page of changes shows it for each run;
-        // what a person reads after a run is told from the status (`after_run.rs`).
+        // The run's line, as the journal keeps it; what a person reads after a run is told from
+        // the status (`after_run.rs`).
         rusqlite::Connection::open(self.store())
             .unwrap()
             .query_row(

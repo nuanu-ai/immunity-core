@@ -50,7 +50,7 @@ fn store_of(tag: &str) -> (crate::common::Scratch, Connection) {
 const MAC: &str = "machine:example-mac";
 
 /// Writes one reading as `put_coverage` writes it, and gives back its latest record with what it
-/// did not read, as `view::latest_coverage` reads it back.
+/// did not read, as `covered::latest_coverage` reads it back.
 fn stored(
     conn: &Connection,
     scope: &str,
@@ -77,7 +77,7 @@ fn stored(
     };
     store::put_coverage(&tx, &r, completeness, reason, &gap).unwrap();
     tx.commit().unwrap();
-    let latest = crate::view::latest_coverage(conn).unwrap();
+    let latest = crate::covered::latest_coverage(conn).unwrap();
     let mine = |l: &&Latest| l.reader == reader && l.scope == scope && l.kind == kind;
     latest.iter().find(mine).unwrap().clone()
 }
@@ -363,7 +363,7 @@ fn a_walk_limited_to_the_folder_given_is_told_by_its_row_and_never_by_its_reason
     let (_dir, conn) = store_of("covered-given");
     let sessions = (crate::agent_folders::READER, crate::agent_folders::KIND);
     stored(&conn, MAC, sessions, ("full", None, Gap::default()));
-    let latest = || crate::view::latest_coverage(&conn).unwrap();
+    let latest = || crate::covered::latest_coverage(&conn).unwrap();
     let mut look = crate::look::Look::default();
     look.present = 1;
     look.read(crate::baseline::Unit::whole("dev"));
@@ -595,4 +595,23 @@ fn a_reading_names_the_kinds_of_watched_place_it_speaks_for_and_no_other() {
         .collect();
     assert_eq!(found, kept);
     assert!(of(&[(crate::tailnet::READER, crate::tailnet::KIND, MAC)]).is_empty());
+}
+
+#[test]
+fn every_way_a_project_or_the_home_folder_runs_code_that_is_read_is_a_kind_the_store_is_seeded_with()
+ {
+    // A reading of a kind the store does not know is refused when it is written: a way read here
+    // would be read and never kept.
+    let (_dir, conn) = store_of("ways-seeded");
+    let registered: Vec<String> = conn
+        .prepare("SELECT name FROM coverage_kind")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    let read = |p: &autorun::Point| p.part != autorun::Part::Present && p.read_here();
+    for (p, _) in autorun::ways().filter(|(p, _)| read(p)) {
+        assert!(registered.contains(&p.kind()), "{}", p.kind());
+    }
 }

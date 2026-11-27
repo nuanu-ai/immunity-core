@@ -945,7 +945,7 @@ fn a_connection_match_keeps_its_port_transport_parent_and_cut_command_line_after
     for fact in [
         "<dt>Port</dt><dd><span class=\"mono\">8443</span></dd>",
         "<dt>Transport</dt><dd><span class=\"w\">tcp</span></dd>",
-        "<dt>Parent</dt><dd><span class=\"mono\">/bin/zsh</span>, pid 500, signed by",
+        "<dt>Parent</dt><dd><span class=\"mono\"><bdi class=\"src\">/bin/zsh</bdi></span>, pid 500, signed by",
     ] {
         assert!(page.contains(fact), "{fact}");
     }

@@ -3528,29 +3528,6 @@ fn a_verdict_an_answer_or_a_statement_given_during_a_check_is_taken_once_the_che
     assert_eq!(mac.json(&["owner"])["statements"][0]["said"], "retired");
 }
 
-#[test]
-fn verdicts_and_answers_are_not_runs_on_the_page() {
-    let mac = Mac::new("not-a-run");
-    mac.package(true);
-    mac.run();
-    let store = mac.store_id();
-    let id = mac.latest(MALICIOUS).unwrap();
-    let changes = |mac: &Mac| -> String {
-        mac.page();
-        let page = std::fs::read_to_string(mac.0.join("store/view/changes.html")).unwrap();
-        let at = page.find("<section id=\"changes\">").unwrap();
-        page[at..].to_string()
-    };
-    let before = changes(&mac);
-    mac.send(&about_finding(&store, &id, "harmless", "case-1"));
-    mac.send(&about_finding(&store, &id, "suspicious", "case-2"));
-    assert!(mac.answer(&id, &["seen"]).status.success());
-    assert_eq!(changes(&mac), before);
-    // Not vacuous: a run is a run on the page.
-    mac.run();
-    assert_ne!(changes(&mac), before);
-}
-
 // ---- The sender's text is data. ----
 
 #[test]
@@ -3612,7 +3589,9 @@ fn the_sender_s_text_never_leaves_its_quotation_and_is_never_cut() {
         long.as_str()
     );
     let page = mac2.page();
-    assert!(page.contains(&format!("<blockquote class=\"quote\">{long}</blockquote>")));
+    assert!(page.contains(&format!(
+        "<blockquote class=\"quote\"><bdi class=\"src\">{long}</bdi></blockquote>"
+    )));
     assert!(
         !page
             .lines()

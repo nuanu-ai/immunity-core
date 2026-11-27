@@ -611,7 +611,7 @@ mod tests {
             watched::content_coverage(&decided, true),
             not_given("partial")
         );
-        let latest = crate::view::Latest {
+        let latest = crate::covered::Latest {
             reader: watched::READER.to_string(),
             scope: format!("file:mac{BEHIND}"),
             kind: watched::CONTENT.to_string(),

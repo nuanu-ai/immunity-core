@@ -1,24 +1,18 @@
 //! The view: a small summary page that answers what the app answers, and pages of details
-//! next to it with the big tables. It only reads. Nothing from the network: plain HTML,
-//! `<details>` and inline CSS. One script, fixed in the program and named by one fixed tag,
-//! keeps the numbers of "As it happens" fresh while the summary is open (`happens.rs`) and
-//! copies a finding's command for an agent; no other page has one, and nothing from the store
-//! ever becomes script.
+//! next to it. Every page is drawn from what the commands answer (`Answers` and the status), and
+//! nothing here reads the store. Nothing from the network: plain HTML, `<details>` and inline
+//! CSS. One script, fixed in the program and named by one fixed tag, keeps the numbers of "As it
+//! happens" fresh while the summary is open (`happens.rs`) and copies a finding's command for an
+//! agent; no other page has one, and nothing from the store ever becomes script.
 //!
-//! Invariant: every piece of text that comes from the store goes through `esc`
-//! before it enters the page. Names, versions, reasons and source references are
-//! partly written by an attacker and must never become markup.
+//! Invariant: text the core did not write (a name, a path, a reason, a rule's title, anything in
+//! a field whose name ends in `_text`) may have been written by an attacker for a person or an
+//! agent to read. It reaches a page only through the printers `secrets::Name` and
+//! `secrets::Said`: `html`, in an element of its own, or `attr`, inside an attribute's quotes.
+//! `esc` is for the core's own words.
 
-use rusqlite::{Connection, OptionalExtension, params};
 use std::error::Error;
 use std::fmt::Write;
-
-/// The runs the changes page lists (`store::listed_runs`).
-const RUNS_SHOWN: i64 = crate::store::RUNS_KEPT;
-/// The most kinds of watched places a watcher's reading is named by on the changes page.
-const KINDS_NAMED: usize = 3;
-/// The latest run is shown open only when its changes fit on a screen or a few.
-const EVENTS_SHOWN_OPEN: usize = 500;
 
 pub type Out = Result<(), Box<dyn Error>>;
 
@@ -35,46 +29,6 @@ pub const MADE: &str = "view/made.json";
 /// changes with time alone, such as an answer that expires or how old the last check is, is
 /// shown at most this late; every page says when it was made.
 pub const CURRENT_FOR: i64 = 3600;
-
-/// What the pages rest on that changes without the clock: the journal's latest entry (every
-/// change, finding raised or answered, owner's word, run and reading of threat data), what
-/// each latest reading covered, the watcher that holds the store and what failed in it, and
-/// the program that writes the pages. Equal bases make the same pages, but for the time
-/// they were made, the latest sample's counts, and what the event level records, which pages
-/// show with their time. What the event level records has a basis of its own,
-/// `events::basis`, kept beside this one in `MADE`: when only it moved, the pages that show it
-/// are written again (`event_pages`). Cheap: a lookup by key, the latest readings and a lock.
-pub fn basis(conn: &Connection, folder: &std::path::Path) -> Result<String, Box<dyn Error>> {
-    use std::hash::{Hash, Hasher};
-    // The latest journal entry but a `matched` one, which says a published rule matched in a
-    // reading: what it counts is the event level's and moves `events::basis`, and no page shows
-    // the entry itself. A match that raises or reopens a finding writes the finding's own entry
-    // in the same transaction, which moves this. Walked from the newest, so a run of `matched`
-    // entries is skipped, not the journal scanned.
-    let journal: i64 = conn
-        .query_row(
-            "SELECT seq FROM journal WHERE entry != 'matched' ORDER BY seq DESC LIMIT 1",
-            [],
-            |r| r.get(0),
-        )
-        .optional()?
-        .unwrap_or(0);
-    // A reading's time and id are new at every reading; what it covered is not.
-    let mut covered = std::collections::hash_map::DefaultHasher::new();
-    for l in latest_coverage(conn)? {
-        (l.reader, l.scope, l.kind, l.completeness, l.reason, l.cause).hash(&mut covered);
-    }
-    let watcher = crate::watch::basis(conn, folder)?;
-    let program = std::env::current_exe()?;
-    let meta = std::fs::metadata(&program)?;
-    Ok(format!(
-        "journal {journal}; covered {:016x}; watcher {watcher}; program {} {} {:?}",
-        covered.finish(),
-        program.display(),
-        meta.len(),
-        meta.modified()?
-    ))
-}
 
 /// What the commands answer, built in process from the read the pages are made in, which the
 /// pages are drawn from: so a page shows what the command shows and decides nothing again.
@@ -99,11 +53,11 @@ pub struct Answers<'a> {
 /// `immunity machine <id>` as the pages ask it, by an id as the contract gives it, and with
 /// `--files-anywhere` when the second is true.
 pub type MachineOf<'a> =
-    dyn Fn(&str, bool) -> rusqlite::Result<Option<crate::contract::v1::Known>> + 'a;
+    dyn Fn(&str, bool) -> Result<Option<crate::contract::v1::Known>, Box<dyn Error>> + 'a;
 
 /// `immunity finding <id>` as the pages ask it.
 pub type FindingOf<'a> =
-    dyn Fn(&str) -> rusqlite::Result<Option<crate::contract::v1::Finding>> + 'a;
+    dyn Fn(&str) -> Result<Option<crate::contract::v1::Finding>, Box<dyn Error>> + 'a;
 
 #[cfg(test)]
 impl Answers<'_> {
@@ -121,19 +75,14 @@ impl Answers<'_> {
 }
 
 /// Every page the view writes, as its path relative to the store's folder and its HTML: the
-/// summary first, then the pages its links lead a person to (`pages.rs`), then one technical
-/// page for each of the big tables. The summary and the pages of this Mac, of vulnerabilities and
-/// of threat data are drawn from what the commands answer (`Answers`, and the result `immunity
-/// status --json` gives), so the two say the same; the technical pages are what the store holds,
-/// reached from one line at the bottom of the summary.
+/// summary first, then the pages its links lead a person to (`pages.rs`). Each is drawn from what
+/// the commands answer (`Answers`, and the result `immunity status --json` gives), so the two say
+/// the same.
 pub fn pages(
-    conn: &Connection,
     result: &crate::contract::v1::Status,
     answers: &Answers,
-    store: &str,
     now: i64,
 ) -> Result<Vec<(String, String)>, Box<dyn Error>> {
-    let latest = latest_coverage(conn)?;
     // This Mac's page lists every watched file on it, so it asks as `immunity machine <this Mac>
     // --files-anywhere` does.
     let this = (result.this_mac.as_ref()).and_then(|m| m.id_text.as_deref());
@@ -142,53 +91,38 @@ pub fn pages(
         None => None,
     };
     let vulnerabilities = answers.vulnerabilities.clone().unwrap_or_default();
+    let detail = |name: &str| format!("{DETAILS}/{name}.html");
     let mut pages = vec![
         (
             SUMMARY.to_string(),
             crate::pages::summary(result, answers, now)?,
         ),
         (
-            format!("{DETAILS}/{}.html", crate::pages::THIS_MAC),
+            detail(crate::pages::THIS_MAC),
             crate::pages::this_mac::page(result, machine.as_ref(), now),
         ),
         (
-            format!("{DETAILS}/{}.html", crate::pages::BEYOND),
+            detail(crate::pages::BEYOND),
             crate::pages::beyond::page(result, &answers.statements, &answers.machine, now)?,
         ),
+        (detail(crate::pages::TECHNICAL), crate::pages::technical()),
         (
-            format!("{DETAILS}/{}.html", crate::pages::TECHNICAL),
-            crate::pages::technical(),
-        ),
-        (
-            format!("{DETAILS}/{}.html", crate::pages::VULNERABILITIES),
+            detail(crate::pages::VULNERABILITIES),
             crate::pages::vulnerabilities::page(&vulnerabilities, result, now),
         ),
         (
-            format!("{DETAILS}/{}.html", crate::pages::THREAT_DATA),
+            detail(crate::pages::THREAT_DATA),
             crate::pages::vulnerabilities::threat_data(result, now),
         ),
         (
-            format!("{DETAILS}/{}.html", crate::pages::RULES),
+            detail(crate::pages::RULES),
             crate::pages::rules::page(&answers.rules, result, now),
         ),
+        (
+            detail(crate::pages::COVERAGE),
+            crate::pages::coverage::page(result, now),
+        ),
     ];
-    for (name, title) in DETAIL_PAGES {
-        let mut body = String::new();
-        match name {
-            "coverage" => coverage(conn, &mut body, &latest, now)?,
-            "changes" => changes(conn, &mut body)?,
-            "gone" => retracted(conn, &mut body)?,
-            _ => vocabulary(conn, &mut body)?,
-        }
-        let mut out = head(title);
-        out.push_str(
-            "<nav class=\"meta\"><a href=\"../view.html\">← What needs a look</a></nav>\n",
-        );
-        header(conn, &mut out, store, now)?;
-        out.push_str(&body);
-        out.push_str(FOOT);
-        pages.push((format!("{DETAILS}/{name}.html"), out));
-    }
     for (anchor, title) in SECTIONS {
         pages.push((section_file(anchor), section_page(anchor, title)));
     }
@@ -213,6 +147,30 @@ pub fn event_pages(
             crate::pages::rules::page(&answers.rules, result, now),
         ),
     ])
+}
+
+/// Takes away what earlier runs of the view left in its folder of details and this run did not
+/// write, such as a page an earlier build wrote and this one does not: every regular file
+/// directly in `DETAILS` under the store's `folder` whose name ends in `.html` and is not one of
+/// `written`, the pages this run wrote, each relative to `folder`. A link is taken away itself
+/// and never followed; a folder, a file of another ending and anything below a folder stay. A
+/// file that cannot be taken away stays, and the view does not fail for it.
+pub fn remove_stale(folder: &std::path::Path, written: &[String]) {
+    let Ok(entries) = std::fs::read_dir(folder.join(DETAILS)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let page = name.as_encoded_bytes().ends_with(b".html");
+        let ours = (name.to_str()).is_some_and(|n| written.contains(&format!("{DETAILS}/{n}")));
+        // The type of the entry itself: a link is a link, whatever it points to.
+        let plain = entry
+            .file_type()
+            .is_ok_and(|t| t.is_file() || t.is_symlink());
+        if page && plain && !ours {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// The sections of the summary something outside the page may ask for, by anchor and
@@ -257,14 +215,6 @@ fn section_page(anchor: &str, title: &str) -> String {
     )
 }
 
-/// The pages of details, by file name and title.
-pub const DETAIL_PAGES: [(&str, &str); 4] = [
-    ("coverage", "What was read and how completely"),
-    ("changes", "Changes"),
-    ("gone", "No longer there"),
-    ("vocabulary", "Vocabulary"),
-];
-
 pub const FOOT: &str = "</main>\n</body>\n</html>\n";
 
 pub fn head(title: &str) -> String {
@@ -297,55 +247,23 @@ pub fn given_by(via: crate::findings::Via) -> &'static str {
     }
 }
 
-/// Makes text safe to put anywhere in the page, inside elements and inside quoted attributes.
-/// Characters that could reorder or hide text are shown escaped, as `shown` shows them. This is
-/// the one place a page writes a name, such as a path or a server's name, and any other text not
-/// already in the form `secrets::said` gives: a backslash is written `\u{5c}`, as `Text::ours`
-/// shows a name, so no name reads as a mark. One that already begins a `\u{…}`, as in a name the
-/// contract gives, is kept, which can read as an escaped character and never as a mark. Text
-/// that holds marks goes through `esc_said`.
+/// The core's own words as a page writes them, inside elements and inside quoted attributes:
+/// the five characters of markup as entities, and nothing else changed. Text from outside goes
+/// through the printers instead (`secrets::Name::html`, `secrets::Said::html`), which write a
+/// hidden character or a backslash as `\u{…}`.
 pub fn esc(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    for (i, c) in s.char_indices() {
-        if c == '\\' && !escape_at(&s[i..]) {
-            out.push_str("\\u{5c}");
-        } else {
-            esc_char(&mut out, c);
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            c => out.push(c),
         }
     }
     out
-}
-
-/// `esc` for text already in the form `secrets::said` gives, or a contract's field that holds
-/// marks: each bare backslash is the start of a mark the core made or of a `\u{…}`, kept.
-pub fn esc_said(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        esc_char(&mut out, c);
-    }
-    out
-}
-
-/// Whether `s` begins with a character written `\u{…}`: one to six hex digits and a brace.
-fn escape_at(s: &str) -> bool {
-    let Some(rest) = s.strip_prefix("\\u{") else {
-        return false;
-    };
-    let hex = rest.bytes().take_while(u8::is_ascii_hexdigit).count();
-    (1..=6).contains(&hex) && rest.as_bytes().get(hex) == Some(&b'}')
-}
-
-/// One character as a page writes it.
-fn esc_char(out: &mut String, c: char) {
-    match c {
-        '&' => out.push_str("&amp;"),
-        '<' => out.push_str("&lt;"),
-        '>' => out.push_str("&gt;"),
-        '"' => out.push_str("&quot;"),
-        '\'' => out.push_str("&#39;"),
-        c if crate::icu::hidden(c) => out.extend(c.escape_unicode()),
-        _ => out.push(c),
-    }
 }
 
 /// Text as the terminal may show it: every character that is hidden is written as
@@ -361,10 +279,6 @@ pub fn shown(s: &str) -> String {
     }
     out
 }
-
-/// What a source said, such as why a reader could not read a place, as every output shows it
-/// (`secrets::said`). A page escapes it with `esc`, as any other text.
-pub use crate::secrets::said;
 
 /// UTC seconds as `YYYY-MM-DD HH:MM UTC`.
 pub fn utc(secs: i64) -> String {
@@ -382,7 +296,6 @@ pub fn iso(secs: i64) -> String {
         rest % 60
     )
 }
-
 /// The date `YYYY-MM-DD` and the seconds into that day, from the civil-from-days algorithm.
 fn civil(secs: i64) -> (String, i64) {
     let (days, rest) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
@@ -466,11 +379,6 @@ pub fn component_name(id: &str) -> (&str, &str) {
     split_component(id).map_or(("", id), |(_, ecosystem, name)| (ecosystem, name))
 }
 
-/// Where a component is, or nothing for anything else.
-pub fn component_place(id: &str) -> &str {
-    split_component(id).map_or("", |(place, _, _)| place)
-}
-
 /// The time and how many whole days ago it was, or that it is ahead of the clock
 /// (`store::age`).
 pub(crate) fn utc_age(secs: i64, now: i64) -> String {
@@ -481,30 +389,9 @@ pub(crate) fn utc_age(secs: i64, now: i64) -> String {
     }
 }
 
-/// The predicate in plain words where there is one.
-fn what(predicate: &str) -> &str {
-    match predicate {
-        "part_of" => "present on",
-        "has_version" => "version",
-        "located_on" => "located on",
-        "runs_os" => "operating system",
-        "runs_platform" => "system, as the private network names it",
-        "runs_kernel" => "kernel",
-        "runs_image" => "image",
-        "known_as" => "known as",
-        "same_as" => "same machine as",
-        other => other,
-    }
-}
-
-/// A table cell with escaped text and an optional class.
+/// A table cell with the core's own words, escaped, and an optional class.
 pub fn td(out: &mut String, class: &str, text: &str) -> Out {
     cell(out, class, &esc(text))
-}
-
-/// `td` for text in the form `secrets::said` gives, which holds marks (`esc_said`).
-pub fn td_said(out: &mut String, class: &str, text: &str) -> Out {
-    cell(out, class, &esc_said(text))
 }
 
 pub(crate) fn cell(out: &mut String, class: &str, html: &str) -> Out {
@@ -516,17 +403,6 @@ pub(crate) fn cell(out: &mut String, class: &str, html: &str) -> Out {
     Ok(())
 }
 
-/// A cell that shows a component's name and keeps its full id as a tooltip.
-fn td_component(out: &mut String, id: &str) -> Out {
-    write!(
-        out,
-        "<td title=\"{}\">{}</td>",
-        esc(id),
-        esc(component_name(id).1)
-    )?;
-    Ok(())
-}
-
 pub fn thead(out: &mut String, columns: &[&str]) {
     out.push_str("<thead><tr>");
     for c in columns {
@@ -535,108 +411,6 @@ pub fn thead(out: &mut String, columns: &[&str]) {
         out.push_str("</th>");
     }
     out.push_str("</tr></thead>\n<tbody>\n");
-}
-
-fn header(conn: &Connection, out: &mut String, store: &str, now: i64) -> Out {
-    let version: String = conn.query_row(
-        "SELECT value FROM meta WHERE key = 'format_version'",
-        [],
-        |r| r.get(0),
-    )?;
-    let finished = crate::status::latest_finished(conn)?.and_then(|m| m.finished_at);
-    write!(
-        out,
-        "<header>\n<h1>What the store holds</h1>\n<p class=\"meta\">Generated {} · store <span class=\"mono\">{}</span> · format version {} · last run finished {}</p>\n</header>\n",
-        utc(now),
-        esc(store),
-        esc(&version),
-        utc_or(finished, "never")
-    )?;
-    Ok(())
-}
-
-/// The latest run, by the order of the journal, if it never wrote `run_finished`.
-fn unfinished_latest_run(conn: &Connection) -> rusqlite::Result<Option<i64>> {
-    let latest: Option<(i64, bool)> = conn
-        .query_row(
-            "SELECT at, EXISTS (SELECT 1 FROM journal f
-                                WHERE f.run_id = j.run_id AND f.entry = 'run_finished')
-             FROM journal j WHERE entry = 'run_started' ORDER BY seq DESC LIMIT 1",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .map(Some)
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            e => Err(e),
-        })?;
-    Ok(latest.and_then(|(at, finished)| (!finished).then_some(at)))
-}
-
-/// The latest coverage record of one reader, scope and kind.
-#[derive(Clone, Default)]
-pub struct Latest {
-    /// Its row of `coverage`.
-    pub id: i64,
-    pub reader: String,
-    pub scope: String,
-    pub kind: String,
-    pub completeness: String,
-    pub reason: Option<String>,
-    /// Why it is incomplete, as `coverage.cause` holds it; `None` on a full reading and on
-    /// a reading written before causes were kept.
-    pub cause: Option<String>,
-    pub at: i64,
-    pub last_full: Option<i64>,
-    /// What it did not read (`store::unread_of`); none on a full reading.
-    pub unread: Vec<crate::store::Unread>,
-}
-
-/// The latest record for each reader, scope and kind, and its latest full one, with what each
-/// did not read.
-/// Readings that are not full come first. Readings inside a container or checkout that
-/// is gone no longer count and are left out. `immunity status` counts coverage from this too.
-pub fn latest_coverage(conn: &Connection) -> rusqlite::Result<Vec<Latest>> {
-    let mut latest: Vec<Latest> = conn
-        .prepare(&format!(
-            "{latest}
-         SELECT c.reader, c.scope, c.kind, c.completeness, c.reason, c.observed_at,
-                (SELECT MAX(f.observed_at) FROM coverage f
-                 WHERE f.reader = c.reader AND f.scope = c.scope AND f.kind = c.kind
-                   AND f.completeness = 'full'),
-                c.cause, c.id
-         FROM latest c
-         WHERE NOT {gone}
-         ORDER BY c.completeness = 'full', c.completeness, c.reader, c.scope, c.kind",
-            latest = crate::store::LATEST,
-            gone = crate::store::gone_entity("c.scope")
-        ))?
-        .query_map([], |r| {
-            Ok(Latest {
-                reader: r.get(0)?,
-                scope: r.get(1)?,
-                kind: r.get(2)?,
-                completeness: r.get(3)?,
-                reason: r.get(4)?,
-                at: r.get(5)?,
-                last_full: r.get(6)?,
-                cause: r.get(7)?,
-                id: r.get(8)?,
-                unread: Vec::new(),
-            })
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    let mut not_full: Vec<&mut Latest> = (latest.iter_mut())
-        .filter(|r| r.completeness != "full")
-        .collect();
-    let ids: Vec<i64> = not_full.iter().map(|r| r.id).collect();
-    for (r, rows) in not_full
-        .iter_mut()
-        .zip(crate::store::unread_of(conn, &ids)?)
-    {
-        r.unread = rows;
-    }
-    Ok(latest)
 }
 
 /// A completeness as the owner reads it: what is known and what is not. A full reading
@@ -664,396 +438,8 @@ pub(crate) fn badge(out: &mut String, completeness: &str, note: Option<&str>) ->
     Ok(())
 }
 
-fn coverage(conn: &Connection, out: &mut String, rows: &[Latest], now: i64) -> Out {
-    out.push_str("<section id=\"coverage\">\n<h2>What was read and how completely</h2>\n");
-    out.push_str("<p class=\"muted\">Everything below is only as good as this.</p>\n");
-    if let Some(at) = unfinished_latest_run(conn)? {
-        writeln!(
-            out,
-            "<p class=\"alert\">The latest run started at {} and never finished. Nothing it read is in the store.</p>",
-            utc(at)
-        )?;
-    }
-    // The content of each watched file and the hooks of each checkout are readings of their
-    // own; those read in full are shown under watched places, not here. A checkout in which the
-    // reading of lockfiles found none is named under machines, as a checkout without a lockfile.
-    let per_thing = [crate::watched::CONTENT, crate::watched::HOOK_KIND];
-    let rows: Vec<&Latest> = rows
-        .iter()
-        .filter(|r| !per_thing.contains(&r.kind.as_str()) || r.completeness != "full")
-        .filter(|r| r.reason.as_deref() != Some(crate::lockfiles::NONE_FOUND_NOTE))
-        .collect();
-    if rows.is_empty() {
-        out.push_str("<p class=\"alert\">Nothing has been read yet.</p>\n</section>\n");
-        return Ok(());
-    }
-    let not_full = rows.iter().filter(|r| r.completeness != "full").count();
-    let partial = rows.iter().filter(|r| r.completeness == "partial").count();
-    if not_full == 0 {
-        out.push_str("<p class=\"ok\">Every reading was full at its latest run.</p>\n");
-    } else {
-        writeln!(
-            out,
-            "<p class=\"alert\">{not_full} of {} readings were not full at their latest run. \
-             What they cover below may be out of date or missing.</p>",
-            rows.len()
-        )?;
-    }
-    if partial > 0 {
-        writeln!(
-            out,
-            "<p class=\"alert\">{partial} of them were partial: what they saw was added, \
-             but what disappeared there cannot be seen. Removals there are unknown.</p>"
-        )?;
-    }
-
-    out.push_str("<div class=\"scroll\"><table>\n");
-    thead(
-        out,
-        &[
-            "Reader",
-            "Where",
-            "What",
-            "Completeness",
-            "Why, or what was there",
-            "Last read",
-            "Last full read",
-        ],
-    );
-    for r in rows {
-        let full = r.completeness == "full";
-        out.push_str(if full { "<tr>" } else { "<tr class=\"bad\">" });
-        td(out, "", &r.reader)?;
-        td(out, "mono", &r.scope)?;
-        td(out, "", &r.kind)?;
-        out.push_str("<td>");
-        badge(out, &r.completeness, r.reason.as_deref())?;
-        out.push_str("</td>");
-        td_said(
-            out,
-            "",
-            &r.reason.as_deref().map_or_else(
-                || (if full { "" } else { "no reason given" }).to_string(),
-                said,
-            ),
-        )?;
-        td(out, "nowrap", &utc_age(r.at, now))?;
-        let last = if full {
-            "this one".to_string()
-        } else {
-            utc_or(r.last_full, "never")
-        };
-        td(out, "nowrap", &last)?;
-        out.push_str("</tr>\n");
-    }
-    out.push_str("</tbody></table></div>\n</section>\n");
-    Ok(())
-}
-
 pub(crate) fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
-}
-
-fn changes(conn: &Connection, out: &mut String) -> Out {
-    write!(
-        out,
-        "<section id=\"changes\">\n<h2>Changes</h2>\n<p class=\"muted\">The last {RUNS_SHOWN} runs, newest first.</p>\n"
-    )?;
-    // The runs whose every reading the store keeps (`store::listed_runs`), so that what the page
-    // says of each does not change when older readings are folded.
-    let runs = crate::store::listed_runs(conn)?;
-    if runs.is_empty() {
-        out.push_str("<p>No runs yet.</p>\n");
-    }
-
-    // Whether a partial reading ever made an assertion: one that never did has nothing
-    // that could be removed, so removals there are not unknown.
-    let mut not_full_stmt = conn.prepare(
-        "SELECT scope, kind, completeness, reason,
-                EXISTS (SELECT 1 FROM assertion a WHERE a.layer IN ('live', 'retracted')
-                          AND a.reader = c.reader AND a.scope = c.scope AND a.kind = c.kind)
-         FROM coverage c
-         WHERE run_id = ?1 AND completeness != 'full'
-         ORDER BY completeness, scope, kind",
-    )?;
-    // Scopes read before this run and not read by it: nothing is known about them.
-    let mut not_repeated_stmt = conn.prepare(&format!(
-        "{}
-         SELECT COUNT(*) FROM reading r
-         WHERE (SELECT c.id FROM coverage c
-                WHERE c.reader = r.reader AND c.scope = r.scope AND c.kind = r.kind
-                ORDER BY c.id LIMIT 1) < (SELECT MIN(id) FROM coverage WHERE run_id = ?1)
-           AND r.scope NOT IN (SELECT scope FROM coverage WHERE run_id = ?1)
-           AND NOT {}",
-        crate::store::LATEST,
-        crate::store::gone_entity("r.scope")
-    ))?;
-    // What a watcher's reading read: the kinds its readings are of, a file's content aside.
-    let mut kinds_stmt = conn.prepare(
-        "SELECT DISTINCT kind FROM coverage WHERE run_id = ?1 AND kind != ?2 ORDER BY kind",
-    )?;
-    for (i, run) in runs.iter().enumerate() {
-        let (run_id, at, finished, report) = (&run.run_id, &run.at, &run.finished, &run.report);
-        // Counted as the report and `immunity status` count them: what was read for the first
-        // time is the baseline, shown as such and never as added.
-        let (since, first, events) = crate::status::run_changes(conn, run_id)?;
-        let not_full: Vec<(String, String, String, Option<String>, bool)> = not_full_stmt
-            .query_map([run_id], |r| {
-                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        // A watcher's reading, `immunity watch`, reads only the watched places and never finishes
-        // a run: it is shown as a watcher's reading, not as a run that did not finish.
-        let sampled = run_id.starts_with(crate::processes::RUN_PREFIX);
-        let watcher = run_id.starts_with(crate::watch::RUN_PREFIX) || sampled;
-        let not_repeated: i64 = if watcher {
-            0
-        } else {
-            not_repeated_stmt.query_row([run_id], |r| r.get(0))?
-        };
-        let partial = not_full.iter().any(|r| r.2 == "partial" && r.4);
-        // The event level keeps no facts: a reading of it that read nothing hides no change.
-        let nothing = not_repeated > 0
-            || not_full.iter().any(|r| {
-                r.2 == "none" && r.1 != crate::events::KIND && r.1 != crate::events::KIND_FILES
-            });
-
-        // No events is "no changes" only when the run finished, read everything in full
-        // and read again every scope read before.
-        let mut counts = format!(
-            "+{} added, {} changed, {} removed",
-            since.added, since.changed, since.removed
-        );
-        if first > 0 {
-            counts.push_str(&format!(
-                ", {} read for the first time and kept as the baseline",
-                plural(first, "thing", "things")
-            ));
-        }
-        let mut unknown = Vec::new();
-        if partial {
-            unknown.push("removals unknown where a reading was partial");
-        }
-        if nothing {
-            unknown.push("changes unknown where nothing was read");
-        }
-        let summary = if !finished && !watcher {
-            "did not finish, changes unknown".to_string()
-        } else if !unknown.is_empty() {
-            format!("{counts}; {}", unknown.join(", "))
-        } else if !events.is_empty() {
-            counts
-        } else {
-            "no changes".to_string()
-        };
-        let summary = if sampled {
-            "sample of running programs and their connections".to_string()
-        } else if watcher {
-            // A reading of some places names them; one of every place, too many to name, says
-            // how many kinds it read.
-            let kinds: Vec<String> = kinds_stmt
-                .query_map(params![run_id, crate::watched::CONTENT], |r| r.get(0))?
-                .collect::<rusqlite::Result<_>>()?;
-            let read = if kinds.len() <= KINDS_NAMED {
-                kinds.join(", ")
-            } else {
-                format!("{} kinds of watched places", kinds.len())
-            };
-            format!("watcher's reading of {read}: {summary}")
-        } else {
-            summary
-        };
-
-        write!(
-            out,
-            "<details{}>\n<summary><span class=\"nowrap\">{}</span> · {}</summary>\n",
-            if i == 0 && events.len() <= EVENTS_SHOWN_OPEN {
-                " open"
-            } else {
-                ""
-            },
-            utc(*at),
-            esc(&summary)
-        )?;
-        // The run's line, as the run printed it: what its readers' sources said in it, such as
-        // why a server could not be opened, was cut piece by piece when the line was put
-        // together (`report` in main.rs), and is never cut again, which could take the core's
-        // words with it.
-        if let Some(report) = report {
-            writeln!(out, "<p class=\"muted mono\">{}</p>", esc_said(report))?;
-        }
-        if not_repeated > 0 {
-            writeln!(
-                out,
-                "<p class=\"alert\">{} read before were not read in this run.</p>",
-                plural(not_repeated as usize, "reading", "readings")
-            )?;
-        }
-        if !not_full.is_empty() {
-            out.push_str("<ul class=\"readings\">\n");
-            for (scope, kind, completeness, reason, _) in &not_full {
-                write!(
-                    out,
-                    "<li><span class=\"mono\">{}</span> · {} ",
-                    esc(scope),
-                    esc(kind)
-                )?;
-                badge(out, completeness, reason.as_deref())?;
-                writeln!(
-                    out,
-                    " {}</li>",
-                    esc_said(
-                        &reason
-                            .as_deref()
-                            .map_or("no reason given".to_string(), said)
-                    )
-                )?;
-            }
-            out.push_str("</ul>\n");
-        }
-        if !events.is_empty() {
-            out.push_str("<div class=\"scroll\"><table class=\"dense\">\n");
-            thead(out, &["Change", "Component", "Where", "What", "Value"]);
-            for e in &events {
-                let entry = if e.first { "first reading" } else { &e.entry };
-                write!(out, "<tr class=\"{}\">", esc(&e.entry))?;
-                td(out, "", entry)?;
-                td_component(out, &e.subject)?;
-                td(out, "mono", component_place(&e.subject))?;
-                td(out, "", what(&e.predicate))?;
-                let value = match (&e.old, &e.new) {
-                    (Some(o), Some(n)) => format!("{o} → {n}"),
-                    (Some(v), None) | (None, Some(v)) => v.clone(),
-                    (None, None) => String::new(),
-                };
-                td(out, "mono", &value)?;
-                out.push_str("</tr>\n");
-            }
-            out.push_str("</tbody></table></div>\n");
-        }
-        out.push_str("</details>\n");
-    }
-    out.push_str("</section>\n");
-    Ok(())
-}
-
-fn retracted(conn: &Connection, out: &mut String) -> Out {
-    out.push_str("<section id=\"gone\">\n<h2>No longer there</h2>\n");
-    type Row = (String, String, String, String, i64, Option<i64>, String);
-    let rows: Vec<Row> = conn
-        .prepare(
-            // A fact of a kind no longer read was set aside, not found gone
-            // (`lifecycle::retire`).
-            "SELECT subject, predicate, object, reader, observed_at, retracted_at, source_ref
-             FROM assertion a WHERE layer = 'retracted'
-               AND NOT EXISTS (SELECT 1 FROM journal j
-                               WHERE j.entry = 'retired' AND j.run_id = a.retracted_by
-                                 AND j.reader = a.reader AND j.scope = a.scope
-                                 AND j.kind = a.kind AND j.subject = a.subject
-                                 AND j.predicate = a.predicate)
-             ORDER BY retracted_at DESC, subject, predicate, object",
-        )?
-        .query_map([], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    if rows.is_empty() {
-        out.push_str("<p>Nothing has disappeared yet.</p>\n</section>\n");
-        return Ok(());
-    }
-    write!(
-        out,
-        "<details>\n<summary>{} statements no longer made, newest first</summary>\n",
-        rows.len()
-    )?;
-    out.push_str("<div class=\"scroll\"><table class=\"dense\">\n");
-    thead(
-        out,
-        &[
-            "Component",
-            "Where",
-            "What",
-            "Value",
-            "Reader",
-            "First seen",
-            "Gone since",
-            "Source",
-        ],
-    );
-    for (subject, predicate, object, reader, seen, gone, source) in &rows {
-        out.push_str("<tr>");
-        td_component(out, subject)?;
-        td(out, "mono", component_place(subject))?;
-        td(out, "", what(predicate))?;
-        td(out, "mono", object)?;
-        td(out, "", reader)?;
-        td(out, "nowrap", &utc(*seen))?;
-        td(out, "nowrap", &utc_or(*gone, ""))?;
-        td(out, "mono", source)?;
-        out.push_str("</tr>\n");
-    }
-    out.push_str("</tbody></table></div>\n</details>\n</section>\n");
-    Ok(())
-}
-
-fn vocabulary(conn: &Connection, out: &mut String) -> Out {
-    out.push_str("<section id=\"vocabulary\">\n<h2>Vocabulary</h2>\n<details>\n");
-    out.push_str("<summary>The words the store uses: kinds of things, links between them, what readings look for and how a source knows</summary>\n");
-    let tables: [(&str, &[&str], &str); 4] = [
-        (
-            "Kinds of things",
-            &["Name", "Status"],
-            "SELECT name, status FROM entity_type ORDER BY status = 'reserved', name",
-        ),
-        (
-            "Links",
-            &["Name", "Points to", "Status"],
-            "SELECT name, COALESCE(object_kind, ''), status FROM predicate
-             ORDER BY status = 'reserved', name",
-        ),
-        (
-            "What readings look for",
-            &["Name"],
-            "SELECT name FROM coverage_kind ORDER BY name",
-        ),
-        (
-            "Basis, strongest first",
-            &["Name", "Strength"],
-            "SELECT name, CAST(strength AS TEXT) FROM basis_kind ORDER BY strength",
-        ),
-    ];
-    for (title, columns, sql) in tables {
-        write!(
-            out,
-            "<h3>{title}</h3>\n<div class=\"scroll\"><table class=\"dense\">\n"
-        )?;
-        thead(out, columns);
-        let mut stmt = conn.prepare(sql)?;
-        let n = stmt.column_count();
-        let rows = stmt.query_map([], |r| {
-            (0..n)
-                .map(|i| r.get::<_, String>(i))
-                .collect::<rusqlite::Result<Vec<_>>>()
-        })?;
-        for row in rows {
-            out.push_str("<tr>");
-            for cell in row? {
-                td(out, "", &cell)?;
-            }
-            out.push_str("</tr>\n");
-        }
-        out.push_str("</tbody></table></div>\n");
-    }
-    out.push_str("</details>\n</section>\n");
-    Ok(())
 }
 
 const HEAD: &str = r#"<!doctype html>
@@ -1140,7 +526,6 @@ table.dense th, table.dense td { padding: 4px 8px; }
 td.mono { white-space: normal; overflow-wrap: break-word; max-width: 36ch; }
 td:not(.mono):not(.nowrap) { min-width: 12ch; overflow-wrap: anywhere; }
 tr.bad td { font-weight: 600; }
-tr.removed td:first-child, tr.changed td:first-child { color: var(--t2); }
 
 /* Marks and notes of the pages of details: words, never a colour. */
 .badge { display: inline-block; padding: 0 8px; border-radius: 999px; font: 600 12px/20px var(--font); white-space: nowrap; border: 1px solid var(--sep); }
@@ -1401,26 +786,8 @@ footer.links { display: flex; flex-wrap: wrap; gap: 8px 24px; margin-top: var(--
 
 #[cfg(test)]
 mod tests {
-    use super::{esc, esc_said, shown, utc};
-
-    #[test]
-    fn the_last_run_finished_is_the_one_the_journal_wrote_last_even_after_the_clock_was_set_back() {
-        let dir = std::env::temp_dir().join(format!("immunity-view-head-{}", std::process::id()));
-        crate::common::remove(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
-        let (ahead, latest) = (1_800_086_400, 1_800_000_000);
-        crate::store::journal_note(&conn, ahead, "run-1", "run_finished", "").unwrap();
-        crate::store::journal_note(&conn, latest, "run-2", "run_finished", "").unwrap();
-        let mut out = String::new();
-        super::header(&conn, &mut out, "store", latest + 60).unwrap();
-        assert!(
-            out.contains(&format!("last run finished {}", utc(latest))),
-            "{out}"
-        );
-        drop(conn);
-        crate::common::remove(&dir);
-    }
+    use super::{esc, shown, utc};
+    use crate::secrets::{Name, Said};
 
     #[test]
     fn a_time_ahead_of_the_clock_is_said_to_be_ahead_and_never_given_an_age() {
@@ -1441,21 +808,29 @@ mod tests {
     }
 
     #[test]
-    fn a_name_on_a_page_never_reads_as_a_mark_and_a_mark_the_core_made_stays_one() {
-        // A page writes every name through `esc`: a file named like a mark shows its backslash
-        // as a source's. A name the contract gave, already written so, is kept as it is. Cut text
-        // goes through `esc_said`, where the core's marks stay bare.
-        let forged = "/Users/example/\\cut{gitleaks:github-pat 40}";
+    fn a_name_on_a_page_never_reads_as_a_mark_or_as_markup_and_a_mark_the_core_made_stays_one() {
+        // A page writes every name through the printer: a file named like a mark shows its
+        // backslash as a source's, a tag in it is shown as text, and it stands in an element of
+        // its own. A name the contract gave, already written so, is kept as it is, and a mark the
+        // core made in cut text stays bare. The core's own words change only by their markup.
+        let forged = "/Users/example/\\cut{gitleaks:github-pat 40}<b>";
+        let shown = "/Users/example/\\u{5c}cut{gitleaks:github-pat 40}&lt;b&gt;";
         assert_eq!(
-            esc(forged),
-            "/Users/example/\\u{5c}cut{gitleaks:github-pat 40}"
+            Name::of(forged).html(),
+            format!("<bdi class=\"src\">{shown}</bdi>")
         );
+        assert_eq!(Name::of(forged).attr(), shown);
         assert_eq!(
-            esc("a\\u{5c}b \\u{202e} \\u{} \\u{1234567}"),
-            "a\\u{5c}b \\u{202e} \\u{5c}u{} \\u{5c}u{1234567}"
+            Name::given("a\\u{5c}b \\u{202e}").attr(),
+            "a\\u{5c}b \\u{202e}"
         );
-        assert_eq!(esc_said(forged), forged);
-        assert_eq!(esc("<a>"), esc_said("<a>"));
+        let mark = crate::secrets::mark("gitleaks:github-pat", 40);
+        let cut = format!("token {mark} \"q\"");
+        assert_eq!(
+            Said::given(&cut).html(),
+            format!("<bdi class=\"src\">token {mark} &quot;q&quot;</bdi>")
+        );
+        assert_eq!(esc("<a href='x'>&\\"), "&lt;a href=&#39;x&#39;&gt;&amp;\\");
     }
 
     #[test]
@@ -1518,7 +893,7 @@ mod tests {
             let escaped: String = c.escape_unicode().collect();
             let text = format!("a{c}b");
             assert_eq!(shown(&text), format!("a{escaped}b"), "{escaped}");
-            assert_eq!(esc(&text), format!("a{escaped}b"), "{escaped}");
+            assert_eq!(Name::of(&text).attr(), format!("a{escaped}b"), "{escaped}");
         }
         // A version carrying variation selectors is not shown as clean text.
         assert_eq!(shown("1.2.3\u{FE0F}\u{E0100}"), "1.2.3\\u{fe0f}\\u{e0100}");
@@ -1526,7 +901,7 @@ mod tests {
         let plain = "web-1 сервер 東京 café ✓ \u{2027}\u{2030}\u{FFFC} Ελλάδα مرحبا שלום \
                      नमस्ते 한국어 ไทย ጤና Ꭰ 𝔘 😀";
         assert_eq!(shown(plain), plain);
-        assert_eq!(esc(plain), plain);
+        assert_eq!(Name::of(plain).attr(), plain);
     }
 
     #[test]
@@ -1539,106 +914,13 @@ mod tests {
     }
 
     #[test]
-    fn the_changes_page_says_the_same_of_every_run_it_lists_after_a_fold() {
-        // The fold keeps every reading of the runs the page lists (`store::listed_runs`), a
-        // watcher's readings before the first full check among them: a run that could not read
-        // a kind still says so after older readings were folded.
-        use crate::store::{
-            Cause, Event, Gap, Reading, journal_event, journal_note, put_coverage, put_entity,
-        };
-        use crate::watched::{AUTOSTART_KIND, PROFILE_KIND, READER};
-        let dir = std::env::temp_dir().join(format!(
-            "immunity-view-fold-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let _removed = crate::common::Scratch::at(dir.clone());
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
-        let mac = "machine:mac";
-        // `journaled`: a reading the page lists, that recorded a change; `full`: a full run.
-        let write = |conn: &mut rusqlite::Connection, i: i64, journaled: bool, full: bool| {
-            let at = 1_900_000_000 + i * 60;
-            let run_id = if full {
-                format!("{at}-000000000")
-            } else {
-                format!("{}{at}-000000000", crate::watch::RUN_PREFIX)
-            };
-            if full {
-                journal_note(conn, at, &run_id, "run_started", "").unwrap();
-            }
-            let tx = conn.transaction().unwrap();
-            put_entity(&tx, mac).unwrap();
-            let r = |kind| Reading {
-                reader: READER,
-                scope: mac,
-                kind,
-                run_id: &run_id,
-                at,
-                observed_at: at,
-            };
-            // The shell profiles could not be read; the launch agents were.
-            let denied = Gap::of(Cause::Failed);
-            put_coverage(&tx, &r(PROFILE_KIND), "none", Some("denied"), &denied).unwrap();
-            put_coverage(&tx, &r(AUTOSTART_KIND), "full", None, &Gap::default()).unwrap();
-            if journaled {
-                let e = Event {
-                    kind: "changed",
-                    subject: format!("file:{mac}/Library/LaunchAgents/org.example.plist"),
-                    predicate: "has_content".to_string(),
-                    old: Some(format!("a{i}")),
-                    new: Some(format!("b{i}")),
-                };
-                journal_event(&tx, &r(AUTOSTART_KIND), &e, None).unwrap();
-            }
-            if full {
-                journal_note(&tx, at, &run_id, "report", "").unwrap();
-                journal_note(&tx, at, &run_id, "run_finished", "").unwrap();
-            }
-            tx.commit().unwrap();
-        };
-        // Readings that changed nothing, which no page lists; then five that the page lists,
-        // then three full checks.
-        for i in 0..10 {
-            write(&mut conn, i, false, false);
-        }
-        for i in 10..15 {
-            write(&mut conn, i, true, false);
-        }
-        for i in 15..18 {
-            write(&mut conn, i, true, true);
-        }
-        let page = |conn: &rusqlite::Connection| {
-            let mut out = String::new();
-            super::changes(conn, &mut out).unwrap();
-            out
-        };
-        let before = page(&conn);
-        let unknown = "changes unknown where nothing was read";
-        assert_eq!(before.matches(unknown).count(), 8);
-        // A watcher's reading names the kinds it read, not every watched place.
-        let named = esc(&format!(
-            "watcher's reading of {AUTOSTART_KIND}, {PROFILE_KIND}:"
-        ));
-        assert_eq!(before.matches(&named).count(), 5);
-        let folded = crate::store::fold(&conn).unwrap();
-        let after = page(&conn);
-        let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(folded.removed, 16);
-        assert_eq!(after, before);
-    }
-
-    #[test]
     fn a_secret_in_what_a_reader_s_source_said_reaches_no_page_and_no_form_of_the_status_and_is_marked_cut()
      {
         // A reader's reason is its source's words, which can hold a token: a tool that echoes a
-        // URL, a server that repeats a command. Wherever it is printed (the run's line on the
-        // page of changes, why a kind of watched place was not read in full in each form of the
-        // status, and the hint of "not read in full" on the summary) it is cut, marked as every
-        // cut is, and the token is in no byte of any page or answer.
+        // URL, a server that repeats a command. Wherever it is printed (the run's line, why a
+        // kind of watched place was not read in full in each form of the status, the hint of
+        // "not read in full" on the summary and the page of what was read) it is cut, marked as
+        // every cut is, and the token is in no byte of any page or answer.
         use crate::store::{Cause, Gap, Reading, journal_note, put_coverage, put_entity};
         use crate::watched::{AUTOSTART_KIND, PROFILE, PROFILE_KIND, READER};
         use prost::Message;
@@ -1839,7 +1121,7 @@ mod tests {
             }),
             ..super::Answers::none()
         };
-        let pages = super::pages(&conn, &m, &answers, "store.db", now).unwrap();
+        let pages = super::pages(&m, &answers, now).unwrap();
         let page = |name: &str| {
             pages
                 .iter()
@@ -1847,15 +1129,6 @@ mod tests {
                 .map(|(_, html)| html.clone())
                 .unwrap_or_else(|| panic!("{name}"))
         };
-        // The page shows the line as the run printed it, never cut again.
-        assert!(
-            page(&format!("{}/changes.html", super::DETAILS)).contains(&format!(
-                "<p class=\"muted mono\">{}</p>",
-                super::esc_said(&line)
-            )),
-            "{}",
-            page(&format!("{}/changes.html", super::DETAILS))
-        );
         let summary = page(super::SUMMARY);
         // The reading that failed is a fault: the band says what its source said as data, as
         // the terminal does, each name and reason quoted, cut once.
@@ -1866,14 +1139,17 @@ mod tests {
             .split("<p class=\"sub fault\">! Could not read: <span class=\"said\">")
             .nth(1)
             .map_or("", |f| &f[..f.find("</span>").unwrap()]);
-        assert!(fault.contains(&super::esc_said(&said)), "{summary}");
+        assert!(
+            fault.starts_with("<bdi class=\"src\">") && fault.contains(&esc(&said)),
+            "{summary}"
+        );
         // What not covered says a source said, as the status gives it: cut once, where it was
         // put together.
         let value = download.and_then(|u| u.value_text.clone()).unwrap();
         assert!(
             pages
                 .iter()
-                .any(|(_, html)| html.contains(&super::esc_said(&value))),
+                .any(|(_, html)| html.contains(&Said::given(&value).html())),
             "{value}"
         );
         // A mark the core made is never written again as a source's, and what the collector
@@ -1891,9 +1167,55 @@ mod tests {
             crate::pages::THIS_MAC
         ));
         assert!(this_mac.contains(&mark), "{this_mac}");
+        // So is a reason the coverage summary gives, on the page of what was read.
+        let coverage = page(&format!(
+            "{}/{}.html",
+            super::DETAILS,
+            crate::pages::COVERAGE
+        ));
+        assert!(coverage.contains(&mark), "{coverage}");
         for (name, html) in &pages {
             assert!(!html.contains(&token), "{name}");
             assert!(!html.contains("\\u{5c}cut{gitleaks"), "{name}");
         }
+    }
+
+    #[test]
+    fn a_page_an_earlier_run_left_is_taken_away_and_nothing_else_in_the_folder_is_touched() {
+        // A page of a thing that is gone, or one an earlier build wrote, would stand beside the
+        // current pages as if it were current. Only such a page goes: never what a link points
+        // to, a folder, a pipe, or a file the view does not write.
+        let scratch = crate::common::Scratch::new("view-stale");
+        let (folder, outside) = (scratch.0.join("store"), scratch.0.join("outside"));
+        let details = folder.join(super::DETAILS);
+        std::fs::create_dir_all(details.join("folder.html")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let target = outside.join("kept.html");
+        for (path, text) in [
+            (details.join("stale.html"), "old"),
+            (details.join("current.html"), "new"),
+            (details.join("notes.txt"), "mine"),
+            (details.join("folder.html/inside.html"), "below"),
+            (target.clone(), "elsewhere"),
+        ] {
+            std::fs::write(path, text).unwrap();
+        }
+        std::os::unix::fs::symlink(&target, details.join("link.html")).unwrap();
+        let pipe = details.join("pipe.html");
+        let pipe = std::ffi::CString::new(pipe.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid C path.
+        assert_eq!(unsafe { libc::mkfifo(pipe.as_ptr(), 0o600) }, 0);
+        super::remove_stale(&folder, &[format!("{}/current.html", super::DETAILS)]);
+        let mut left: Vec<String> = std::fs::read_dir(&details)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            ["current.html", "folder.html", "notes.txt", "pipe.html"]
+        );
+        assert!(details.join("folder.html/inside.html").is_file());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "elsewhere");
     }
 }

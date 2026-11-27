@@ -11,8 +11,9 @@
 //! ends in `_text`, shown as the terminal shows it and cut to `TEXT_CAP` characters. Every
 //! other string is a closed literal of the store or a sentence of the program's own.
 
+use crate::covered::Latest;
 use crate::store::{self, Totals};
-use crate::view::{self, Latest};
+use crate::view;
 use crate::{ServerCounts, covered, findings, resolver, servers, threats, watched};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::{Value, json};
@@ -459,55 +460,6 @@ fn count_since(events: &[Journaled]) -> Since {
     }
 }
 
-/// One difference a run journaled, as the page of changes shows it.
-pub struct RunEvent {
-    pub entry: String,
-    pub subject: String,
-    pub predicate: String,
-    pub old: Option<String>,
-    pub new: Option<String>,
-    /// A first reading: what was there, taken as the baseline.
-    pub first: bool,
-}
-
-/// What one run journaled, counted as the report and `immunity status` count it, and how many
-/// things it read for the first time and took as their baseline.
-pub fn run_changes(
-    conn: &Connection,
-    run_id: &str,
-) -> rusqlite::Result<(Since, usize, Vec<RunEvent>)> {
-    let mut events = journaled(conn, Some(run_id), None, &baselines(conn)?)?;
-    // The store's first run, as the report calls it: everything it found is the baseline.
-    let first_run: bool = conn.query_row(
-        "SELECT NOT EXISTS (SELECT 1 FROM journal WHERE entry = 'run_finished' AND run_id != ?1
-                              AND seq < (SELECT MIN(seq) FROM journal WHERE run_id = ?1))",
-        [run_id],
-        |r| r.get(0),
-    )?;
-    if first_run {
-        events.iter_mut().for_each(|e| e.first = true);
-    }
-    let first = events
-        .iter()
-        .filter(|e| e.first)
-        .map(|e| e.subject.as_str())
-        .collect::<HashSet<_>>()
-        .len();
-    let since = count_since(&events);
-    let events = events
-        .into_iter()
-        .map(|e| RunEvent {
-            entry: e.entry,
-            subject: e.subject,
-            predicate: e.predicate,
-            old: e.old,
-            new: e.new,
-            first: e.first,
-        })
-        .collect();
-    Ok((since, first, events))
-}
-
 /// A file's path from its id, `file:<machine>/<path>`.
 fn path_of(id: &str) -> &str {
     id.strip_prefix("file:")
@@ -818,7 +770,7 @@ pub fn state(conn: &Connection, home: &Path, now: i64) -> Res<State> {
 /// The latest readings, their problems and what needs a look at `now`: what `needs_a_look`
 /// serves.
 fn looked(conn: &Connection, now: i64) -> Res<(Vec<Latest>, Problems, findings::Needs)> {
-    let coverage = view::latest_coverage(conn)?;
+    let coverage = crate::covered::latest_coverage(conn)?;
     let problems = problems(conn, &coverage)?;
     let needs = findings::needs(conn, now)?;
     Ok((coverage, problems, needs))

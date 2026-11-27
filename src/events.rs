@@ -4294,14 +4294,14 @@ pub fn served(
 /// and the headline alone say it.
 pub fn served_readings<'a>(
     level: Option<&Level>,
-    latest: &'a [crate::view::Latest],
+    latest: &'a [crate::covered::Latest],
     this: Option<&str>,
-) -> std::borrow::Cow<'a, [crate::view::Latest]> {
+) -> std::borrow::Cow<'a, [crate::covered::Latest]> {
     let kept = std::borrow::Cow::Borrowed(latest);
     let Some(l) = level.filter(|l| l.state == FAILED) else {
         return kept;
     };
-    let mine = |r: &&crate::view::Latest| {
+    let mine = |r: &&crate::covered::Latest| {
         r.reader == READER && r.kind == KIND && this.is_none_or(|t| r.scope == t)
     };
     let stored = latest.iter().find(mine);
@@ -4312,7 +4312,7 @@ pub fn served_readings<'a>(
     if stored.is_some_and(|r| r.cause.as_deref() == Some(failed)) {
         return kept;
     }
-    let said = crate::view::Latest {
+    let said = crate::covered::Latest {
         reader: READER.into(),
         scope: scope.into(),
         kind: KIND.into(),

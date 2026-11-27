@@ -247,8 +247,8 @@ fn immunity_run_curl(home: &Path, store: &Path, curl: &Path) -> Command {
 }
 
 /// Runs a command that must succeed and returns what it printed; for `immunity run` for a person,
-/// the run's line as the journal keeps it and the page of changes shows it for each run. What a
-/// person reads after a run is told from the status (`after_run.rs`), and pinned there.
+/// the run's line as the journal keeps it. What a person reads after a run is told from the
+/// status (`after_run.rs`), and pinned there.
 fn ok(cmd: &mut Command) -> String {
     let args: Vec<String> = cmd
         .get_args()
@@ -532,7 +532,7 @@ fn journal_is_append_only() {
 
 #[test]
 fn text_from_the_store_never_becomes_markup() {
-    // Package names and versions are partly written by an attacker.
+    // Package names and versions and the names of folders are written by whoever made them.
     let dir = Dir::new("escape");
     let store = dir.store();
     let evil = with_package(
@@ -542,6 +542,7 @@ fn text_from_the_store_never_becomes_markup() {
         Some("homebrew/core"),
         &["1.0\"><b>bold</b>"],
     );
+    checkout(&dir.0, "<script>alert('x')<script>\"onload=\"x<b>");
     immunity(&store, &dir.input("brew.txt", &evil));
     let page = view(&store);
 
@@ -562,8 +563,9 @@ fn text_from_the_store_never_becomes_markup() {
         !page.contains("\"onload"),
         "a quote from a name reached the page"
     );
-    assert!(page.contains("&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;&quot;onload=&quot;x"));
-    assert!(page.contains("1.0&quot;&gt;&lt;b&gt;bold&lt;/b&gt;"));
+    assert!(page.contains(
+        "<bdi class=\"src\">~/&lt;script&gt;alert(&#39;x&#39;)&lt;script&gt;&quot;onload=&quot;x&lt;b&gt;</bdi>"
+    ));
 }
 
 #[test]
@@ -590,6 +592,19 @@ fn view_does_not_change_or_create_the_store() {
 }
 
 #[test]
+fn a_page_an_earlier_build_wrote_is_gone_once_the_pages_are_written_again() {
+    // A page this build no longer writes would stand beside the current ones as if current.
+    let dir = Dir::new("stale-page");
+    let store = dir.store();
+    immunity(&store, &dir.input("brew.txt", SAMPLE));
+    view(&store);
+    let old = dir.0.join("view/changes.html");
+    std::fs::write(&old, "<!doctype html>").unwrap();
+    view(&store);
+    assert!(!old.exists());
+}
+
+#[test]
 fn reading_that_failed_is_shown_with_its_reason_and_not_as_full() {
     // False calm: the page must not present a scope as read when it was not.
     let dir = Dir::new("failed");
@@ -607,30 +622,10 @@ fn reading_that_failed_is_shown_with_its_reason_and_not_as_full() {
         .split("<tr")
         .find(|r| r.contains("machine:mac") && r.contains("brew packages"))
         .expect("no coverage row for the brew reading");
-    assert!(row.contains("could not be read"), "{row}");
+    assert!(row.contains("<td>failed</td>"), "{row}");
     assert!(row.contains(reason[0].as_str()), "{row}");
     assert!(!row.contains("full"), "{row}");
     assert!(!coverage.contains("Every reading was full"), "{coverage}");
-}
-
-#[test]
-fn removed_component_is_under_no_longer_there() {
-    // What is gone is listed as gone; an old version is gone too.
-    let dir = Dir::new("view-gone");
-    let store = dir.store();
-    immunity(&store, &dir.input("before.txt", SAMPLE));
-    let after = without(SAMPLE, "git").replace(
-        "{\"version\": \"22.9.0\", \"installed_on_request\": true}, ",
-        "",
-    );
-    immunity(&store, &dir.input("after.txt", &after));
-    let page = view(&store);
-
-    let git = ">git</td>";
-    let gone = section(&page, "gone");
-    assert!(gone.contains(git), "{gone}");
-    assert!(gone.contains("2.47.0"), "{gone}");
-    assert!(gone.contains("22.9.0"), "{gone}");
 }
 
 #[test]
@@ -973,11 +968,16 @@ fn under_partial_coverage_new_assertions_become_live_and_nothing_is_retracted() 
 
     let page = view(&store);
     let coverage = section(&page, "coverage");
-    let row = coverage
-        .split("<tr")
-        .find(|r| r.contains("lockfile dependencies"))
-        .expect("no coverage row for the lockfile reading");
-    assert!(row.contains("partial, removals unknown"), "{row}");
+    assert!(
+        coverage
+            .split("<tr")
+            .any(|r| r.contains("lockfile dependencies")),
+        "{coverage}"
+    );
+    assert!(
+        coverage.contains("1 of them was partial: what they saw was added, but what disappeared there cannot be seen. Removals there are unknown."),
+        "{coverage}"
+    );
 }
 
 #[test]
@@ -1259,18 +1259,12 @@ fn without_homebrew_the_brew_reading_has_nothing_to_read_and_is_not_a_failure() 
     assert!(report.contains("Homebrew is not installed"), "{report}");
     assert!(!report.contains("could not be read"), "{report}");
 
+    // On the page of what was read it is counted as having nothing to read, never listed among
+    // the readings that were not full.
     let page = view(&store);
-    let row = section(&page, "coverage")
-        .split("<tr")
-        .find(|r| r.contains("brew packages"))
-        .expect("no coverage row for the brew reading")
-        .to_string();
-    assert!(row.contains("nothing to read"), "{row}");
-    assert!(
-        row.contains("Homebrew is not installed on this machine"),
-        "{row}"
-    );
-    assert!(!row.contains("could not be read"), "{row}");
+    let coverage = section(&page, "coverage");
+    assert!(!coverage.contains("brew packages"), "{coverage}");
+    assert!(!coverage.contains(" 0 had nothing to read"), "{coverage}");
 }
 
 #[test]
@@ -1642,7 +1636,6 @@ fn a_kind_no_longer_read_is_set_aside_once_and_never_told_as_read_in_full_or_rem
     assert!(!said.contains("what no row of its table"), "{said}");
     assert_eq!(status_json(&store)["last_finished_run"]["set_aside"], 2);
     let pages = view(&store);
-    assert!(!section(&pages, "gone").contains("wordpress"), "{pages}");
     assert!(!pages.contains("wordpress-core"), "{pages}");
     // Once set aside, nothing more is written about it, and nothing more is said.
     let again = immunity_all(&store, &brew, &servers, &absent);
@@ -3769,6 +3762,63 @@ fn text_from_the_mac_in_the_text_of_every_command_is_quoted_or_a_value_of_its_ow
     assert!(found.is_empty(), "{found:#?}");
 }
 
+/// Where in a page the canary's word stands outside the printer: not inside `<bdi class="src">`,
+/// and not inside an attribute's value as the attribute form writes it, the rest of the marker
+/// following as its entities with every hidden character and the backslash written `\u{…}`.
+fn outside_the_printer(page: &str) -> Vec<String> {
+    let as_attribute = r#" &quot;q&quot;; s, c\u{a}(os error 13)\u{202e}\u{5c}"#;
+    let mut out = Vec::new();
+    for (at, _) in page.match_indices(CANARY_WORD) {
+        let before = &page[..at];
+        // Inside a tag when its last `<` comes after its last `>`; else in an element.
+        let in_tag = before.rfind('<') > before.rfind('>');
+        let in_bdi = before.rfind("<bdi class=\"src\">") > before.rfind("</bdi>");
+        let fine = match in_tag {
+            true => {
+                before
+                    .rsplit('<')
+                    .next()
+                    .is_some_and(|tag| tag.matches('"').count() % 2 == 1)
+                    && page[at + CANARY_WORD.len()..].starts_with(as_attribute)
+            }
+            false => in_bdi,
+        };
+        if !fine {
+            let from = before.char_indices().rev().nth(80).map_or(0, |(i, _)| i);
+            out.push(page[from..at + CANARY_WORD.len()].to_string());
+        }
+    }
+    out
+}
+
+#[test]
+fn text_from_the_mac_on_every_page_stands_only_in_an_element_of_its_own_or_an_attribute_s_form() {
+    // The same store as above, every page `immunity view` writes: the marker stands only where
+    // the printer put it, and its right-to-left override and line break never reach a page as
+    // they are.
+    let (_dir, home, store) = canary_mac("canary-view");
+    let out = ok(immunity_cmd(&home)
+        .args(["view", "--no-open", "--store"])
+        .arg(&store));
+    let mut found = Vec::new();
+    let mut marked = 0;
+    for path in out.lines() {
+        let page = std::fs::read_to_string(path).unwrap();
+        assert!(!page.contains('\u{202e}'), "{path}");
+        assert!(!page.contains("\n(os error 13)"), "{path}");
+        marked += usize::from(page.contains(CANARY_WORD));
+        found.extend(
+            outside_the_printer(&page)
+                .into_iter()
+                .map(|at| format!("{path}: {at}")),
+        );
+    }
+    // The marker is there to be found: on the summary, the page of this Mac, the page of known
+    // vulnerabilities and the page of what was read.
+    assert!(marked >= 4, "{marked}");
+    assert!(found.is_empty(), "{found:#?}");
+}
+
 #[test]
 fn a_tool_read_before_and_not_found_now_is_lost_sight_of_and_never_told_as_not_installed() {
     // An earlier version found Homebrew and Tailscale through PATH; this one looks only at
@@ -4077,16 +4127,6 @@ fn a_standing_partial_reading_without_assertions_still_lets_the_report_say_no_ch
 
     assert!(report.contains("Since last run: no changes."), "{report}");
     assert!(!report.contains("partial"), "{report}");
-    let page = view(&store);
-    let latest = section(&page, "changes")
-        .split("<details")
-        .nth(1)
-        .unwrap()
-        .split("</summary>")
-        .next()
-        .unwrap()
-        .to_string();
-    assert!(latest.ends_with("· no changes"), "{latest}");
     assert_eq!(
         rows(
             &store,
@@ -6477,10 +6517,7 @@ fn a_withdrawn_statement_restores_the_machine_and_stays_in_the_journal() {
     );
     // The owner's word is not a run, and is not shown as one that did not finish.
     let page = view(&h.store());
-    assert!(
-        !section(&page, "changes").contains("did not finish"),
-        "{page}"
-    );
+    assert!(!page.contains("never finished"), "{page}");
 
     let report = h.run(&h.absent(), &h.none());
     assert!(
@@ -6883,8 +6920,6 @@ fn what_a_server_said_takes_no_word_of_the_core_s_with_it_and_no_secret_or_mark_
         "{printed}"
     );
     let page = view(&h.store());
-    // The run's line on the page of changes, as the run printed it.
-    assert!(page.contains(&web), "{page}");
     // The advice is decided from what the server said, and the reason is cut once.
     assert!(
         machine_block(&page, "web-new").contains(&format!("?t={mark}</bdi>. {advice}")),
@@ -8980,7 +9015,8 @@ fn a_checkout_that_is_gone_takes_its_hooks_with_it() {
         report.contains("not read in full: hooks in 2 checkouts (nothing read)."),
         "{report}"
     );
-    // A checkout's hooks read in full are counted under watched places, not listed in coverage.
+    // A checkout's hooks read in full, here with none to read, are not listed among what was not
+    // read; those that could not be read are.
     let page = view(&w.store());
     assert!(!section(&page, "coverage").contains("dev/plain"));
     assert!(section(&page, "coverage").contains("dev/tree"));
@@ -13723,7 +13759,9 @@ fn the_summary_page_says_what_status_says_with_each_item_in_full_and_no_markup_f
         "{row}"
     );
     assert!(
-        row.contains("<blockquote class=\"quote\">my &lt;b&gt;own&lt;/b&gt; agent</blockquote>"),
+        row.contains(
+            "<blockquote class=\"quote\"><bdi class=\"src\">my &lt;b&gt;own&lt;/b&gt; agent</bdi></blockquote>"
+        ),
         "{row}"
     );
 }
@@ -14450,8 +14488,8 @@ fn a_section_of_the_summary_can_be_opened_from_outside_as_a_file() {
 
 #[test]
 fn the_summary_page_stays_small_on_a_large_store() {
-    // The page Details opens was 15 MB on a real store. The big tables live in pages of
-    // their own; the summary holds counts and what needs a look.
+    // The page Details opens was 15 MB on a real store. The summary holds counts and what
+    // needs a look, never a row for each package.
     let w = Watch::new("view-large");
     put(w.home(), "brew.txt", &many_formulae(20_000, "1.0"));
     let brew = w.home().join("brew.txt");
@@ -14485,10 +14523,6 @@ fn the_summary_page_stays_small_on_a_large_store() {
         })
         .collect();
     assert!(sizes[0].1 < 200_000, "{sizes:?}");
-    assert!(
-        sizes.iter().map(|s| s.1).sum::<usize>() > 1_000_000,
-        "{sizes:?}"
-    );
     let page = &pages[0].1;
     let components = status_json(&w.store())["estate"]["components"]
         .as_i64()

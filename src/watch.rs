@@ -85,7 +85,7 @@
 //! It writes no page of the view, only that small file: a change can come every few seconds and the pages cost
 //! seconds of processor time, mostly for pages nobody has open. A page is brought up to date
 //! when it is asked for, by `immunity view --if-stale`, which writes only when something the pages
-//! rest on moved since they were made (`view::basis`). The watcher stops,
+//! rest on moved since they were made (`view_basis` in main.rs). The watcher stops,
 //! with exit 0, when stdout is closed or its parent process is gone. `--standalone` keeps it
 //! running after its parent exits and permits launchd to supervise it directly.
 //!

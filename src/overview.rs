@@ -323,6 +323,8 @@ pub(crate) struct Fault {
     /// What a source said, as printed (`Said::quoted`), cut on a terminal to a line: a sentence
     /// keeps its start, names their start and end. Whole in a pipe.
     said: Option<(String, Cut)>,
+    /// That `said` is the core's own words, such as why an answer is not fresh, and no source's.
+    ours: bool,
     tail: String,
     command: Option<&'static str>,
     advice: Option<String>,
@@ -336,6 +338,7 @@ impl Fault {
         Fault {
             words: words.into(),
             said: None,
+            ours: false,
             tail: String::new(),
             command: None,
             advice: None,
@@ -346,6 +349,17 @@ impl Fault {
     fn said(mut self, text: Option<&str>, cut: Cut) -> Fault {
         self.said = text.filter(|t| !t.is_empty()).map(|t| (t.to_string(), cut));
         self
+    }
+
+    /// `said` for the core's own words in its place.
+    fn ours(mut self, text: Option<&str>, cut: Cut) -> Fault {
+        self.ours = true;
+        self.said(text, cut)
+    }
+
+    /// That what it says in the place of a source's words is the core's own.
+    pub(crate) fn said_is_ours(&self) -> bool {
+        self.ours
     }
 
     fn run(mut self, command: &'static str) -> Fault {
@@ -813,7 +827,7 @@ pub(crate) fn told(s: &v1::Status, screen: &Screen) -> Told {
         faults.insert(
             0,
             Fault::new("This answer is not fresh")
-                .said(reason, Cut::End)
+                .ours(reason, Cut::End)
                 .run(if no_watcher {
                     "immunity on"
                 } else {
@@ -3694,6 +3708,12 @@ mod tests {
         assert_eq!(
             fault_lines_of(&text)[0],
             "! This answer is not fresh: the latest full check finished more than 2 hours ago   immunity run"
+        );
+        // On a page they are the core's words, never set apart as what a source said.
+        let (_, faults) = crate::pages::band(&s);
+        assert!(
+            faults.contains("not fresh: <span class=\"said\">the latest full check finished more than 2 hours ago</span>"),
+            "{faults}"
         );
         // No watcher runs: the command that starts one.
         s.watching = None;

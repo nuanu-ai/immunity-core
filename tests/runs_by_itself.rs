@@ -117,8 +117,8 @@ impl Estate {
         self.go(None, &self.0.join("empty"))
     }
 
-    /// A run, and its line as the journal keeps it and the page of changes shows it for each
-    /// run. What a person reads after a run is told from the status (`after_run.rs`).
+    /// A run, and its line as the journal keeps it. What a person reads after a run is told from
+    /// the status (`after_run.rs`).
     fn go(&self, root: Option<&Path>, sessions: &Path) -> String {
         let out = self.command(root, sessions).output().unwrap();
         assert!(
@@ -839,7 +839,7 @@ fn a_walk_given_a_folder_closes_the_known_projects_gone_from_it_and_none_outside
 fn a_checkout_deleted_and_made_again_is_not_gone_and_a_run_that_does_not_read_it_says_so() {
     // Made again at its path, it holds a retracted `located_on` and a live one. A run whose walk
     // is pointed elsewhere reads nothing in it: its readings are counted as not repeated, in the
-    // run's line and on the page of changes, as those of a checkout that never went.
+    // run's line, as those of a checkout that never went.
     let e = Estate::new("made-again");
     let make = || put(&e.checkout("dev/shop").join("package-lock.json"), LOCK);
     make();
@@ -852,12 +852,6 @@ fn a_checkout_deleted_and_made_again_is_not_gone_and_a_run_that_does_not_read_it
     assert!(
         line.contains("2 earlier readings were not repeated."),
         "{line}"
-    );
-    let latest = e.page("changes.html");
-    let latest = latest.split("<details").nth(1).unwrap();
-    assert!(
-        latest.contains("2 readings read before were not read in this run."),
-        "{latest}"
     );
 }
 
@@ -6045,27 +6039,10 @@ fn a_folder_that_could_not_be_listed_on_the_first_day_is_told_once_when_it_can_b
     assert_eq!(e.told(), ["checkout:machine:mac/archive/old (1)"]);
 }
 
-/// The page of changes, as `immunity view` writes it.
-fn changes_page(e: &Estate) -> String {
-    let out = Command::new(env!("CARGO_BIN_EXE_immunity"))
-        .args(["view", "--no-open", "--store"])
-        .arg(e.store())
-        .output()
-        .unwrap();
-    let pages = String::from_utf8(out.stdout).unwrap();
-    let path = pages
-        .lines()
-        .find(|p| p.ends_with("changes.html"))
-        .unwrap()
-        .to_string();
-    std::fs::read_to_string(path).unwrap()
-}
-
 #[test]
-fn the_changes_page_the_status_and_the_journal_count_a_first_reading_alike() {
-    // On the first day everything found is the baseline: the page says so and counts nothing
-    // as added, as the status does. A later first reading is shown as such on the page, and
-    // the counts of the page are the status's.
+fn the_status_and_the_journal_count_a_first_reading_alike() {
+    // On the first day everything found is the baseline, and nothing is counted as added. A
+    // later first reading is counted as such, never as an addition, and the journal marks it.
     let e = Estate::new("page-agrees");
     let shop = e.checkout("dev/shop");
     package(&shop, "\"postinstall\": \"node setup.js\"");
@@ -6080,20 +6057,10 @@ fn the_changes_page_the_status_and_the_journal_count_a_first_reading_alike() {
     package(&app, "\"postinstall\": \"node setup.js\"");
     e.run();
     assert!(e.status()["since_previous_run"].is_null());
-    let page = changes_page(&e);
-    assert!(page.contains("+0 added, 0 changed, 0 removed, "), "{page}");
-    assert!(!page.contains("<td>added</td>"), "{page}");
     e.run_in(&e.home().join("Documents"));
     let since = &e.status()["last_finished_run"]["since_previous_run"];
     // The project, its file and the ways it holds are a first reading, never an addition.
     assert_eq!(since["added"], 0, "{since}");
-    let page = changes_page(&e);
-    let counts = format!(
-        "+{} added, {} changed, {} removed, 2 things read for the first time and kept as the baseline",
-        since["added"], since["changed"], since["removed"]
-    );
-    assert!(page.contains(&counts), "{counts}\n{page}");
-    assert!(page.contains("<td>first reading</td>"), "{page}");
     // The journal marks it, and the item rests on the place it names.
     assert_eq!(
         e.rows(

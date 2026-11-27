@@ -1310,7 +1310,7 @@ mod tests {
         let own = put(events::FAILED);
         let failed = put(events::RUNNING);
         assert_eq!((failed.state.as_str(), failed.read_at), (events::FAILED, 5));
-        let row = |scope: &str, completeness: &str| crate::view::Latest {
+        let row = |scope: &str, completeness: &str| crate::covered::Latest {
             reader: events::READER.to_string(),
             scope: scope.to_string(),
             kind: events::KIND.to_string(),
@@ -1323,7 +1323,7 @@ mod tests {
         };
         let this = Some("machine:mac");
         // Each row as (scope, completeness, at).
-        let served = |level: &events::Level, rows: &[crate::view::Latest]| {
+        let served = |level: &events::Level, rows: &[crate::covered::Latest]| {
             let rows = events::served_readings(Some(level), rows, this);
             let told = rows
                 .iter()
