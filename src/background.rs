@@ -13,7 +13,7 @@ pub const EVERY: i64 = 60 * 60;
 /// tried again: within minutes, not at the next hour.
 const RETRY: i64 = 5 * 60;
 /// How long a full check may run, in awake time: a sleep while it runs does not end it.
-const LIMIT: Duration = Duration::from_secs(30 * 60);
+pub const LIMIT: Duration = Duration::from_secs(30 * 60);
 pub const CHECK_ARG: &str = "--background-check";
 /// The most of a check's output the watcher keeps, to read the `Failure` it prints: the longest
 /// text the cut of secrets reads (`secrets::LINE_CAP`), as a detail longer is withheld whole.
@@ -132,7 +132,7 @@ impl Checks {
         if let Some(running) = &mut self.running {
             match running.finished() {
                 Ok(Some(status)) => {
-                    let (since, expired) = (running.since, Self::expired(running.since, awake));
+                    let (since, expired) = (running.since, expired(running.since, awake));
                     self.running = None;
                     if status.code() == Some(crate::EXIT_RUN_IN_PROGRESS.into()) {
                         self.next = self.next.min(now.saturating_add(RETRY));
@@ -155,7 +155,7 @@ impl Checks {
                 }
                 Ok(None) => {}
             }
-            if Self::expired(running.since, awake) {
+            if expired(running.since, awake) {
                 self.running = None;
                 return Some(Err(
                     "the full check exceeded 30 minutes and was stopped".into()
@@ -190,16 +190,18 @@ impl Checks {
     pub fn late_reason(&mut self, awake: Instant) -> Option<Result<(), String>> {
         let (status, since) = self.late?;
         let said = match self.said.as_ref()?.try_recv() {
-            Err(TryRecvError::Empty) if !Self::expired(since, awake) => return None,
+            Err(TryRecvError::Empty) if !expired(since, awake) => return None,
             said => said.ok().and_then(|said| reason(&said)),
         };
         (self.said, self.late) = (None, None);
         Some(said?.map_err(|why| format!("the full check failed ({status}): {why}")))
     }
+}
 
-    fn expired(since: Instant, awake: Instant) -> bool {
-        awake.saturating_duration_since(since) >= LIMIT
-    }
+/// Whether what began at `since` has gone on past `LIMIT` at `awake`, both `Instant`s, which
+/// count awake time: a check's own run, and the watcher's wait for the lock a check holds.
+pub fn expired(since: Instant, awake: Instant) -> bool {
+    awake.saturating_duration_since(since) >= LIMIT
 }
 
 /// The first `SAID_CAP` bytes a check printed, the rest read and dropped to the end, so the check

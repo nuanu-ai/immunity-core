@@ -3842,6 +3842,43 @@ fn an_error_is_printed_escaped() {
 }
 
 #[test]
+fn a_run_given_another_checkouts_root_is_not_a_full_check_and_the_status_is_as_old_as_the_last_one()
+{
+    // No false calm: a run pointed at one folder did not look for projects in the rest of the
+    // home folder, so the status is as fresh as the latest whole check and no fresher, and the
+    // run says what it did not read.
+    let dir = Dir::new("narrowed-run");
+    let store = dir.store();
+    let brew = dir.input("brew.txt", SAMPLE);
+    let absent = dir.0.join("absent");
+    checkout(&dir.0, "dev/shop");
+    let given = |root: &Path| immunity_all(&store, &brew, &absent, root);
+    let report = given(&dir.0.join("dev"));
+    assert!(
+        report.contains("Not a full check: projects were looked for only in "),
+        "{report}"
+    );
+    let s = status_json(&store);
+    assert_eq!(s["headline"], "not_checked", "{s:#}");
+    assert!(s["this_mac"]["checked_at"].is_null(), "{s:#}");
+    view(&store);
+    let beyond = store.parent().unwrap().join("view").join("beyond.html");
+    let page = std::fs::read_to_string(&beyond).unwrap();
+    assert!(page.contains("Last full check never"), "{page}");
+    immunity_home(&store, &brew, &absent);
+    let checked = status_json(&store)["this_mac"]["checked_at"].clone();
+    assert!(checked.is_i64(), "{checked}");
+    common::next_second();
+    given(&dir.0.join("dev"));
+    assert_eq!(status_json(&store)["this_mac"]["checked_at"], checked);
+    // The home folder given by name is what a full check walks.
+    common::next_second();
+    let report = given(&dir.0);
+    assert!(!report.contains("Not a full check"), "{report}");
+    assert_ne!(status_json(&store)["this_mac"]["checked_at"], checked);
+}
+
+#[test]
 fn an_explicit_checkouts_root_never_retracts_checkouts_found_by_the_home_walk() {
     // A walk of one folder says nothing about the rest of the home folder.
     let dir = Dir::new("given-root");
@@ -5069,7 +5106,7 @@ fn the_page_beyond_this_mac_says_when_the_check_its_lists_rest_on_was_made() {
     let store = dir.store();
     let absent = dir.0.join("absent");
     let brew = dir.input("brew.txt", SAMPLE);
-    immunity_all(&store, &brew, &absent, &absent);
+    immunity_home(&store, &brew, &absent);
     view(&store);
     let finished: i64 = rows(
         &store,
@@ -7066,8 +7103,9 @@ impl Feed {
             .arg(brew)
             .arg("--servers-input")
             .arg(self.dir.0.join("absent"))
+            // The home folder, which a full check walks: it holds no checkout.
             .arg("--checkouts-root")
-            .arg(self.dir.0.join("absent"))
+            .arg(&self.dir.0)
             .args(args))
     }
 

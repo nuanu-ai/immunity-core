@@ -2520,6 +2520,11 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     read_threats(&run, catalogue)?;
     read_feeds(&run, feeds)?;
     opened += match_dependencies(&run)?;
+    let narrowed = narrowed(args);
+    if let Some(what) = &narrowed {
+        run.notes
+            .push(format!("Not a full check: {}.", known::whole(what)));
+    }
 
     // What the line counts is read back from what the run wrote, by the code `immunity status`
     // reads it with after the run.
@@ -2546,6 +2551,9 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     }
     let line = report(run.readers, &run.notes, &summary, &said);
     store::journal_note(&tx, at, &run_id, "report", &line)?;
+    if let Some(what) = &narrowed {
+        store::journal_note(&tx, at, &run_id, "run_narrowed", what)?;
+    }
     // The time the run finished, so that its start and its end are both in the journal.
     store::journal_note(&tx, now_secs(), &run_id, "run_finished", "")?;
     tx.commit()?;
@@ -2553,6 +2561,21 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     // lock still held; what the run did is committed, whatever comes of that.
     store::tidy(&conn);
     Ok((line, watched))
+}
+
+/// What a run was told not to read of what a full check reads, `None` for a full check
+/// (`status::FULL_CHECKS`). A checkouts root other than the home folder, made real, leaves the
+/// rest of the home folder's projects unlooked for, and what the store knew outside it is kept
+/// unread. Every other root and input stands in for a source whole, as an invented home does,
+/// and its reader reads all of it.
+fn narrowed(args: &Args) -> Option<String> {
+    let start = checkouts::start(args.checkouts_root.as_deref(), &args.home);
+    (start.root != start.real_home).then(|| {
+        format!(
+            "projects were looked for only in {}, not in the whole home folder",
+            start.root.display()
+        )
+    })
 }
 
 /// One run in progress: where it writes and what it has seen so far.

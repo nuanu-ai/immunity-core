@@ -111,12 +111,29 @@ pub fn latest_run(conn: &Connection) -> rusqlite::Result<Option<RunMark>> {
     }))
 }
 
-/// The latest run that finished. A run writes in one transaction, so what the store holds is
-/// what this run left, with the owner's word since.
+/// The `run_finished` entries of full checks, as rows of the journal, read `FROM (FULL_CHECKS)`:
+/// a run told to read less than a full check reads says so with `run_narrowed` and is not one
+/// (`main::narrowed`). Everything that asks for the latest full check asks it here.
+pub const FULL_CHECKS: &str = "SELECT * FROM journal WHERE entry = 'run_finished'
+    AND run_id NOT IN (SELECT run_id FROM journal WHERE entry = 'run_narrowed')";
+
+/// The latest run that finished, a full check or not. A run writes in one transaction, so what
+/// the store holds is what this run left, with the owner's word since.
 pub fn latest_finished(conn: &Connection) -> rusqlite::Result<Option<RunMark>> {
+    latest_of(conn, "SELECT * FROM journal WHERE entry = 'run_finished'")
+}
+
+/// The latest full check that finished (`FULL_CHECKS`): what the status is as fresh as, and
+/// what the event level counts since.
+pub fn latest_check(conn: &Connection) -> rusqlite::Result<Option<RunMark>> {
+    latest_of(conn, FULL_CHECKS)
+}
+
+/// The latest run of the `run_finished` entries `finished` selects.
+fn latest_of(conn: &Connection, finished: &str) -> rusqlite::Result<Option<RunMark>> {
     let finished: Option<(String, i64)> = conn
         .query_row(
-            "SELECT run_id, at FROM journal WHERE entry = 'run_finished' ORDER BY seq DESC LIMIT 1",
+            &format!("SELECT run_id, at FROM ({finished}) ORDER BY seq DESC LIMIT 1"),
             [],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
@@ -1133,7 +1150,7 @@ pub fn message(
             technique_text: i.technique.map(whole),
             change: i.change.as_deref().map(crate::finding_answer::change_of),
             evidence: match f {
-                Some(f) => crate::finding_answer::evidence(conn, f)?
+                Some(f) => crate::finding_answer::evidence(conn, f, now)?
                     .map(|body| v1::Evidence { body: Some(body) }),
                 None => None,
             },

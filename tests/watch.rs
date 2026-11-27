@@ -1355,6 +1355,43 @@ fn failing(mac: &Mac) -> (Value, Vec<Value>) {
 }
 
 #[test]
+fn a_watcher_that_says_it_has_waited_for_the_run_lock_too_long_is_not_live_and_says_what_it_waits_for()
+ {
+    // A check that does not end holds the run lock, and the watcher waits past the time a check
+    // may take: its lock file says so, as the watcher writes it, and no answer calls it live.
+    let mac = Mac::new("waits-for-the-run-lock");
+    mac.run();
+    let lock = std::fs::File::options()
+        .create(true)
+        .append(true)
+        .open(mac.root.join("store/watch.lock"))
+        .unwrap();
+    lock.try_lock().unwrap();
+    let says = |state: &str| {
+        let text = format!("{}\nheartbeat\n{state}", now() - 3600);
+        lock.set_len(0).unwrap();
+        std::os::unix::fs::FileExt::write_all_at(&lock, text.as_bytes(), 0).unwrap();
+    };
+    says(&format!("waiting {}", now() - 1900));
+    assert_eq!(failing(&mac), (false.into(), vec!["read".into()]));
+    let out = mac
+        .immunity()
+        .args(["status", "--store"])
+        .arg(mac.store())
+        .output()
+        .unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        text.contains("The watcher's latest reading of the watched places failed")
+            && text.contains("waited for the run lock since"),
+        "{text}"
+    );
+    says("ready");
+    assert_eq!(failing(&mac), (true.into(), vec![]));
+    common::release(lock);
+}
+
+#[test]
 fn a_place_left_unsubscribed_is_not_watched_live_until_a_later_subscription_takes_it() {
     // The first invariant: under launchd a problem line goes nowhere, so a place the watcher
     // could not subscribe to stands as a failure in the status, the text and the page.

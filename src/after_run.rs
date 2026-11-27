@@ -101,6 +101,21 @@ pub fn run(s: &v1::Status, screen: &Screen) -> String {
             "What it found is kept as the baseline: a change from now on is a finding".to_string(),
         );
     }
+    // A run that finished after the latest full check is not one: on this build, a run given a
+    // checkouts root other than the home folder (`status::FULL_CHECKS`).
+    let full = s.this_mac.as_ref().and_then(|m| m.checked_at);
+    if check
+        .and_then(|c| c.finished_at)
+        .is_some_and(|end| full.is_none_or(|at| at < end))
+    {
+        own.push(format!(
+            "Not a full check: projects were looked for only in the folder given, {}",
+            match full {
+                Some(_) => "so this answer is as fresh as the latest full check",
+                None => "and no full check has finished",
+            }
+        ));
+    }
     if let Some(f) = finished.filter(|f| f.set_aside > 0) {
         own.push(format!(
             "{} set aside as no longer read by this version, not counted as removed",
@@ -801,6 +816,31 @@ mod tests {
         // Not the first: no word of a baseline.
         s.last_finished_run.as_mut().unwrap().first_run = false;
         assert!(!run(&s, &Screen::pipe()).contains("baseline"));
+    }
+
+    #[test]
+    fn a_run_that_finished_after_the_latest_full_check_says_it_was_not_one() {
+        let mut s = status();
+        let end = STARTED + 12;
+        let said = |s: &v1::Status| {
+            let text = run(s, &Screen::pipe());
+            let line = text.lines().find(|l| l.contains("Not a full check"));
+            line.map(|l| l.trim().to_string())
+        };
+        for (checked, words) in [
+            (
+                Some(end - 1),
+                Some("so this answer is as fresh as the latest full check"),
+            ),
+            (None, Some("and no full check has finished")),
+            (Some(end), None),
+        ] {
+            s.this_mac.as_mut().unwrap().checked_at = checked;
+            let expected = words.map(|w| {
+                format!("Not a full check: projects were looked for only in the folder given, {w}")
+            });
+            assert_eq!(said(&s), expected, "{checked:?}");
+        }
     }
 
     #[test]
