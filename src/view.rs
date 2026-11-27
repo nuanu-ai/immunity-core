@@ -79,6 +79,34 @@ pub fn basis(conn: &Connection, folder: &std::path::Path) -> Result<String, Box<
     ))
 }
 
+/// What the commands answer, built in process from the read the pages are made in, which the
+/// pages are drawn from: so a page shows what the command shows and decides nothing again.
+pub struct Answers<'a> {
+    /// `immunity findings`.
+    pub findings: crate::contract::v1::Findings,
+    /// `immunity finding <id>` for a finding a page opens; `None` for an id the store does not
+    /// hold.
+    pub finding: Box<FindingOf<'a>>,
+    /// `immunity rules`, of the event level the status rests on.
+    pub rules: crate::contract::v1::Rules,
+}
+
+/// `immunity finding <id>` as the pages ask it.
+pub type FindingOf<'a> =
+    dyn Fn(&str) -> rusqlite::Result<Option<crate::contract::v1::Finding>> + 'a;
+
+#[cfg(test)]
+impl Answers<'_> {
+    /// No finding, and the rules with no reading of the event level.
+    pub fn none() -> Answers<'static> {
+        Answers {
+            findings: Default::default(),
+            finding: Box::new(|_| Ok(None)),
+            rules: Default::default(),
+        }
+    }
+}
+
 /// Every page the view writes, as its path relative to the store's folder and its HTML: the
 /// summary first, then the pages its links lead a person to (`pages.rs`), then one technical
 /// page for each of the big tables. The summary is built from the state and the
@@ -88,6 +116,7 @@ pub fn pages(
     conn: &Connection,
     st: &crate::status::State,
     result: &crate::contract::v1::Status,
+    answers: &Answers,
     store: &str,
     now: i64,
 ) -> Result<Vec<(String, String)>, Box<dyn Error>> {
@@ -95,7 +124,7 @@ pub fn pages(
     let mut pages = vec![
         (
             SUMMARY.to_string(),
-            crate::pages::summary(conn, st, result, now)?,
+            crate::pages::summary(conn, st, result, answers, now)?,
         ),
         (
             format!("{DETAILS}/{}.html", crate::pages::THIS_MAC),
@@ -119,11 +148,7 @@ pub fn pages(
         ),
         (
             format!("{DETAILS}/{}.html", crate::pages::RULES),
-            crate::pages::rules(
-                &result.rules.clone().unwrap_or_default(),
-                st.event_level.as_ref(),
-                now,
-            ),
+            crate::pages::rules::page(&answers.rules, result, now),
         ),
     ];
     for (name, title) in DETAIL_PAGES {
@@ -158,20 +183,17 @@ pub fn event_pages(
     conn: &Connection,
     st: &crate::status::State,
     result: &crate::contract::v1::Status,
+    answers: &Answers,
     now: i64,
 ) -> Result<Vec<(String, String)>, Box<dyn Error>> {
     Ok(vec![
         (
             SUMMARY.to_string(),
-            crate::pages::summary(conn, st, result, now)?,
+            crate::pages::summary(conn, st, result, answers, now)?,
         ),
         (
             format!("{DETAILS}/{}.html", crate::pages::RULES),
-            crate::pages::rules(
-                &result.rules.clone().unwrap_or_default(),
-                st.event_level.as_ref(),
-                now,
-            ),
+            crate::pages::rules::page(&answers.rules, result, now),
         ),
     ])
 }
@@ -2077,6 +2099,8 @@ a:focus-visible, summary:focus-visible { outline: 2px solid var(--link); outline
 .meta { color: var(--t2); font: var(--caption); margin: 0; overflow-wrap: anywhere; }
 .muted, .sec, .quiet, .t2 { color: var(--t2); }
 .mono, code, .said { font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; }
+/* Text from the Mac or a source (`secrets::Name::html`): isolated, so it cannot reorder the words around it. */
+bdi.src { unicode-bidi: isolate; overflow-wrap: anywhere; }
 .nowrap { white-space: nowrap; }
 .num { font-variant-numeric: tabular-nums; }
 .hidden { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
@@ -2795,7 +2819,7 @@ mod tests {
             );
         }
 
-        let pages = super::pages(&conn, &st, &m, "store.db", now).unwrap();
+        let pages = super::pages(&conn, &st, &m, &super::Answers::none(), "store.db", now).unwrap();
         let page = |name: &str| {
             pages
                 .iter()

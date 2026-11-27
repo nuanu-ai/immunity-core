@@ -1099,7 +1099,7 @@ fn verdict_lines(s: &Screen, f: &v1::Finding) -> Vec<String> {
 }
 
 /// Who gave an answer, as a person reads it.
-fn given_by(via: i32) -> &'static str {
+pub(crate) fn given_by(via: i32) -> &'static str {
     view::given_by(match v1::Via::try_from(via) {
         Ok(v1::Via::App) => findings::Via::App,
         Ok(v1::Via::Agent) => findings::Via::Agent,

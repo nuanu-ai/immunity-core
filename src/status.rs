@@ -1293,6 +1293,8 @@ fn this_mac_message(m: &crate::covered::ThisMac, now: i64) -> crate::contract::v
         fresh: stale_reason.is_none(),
         stale_reason,
         fresh_for_seconds: n(FRESH_FOR),
+        id_text: m.machine.as_deref().map(crate::known::whole),
+        name_text: m.named().map(crate::known::whole),
     }
 }
 
@@ -1576,8 +1578,8 @@ pub(crate) fn rules_now_of(
             ),
         },
     };
-    // Whether a rule watches now is one predicate, the page's too (`happens::Watching`).
-    let now = crate::happens::Watching::of(level);
+    // Whether a rule watches now is one predicate (`events::Watching`); the pages read it here.
+    let now = crate::events::Watching::of(level);
     // While the level runs, a rule evaluated in full that does not watch is named, with why:
     // its events are not collected, or what it reads does not arrive because the collector
     // does not keep it, keeps it and never filled it, or no line that would carry it was read.

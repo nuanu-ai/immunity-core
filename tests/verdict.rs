@@ -954,7 +954,7 @@ fn every_command_for_an_agent_on_the_summary_has_one_fixed_hidden_copy_button_an
 }
 
 #[test]
-fn on_the_page_a_finding_and_the_response_layer_s_own_are_one_row_counted_as_one_and_a_verdict_never_takes_either_out_of_open()
+fn on_the_page_a_finding_and_the_response_layer_s_own_are_one_row_counted_as_two_and_a_verdict_never_takes_either_out_of_open()
  {
     let mac = Mac::new("page-pair");
     mac.append(&dd(1));
@@ -966,15 +966,13 @@ fn on_the_page_a_finding_and_the_response_layer_s_own_are_one_row_counted_as_one
         .as_str()
         .unwrap()
         .to_string();
-    // The store counts the pair as two findings; the tabs count things as the rows show
-    // them, the pair as one.
+    // The tabs count findings as the status does: the pair is two findings in one row.
     let total = mac.status()["needs_a_look"]["total"].as_u64().unwrap();
     assert!(total >= 2);
     let page = mac.page();
     assert!(
         page.contains(&format!(
-            "<a id=\"open\" href=\"#open\">Open <span class=\"tn\">{}</span></a>",
-            total - 1
+            "<a id=\"open\" href=\"#open\">Open <span class=\"tn\">{total}</span></a>"
         )),
         "{page}"
     );
@@ -1074,9 +1072,9 @@ fn drawn_rows(page: &str) -> Vec<Vec<String>> {
 
 /// What the page says it holds and what it draws, each read on its own. Said: the band's
 /// numbers (what needs the person now, what is to look at) and the three tabs, as written.
-/// Drawn: the rows, each by the findings in it, weighed by what `immunity status` says needs a
-/// look and is urgent, and what `immunity findings --all` says is answered; not by the classes
-/// the page gives its rows. Every finding open or answered is drawn, in exactly one row.
+/// Drawn: the findings in the rows, counted by what `immunity status` says needs a look and is
+/// urgent, and what `immunity findings --all` says is answered; not by the classes the page
+/// gives its rows. Every finding open or answered is drawn, in exactly one row.
 fn said_and_drawn(mac: &Mac, page: &str) -> ([usize; 5], [usize; 5]) {
     let between = |from: &str, to: &str| -> String {
         let at = page.find(from).unwrap_or_else(|| panic!("no {from}")) + from.len();
@@ -1116,19 +1114,8 @@ fn said_and_drawn(mac: &Mac, page: &str) -> ([usize; 5], [usize; 5]) {
     let mut expected: Vec<&String> = needs.keys().chain(answered.iter()).collect();
     expected.sort();
     assert_eq!(every, expected, "every finding drawn once: {page}");
-    // A row weighs its findings, the response layer's own finding with its pair as one: a
-    // group's row counts each finding of the group.
-    let verdicts: std::collections::BTreeSet<String> = mac.json(&["findings", "--all"])["findings"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|f| f["finding"]["rule"] == VERDICT_RULE)
-        .map(|f| f["finding"]["id"].as_str().unwrap().to_string())
-        .collect();
-    let weight = |r: &Vec<String>| r.iter().filter(|id| !verdicts.contains(*id)).count().max(1);
-    let count = |f: &dyn Fn(&String) -> bool| -> usize {
-        rows.iter().filter(|r| r.iter().any(f)).map(weight).sum()
-    };
+    // Each finding counts once, as the status counts it: both of a pair, each of a group.
+    let count = |f: &dyn Fn(&String) -> bool| -> usize { every.iter().filter(|id| f(id)).count() };
     let now = count(&|id| needs.get(id) == Some(&true));
     let open = count(&|id| needs.contains_key(id));
     let drawn = [
@@ -1142,9 +1129,9 @@ fn said_and_drawn(mac: &Mac, page: &str) -> ([usize; 5], [usize; 5]) {
 }
 
 #[test]
-fn on_every_state_the_band_and_each_tab_count_the_rows_drawn_a_pair_as_one_thing() {
-    // The person sees things: a finding and the response layer's own finding about the same
-    // thing are one row, so the band and the tabs count them as one, in every state the
+fn on_every_state_the_band_and_each_tab_count_findings_as_the_status_does_a_pair_as_two() {
+    // A finding and the response layer's own finding about the same thing are one row, and the
+    // band and the tabs count them as the status does, as two findings, in every state the
     // answers leave. It is never calm while a finding stands, and a verdict never takes a
     // finding out of Open.
     let mac = Mac::new("page-counts");
@@ -1169,32 +1156,37 @@ fn on_every_state_the_band_and_each_tab_count_the_rows_drawn_a_pair_as_one_thing
         .as_str()
         .unwrap()
         .to_string();
-    // The verdict's own finding joins the row of the finding it is about: no row is added, and
-    // the row needs the person now.
+    // The verdict's own finding joins the row of the finding it is about and is counted: it
+    // needs the person now.
     let pair = check("a pair, both open");
-    assert_eq!(pair[2], before[2], "{pair:?} {before:?}");
+    assert_eq!(pair[2], before[2] + 1, "{pair:?} {before:?}");
     assert_eq!(pair[0], before[0] + 1, "{pair:?} {before:?}");
     assert!(mac.answer(&padding, &["seen"]).status.success());
     // The core's finding answered, the response layer's open: the row stays in Open and is in
     // Answered too.
     let half = check("the core's finding answered");
-    assert_eq!((half[2], half[3]), (pair[2], 1), "{half:?}");
+    assert_eq!((half[2], half[3]), (pair[2] - 1, 1), "{half:?}");
     assert!(mac.answer(&own, &["seen"]).status.success());
     let both = check("both answered");
-    assert_eq!((both[2], both[3]), (pair[2] - 1, 1), "{both:?}");
+    assert_eq!((both[2], both[3]), (pair[2] - 2, 2), "{both:?}");
     // The response layer judges the same finding suspicious again: its new finding, the next
-    // occurrence of the one answered before, joins the core's row, which is open again.
+    // occurrence of the one answered before, joins the core's row, which is open again. The
+    // answer to the one before no longer hides a finding, so that one leaves the table.
     let again = mac.send(&about_finding(&store, &padding, "suspicious", "case-3"));
     let again = again["recorded"]["finding"]["id"].as_str().unwrap();
     let more = check("a second finding of the response layer about the same thing");
-    assert_eq!((more[2], more[4]), (both[2] + 1, both[4]), "{more:?}");
+    assert_eq!(
+        (more[2], more[3], more[4]),
+        (both[2] + 1, 1, both[4]),
+        "{more:?}"
+    );
     let page = mac.page();
     assert!(
         drawn_rows(&page).contains(&vec![padding.clone(), again.to_string()]),
         "{page}"
     );
-    // A pair where both findings need the person now is one thing that does: the store counts
-    // two urgent findings, the band one.
+    // A pair where both findings need the person now: the status counts two urgent findings,
+    // and so does the band.
     let sealed = insert_findings(&mac, "integrity.app-seal", "s", 1);
     let mut verdict = about_finding(&store, &sealed[0], "suspicious", "case-2");
     verdict["severity"] = json!("critical");
@@ -1205,14 +1197,14 @@ fn on_every_state_the_band_and_each_tab_count_the_rows_drawn_a_pair_as_one_thing
         .to_string();
     assert_eq!(mac.status()["needs_a_look"]["urgent_total"], 2);
     let urgent = check("a pair, both urgent");
-    assert_eq!(urgent[0], both[0] + 1, "{urgent:?}");
+    assert_eq!(urgent[0], both[0] + 2, "{urgent:?}");
     // The response layer's finding answered while the core's stays open: the row stays where
     // it was, in Open and needing the person now, and is under Answered too.
     assert!(mac.answer(&own, &["seen"]).status.success());
     let half = check("the core's finding open, the response layer's answered");
     assert_eq!(
         (half[0], half[2], half[3]),
-        (urgent[0], urgent[2], urgent[3] + 1),
+        (urgent[0] - 1, urgent[2] - 1, urgent[3] + 1),
         "{half:?}"
     );
     let page = mac.page();
@@ -1249,7 +1241,7 @@ fn a_verdict_about_one_rule_is_never_folded_into_another_rule_s_finding_about_th
     let page = mac.page();
     let (said, drawn) = said_and_drawn(&mac, &page);
     assert_eq!(said, drawn, "{page}");
-    // No true pair here, so the band says the status's totals as they are.
+    // The band says the status's totals.
     assert_eq!((said[0], said[1]), (urgent, total - urgent), "{page}");
     let rows = drawn_rows(&page);
     assert!(rows.contains(&vec![own.clone()]), "{rows:?}");
@@ -4234,7 +4226,9 @@ fn an_open_finding_of_a_rule_this_build_does_not_have_is_counted_shown_read_and_
     assert_eq!((said, drawn), ([0, 1, 1, 0, 1], [0, 1, 1, 0, 1]), "{page}");
     assert!(!page.contains("Nothing needs you"), "{page}");
     assert!(
-        page.contains(&format!("<span class=\"mono\">{GONE}</span>")),
+        page.contains(&format!(
+            "<span class=\"mono\"><bdi class=\"src\">{GONE}</bdi></span>"
+        )),
         "{page}"
     );
     // Listed, and read whole with the journal entry it rests on.
@@ -5503,8 +5497,8 @@ fn the_page_draws_a_group_as_one_row_of_its_folder_and_counts_each_finding() {
     let page = mac.page();
     let (said, drawn) = said_and_drawn(&mac, &page);
     assert_eq!(said, drawn, "{page}");
-    // Nine hooks and the pair as one: nine findings, in six rows.
-    assert_eq!(said[4], 9, "{page}");
+    // Nine hooks and the response layer's finding about one of them: ten findings, in six rows.
+    assert_eq!(said[4], 10, "{page}");
     let rows = drawn_rows(&page);
     assert_eq!(rows.len(), 6, "{rows:?}");
     assert!(rows.contains(&vec![odd[4].clone()]), "{rows:?}");
@@ -5523,12 +5517,12 @@ fn the_page_draws_a_group_as_one_row_of_its_folder_and_counts_each_finding() {
         "{page}"
     );
     assert!(
-        page.contains("<span class=\"fw\">~/dev/shop/.git/hooks</span><span class=\"fk\">Git hook · added · 2 findings</span>"),
+        page.contains("<span class=\"fw\"><bdi class=\"src\">~/dev/shop/.git/hooks</bdi></span><span class=\"fk\">Git hook · added · 2 findings</span>"),
         "{page}"
     );
     // The folder is data, escaped as every name is.
     assert!(
-        page.contains("<span class=\"fw\">~/dev/&lt;i&gt;odd&lt;/i&gt;/.git/hooks</span><span class=\"fk\">Git hook · changed · 2 findings</span>"),
+        page.contains("<span class=\"fw\"><bdi class=\"src\">~/dev/&lt;i&gt;odd&lt;/i&gt;/.git/hooks</bdi></span><span class=\"fk\">Git hook · changed · 2 findings</span>"),
         "{page}"
     );
     assert!(!page.contains("<i>odd"), "{page}");

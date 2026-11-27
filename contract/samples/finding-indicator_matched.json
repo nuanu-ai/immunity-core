@@ -67,6 +67,7 @@
   "technique_text": null,
   "thing": null,
   "title": "Something on this Mac matches a sign of a known attack from the list you gave.",
+  "value_text": "[ipv4-addr:value = '203.0.113.7']",
   "verdicts": null,
   "where_text": "/opt/tools/bin/node"
 }
