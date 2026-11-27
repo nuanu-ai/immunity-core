@@ -3092,7 +3092,13 @@ fn read_checkouts(
             "could not look for checkouts in {}: not a folder",
             root.display()
         );
-        let gap = Gap::of(Cause::Failed);
+        // It looked at nothing, so what the walk before it failed to read is still not read.
+        let mut look = look::Look::default();
+        carry_failed(run.tx, &reading, &mut look, |_| true)?;
+        let gap = Gap {
+            not_read: look.not_read_rows(),
+            ..Gap::of(Cause::Failed)
+        };
         run.apply(&reading, checkouts::BASIS, "none", Some(&reason), &gap, &[])?;
         // Its root is the unit of the failure (`fault.rs`).
         let unit = Unit::whole(checkouts::rel(&start.home, root));

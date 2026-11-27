@@ -3942,10 +3942,34 @@ fn a_walk_of_another_folder_keeps_the_failure_of_the_walk_before_it_outside_that
     drop(locked);
     immunity_all(&store, &brew, &absent, &dir.0.join("work"));
     assert_eq!(walk(), ["partial|not_given|NULL"]);
+    // A second run that does not look into the project still keeps what was not read there.
+    assert_eq!(matching(), ["partial|failed|other/app/package-lock.json"]);
     // A project the run looked into is judged by what this run read there.
     drop(unreadable);
     immunity_all(&store, &brew, &absent, &dir.0.join("other"));
     assert_eq!(matching(), ["partial|no_reader|NULL"]);
+}
+
+#[test]
+fn a_walk_given_a_folder_that_is_not_there_keeps_the_failure_of_the_walk_before_it() {
+    // No false calm: a run given a mistyped folder looked at nothing, so the failure of the
+    // full check before it stands, and the walk after it still has it to keep.
+    let dir = Dir::new("missing-root-keeps-failure");
+    let store = dir.store();
+    let brew = dir.input("brew.txt", SAMPLE);
+    let absent = dir.0.join("absent");
+    checkout(&dir.0, "dev/shop");
+    checkout(&dir.0, "work/site");
+    let walk = "SELECT completeness, cause, (SELECT group_concat(path) FROM coverage_unread u
+                  WHERE u.coverage = c.id AND u.cause = 'failed') FROM coverage c
+                WHERE kind = 'checkouts under the home folder' ORDER BY id DESC LIMIT 1";
+    let _locked = Locked::new(dir.0.join("work"));
+    immunity_home(&store, &brew, &absent);
+    assert_eq!(rows(&store, walk), ["partial|failed|work"]);
+    immunity_all(&store, &brew, &absent, &dir.0.join("dve"));
+    assert_eq!(rows(&store, walk), ["none|failed|work"]);
+    immunity_all(&store, &brew, &absent, &dir.0.join("dev"));
+    assert_eq!(rows(&store, walk), ["partial|failed|work"]);
 }
 
 #[test]

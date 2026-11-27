@@ -1172,7 +1172,9 @@ fn write_answers(
 }
 
 /// Links records to the catalogue's exploited CVEs through their own ids and aliases, and through
-/// the aliases of a record they name, as a RustSec record names a GitHub one.
+/// the aliases of a record they name, as a RustSec record names a GitHub one. An id held by
+/// several sources names the aliases of every copy. A record with no alias and an id off the
+/// list links nothing and names nothing, so it is not read.
 fn link_catalogue(tx: &Transaction) -> rusqlite::Result<()> {
     tx.execute("DELETE FROM vulnerability_linked", [])?;
     let catalogue: HashSet<String> = tx
@@ -1185,7 +1187,8 @@ fn link_catalogue(tx: &Transaction) -> rusqlite::Result<()> {
     let records: Vec<(String, String, Vec<String>)> = tx
         .prepare(
             "SELECT source, id, aliases FROM advisory
-             WHERE gone_at IS NULL AND withdrawn IS NULL",
+             WHERE gone_at IS NULL AND withdrawn IS NULL
+               AND (aliases != '[]' OR id IN (SELECT id FROM threat WHERE gone_at IS NULL))",
         )?
         .query_map([], |r| {
             let aliases: String = r.get(2)?;
@@ -1196,8 +1199,10 @@ fn link_catalogue(tx: &Transaction) -> rusqlite::Result<()> {
             ))
         })?
         .collect::<rusqlite::Result<_>>()?;
-    let by_id: HashMap<&str, &Vec<String>> =
-        records.iter().map(|(_, id, a)| (id.as_str(), a)).collect();
+    let mut by_id: HashMap<&str, BTreeSet<&str>> = HashMap::new();
+    for (_, id, aliases) in &records {
+        (by_id.entry(id).or_default()).extend(aliases.iter().map(String::as_str));
+    }
     let mut put = tx.prepare(
         "INSERT OR IGNORE INTO vulnerability_linked (cve, source, advisory) VALUES (?1, ?2, ?3)",
     )?;
@@ -1205,7 +1210,7 @@ fn link_catalogue(tx: &Transaction) -> rusqlite::Result<()> {
         let mut names: BTreeSet<&str> = aliases.iter().map(String::as_str).collect();
         for a in aliases {
             if let Some(more) = by_id.get(a.as_str()) {
-                names.extend(more.iter().map(String::as_str));
+                names.extend(more);
             }
         }
         names.insert(id);
