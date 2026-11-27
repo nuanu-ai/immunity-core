@@ -240,6 +240,15 @@ pub struct ThisMac {
 }
 
 impl ThisMac {
+    /// Its name for a person: the one the latest full check kept, else the name in its id.
+    pub fn named(&self) -> Option<&str> {
+        let id = self.machine.as_deref()?;
+        let in_id = id.strip_prefix("machine:").unwrap_or(id);
+        Some(self.name.as_deref().unwrap_or(in_id))
+    }
+}
+
+impl ThisMac {
     /// Before any reading of this Mac.
     pub fn unchecked(live: bool) -> ThisMac {
         ThisMac {

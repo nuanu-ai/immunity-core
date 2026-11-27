@@ -1294,11 +1294,7 @@ fn this_mac_message(m: &crate::covered::ThisMac, now: i64) -> crate::contract::v
         stale_reason,
         fresh_for_seconds: n(FRESH_FOR),
         id_text: m.machine.as_deref().map(crate::known::whole),
-        name_text: (m
-            .machine
-            .as_deref()
-            .map(|id| id.strip_prefix("machine:").unwrap_or(id)))
-        .map(|named| crate::known::whole(m.name.as_deref().unwrap_or(named))),
+        name_text: m.named().map(crate::known::whole),
     }
 }
 
