@@ -40,8 +40,37 @@ fn class_words(class: i32) -> &'static str {
     }
 }
 
+/// Whether the page may say that every reading was full. All of these hold: a full check has
+/// finished; the summary counts at least one reading and every one is full without a note; no
+/// machine could not be reached and no reading is implied by one; no group of readings is
+/// listed or counted; and the latest finished check made again every reading an earlier one
+/// made. Anything else, an empty summary or a class this build does not know among them, is
+/// never calm.
+fn all_full(r: &v1::Status, c: &v1::CoverageSummary) -> bool {
+    let checked = r.this_mac.as_ref().is_some_and(|m| m.checked_at.is_some());
+    checked
+        && c.readings > 0
+        && c.full == c.readings
+        && c.unreached_total == 0
+        && c.unreached.is_empty()
+        && c.implied_by_unreached == 0
+        && c.problems.is_empty()
+        && c.problems_total == 0
+        && not_repeated(r) == 0
+}
+
+/// How many readings an earlier check made that the latest finished one did not make again.
+fn not_repeated(r: &v1::Status) -> u64 {
+    (r.last_finished_run.as_ref())
+        .and_then(|f| f.readings.as_ref())
+        .map_or(0, |x| x.not_repeated)
+}
+
 fn body(out: &mut String, r: &v1::Status) -> Out {
     out.push_str("<section id=\"coverage\">\n<p class=\"muted\">What the other pages say is only as good as this.</p>\n");
+    if r.running {
+        out.push_str("<p class=\"alert\">A check is running now. This page shows what was read before it.</p>\n");
+    }
     // A check that died: nothing it read is in the store, whatever the readings below say.
     if let Some(at) = (r.last_run.as_ref())
         .filter(|l| l.finished_at.is_none() && !r.running)
@@ -83,16 +112,26 @@ fn body(out: &mut String, r: &v1::Status) -> Out {
             "machines that could not be reached"
         ),
     )?;
-    let not_full = c.partial + c.none;
-    if not_full == 0 {
+    let checked = r.this_mac.as_ref().is_some_and(|m| m.checked_at.is_some());
+    if all_full(r, c) {
         out.push_str("<p class=\"ok\">Every reading was full at its latest run.</p>\n");
-    } else {
+    } else if !checked {
+        out.push_str(
+            "<p class=\"alert\">No full check has finished, so what was read is not known.</p>\n",
+        );
+    } else if c.readings == 0 {
+        out.push_str(
+            "<p class=\"alert\">The status counts no reading, so what was read is not known.</p>\n",
+        );
+    } else if c.full < c.readings {
         writeln!(
             out,
-            "<p class=\"alert\">{} of {} were not full at their latest run. What they cover may be out of date or missing.</p>",
-            grouped(not_full as i64),
+            "<p class=\"alert\">{} of {} were not plainly full at their latest run. What they cover may be out of date or missing.</p>",
+            grouped((c.readings - c.full) as i64),
             counted(c.readings as i64, "reading", "readings"),
         )?;
+    } else {
+        out.push_str("<p class=\"alert\">Not every reading is known to be full and current.</p>\n");
     }
     if c.partial > 0 {
         writeln!(
@@ -100,6 +139,14 @@ fn body(out: &mut String, r: &v1::Status) -> Out {
             "<p class=\"alert\">{} of them {} partial: what they saw was added, but what disappeared there cannot be seen. Removals there are unknown.</p>",
             grouped(c.partial as i64),
             if c.partial == 1 { "was" } else { "were" }
+        )?;
+    }
+    let stale = not_repeated(r);
+    if stale > 0 {
+        writeln!(
+            out,
+            "<p class=\"alert\">The latest finished check did not read again all that earlier checks read: {}, and what they hold may be out of date.</p>",
+            esc(&crate::overview::not_repeated(stale))
         )?;
     }
     unreached(out, c)?;
@@ -170,23 +217,33 @@ fn groups(out: &mut String, c: &v1::CoverageSummary) -> Out {
             if more > 0 && !examples.is_empty() {
                 examples.push(format!("and {} more", grouped(more as i64)));
             }
-            cell(out, "mono", &examples.join(", "))?;
+            match examples.is_empty() {
+                true => cell(out, "", "the status names no place")?,
+                false => cell(out, "mono", &examples.join(", "))?,
+            }
             cell(out, "", &reason(g.reason_text.as_deref()))?;
             out.push_str("</tr>\n");
         }
         out.push_str("</tbody></table></div>\n");
     }
     if hidden > 0 {
-        // The readings of the groups not listed: those of every class, less those listed.
+        // The readings of the groups not listed: those of every class, less those listed. When
+        // the counts leave none for them, they disagree, and how many there are is not said.
         let all = c.failed + c.no_reader + c.not_given + c.read_nothing;
         let listed: u64 = c.problems.iter().map(|g| g.count).sum();
-        writeln!(
-            out,
-            "<p class=\"alert\">{} of readings, {} among them, {} not listed here.</p>",
-            counted(hidden as i64, "more group", "more groups"),
-            counted(all.saturating_sub(listed) as i64, "reading", "readings"),
-            if hidden == 1 { "is" } else { "are" }
-        )?;
+        let groups = counted(hidden as i64, "more group", "more groups");
+        let verb = if hidden == 1 { "is" } else { "are" };
+        match all > listed {
+            true => writeln!(
+                out,
+                "<p class=\"alert\">{groups} of readings, {} among them, {verb} not listed here.</p>",
+                counted((all - listed) as i64, "reading", "readings"),
+            )?,
+            false => writeln!(
+                out,
+                "<p class=\"alert\">{groups} of readings {verb} not listed here, and how many readings they hold is not known.</p>",
+            )?,
+        }
     }
     Ok(())
 }
@@ -287,46 +344,146 @@ mod tests {
         assert!(!whole.contains("not listed here"), "{whole}");
     }
 
+    /// A status after a full check whose three readings were all full, and nothing else.
+    fn calm() -> v1::Status {
+        v1::Status {
+            this_mac: Some(v1::ThisMac {
+                checked_at: Some(1_800_000_000),
+                ..Default::default()
+            }),
+            coverage: Some(v1::CoverageSummary {
+                readings: 3,
+                full: 3,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    const FULL: &str = "Every reading was full";
+
     #[test]
-    fn a_page_says_every_reading_was_full_only_when_none_was_partial_or_read_nothing() {
-        // False calm: "every reading was full" over a reading that was partial or failed.
-        let full = v1::CoverageSummary {
-            readings: 3,
-            full: 3,
+    fn a_page_says_every_reading_was_full_only_when_nothing_at_all_says_otherwise() {
+        // False calm: the green line beside a reading, a machine, a group or a check that says
+        // something was not read, or with nothing to rest on.
+        let said = |change: &dyn Fn(&mut v1::Status)| {
+            let mut r = calm();
+            change(&mut r);
+            page(&r, 1_800_000_100)
+        };
+        fn c(r: &mut v1::Status) -> &mut v1::CoverageSummary {
+            r.coverage.as_mut().unwrap()
+        }
+        assert!(said(&|_| {}).contains(FULL));
+        let failed = v1::ReadingGroup {
+            class: v1::ReadingClass::Failed as i32,
+            count: 1,
             ..Default::default()
         };
-        let said = |c: v1::CoverageSummary| {
-            page(
-                &v1::Status {
-                    coverage: Some(c),
+        type Change<'a> = &'a dyn Fn(&mut v1::Status);
+        let cases: [(&str, Change); 11] = [
+            ("not plainly full", &|r| c(r).full = 2),
+            ("a group listed", &|r| c(r).problems = vec![failed.clone()]),
+            ("a group counted", &|r| c(r).problems_total = 1),
+            ("an unknown class", &|r| {
+                c(r).problems = vec![v1::ReadingGroup {
+                    class: 99,
+                    ..failed.clone()
+                }]
+            }),
+            ("a machine counted", &|r| c(r).unreached_total = 1),
+            ("a machine listed", &|r| {
+                c(r).unreached = vec![v1::Unreached::default()]
+            }),
+            ("an implied reading", &|r| c(r).implied_by_unreached = 1),
+            ("no reading", &|r| (c(r).readings, c(r).full) = (0, 0)),
+            ("no full check", &|r| r.this_mac = None),
+            ("a check without a time", &|r| {
+                r.this_mac.as_mut().unwrap().checked_at = None
+            }),
+            ("readings not repeated", &|r| {
+                r.last_finished_run = Some(v1::FinishedCheck {
+                    readings: Some(v1::CheckReadings {
+                        not_repeated: 2,
+                        ..Default::default()
+                    }),
                     ..Default::default()
-                },
-                1_800_000_000,
-            )
-        };
-        assert!(said(full.clone()).contains("Every reading was full"));
-        for c in [
-            v1::CoverageSummary {
-                partial: 1,
-                ..full.clone()
-            },
-            v1::CoverageSummary {
-                none: 1,
-                ..full.clone()
-            },
-        ] {
-            let page = said(c);
-            assert!(
-                !page.contains("Every reading was full")
-                    && page.contains("1 of 3 readings were not full"),
-                "{page}"
-            );
+                })
+            }),
+        ];
+        for (case, change) in cases {
+            let page = said(change);
+            assert!(!page.contains(FULL), "{case}: {page}");
         }
+        // What each says instead.
+        assert!(said(&|r| c(r).full = 2).contains("1 of 3 readings were not plainly full"));
+        assert!(
+            said(&|r| r.this_mac = None)
+                .contains("No full check has finished, so what was read is not known.")
+        );
+        assert!(
+            said(&|r| (c(r).readings, c(r).full) = (0, 0))
+                .contains("The status counts no reading, so what was read is not known.")
+        );
+        assert!(
+            said(&|r| c(r).implied_by_unreached = 1)
+                .contains("Not every reading is known to be full and current.")
+        );
+        let unknown = said(&|r| {
+            c(r).problems = vec![v1::ReadingGroup {
+                class: 99,
+                ..failed.clone()
+            }]
+        });
+        assert!(
+            unknown.contains("<tr class=\"bad\"><td>failed</td>"),
+            "{unknown}"
+        );
+        let stale = said(cases[10].1);
+        assert!(
+            stale.contains("did not read again all that earlier checks read: 2 earlier readings were not repeated,"),
+            "{stale}"
+        );
         // No summary at all is not known, never calm.
         let none = page(&v1::Status::default(), 1_800_000_000);
         assert!(
-            !none.contains("Every reading was full") && none.contains("is not known"),
+            !none.contains(FULL) && none.contains("is not known"),
             "{none}"
+        );
+    }
+
+    #[test]
+    fn a_running_check_is_said_above_what_was_read_before_it() {
+        // The numbers are those of what is stored; a check running now may change them.
+        let mut r = calm();
+        r.running = true;
+        let page = page(&r, 1_800_000_100);
+        let running = page.find("A check is running now. This page shows what was read before it.");
+        assert!(
+            running.is_some_and(|at| page.find(FULL).is_some_and(|full| at < full)),
+            "{page}"
+        );
+        assert!(!super::page(&calm(), 1_800_000_100).contains("is running now"));
+    }
+
+    #[test]
+    fn a_hidden_group_is_never_said_to_hold_no_reading_and_a_group_with_no_place_says_so() {
+        // The message's counts disagree when the groups it lists hold as many readings as the
+        // classes count: the page then says the hidden groups' readings are not known.
+        let mut r = summary(5, 6, 0, 0);
+        if let Some(c) = r.coverage.as_mut() {
+            c.failed = 10;
+            c.problems[0].examples_text.clear();
+        }
+        let page = page(&r, 1_800_000_100);
+        assert!(
+            page.contains("1 more group of readings is not listed here, and how many readings they hold is not known.")
+                && !page.contains("0 readings"),
+            "{page}"
+        );
+        assert!(
+            page.contains("<td>the status names no place</td>"),
+            "{page}"
         );
     }
 

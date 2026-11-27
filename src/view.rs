@@ -149,28 +149,34 @@ pub fn event_pages(
     ])
 }
 
-/// Takes away what earlier runs of the view left in its folder of details and this run did not
-/// write, such as a page an earlier build wrote and this one does not: every regular file
-/// directly in `DETAILS` under the store's `folder` whose name ends in `.html` and is not one of
-/// `written`, the pages this run wrote, each relative to `folder`. A link is taken away itself
-/// and never followed; a folder, a file of another ending and anything below a folder stay. A
-/// file that cannot be taken away stays, and the view does not fail for it.
-pub fn remove_stale(folder: &std::path::Path, written: &[String]) {
-    let Ok(entries) = std::fs::read_dir(folder.join(DETAILS)) else {
+/// Takes away the pages the view's previous full write wrote and this one did not, such as a
+/// page an earlier build wrote and this one does not: each name the previous manifest
+/// (`previous`, the bytes of `MADE` before this write) lists under `"pages"` that is not one of
+/// `written`. The manifest is a file on disk that may have been edited, so a name is acted on
+/// only in a form the view writes a page of details by (`of_a_page`); any other is skipped, and
+/// a manifest that is not what the view writes takes nothing away. Nothing else in the folder
+/// is looked at. Each is taken away itself (`remove_file`, which never follows a link in its
+/// last part); one that cannot be stays, and the view does not fail for it.
+pub fn remove_stale(folder: &std::path::Path, previous: &[u8], written: &[String]) {
+    let Ok(made) = serde_json::from_slice::<serde_json::Value>(previous) else {
         return;
     };
-    for entry in entries.flatten() {
-        let name = entry.file_name();
-        let page = name.as_encoded_bytes().ends_with(b".html");
-        let ours = (name.to_str()).is_some_and(|n| written.contains(&format!("{DETAILS}/{n}")));
-        // The type of the entry itself: a link is a link, whatever it points to.
-        let plain = entry
-            .file_type()
-            .is_ok_and(|t| t.is_file() || t.is_symlink());
-        if page && plain && !ours {
-            let _ = std::fs::remove_file(entry.path());
+    let Some(pages) = made["pages"].as_array() else {
+        return;
+    };
+    for name in pages.iter().filter_map(|p| p.as_str()) {
+        if of_a_page(name) && !written.iter().any(|w| w == name) {
+            let _ = std::fs::remove_file(folder.join(name));
         }
     }
+}
+
+/// Whether `name` has the form the view names a page of details by, relative to the store's
+/// folder: `DETAILS`, a slash, and one plain file name ending in `.html`. Not absolute, no
+/// `..`, no folder below, never empty.
+fn of_a_page(name: &str) -> bool {
+    (name.strip_prefix(DETAILS).and_then(|n| n.strip_prefix('/')))
+        .is_some_and(|file| file.ends_with(".html") && !file.contains('/'))
 }
 
 /// The sections of the summary something outside the page may ask for, by anchor and
@@ -1181,41 +1187,59 @@ mod tests {
     }
 
     #[test]
-    fn a_page_an_earlier_run_left_is_taken_away_and_nothing_else_in_the_folder_is_touched() {
+    fn a_page_the_previous_write_listed_and_this_one_did_not_is_taken_away_and_nothing_else() {
         // A page of a thing that is gone, or one an earlier build wrote, would stand beside the
-        // current pages as if it were current. Only such a page goes: never what a link points
-        // to, a folder, a pipe, or a file the view does not write.
+        // current pages as if it were current. Only a page the view's own previous write listed
+        // goes: never a person's file beside them, a name the manifest was edited to hold that
+        // the view never writes, or what a link points to.
         let scratch = crate::common::Scratch::new("view-stale");
-        let (folder, outside) = (scratch.0.join("store"), scratch.0.join("outside"));
+        let root = scratch.0.clone();
+        let folder = root.join("store");
         let details = folder.join(super::DETAILS);
-        std::fs::create_dir_all(details.join("folder.html")).unwrap();
-        std::fs::create_dir_all(&outside).unwrap();
-        let target = outside.join("kept.html");
-        for (path, text) in [
-            (details.join("stale.html"), "old"),
-            (details.join("current.html"), "new"),
-            (details.join("notes.txt"), "mine"),
-            (details.join("folder.html/inside.html"), "below"),
-            (target.clone(), "elsewhere"),
-        ] {
-            std::fs::write(path, text).unwrap();
+        std::fs::create_dir_all(details.join("sub")).unwrap();
+        let elsewhere = [
+            root.join("outside.html"),
+            folder.join("outside.html"),
+            folder.join("viewer.html"),
+            root.join("abs.html"),
+            root.join("kept.html"),
+            details.join("sub/x.html"),
+            details.join("notes.txt"),
+            details.join("notes.html"),
+            details.join("current.html"),
+        ];
+        for path in elsewhere.iter().chain([&details.join("stale.html")]) {
+            std::fs::write(path, "page").unwrap();
         }
-        std::os::unix::fs::symlink(&target, details.join("link.html")).unwrap();
-        let pipe = details.join("pipe.html");
-        let pipe = std::ffi::CString::new(pipe.as_os_str().as_encoded_bytes()).unwrap();
-        // SAFETY: a valid C path.
-        assert_eq!(unsafe { libc::mkfifo(pipe.as_ptr(), 0o600) }, 0);
-        super::remove_stale(&folder, &[format!("{}/current.html", super::DETAILS)]);
-        let mut left: Vec<String> = std::fs::read_dir(&details)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        left.sort();
-        assert_eq!(
-            left,
-            ["current.html", "folder.html", "notes.txt", "pipe.html"]
-        );
-        assert!(details.join("folder.html/inside.html").is_file());
-        assert_eq!(std::fs::read_to_string(&target).unwrap(), "elsewhere");
+        std::os::unix::fs::symlink(root.join("kept.html"), details.join("link.html")).unwrap();
+        let previous = serde_json::json!({"pages": [
+            "view/stale.html", "view/current.html", "view/link.html", "../outside.html",
+            "view/../outside.html", root.join("abs.html").to_str(), "view/sub/x.html",
+            "view/notes.txt", "viewer.html", "view/", 3,
+        ]})
+        .to_string();
+        let written = ["view.html".to_string(), "view/current.html".to_string()];
+        // No manifest, or one the view does not write, takes nothing away.
+        for nothing in ["", "not json", "{\"pages\": \"view/stale.html\"}"] {
+            super::remove_stale(&folder, nothing.as_bytes(), &written);
+            assert!(details.join("stale.html").is_file(), "{nothing}");
+        }
+        super::remove_stale(&folder, previous.as_bytes(), &written);
+        assert!(!details.join("stale.html").exists());
+        assert!(std::fs::symlink_metadata(details.join("link.html")).is_err());
+        for path in &elsewhere {
+            assert!(path.is_file(), "{}", path.display());
+        }
+        // With the folder of details a link to a folder another program writes in, what is there
+        // and no manifest names stays.
+        let (other, shared) = (root.join("other"), root.join("shared"));
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::create_dir_all(&shared).unwrap();
+        std::os::unix::fs::symlink(&shared, other.join(super::DETAILS)).unwrap();
+        std::fs::write(shared.join("foreign.html"), "theirs").unwrap();
+        std::fs::write(shared.join("stale.html"), "ours").unwrap();
+        let ours = r#"{"pages": ["view/stale.html"]}"#;
+        super::remove_stale(&other, ours.as_bytes(), &written);
+        assert!(shared.join("foreign.html").is_file() && !shared.join("stale.html").exists());
     }
 }

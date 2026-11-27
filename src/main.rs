@@ -1651,8 +1651,10 @@ fn write_view(store: &Path, if_stale: bool) -> Result<Vec<PathBuf>, Box<dyn Erro
         Current::No => {}
     }
     std::fs::write(folder.join(happens::SCRIPT_FILE), happens::SCRIPT)?;
-    // Every page is written: what earlier runs left and this one did not write goes.
-    view::remove_stale(&folder, &names);
+    // Every page is written: what the previous full write listed and this one did not write
+    // goes, by the manifest it left; without one, nothing does.
+    let previous = open::read(&folder.join(view::MADE), open::Reach::Own, open::UNCAPPED);
+    view::remove_stale(&folder, &previous.unwrap_or_default(), &names);
     // Last, so that pages cut short by a failure are never named as current.
     let made = serde_json::json!({
         "basis": basis,
@@ -5804,14 +5806,7 @@ fn summary_sentences(s: &status::Summary) -> String {
         ));
     }
     if t.not_repeated > 0 {
-        gaps.push(format!(
-            "{} not repeated",
-            things(
-                t.not_repeated,
-                "earlier reading was",
-                "earlier readings were"
-            )
-        ));
+        gaps.push(overview::not_repeated(t.not_repeated as u64));
     }
     if !gaps.is_empty() {
         let gaps = gaps.join("; ");

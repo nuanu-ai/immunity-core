@@ -593,15 +593,28 @@ fn view_does_not_change_or_create_the_store() {
 
 #[test]
 fn a_page_an_earlier_build_wrote_is_gone_once_the_pages_are_written_again() {
-    // A page this build no longer writes would stand beside the current ones as if current.
+    // A page this build no longer writes would stand beside the current ones as if current. It
+    // is known by the manifest the earlier write left; a person's own file beside it stays.
     let dir = Dir::new("stale-page");
     let store = dir.store();
     immunity(&store, &dir.input("brew.txt", SAMPLE));
     view(&store);
-    let old = dir.0.join("view/changes.html");
+    let (old, notes) = (
+        dir.0.join("view/changes.html"),
+        dir.0.join("view/notes.html"),
+    );
     std::fs::write(&old, "<!doctype html>").unwrap();
+    std::fs::write(&notes, "mine").unwrap();
+    let made = dir.0.join("view/made.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&made).unwrap()).unwrap();
+    manifest["pages"]
+        .as_array_mut()
+        .unwrap()
+        .push("view/changes.html".into());
+    std::fs::write(&made, manifest.to_string()).unwrap();
     view(&store);
-    assert!(!old.exists());
+    assert!(!old.exists() && notes.is_file());
 }
 
 #[test]

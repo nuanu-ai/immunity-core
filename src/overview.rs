@@ -36,6 +36,15 @@ pub(crate) fn count(n: u64, one: &str, many: &str) -> String {
     crate::things(i64::try_from(n).unwrap_or(i64::MAX), one, many)
 }
 
+/// Readings an earlier check made that the latest finished one did not make again, as the
+/// status says them under its gaps.
+pub(crate) fn not_repeated(n: u64) -> String {
+    format!(
+        "{} not repeated",
+        count(n, "earlier reading was", "earlier readings were")
+    )
+}
+
 /// `n` with thousands grouped.
 pub(crate) fn grouped(n: u64) -> String {
     count(n, "", "").trim_end().to_string()
@@ -1258,14 +1267,7 @@ fn counted(screen: &Screen, s: &v1::Status, f: &v1::FinishedCheck) -> Vec<(&'sta
             ));
         }
         if r.not_repeated > 0 {
-            gaps.push(format!(
-                "{} not repeated",
-                count(
-                    r.not_repeated,
-                    "earlier reading was",
-                    "earlier readings were"
-                )
-            ));
+            gaps.push(not_repeated(r.not_repeated));
         }
         if !gaps.is_empty() {
             parts.push(("Gaps", gaps.join("; ")));
