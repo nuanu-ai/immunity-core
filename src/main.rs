@@ -2507,13 +2507,6 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     read_other_autoruns(&mut run, &args.home, &found, walk_failure)?;
     stage(CheckStage::Software);
     let mut changed = read_integrity(&mut run, args)?;
-    stage(CheckStage::Events);
-    opened += read_events(&mut run, args)?;
-    read_traces(&mut run, args)?;
-    // Once the last reader has finished, what no reading places any more is gone; then the
-    // matchers compare what is left in force: a digest that went is matched to no indicator.
-    opened += settled(&mut run, &mut watched)?;
-    stage(CheckStage::Saving);
     changed.extend(read_indicators(
         &mut run,
         args,
@@ -2522,6 +2515,11 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
         &not_told,
     )?);
     opened += findings::detect(run.tx, run.run_id, run.at, &changed)?;
+    stage(CheckStage::Events);
+    opened += read_events(&mut run, args)?;
+    read_traces(&mut run, args)?;
+    opened += settled(&mut run, &mut watched)?;
+    stage(CheckStage::Saving);
     resolve(&mut run)?;
     read_threats(&run, catalogue)?;
     read_feeds(&run, feeds)?;

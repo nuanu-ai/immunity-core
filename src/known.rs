@@ -2,9 +2,8 @@
 //! (`contract/immunity/v1/known.proto`): the answer that `immunity project`, `immunity program` and
 //! `immunity machine` share.
 //!
-//! It reads the store, and no reader runs. A path is looked at only before an answer of `gone`,
-//! to find where it is on the disk (`on_disk`), through the guard that never looks inside a folder
-//! macOS asks permission for: looking there would raise the dialog.
+//! It reads the store and nothing else. No reader runs and no path is looked at: a thing may be
+//! in a folder macOS asks permission for, and looking would raise the dialog.
 //!
 //! A command of the contract only turns what was asked into a `Question`: the entity it names,
 //! the folder it lies in where it has one, and the readings that find things of its kind. The
@@ -305,7 +304,6 @@ pub fn known_of(
     let mut subjects: BTreeMap<String, String> = BTreeMap::new();
     let mut own_ids: BTreeSet<String> = BTreeSet::new();
     let mut owners: BTreeSet<ReadingKey> = BTreeSet::new();
-    let mut untold = None;
     if let Some((id, ty)) = &thing {
         let mut own: Parts = Parts::new();
         own.insert(id.to_string(), ty.clone());
@@ -325,12 +323,9 @@ pub fn known_of(
             }
         }
         own_ids.extend(own.keys().cloned());
-        let here = q.machine.map(|machine| (machine, home));
-        let (presence, readings, why) =
-            presence(conn, own.keys(), with_parts, &latest, q.found_by, here)?;
+        let (presence, readings) = presence(conn, own.keys(), with_parts, &latest, q.found_by)?;
         known.presence = presence as i32;
         owners = readings;
-        untold = why;
         known.thing = Some(entity(id, ty));
         known.same_as = own
             .iter()
@@ -386,18 +381,6 @@ pub fn known_of(
             reason,
         );
     }
-    // A thing whose place could not be followed on the disk is not known to be gone: why.
-    if let (Some(why), Some(machine)) = (untold, q.machine) {
-        let (kind, reason) = (unread_kind(q.question), format!("{UNTOLD}{why}"));
-        by_rule_for(
-            &mut known,
-            RULE_READER,
-            kind,
-            machine,
-            &reason,
-            v1::Cause::Failed,
-        );
-    }
     // A finding is the thing's when what it is about, or anything a reading ever tied it to, at
     // any depth, is the thing under one of its ids or a part of it, lies in its folder or at or
     // inside the place asked, or is named by its id as inside it. Places are compared by the key
@@ -443,19 +426,13 @@ type ReadingKey = (String, String, String);
 /// reading's latest retraction of it, in the order of runs, set aside with a journal entry
 /// `retired` without looking at it (`lifecycle::retire`, `look::retire_facts`): that says nothing
 /// of whether it is there, whatever the latest reading of its kind was.
-///
-/// Before `gone`, each place on `here`, this Mac with its home folder, is found on the disk
-/// (`on_disk`): a place held under its real path in the volume's spelling, reached through a link
-/// or spelled otherwise, is held; one in a folder macOS asks permission for is `unknown`, and so
-/// is one that could not be followed, with what the system said as the third value.
 fn presence<'a>(
     conn: &Connection,
     units: impl Iterator<Item = &'a String>,
     with_parts: bool,
     latest: &[Reading],
     found_by: &[(&str, &str)],
-    here: Option<(&str, &Path)>,
-) -> rusqlite::Result<(v1::Presence, BTreeSet<ReadingKey>, Option<String>)> {
+) -> rusqlite::Result<(v1::Presence, BTreeSet<ReadingKey>)> {
     let units: Vec<&String> = units.collect();
     let mut held = with_parts;
     let mut owners: BTreeSet<ReadingKey> = BTreeSet::new();
@@ -489,7 +466,7 @@ fn presence<'a>(
         }
     }
     if held {
-        return Ok((v1::Presence::Held, owners, None));
+        return Ok((v1::Presence::Held, owners));
     }
     let mut last = conn.prepare(
         "SELECT completeness FROM coverage WHERE reader = ?1 AND scope = ?2 AND kind = ?3
@@ -518,64 +495,12 @@ fn presence<'a>(
             .optional()?;
         all_full = all_full && completeness.as_deref() == Some("full");
     }
-    let (mut untold, looked) = (None, all_full);
-    let here = here.filter(|_| looked);
-    for (unit, (machine, path)) in units.iter().filter_map(|u| Some((u, place_of(u)?))) {
-        let Some((_, home)) = here.filter(|(this, _)| *this == machine) else {
-            continue;
-        };
-        match on_disk(home, path) {
-            OnDisk::At(real) if real != path => {
-                // The same id, of the same type on the same machine, at the real path.
-                let id = format!("{}{real}", &unit[..unit.len() - path.len()]);
-                if live.query_row([&id], |r| r.get::<_, bool>(0))? {
-                    return Ok((v1::Presence::Held, owners, None));
-                }
-            }
-            OnDisk::At(_) | OnDisk::Absent => {}
-            OnDisk::Guarded => all_full = false,
-            OnDisk::Untold(why) => (all_full, untold) = (false, Some(why)),
-        }
-    }
     let presence = if all_full {
         v1::Presence::Gone
     } else {
         v1::Presence::Unknown
     };
-    Ok((presence, owners, untold))
-}
-
-/// How a reading made by rule says that where a path leads on the disk could not be told.
-const UNTOLD: &str =
-    "where this path leads on the disk could not be told, so it is not known to be gone: ";
-
-/// Where a place is on the disk.
-enum OnDisk {
-    /// There, at this path as ids name it, in the spelling the volume gives its names.
-    At(String),
-    /// In a folder macOS asks permission for, which was not entered.
-    Guarded,
-    /// Nothing is there (`look::Absent::on_the_way`).
-    Absent,
-    /// It could not be followed, as through a folder that cannot be searched: what the system said.
-    Untold(String),
-}
-
-/// The place at `path`, as ids name paths, made real through the guard (`guarded::real`), and
-/// then, with no link or guarded folder left on it, spelled as the volume spells its names, as
-/// the walk tells a checkout the disk names otherwise (`checkouts::Walk::look_again`).
-fn on_disk(home: &Path, path: &str) -> OnDisk {
-    let real_home = crate::watched::real(home.to_path_buf());
-    let real = match guarded::real(&home.join(path), &[home, &real_home]) {
-        guarded::Real::At(real) => std::fs::canonicalize(real),
-        guarded::Real::Guarded(_) => return OnDisk::Guarded,
-        guarded::Real::Failed(e) => Err(e),
-    };
-    match real {
-        Ok(real) => OnDisk::At(checkouts::rel(&real_home, &real)),
-        Err(e) if crate::look::Absent::on_the_way(&e).is_some() => OnDisk::Absent,
-        Err(e) => OnDisk::Untold(e.to_string()),
-    }
+    Ok((presence, owners))
 }
 
 /// What each entity was ever `part_of` or `located_on`, in force or retracted, looked up by its id
@@ -1091,7 +1016,7 @@ mod tests {
         };
         let presence = |thing: &str| {
             let unit = format!("file:machine:mac/{thing}");
-            super::presence(&conn, std::iter::once(&unit), false, &[], &[], None)
+            super::presence(&conn, std::iter::once(&unit), false, &[], &[])
                 .unwrap()
                 .0
         };
@@ -1242,16 +1167,9 @@ mod tests {
         let presence = |found_by: &[(&str, &str)]| {
             let latest = super::latest(&conn).unwrap();
             let unit = shop.to_string();
-            (super::presence(
-                &conn,
-                std::iter::once(&unit),
-                false,
-                &latest,
-                found_by,
-                None,
-            ))
-            .unwrap()
-            .0
+            (super::presence(&conn, std::iter::once(&unit), false, &latest, found_by))
+                .unwrap()
+                .0
         };
         assert_eq!(presence(&[]), v1::Presence::Unknown);
         assert_eq!(presence(&crate::project::FOUND_BY), v1::Presence::Unknown);
@@ -1262,121 +1180,5 @@ mod tests {
         )
         .unwrap();
         assert_eq!(presence(&[]), v1::Presence::Gone);
-    }
-
-    /// The presence of the checkout at `rel` that the walk found no longer in a reading of
-    /// `completeness`, on a store in `dir` where the checkouts `held` are in force, asked on this
-    /// Mac with `home`; and the reason of the reading made by rule that says its place could not
-    /// be followed.
-    fn gone_from(
-        dir: &Path,
-        (home, completeness): (&Path, &str),
-        rel: &str,
-        held: &[&str],
-    ) -> (v1::Presence, Option<String>) {
-        for file in ["store.db", "store.db-wal", "store.db-shm"] {
-            let _ = std::fs::remove_file(dir.join(file));
-        }
-        let conn = store::open_or_make(&dir.join("store.db")).unwrap();
-        let fact = |id: &str, layer: &str, retracted: &str| {
-            conn.execute_batch(&format!(
-                "INSERT OR IGNORE INTO entity (id, type) VALUES ('{id}', 'checkout');
-                 INSERT INTO assertion (layer, subject, predicate, object, reader, scope, kind,
-                     source_ref, basis, observed_at, run_id, retracted_at, retracted_by)
-                 VALUES ('{layer}', '{id}', 'located_on', 'machine:mac', '{reader}',
-                         'machine:mac', '{kind}', 'raw', 'observed', 0, 'run-0', {retracted});",
-                reader = checkouts::READER,
-                kind = checkouts::KIND,
-            ))
-            .unwrap();
-        };
-        conn.execute_batch(&format!(
-            "INSERT INTO entity (id, type) VALUES ('machine:mac', 'machine');
-             INSERT INTO coverage (reader, run_id, observed_at, scope, kind, completeness,
-                 reason, cause)
-             VALUES ('{}', 'run-1', 1, 'machine:mac', '{}', '{completeness}', 'invented', 'failed');",
-            checkouts::READER,
-            checkouts::KIND,
-        ))
-        .unwrap();
-        let unit = format!("checkout:machine:mac/{rel}");
-        fact(&unit, "retracted", "1, 'run-1'");
-        for rel in held {
-            fact(&format!("checkout:machine:mac/{rel}"), "live", "NULL, NULL");
-        }
-        let q = Question {
-            question: v1::Question::Project,
-            asked: rel,
-            id: Some(&unit),
-            also: &[],
-            folder: None,
-            place: None,
-            places: &[],
-            unread: None,
-            machine: Some("machine:mac"),
-            found_by: &[],
-            inside: &[],
-            files_anywhere: false,
-        };
-        let known = known_of(&conn, &q, home, 1).unwrap();
-        let by_rule = (known.coverage.iter())
-            .find(|c| c.reader == RULE_READER && c.cause == Some(v1::Cause::Failed as i32));
-        let presence = v1::Presence::try_from(known.presence).unwrap();
-        (presence, by_rule.and_then(|c| c.reason_text.clone()))
-    }
-
-    #[test]
-    fn a_thing_held_under_its_real_path_through_a_link_or_in_the_volume_s_spelling_is_never_gone() {
-        // No false calm. A project known under a path that now leads through a link, or under a
-        // spelling the volume folds into the one the walk met, is there: held, never gone.
-        use v1::Presence::{Gone, Held};
-        let dir = crate::common::Scratch::new("known-real-path");
-        let home = std::fs::canonicalize(&*dir).unwrap().join("home");
-        std::fs::create_dir_all(home.join("dev/shop/.git")).unwrap();
-        std::os::unix::fs::symlink("dev", home.join("work")).unwrap();
-        assert_eq!(
-            gone_from(&dir, (&home, "full"), "work/shop", &["dev/shop"]).0,
-            Held
-        );
-        // One the store holds in force under no name it has is gone, as before.
-        assert_eq!(gone_from(&dir, (&home, "full"), "work/shop", &[]).0, Gone);
-        assert_eq!(
-            gone_from(&dir, (&home, "full"), "dev/gone", &["dev/shop"]).0,
-            Gone
-        );
-        // Only on a volume that ignores case, as a Mac's do by default.
-        if home.join("DEV/SHOP").exists() {
-            assert_eq!(
-                gone_from(&dir, (&home, "full"), "Dev/Shop", &["dev/shop"]).0,
-                Held
-            );
-        }
-    }
-
-    #[test]
-    fn a_thing_whose_place_leads_into_a_guarded_folder_or_cannot_be_followed_is_never_gone() {
-        // No false calm. A place that now leads through a link into a folder macOS asks
-        // permission for may be there, not looked at; one behind a folder that cannot be
-        // searched may be there too, and the answer says what the system said.
-        use std::os::unix::fs::PermissionsExt;
-        use v1::Presence::Unknown;
-        let dir = crate::common::Scratch::new("known-untold-path");
-        let home = std::fs::canonicalize(&*dir).unwrap().join("home");
-        std::fs::create_dir_all(home.join("shut/shop")).unwrap();
-        std::os::unix::fs::symlink(home.join("Documents/shop"), home.join("moved")).unwrap();
-        assert_eq!(
-            gone_from(&dir, (&home, "full"), "moved", &[]),
-            (Unknown, None)
-        );
-        let mode =
-            |m| std::fs::set_permissions(home.join("shut"), std::fs::Permissions::from_mode(m));
-        mode(0o000).unwrap();
-        let (presence, untold) = gone_from(&dir, (&home, "full"), "shut/shop", &[]);
-        // Not known to be gone from the store, the disk is not looked at and adds no reading.
-        let partial = gone_from(&dir, (&home, "partial"), "shut/shop", &[]);
-        mode(0o755).unwrap();
-        assert_eq!(presence, Unknown);
-        assert!(untold.is_some_and(|why| why.starts_with(UNTOLD) && why.contains("os error 13")));
-        assert_eq!(partial, (Unknown, None));
     }
 }

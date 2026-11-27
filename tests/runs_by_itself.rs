@@ -8832,29 +8832,6 @@ fn a_program_a_startup_item_runs_whose_hash_is_on_the_list_is_matched() {
     );
 }
 
-#[test]
-fn an_indicator_is_never_matched_on_a_watched_file_that_went_in_the_same_check() {
-    // Matching runs after the run has settled what is gone: a digest the check retracts with
-    // its file is no match, in the check that finds it gone.
-    let e = Estate::new("indicator-gone");
-    let profile = e.home().join(".zshrc");
-    put(&profile, "export EXAMPLE=1\n");
-    let sha = sha256_of(std::fs::read(&profile).unwrap());
-    e.list(&format!(
-        r#"[{{"kind": "file:hashes.'SHA-256'", "value": "{sha}"}}]"#
-    ));
-    let matched = format!(
-        "SELECT subject FROM assertion WHERE layer = 'live' AND kind = '{}'
-           AND subject = 'file:machine:mac/.zshrc'",
-        "indicators matched against watched files and texts read in checkouts"
-    );
-    e.run();
-    assert_eq!(e.rows(&matched).len(), 1);
-    std::fs::remove_file(&profile).unwrap();
-    e.run();
-    assert!(e.rows(&matched).is_empty());
-}
-
 /// `immunity status` for a person and as JSON, with the estate's home folder as `HOME`.
 fn said(e: &Estate) -> (String, serde_json::Value) {
     let out = |form: &[&str]| {

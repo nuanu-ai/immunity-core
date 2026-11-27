@@ -195,11 +195,11 @@ enum CheckStage {
   CHECK_STAGE_LOCKFILES = 4;
   // Reading the watched places and what runs by itself.
   CHECK_STAGE_PLACES = 5;
-  // Looking for software changed in place.
+  // Looking for software changed in place, and matching the list of indicators.
   CHECK_STAGE_SOFTWARE = 6;
   // Reading the events and the local traces of servers.
   CHECK_STAGE_EVENTS = 7;
-  // Matching the list of indicators, and packages to the vulnerability data, counting and saving what the check read.
+  // Matching packages to the vulnerability data, counting and saving what the check read.
   CHECK_STAGE_SAVING = 8;
 }
 

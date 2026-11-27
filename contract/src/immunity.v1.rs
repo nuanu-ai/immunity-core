@@ -4747,13 +4747,13 @@ pub enum CheckStage {
     /// Reading the watched places and what runs by itself.
     #[serde(rename = "places")]
     Places = 5,
-    /// Looking for software changed in place.
+    /// Looking for software changed in place, and matching the list of indicators.
     #[serde(rename = "software")]
     Software = 6,
     /// Reading the events and the local traces of servers.
     #[serde(rename = "events")]
     Events = 7,
-    /// Matching the list of indicators, and packages to the vulnerability data, counting and saving what the check read.
+    /// Matching packages to the vulnerability data, counting and saving what the check read.
     #[serde(rename = "saving")]
     Saving = 8,
 }
