@@ -505,8 +505,9 @@ message PackageRecord {
   // How the core labels it from the record's kind and severity: `malicious`, `critical`,
   // `high`, `moderate`, `low` or `none`.
   string label = 4;
-  // Whether CISA lists a vulnerability it names as used in attacks. Absent while the catalogue
-  // has never been read, so that not known is never read as off the list.
+  // Whether CISA lists a vulnerability it names as used in attacks: true however old the
+  // catalogue, false only while it is current at the answer's `answered_at`. Absent when the
+  // catalogue was never read or is not current, so that not known is never read as off the list.
   optional bool exploited = 5;
   optional string summary_text = 6;
   // The releases it is fixed in, where the record gives them.

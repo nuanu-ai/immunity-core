@@ -2259,7 +2259,7 @@ pub fn list(conn: Option<&Connection>, now: i64) -> rusqlite::Result<v1::Vulnera
     };
     let this = crate::findings::This::of(conn, crate::covered::this_machine(conn)?)?;
     let all = affecting(conn)?;
-    let listed = crate::threats::last_good(conn)?.is_some();
+    let listed = catalogue_current(conn, now)?;
     out.store_id = Some(crate::store::id(conn)?);
     // Matching runs in every check that finishes.
     if crate::status::latest_finished(conn)?.is_none() {
@@ -2301,10 +2301,19 @@ pub fn list(conn: Option<&Connection>, now: i64) -> rusqlite::Result<v1::Vulnera
     Ok(out)
 }
 
-/// Whether a record is used in attacks: known only once the list of them was read, or when a
-/// record is on it.
-pub fn exploited(on_list: bool, list_read: bool) -> Option<bool> {
-    (on_list || list_read).then_some(on_list)
+/// Whether a record is used in attacks: `true` while it is on the catalogue's list, however old
+/// the list, and `false` only while the catalogue is current (`catalogue_current`); else not
+/// known.
+pub fn exploited(on_list: bool, current: bool) -> Option<bool> {
+    (on_list || current).then_some(on_list)
+}
+
+/// Whether the catalogue of exploited vulnerabilities is current at `now`, the answer's time,
+/// by the rule for data answers rest on (`read_not_current` with `threats::CURRENT_FOR`). Only a
+/// current catalogue says a record is off its list.
+pub fn catalogue_current(conn: &Connection, now: i64) -> rusqlite::Result<bool> {
+    let read = crate::threats::last_good(conn)?.map(|(at, _)| at);
+    Ok(read_not_current(read, now, crate::threats::CURRENT_FOR).is_none())
 }
 
 fn no_store(section: &str) -> v1::NotComputed {
@@ -2315,7 +2324,8 @@ fn no_store(section: &str) -> v1::NotComputed {
 }
 
 /// An "affects" answer: the package in its project and the record. Whether the record is used in
-/// attacks is absent while that list was never read, so that not known is never off the list.
+/// attacks is absent while that list is not current (`exploited`), so that not known is never off
+/// the list.
 fn affected_message(
     a: &Affecting,
     this: Option<&crate::findings::This>,
@@ -2371,15 +2381,15 @@ pub fn one(conn: Option<&Connection>, id: &str, now: i64) -> rusqlite::Result<v1
     let this = crate::findings::This::of(conn, crate::covered::this_machine(conn)?)?;
     let place_of = |c: &str| whole(&crate::findings::place(c, this.as_ref()));
     let records = held_records(conn, id)?;
-    // Not known while the catalogue was never read.
-    out.in_catalogue = match crate::threats::last_good(conn)?.is_some() {
-        true => Some(conn.query_row(
+    // Off the list only while the catalogue is current (`exploited`).
+    out.in_catalogue = exploited(
+        conn.query_row(
             "SELECT EXISTS (SELECT 1 FROM threat WHERE id = ?1 AND gone_at IS NULL)",
             [id],
             |r| r.get(0),
-        )?),
-        false => None,
-    };
+        )?,
+        catalogue_current(conn, now)?,
+    );
     let in_catalogue = out.in_catalogue == Some(true);
     let places: Vec<Place> = conn
         .prepare(
@@ -3254,7 +3264,7 @@ mod tests {
             );
             let releases = BTreeSet::from([release.to_string()]);
             assert_eq!(packages.of(&about).unwrap().1, releases);
-            let whole = crate::finding_answer::package(&tx, &about).unwrap();
+            let whole = crate::finding_answer::package(&tx, &about, crate::now_secs()).unwrap();
             let shown: Vec<(&str, &str)> = (whole.releases.iter())
                 .map(|r| (r.version_text.as_str(), r.at_text.as_str()))
                 .collect();

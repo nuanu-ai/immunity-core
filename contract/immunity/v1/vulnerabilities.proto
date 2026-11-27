@@ -218,8 +218,9 @@ message Vulnerability {
   optional string store_id = 3;
   // The id asked about, as given. Whole.
   string id_text = 4;
-  // The catalogue of exploited vulnerabilities holds it. Absent when the catalogue was never
-  // read, or there is no store.
+  // The catalogue of exploited vulnerabilities holds it, however old the catalogue. False only
+  // while the catalogue is current at `answered_at`; absent when it was never read, when it is
+  // not current, or when there is no store.
   optional bool in_catalogue = 5;
   // Whether the data holds a record of it. Absent when there is no store; then `not_computed`
   // says so.

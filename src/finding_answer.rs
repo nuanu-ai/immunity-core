@@ -128,7 +128,7 @@ pub fn of(
         first_seen_at: f.first_seen.0,
         last_seen_at: f.last_seen.0,
         answer: i.answer.as_ref().map(answer),
-        evidence: evidence(conn, f)?.map(|body| v1::Evidence { body: Some(body) }),
+        evidence: evidence(conn, f, now)?.map(|body| v1::Evidence { body: Some(body) }),
         rests_on,
         answers_note: findings::ANSWERS_NOTE.to_string(),
         thing: i.thing.clone(),
@@ -277,7 +277,11 @@ fn answer(a: &findings::Answered) -> v1::Answer {
 
 /// What a finding rests on, by the kind of its rule; `None` for a kind this build does not
 /// shape.
-pub fn evidence(conn: &Connection, f: &Found) -> rusqlite::Result<Option<v1::evidence::Body>> {
+pub fn evidence(
+    conn: &Connection,
+    f: &Found,
+    now: i64,
+) -> rusqlite::Result<Option<v1::evidence::Body>> {
     use v1::evidence::Body;
     if let Some(l) = findings::published(&f.rule) {
         let (Some(meta), Some(kind)) = (&l.meta, l.kind) else {
@@ -344,9 +348,9 @@ pub fn evidence(conn: &Connection, f: &Found) -> rusqlite::Result<Option<v1::evi
                     Some(k) => v1::VulnerablePackage {
                         no_longer_found: Some(value_of::<v1::NoLongerFound>(&k.why)),
                         no_longer_found_at: Some(k.at),
-                        ..package_in(conn, k.was, &f.about)?
+                        ..package_in(conn, k.was, &f.about, now)?
                     },
-                    None => package(conn, &f.about)?,
+                    None => package(conn, &f.about, now)?,
                 })
             }
             _ => return Ok(None),
@@ -606,8 +610,12 @@ fn process(note: &serde_json::Value) -> v1::DetachedProcess {
 /// A package a project depends on, from the answers that stand now, as the report reads them
 /// (`vulnerabilities::finding_detail`): every record that affects it, and every release it
 /// affects with where it is declared.
-pub fn package(conn: &Connection, about: &str) -> rusqlite::Result<v1::VulnerablePackage> {
-    package_in(conn, vulnerabilities::affecting(conn)?, about)
+pub fn package(
+    conn: &Connection,
+    about: &str,
+    now: i64,
+) -> rusqlite::Result<v1::VulnerablePackage> {
+    package_in(conn, vulnerabilities::affecting(conn)?, about, now)
 }
 
 /// The same from the answers in `list`.
@@ -615,6 +623,7 @@ fn package_in(
     conn: &Connection,
     list: Vec<vulnerabilities::Affecting>,
     about: &str,
+    now: i64,
 ) -> rusqlite::Result<v1::VulnerablePackage> {
     let mine: Vec<vulnerabilities::Affecting> =
         list.into_iter().filter(|a| a.is_about(about)).collect();
@@ -635,14 +644,14 @@ fn package_in(
             at_text: whole(&vulnerabilities::at_shown(line)),
         })
         .collect();
-    let listed = crate::threats::last_good(conn)?.is_some();
+    let current = vulnerabilities::catalogue_current(conn, now)?;
     for a in &mine {
         out.records.push(v1::PackageRecord {
             id_text: whole(&a.advisory),
             aliases_text: a.aliases.iter().map(|s| whole(s)).collect(),
             source: vulnerabilities::source_name(&a.advisory).to_string(),
             label: a.label.to_string(),
-            exploited: vulnerabilities::exploited(a.exploited, listed),
+            exploited: vulnerabilities::exploited(a.exploited, current),
             summary_text: a.summary.as_deref().map(whole),
             fixed_text: a.fixed.iter().map(|s| whole(s)).collect(),
         });

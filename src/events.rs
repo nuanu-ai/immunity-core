@@ -4333,14 +4333,15 @@ impl Since {
 /// The journal sequence number of the `run_started` of the latest finished full check, `None`
 /// when none has finished. One that left no start is 0, so every reading counts as since it.
 fn check_seq(conn: &Connection) -> rusqlite::Result<Option<i64>> {
+    let Some(check) = crate::status::latest_check(conn)? else {
+        return Ok(None);
+    };
     conn.query_row(
-        "SELECT COALESCE((SELECT MIN(s.seq) FROM journal s
-                          WHERE s.entry = 'run_started' AND s.run_id = f.run_id), 0)
-         FROM journal f WHERE f.entry = 'run_finished' ORDER BY f.seq DESC LIMIT 1",
-        [],
+        "SELECT COALESCE(MIN(seq), 0) FROM journal WHERE entry = 'run_started' AND run_id = ?1",
+        [&check.id],
         |r| r.get(0),
     )
-    .optional()
+    .map(Some)
 }
 
 /// The journal sequence number from which counts are kept whatever their age: the start of the
@@ -5900,6 +5901,10 @@ mod tests {
         assert!(!lost(&conn));
         read(&mut conn, start + 300, &[6]);
         read(&mut conn, start + 200, &[7]);
+        assert!(lost(&conn));
+        // A run told to read less than a full check reads is no check: the loss stays counted.
+        crate::store::journal_note(&conn, start + 400, "given", "run_narrowed", "").unwrap();
+        check(&conn, "given", start + 400);
         assert!(lost(&conn));
         read(&mut conn, start + 3 * DAY, &[8]);
         assert!(lost(&conn));

@@ -299,7 +299,7 @@ fn earlier_probe(r: &Latest) -> bool {
 /// own places failed or one read here before is not read now (`fault::lost`); else `watched`.
 pub fn this_mac(conn: &Connection, latest: &[Latest], live: bool) -> rusqlite::Result<ThisMac> {
     let this = this_machine(conn)?;
-    let checked_at = status::latest_finished(conn)?.and_then(|r| r.finished_at);
+    let checked_at = status::latest_check(conn)?.and_then(|r| r.finished_at);
     let live_read_at = crate::watch::last_read(conn)?;
     let Some(this) = this else {
         return Ok(ThisMac {

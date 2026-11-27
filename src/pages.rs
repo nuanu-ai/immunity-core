@@ -1365,17 +1365,18 @@ fn watched_table(
                             "known vulnerabilities"
                         ))
                     )));
-                    // "None used in attacks" rests on the list of them having been read; one
-                    // that is used is a finding, in the table of findings.
-                    // Its fault is the list's download, by the message's items.
+                    // "None used in attacks" rests on a current list of them
+                    // (`vulnerabilities::exploited`); one that is used is a finding, in the
+                    // table of findings. Its fault is the list's download, by the message's items.
                     if !any_used(conn)? {
                         let list = [covered::THREATS_UNREAD.id, covered::THREATS_FIXABLE.id];
                         let unknown = "whether any is used in attacks is not known";
-                        beside.push(match crate::threats::last_good(conn)?.is_none() {
-                            true => {
+                        let current = crate::vulnerabilities::catalogue_current(conn, now)?;
+                        beside.push(match current {
+                            false => {
                                 by(&list, unknown).unwrap_or_else(|| Standing::none(esc(unknown)))
                             }
-                            false => Standing::read("none is known to be used in attacks"),
+                            true => Standing::read("none is known to be used in attacks"),
                         });
                     }
                 }
@@ -2826,7 +2827,7 @@ const YOUR_DEVICES: &str = "Phones, tablets and computers on your private networ
 /// aside, each in a section of its own.
 pub fn beyond(conn: &Connection, latest: &[Latest], now: i64) -> Result<String, Box<dyn Error>> {
     // When its "none" was established: the last full check, as on the page of this Mac.
-    let checked_at = crate::status::latest_finished(conn)?.and_then(|r| r.finished_at);
+    let checked_at = crate::status::latest_check(conn)?.and_then(|r| r.finished_at);
     let mut out = top(
         "Beyond this Mac",
         &format!(

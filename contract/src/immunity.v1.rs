@@ -2203,8 +2203,9 @@ pub struct PackageRecord {
     /// `high`, `moderate`, `low` or `none`.
     #[prost(string, tag = "4")]
     pub label: ::prost::alloc::string::String,
-    /// Whether CISA lists a vulnerability it names as used in attacks. Absent while the catalogue
-    /// has never been read, so that not known is never read as off the list.
+    /// Whether CISA lists a vulnerability it names as used in attacks: true however old the
+    /// catalogue, false only while it is current at the answer's `answered_at`. Absent when the
+    /// catalogue was never read or is not current, so that not known is never read as off the list.
     #[prost(bool, optional, tag = "5")]
     pub exploited: ::core::option::Option<bool>,
     #[prost(string, optional, tag = "6")]
@@ -2950,8 +2951,9 @@ pub struct Vulnerability {
     /// The id asked about, as given. Whole.
     #[prost(string, tag = "4")]
     pub id_text: ::prost::alloc::string::String,
-    /// The catalogue of exploited vulnerabilities holds it. Absent when the catalogue was never
-    /// read, or there is no store.
+    /// The catalogue of exploited vulnerabilities holds it, however old the catalogue. False only
+    /// while the catalogue is current at `answered_at`; absent when it was never read, when it is
+    /// not current, or when there is no store.
     #[prost(bool, optional, tag = "5")]
     pub in_catalogue: ::core::option::Option<bool>,
     /// Whether the data holds a record of it. Absent when there is no store; then `not_computed`
