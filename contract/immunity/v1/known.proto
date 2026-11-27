@@ -166,6 +166,9 @@ message Coverage {
   optional int64 observed_at = 7;
   // What this build has no reader for, found in this reading.
   repeated Lack lacks = 8;
+  // When it was last read in full: `observed_at` on a full reading, an earlier time on one that
+  // was not. Absent when it was never read in full, and on a reading made by rule. Since 1.39.0.
+  optional int64 last_full_at = 9;
 }
 
 // How much of what was looked for was read. `UNSPECIFIED`, or a value the reader does not know,

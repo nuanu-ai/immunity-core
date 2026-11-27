@@ -1577,6 +1577,8 @@ fn write_view(store: &Path, if_stale: bool) -> Result<Vec<PathBuf>, Box<dyn Erro
     }
     let now = now_secs();
     let folder = home(store);
+    // Where ids name paths, for `immunity machine` (`known::known_of`).
+    let home_folder = user_home().unwrap_or_default();
     let (current, pages, basis, events_basis, until) = store::read(store, |tx| {
         let current = match if_stale {
             true => current_view(tx, store, now)?,
@@ -1599,6 +1601,8 @@ fn write_view(store: &Path, if_stale: bool) -> Result<Vec<PathBuf>, Box<dyn Erro
             findings: finding_answer::list_of(tx, &found, now)?,
             finding: Box::new(|id| finding_answer::of(tx, &found, id, now)),
             rules: rules_answer(level, result.store_id.clone(), true, now),
+            statements: owner::statements(tx, now)?,
+            machine: Box::new(|id| Ok(machine::answer(tx, Some(id), &home_folder, now)?.ok())),
         };
         let pages = match current {
             Current::Events(_) => view::event_pages(tx, &state, &result, &answers, now)?,
@@ -2215,23 +2219,9 @@ fn owner_cmd(args: &OwnerArgs) -> ExitCode {
         .unwrap_or_default();
     let at = now.as_secs() as i64;
     let Some((name, act)) = &args.act else {
-        let listed = store::read(store_path, |c| {
-            Ok((
-                owner::standing(c)?,
-                owner::withdrawn(c)?,
-                Some(store::id(c)?),
-            ))
-        });
-        let (standing, withdrawn, store_id) = match listed {
-            Ok(l) => l,
+        let m = match store::read(store_path, |c| Ok(owner::statements(c, at)?)) {
+            Ok(m) => m,
             Err(e) => return failed(&e),
-        };
-        let m = v1::Statements {
-            format: 1,
-            answered_at: at,
-            store_id,
-            statements: standing.iter().map(owner::statement).collect(),
-            withdrawn: withdrawn.max(0) as u64,
         };
         return answer::print("owner", args.form, &m, |m| {
             lists::statements(m, &screen::Screen::of_stdout())
@@ -3739,7 +3729,7 @@ fn server_counts(
         checked_in_last_check: 0,
         own_devices: beyond.own_devices.len(),
         other_devices: beyond.other_devices.len(),
-        system_not_given: beyond.system_not_given,
+        system_not_given: beyond.system_not_given.len(),
         set_aside: standing.len(),
         seen: standing
             .iter()

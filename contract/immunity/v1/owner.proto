@@ -13,6 +13,7 @@ package immunity.v1;
 
 import "immunity/v1/event.proto";
 import "immunity/v1/findings.proto";
+import "immunity/v1/known.proto";
 
 // The answer to `immunity owner` without a statement: the statements that stand.
 message Statements {
@@ -23,9 +24,59 @@ message Statements {
   int64 answered_at = 2;
   // The store this answer was read from, as in every answer (`common.proto`).
   optional string store_id = 3;
+  // In the order of the name each was made under.
   repeated Statement statements = 4;
   // How many were withdrawn and are kept.
   uint64 withdrawn = 5;
+  // The machines beyond this Mac that the store knows and that a statement can be made about,
+  // servers first, then the person's own devices, then other people's, each kind in the order of
+  // the name shown. A machine
+  // set aside by a statement that stands, which nothing seen since contradicts, is in
+  // `statements` and not here. Since 1.39.0.
+  repeated KnownMachine machines = 6;
+  // The readings on this Mac that find machines (the SSH settings, the list of machines SSH has
+  // connected to, and the private network) whose latest reading was not full or was not taken by
+  // the latest run that finished. One never taken is here too, made by rule: completeness
+  // `none` and no `observed_at`. While one is here, `machines` may not be whole; empty means
+  // each was read in full by that run. Since 1.39.0.
+  repeated Coverage machines_not_read = 7;
+}
+
+// A machine beyond this Mac, as the traces on this Mac and the private network tell it apart.
+// Since 1.39.0.
+message KnownMachine {
+  // The machine by the name it is shown by: the id the server check visited it under, else its
+  // first id, without `machine:`. Whole.
+  string machine_text = 1;
+  // Every id the store knows it by, which `immunity machine` and `immunity owner` take. Whole.
+  repeated string entities_text = 2;
+  // Every other name and address the store knows it by. Whole.
+  repeated string names_text = 3;
+  MachineKind kind = 4;
+  // The system the private network gives, for a machine that no other trace names. Whole.
+  // Absent when it gives none.
+  optional string system_text = 5;
+  // A server known only from the private network, which does not say what system it runs: it is
+  // counted as a server, and its system is not guessed.
+  bool system_not_given = 6;
+  // The kinds of the readings that name it, in the core's words and in their order: the readings
+  // that find machines (`ssh configuration`, `known hosts`, `tailnet peers`) and the server
+  // check's own (`own names and addresses`).
+  repeated string known_from = 7;
+}
+
+// What a machine beyond this Mac is. `UNSPECIFIED`, or a value the reader does not know, is read
+// as a server.
+enum MachineKind {
+  MACHINE_KIND_UNSPECIFIED = 0;
+  // One the person logs in to over SSH, or one the private network shows as theirs or as the
+  // network's own and does not name as a phone, a tablet, a TV or a desktop system.
+  MACHINE_KIND_SERVER = 1;
+  // One of the person's own phones, tablets or computers that the private network alone names
+  // and that the server check cannot read.
+  MACHINE_KIND_OWN_DEVICE = 2;
+  // Someone else's device, which the private network alone names as another user's.
+  MACHINE_KIND_OTHER_DEVICE = 3;
 }
 
 // A statement that stands.
