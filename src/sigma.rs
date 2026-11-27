@@ -130,6 +130,7 @@ pub const ELASTIC_SHIPPED: &[(&str, &str)] = shipped![
     "cross-platform/command_and_control_tunnel_qemu.yml",
     "cross-platform/command_and_control_tunneling_via_tailscaled.yml",
     "cross-platform/credential_access_cookies_chromium_browsers_debugging.yml",
+    "cross-platform/credential_access_genai_process_sensitive_file_access.yml",
     "cross-platform/credential_access_gitleaks_execution.yml",
     "cross-platform/credential_access_suspicious_instance_metadata_service_api_cli.yml",
     "cross-platform/credential_access_trufflehog_execution.yml",
@@ -190,6 +191,7 @@ pub const ELASTIC_SHIPPED: &[(&str, &str)] = shipped![
     "macos/persistence_manual_chromium_extension_loading.yml",
     "macos/persistence_screensaver_engine_unexpected_child_process.yml",
     "macos/privilege_escalation_explicit_creds_via_scripting.yml",
+    "macos/privilege_escalation_exploit_adobe_acrobat_updater.yml",
 ];
 
 /// Elastic's behaviour rules for macOS, translated into Sigma: each file's path under
@@ -245,6 +247,7 @@ pub const ELASTIC_BEHAVIOUR_SHIPPED: &[(&str, &str)] = shipped![
     "macos/execution_suspicious_audio_unit_plug_in_file_access.yml",
     "macos/execution_suspicious_elevated_command_execution.yml",
     "macos/execution_suspicious_installer_remote_plugin_service_child_process.yml",
+    "macos/execution_suspicious_terminal_child_process_execution.yml",
     "macos/execution_temporary_binary_execution_via_osascript.yml",
     "macos/execution_volume_muted_via_osascript.yml",
     "macos/execution_vscode_extension_install_via_uri_handler.yml",
@@ -2460,20 +2463,20 @@ mod tests {
             ]
         };
         assert_eq!(totals("sigma"), [75, 0, 74, 1, 0]);
-        // Of Elastic's 185 rules for macOS, 66 translated: 12 of them with an alternative the
-        // translation left out, and 119 not taken.
-        assert_eq!(totals("elastic"), [66, 119, 54, 12, 119]);
-        // Of Elastic's 278 behaviour rules for macOS, 57 translated: 10 of them with an
-        // alternative the translation left out, and 221 not taken.
-        assert_eq!(totals("elastic-behaviour"), [57, 221, 47, 10, 221]);
+        // Of Elastic's 185 rules for macOS, 68 translated: 12 of them with an alternative the
+        // translation left out, and 117 not taken.
+        assert_eq!(totals("elastic"), [68, 117, 56, 12, 117]);
+        // Of Elastic's 278 behaviour rules for macOS, 58 translated: 10 of them with an
+        // alternative the translation left out, and 220 not taken.
+        assert_eq!(totals("elastic-behaviour"), [58, 220, 48, 10, 220]);
         assert_eq!(
             s.totals,
             Some(v1::RuleTotals {
-                shipped: 198,
-                not_taken: 340,
-                evaluated: 175,
+                shipped: 201,
+                not_taken: 337,
+                evaluated: 178,
                 in_part: 23,
-                not_evaluated: 340
+                not_evaluated: 337
             })
         );
         let ids = |key: &str, source: &str, events: &str| -> Vec<String> {
@@ -2494,16 +2497,16 @@ mod tests {
         assert_eq!(ids("in_part", "sigma", CATEGORY), [RENAMED_MESHAGENT]);
         // The five rules for file events, each evaluated in full over files created or renamed.
         assert_eq!(ids("evaluated", "sigma", FILE_CATEGORY), FILE_RULES);
-        assert_eq!(ids("evaluated", "elastic", CATEGORY).len(), 49);
-        assert_eq!(ids("evaluated", "elastic", FILE_CATEGORY).len(), 5);
-        assert_eq!(ids("evaluated", "elastic-behaviour", CATEGORY).len(), 44);
+        assert_eq!(ids("evaluated", "elastic", CATEGORY).len(), 50);
+        assert_eq!(ids("evaluated", "elastic", FILE_CATEGORY).len(), 6);
+        assert_eq!(ids("evaluated", "elastic-behaviour", CATEGORY).len(), 45);
         assert_eq!(
             ids("evaluated", "elastic-behaviour", FILE_CATEGORY).len(),
             3
         );
         assert_eq!(
             (rules.evaluated(Kind::Process), rules.evaluated(Kind::File)),
-            (69 + 49 + 44, 5 + 5 + 3)
+            (69 + 50 + 45, 5 + 6 + 3)
         );
         // No two rules share an id: the store counts matches by a rule's id.
         let all: Vec<&str> = rules
@@ -2611,7 +2614,7 @@ mod tests {
         samples_match_as_the_reference_said(
             &ELASTIC,
             include_str!("../tests/elastic/samples.jsonl"),
-            66,
+            68,
         );
     }
 
@@ -2623,7 +2626,7 @@ mod tests {
         samples_match_as_the_reference_said(
             &ELASTIC_BEHAVIOUR,
             include_str!("../tests/elastic-behaviour/samples.jsonl"),
-            57,
+            58,
         );
     }
 
@@ -4374,10 +4377,10 @@ mod tests {
             .iter()
             .filter(|r| level(r) == "not_stated")
             .collect();
-        assert_eq!(none.len(), 47);
+        assert_eq!(none.len(), 48);
         assert!(none.iter().all(|r| r["source"] == "elastic-behaviour"));
         assert!(
-            evaluated[evaluated.len() - 47..]
+            evaluated[evaluated.len() - 48..]
                 .iter()
                 .all(|r| level(r) == "not_stated")
         );
@@ -4419,12 +4422,12 @@ mod tests {
         assert_eq!(
             lines[..6],
             [
-                "Immunity Core evaluates 175 published rules in full and 23 in part; 340 it cannot yet",
+                "Immunity Core evaluates 178 published rules in full and 23 in part; 337 it cannot yet",
                 "",
                 "  Source                     In full  In part  Not evaluated",
                 "  SigmaHQ's rule set              74        1              0",
-                "  Elastic's detection rules       54       12            119",
-                "  Elastic's behaviour rules       47       10            221",
+                "  Elastic's detection rules       56       12            117",
+                "  Elastic's behaviour rules       48       10            220",
             ],
             "{text}"
         );
@@ -4447,12 +4450,12 @@ mod tests {
             })
             .filter(|r| r.contains(&"in full"))
             .collect();
-        assert_eq!(full.len(), 175);
+        assert_eq!(full.len(), 178);
         let first_silent = full
             .iter()
             .position(|r| r[0] == "not stated")
             .expect("rules of a set that states no level");
-        assert_eq!(full.len() - first_silent, 47);
+        assert_eq!(full.len() - first_silent, 48);
         assert!(full[first_silent..].iter().all(|r| r[0] == "not stated"));
         assert!(
             full.iter()
@@ -4893,6 +4896,19 @@ mod tests {
         );
         grep.user_id = Some(501);
         base.push(grep);
+        // A program run as root by an updater's privileged helper.
+        let mut helper = start(
+            "/bin/sh",
+            &["sh", "-c", "true"],
+            "/Library/PrivilegedHelperTools/com.adobe.ARMDC.SMJobBlessHelper",
+        );
+        helper.user_id = Some(0);
+        base.push(helper);
+        files.push(file(
+            "/Users/example/.local/bin/claude",
+            "/Users/example/.zshrc",
+            None,
+        ));
         files.push(file(
             "/usr/bin/java",
             "/opt/papercut/server/lib/Udx.class",

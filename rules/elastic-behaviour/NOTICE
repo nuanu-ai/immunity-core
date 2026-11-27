@@ -2,7 +2,7 @@ Behaviour rules for macOS from Elastic's protections artifacts,
 https://github.com/elastic/protections-artifacts, at commit
 a87715d87a2babd51b37ff6c55f104fe7e567911, translated into Sigma.
 
-Of the 278 rules in that repository's `behavior/rules/macos/`, 57 are here as Sigma files, at
+Of the 278 rules in that repository's `behavior/rules/macos/`, 58 are here as Sigma files, at
 the path their upstream rule has under `behavior/rules/` (`macos/`), with `.yml` for `.toml`.
 Each file is a mechanical translation of the upstream rule it names, and is not the upstream
 file. Its `references` link to the upstream file at that commit, and its `elastic` block gives
@@ -25,8 +25,8 @@ Every one of the 278 upstream rules carries actions that stop a process. The tra
 them in `actions_ignored`, and Immunity Core takes none of them: it never stops a process.
 
 Each translation was checked against a reference that follows Elasticsearch's documented
-meaning of the upstream query, on 11,472 invented events evaluated by `sigma-rust` 0.7.0, the
-evaluator this program uses, over events built as this program builds them. The 57 agreed with
+meaning of the upstream query, on 11,744 invented events evaluated by `sigma-rust` 0.7.0, the
+evaluator this program uses, over events built as this program builds them. The 58 agreed with
 the reference on every event.
 
 What the translations rest on:
@@ -47,15 +47,15 @@ What the translations rest on:
   files modified or opened. One of them also asks for files modified, which never match here.
 
 6 titles are shared by two sets among the rules evaluated, and 14 among all the rules listed,
-taken or not, each pair under different ids. Among the rules evaluated, 5 of the 57 share a
-title with one of the 66 detection rules in `rules/elastic/`: Dumping Account Hashes via
+taken or not, each pair under different ids. Among the rules evaluated, 5 of the 58 share a
+title with one of the 68 detection rules in `rules/elastic/`: Dumping Account Hashes via
 Built-In Commands, Modification of Safari Settings via Defaults Command, Potential Privacy
 Control Bypass via Localhost Secure Copy, Potential Kerberos Attack via Bifrost, and Unexpected
 Child Process of macOS Screensaver Engine. One shares it with a SigmaHQ rule in `rules/sigma/`:
 Potential XCSSET Malware Infection. An event that matches both is counted once in each set.
 Every listing of rules names each rule's set beside its title.
 
-`not-taken.tsv` lists the other 221 rules, each with its upstream path, rule id, name, an empty
+`not-taken.tsv` lists the other 220 rules, each with its upstream path, rule id, name, an empty
 severity, the reason it was not taken and the translation's detail: `sequence` (it correlates
 several events), `needs_events` (it is about events this program does not record),
 `needs_fields` (a part it cannot do without reads a field the events do not give), `never_true`

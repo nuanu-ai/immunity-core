@@ -1745,7 +1745,7 @@ fn no_collector_and_no_log_is_an_answer_that_says_so_and_names_the_rules_that_ju
         .iter()
         .filter(|u| u["reason"] == "not_collected")
         .collect();
-    assert_eq!(not_collected.len(), 14, "{m:#}");
+    assert_eq!(not_collected.len(), 15, "{m:#}");
     assert!(
         not_collected
             .iter()
@@ -2037,7 +2037,7 @@ fn unreadable_lines_are_counted_and_the_rules_that_judge_nothing_are_named_with_
         .iter()
         .filter(|u| u["reason"] == "not_collected")
         .collect();
-    assert_eq!(not_collected.len(), 14, "{unevaluated:#?}");
+    assert_eq!(not_collected.len(), 15, "{unevaluated:#?}");
     assert!(
         not_collected.iter().all(|u| u["detail_text"]
             == "the collector installed here records program starts only; installing the event level again adds files created and renamed"),
@@ -2059,7 +2059,7 @@ fn unreadable_lines_are_counted_and_the_rules_that_judge_nothing_are_named_with_
             ("function", 1),
             ("in_part", 23),
             ("needs_events", 23 + 42),
-            ("needs_fields", 23 + 61),
+            ("needs_fields", 21 + 60),
             ("never_true", 4),
             ("not_eql", 40),
             ("regex", 1),
@@ -2477,8 +2477,8 @@ fn immunity_rules_lists_both_sets_and_names_every_rule_not_taken_with_its_reason
             .collect::<Vec<_>>(),
         [
             (json!("sigma"), json!(75), json!(0)),
-            (json!("elastic"), json!(66), json!(119)),
-            (json!("elastic-behaviour"), json!(57), json!(221)),
+            (json!("elastic"), json!(68), json!(117)),
+            (json!("elastic-behaviour"), json!(58), json!(220)),
         ]
     );
     let not_evaluated: Vec<Value> = rules["not_evaluated"]
@@ -2487,7 +2487,7 @@ fn immunity_rules_lists_both_sets_and_names_every_rule_not_taken_with_its_reason
         .iter()
         .map(flat)
         .collect();
-    assert_eq!(not_evaluated.len(), 119 + 221);
+    assert_eq!(not_evaluated.len(), 117 + 220);
     assert!(
         not_evaluated
             .iter()
@@ -2506,7 +2506,7 @@ fn immunity_rules_lists_both_sets_and_names_every_rule_not_taken_with_its_reason
         [
             ("function", 1),
             ("needs_events", 42),
-            ("needs_fields", 61),
+            ("needs_fields", 60),
             ("never_true", 4),
             ("regex", 1),
             ("sequence", 109),
@@ -2555,9 +2555,15 @@ fn immunity_rules_lists_both_sets_and_names_every_rule_not_taken_with_its_reason
     );
     let fields = not_evaluated
         .iter()
-        .find(|r| r["reason"] == "needs_fields" && r["detail_text"] == "needs_fields user.name")
+        .find(|r| {
+            r["reason"] == "needs_fields"
+                && r["detail_text"] == "needs_fields process.Ext.effective_parent.executable"
+        })
         .unwrap();
-    assert_eq!(fields["fields_text"], json!(["user.name"]));
+    assert_eq!(
+        fields["fields_text"],
+        json!(["process.Ext.effective_parent.executable"])
+    );
     let in_part = rules["in_part"]
         .as_array()
         .unwrap()
@@ -2651,7 +2657,7 @@ fn a_rule_a_translated_set_did_not_take_is_named_with_its_reason_and_what_the_tr
             "set": "Elastic's detection rules",
         })
     );
-    let fields = by_name("elastic:f85ce03f-d8a8-4c83-acdc-5c8cd0592be7");
+    let fields = by_name("elastic:d75991f2-b989-419d-b797-ac1e54ec2d61");
     assert_eq!(
         (
             &fields["reason"],
@@ -2660,8 +2666,8 @@ fn a_rule_a_translated_set_did_not_take_is_named_with_its_reason_and_what_the_tr
         ),
         (
             &json!("needs_fields"),
-            &json!(["user.name"]),
-            &json!("needs_fields user.name")
+            &json!(["process.Ext.effective_parent.executable"]),
+            &json!("needs_fields process.Ext.effective_parent.executable")
         )
     );
     let in_part = by_name("elastic:10a500bb-a28f-418e-ba29-ca4c8d1a9f2f");
