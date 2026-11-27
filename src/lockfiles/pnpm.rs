@@ -28,8 +28,8 @@ enum PnpmFormat {
 ///
 /// pnpm does not write which registry a package came from: an entry the registry served carries
 /// only its `integrity`, and pnpm fetches it from the registry the project is set up with. Such
-/// an entry is taken as the public registry's, as npm's own lockfile is read for an entry with no
-/// address; one whose key names a host, in 5.x and 6.0, is another registry's.
+/// an entry is taken as the public registry's; one whose key names a host, in 5.x and 6.0, is
+/// another registry's.
 pub(super) fn pnpm(text: &str) -> Parsed {
     let (mut out, mut unknown) = (Vec::new(), Vec::new());
     // An empty file is one empty document, which has no version.
