@@ -367,6 +367,109 @@ pub fn statement(s: &Standing) -> crate::contract::v1::Statement {
     }
 }
 
+/// The answer of `immunity owner` without a statement: the statements that stand, and the machines
+/// beyond this Mac a statement can be made about, told apart once, here (`beyond::split`). The
+/// pages are drawn from it too.
+pub fn statements(
+    conn: &Connection,
+    now: i64,
+) -> rusqlite::Result<crate::contract::v1::Statements> {
+    use crate::contract::v1;
+    use crate::known::whole;
+    let this = crate::covered::this_machine(conn)?.unwrap_or_default();
+    let split = crate::beyond::split(conn, &this)?;
+    let known_as = store::live_known_as(conn)?;
+    let visited: Vec<String> = conn
+        .prepare("SELECT DISTINCT scope FROM coverage WHERE reader = ?1 AND kind = ?2")?
+        .query_map([crate::servers::READER, crate::servers::VISIT], |r| {
+            r.get(0)
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    // The readings that name each machine, by the kind of what they say of it.
+    let named_by: Vec<(String, String)> = conn
+        .prepare("SELECT DISTINCT subject, kind FROM assertion WHERE layer = 'live' AND predicate = 'known_as'")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let kinds = [
+        (v1::MachineKind::Server, &split.servers),
+        (v1::MachineKind::OwnDevice, &split.own_devices),
+        (v1::MachineKind::OtherDevice, &split.other_devices),
+    ];
+    let mut machines: Vec<v1::KnownMachine> = Vec::new();
+    for (kind, groups) in kinds {
+        let first = machines.len();
+        for (i, group) in groups.iter().enumerate() {
+            let shown = (group.iter().find(|m| visited.contains(m)))
+                .or(group.first())
+                .map_or("", |m| bare(m));
+            let known: Vec<&str> = (known_as.iter())
+                .filter(|k| group.contains(&k.entity))
+                .map(|k| k.value.as_str())
+                .collect();
+            let mut names: Vec<&str> = group.iter().map(|m| bare(m)).chain(known).collect();
+            names.sort();
+            names.dedup();
+            let known_from: std::collections::BTreeSet<&String> = (named_by.iter())
+                .filter(|(m, _)| group.contains(m))
+                .map(|(_, k)| k)
+                .collect();
+            machines.push(v1::KnownMachine {
+                machine_text: whole(shown),
+                entities_text: group.iter().map(|m| whole(m)).collect(),
+                names_text: (names.iter())
+                    .filter(|n| **n != shown)
+                    .map(|n| whole(n))
+                    .collect(),
+                kind: kind as i32,
+                system_text: group
+                    .iter()
+                    .find_map(|m| split.platform.get(m))
+                    .map(|p| whole(p)),
+                system_not_given: kind == v1::MachineKind::Server
+                    && split.system_not_given.contains(&i),
+                known_from: known_from.into_iter().cloned().collect(),
+            });
+        }
+        machines[first..].sort_by(|a, b| a.machine_text.cmp(&b.machine_text));
+    }
+    // What the list rests on: the readings on this Mac that find machines, each taken in full by
+    // the latest run that finished, or it may not be whole.
+    let latest_run = crate::status::latest_finished(conn)?.map(|r| r.started_at);
+    let mut machines_not_read = Vec::new();
+    let mut taken = Vec::new();
+    for r in crate::known::latest(conn)? {
+        let key = (r.reader.clone(), r.kind.clone());
+        let finds = crate::machine::FOUND_BY.contains(&(key.0.as_str(), key.1.as_str()));
+        if !finds {
+            continue;
+        }
+        taken.push(key);
+        if r.completeness != "full" || !crate::look::fresh(r.at, latest_run, now) {
+            machines_not_read.push(crate::known::coverage(conn, r)?);
+        }
+    }
+    for (reader, kind) in crate::machine::FOUND_BY {
+        if !taken.contains(&(reader.to_string(), kind.to_string())) {
+            machines_not_read.push(v1::Coverage {
+                reader: reader.to_string(),
+                kind: kind.to_string(),
+                scope_text: whole(&this),
+                completeness: v1::Completeness::None as i32,
+                ..Default::default()
+            });
+        }
+    }
+    Ok(v1::Statements {
+        format: 1,
+        answered_at: now,
+        store_id: Some(store::id(conn)?),
+        statements: standing(conn)?.iter().map(statement).collect(),
+        withdrawn: withdrawn(conn)?.max(0) as u64,
+        machines,
+        machines_not_read,
+    })
+}
+
 /// `statements_outside_app` of the contract's `Status`: the statements that stand and are known
 /// to have been made outside the app, the latest first, at most `shown`, with their total.
 pub fn outside_app(
@@ -386,5 +489,111 @@ pub fn outside_app(
     crate::contract::v1::StatementsOutsideApp {
         total: outside.len() as u64,
         items: outside.iter().take(shown).map(|s| statement(s)).collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::contract::v1;
+    use crate::store::{Gap, Reading, journal_note, put_coverage};
+
+    #[test]
+    fn the_list_of_machines_names_each_reading_that_finds_them_and_was_not_read_in_full_by_the_latest_run()
+     {
+        // "None known" rests on the readings that find machines: one not full, one older than
+        // the latest run and one never taken each keep the list from being called whole.
+        let scratch = crate::common::Scratch::new("owner-not-read");
+        let mut conn = crate::store::open_or_make(&scratch.0.join("store.db")).unwrap();
+        let (at, run_id) = (1_900_000_000, "1900000000-000000000");
+        let tx = conn.transaction().unwrap();
+        tx.execute_batch(
+            "INSERT INTO meta (key, value) VALUES ('machine', 'machine:mac'), ('machine_name', 'mac')",
+        )
+        .unwrap();
+        crate::store::put_entity(&tx, "machine:mac").unwrap();
+        journal_note(&tx, at, run_id, "run_started", "").unwrap();
+        let read = |reader, kind, observed_at, completeness, reason| {
+            let r = Reading {
+                reader,
+                scope: "machine:mac",
+                kind,
+                run_id,
+                at,
+                observed_at,
+            };
+            let gap = match completeness {
+                "full" => Gap::default(),
+                _ => Gap::of(crate::store::Cause::Failed),
+            };
+            put_coverage(&tx, &r, completeness, reason, &gap).unwrap();
+        };
+        use crate::{known_hosts, ssh_config, tailnet};
+        read(ssh_config::READER, ssh_config::KIND, at - 50, "full", None);
+        read(ssh_config::READER, ssh_config::KIND, at, "full", None);
+        read(
+            known_hosts::READER,
+            known_hosts::KIND,
+            at - 100,
+            "full",
+            None,
+        );
+        journal_note(&tx, at + 1, run_id, "run_finished", "").unwrap();
+        tx.commit().unwrap();
+        let not_read = |conn: &rusqlite::Connection| {
+            let m = super::statements(conn, at + 60).unwrap();
+            (m.machines_not_read.iter())
+                .map(|c| {
+                    (
+                        c.reader.clone(),
+                        c.completeness,
+                        c.observed_at,
+                        c.last_full_at,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let none = v1::Completeness::None as i32;
+        assert_eq!(
+            not_read(&conn),
+            [
+                (
+                    known_hosts::READER.to_string(),
+                    v1::Completeness::Full as i32,
+                    Some(at - 100),
+                    Some(at - 100)
+                ),
+                (tailnet::READER.to_string(), none, None, None),
+            ]
+        );
+        // A reading that failed after a full one says when that one was.
+        let tx = conn.transaction().unwrap();
+        journal_note(&tx, at + 2, "1900000002-000000000", "run_started", "").unwrap();
+        let r = Reading {
+            reader: ssh_config::READER,
+            scope: "machine:mac",
+            kind: ssh_config::KIND,
+            run_id: "1900000002-000000000",
+            at: at + 2,
+            observed_at: at + 2,
+        };
+        put_coverage(
+            &tx,
+            &r,
+            "none",
+            Some("refused"),
+            &Gap::of(crate::store::Cause::Failed),
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        assert!(
+            not_read(&conn).contains(&(
+                ssh_config::READER.to_string(),
+                none,
+                Some(at + 2),
+                Some(at)
+            )),
+            "{:?}",
+            not_read(&conn)
+        );
     }
 }

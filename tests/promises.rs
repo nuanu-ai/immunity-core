@@ -614,8 +614,8 @@ fn reading_that_failed_is_shown_with_its_reason_and_not_as_full() {
 }
 
 #[test]
-fn removed_component_is_under_no_longer_there_and_not_on_the_machine() {
-    // The machine shows only what is there now; an old version is gone too.
+fn removed_component_is_under_no_longer_there() {
+    // What is gone is listed as gone; an old version is gone too.
     let dir = Dir::new("view-gone");
     let store = dir.store();
     immunity(&store, &dir.input("before.txt", SAMPLE));
@@ -627,10 +627,6 @@ fn removed_component_is_under_no_longer_there_and_not_on_the_machine() {
     let page = view(&store);
 
     let git = ">git</td>";
-    let machines = section(&page, "machines");
-    assert!(machines.contains(">node</td>"), "{machines}");
-    assert!(!machines.contains(git), "{machines}");
-    assert!(!machines.contains("22.9.0"), "{machines}");
     let gone = section(&page, "gone");
     assert!(gone.contains(git), "{gone}");
     assert!(gone.contains("2.47.0"), "{gone}");
@@ -675,10 +671,6 @@ fn a_formula_and_a_cask_with_one_token_and_a_tap_package_with_a_core_name_are_di
             "component:machine:mac/brew/someone/tools/git|9.1",
         ]
     );
-    // Shown on the machine by Homebrew's full name, with what kind of package it is.
-    let mac = machine_block(&view(&store), "mac");
-    assert!(mac.contains(">brew-cask</td>"), "{mac}");
-    assert!(mac.contains(">someone/tools/git</td>"), "{mac}");
 }
 
 #[test]
@@ -1037,14 +1029,13 @@ fn server_file_without_end_is_a_machine_not_read_and_retracts_nothing() {
         ["machine:db-1"]
     );
     assert!(!live_before.iter().any(|r| r.contains("machine:db-1")));
-    let page = view(&store);
-    let machines = section(&page, "machines");
-    let db = machines
-        .split("<details class=\"machine\">")
-        .find(|m| m.contains("<strong>db-1</strong>"))
-        .expect("db-1 is not on the page");
-    assert!(db.contains("could not be read"), "{db}");
-    assert!(db.contains("0 components"), "{db}");
+    let db = machine_block(&view(&store), "db-1");
+    assert!(
+        db.contains("<span class=\"badge bad\">did not finish</span>")
+            && db.contains("· nothing read")
+            && !db.contains("<h3>"),
+        "{db}"
+    );
 }
 
 /// Sets a file's modification time.
@@ -1098,13 +1089,8 @@ fn time_of_a_server_reading_is_taken_at_from_the_file_not_its_time_on_disk() {
     ];
     assert_eq!(times("coverage"), expected);
     assert_eq!(times("assertion"), expected);
-    let page = view(&store);
-    let web = section(&page, "machines")
-        .split("<details class=\"machine\">")
-        .find(|m| m.contains("<strong>web-1</strong>"))
-        .unwrap()
-        .to_string();
-    assert!(web.contains("read 2026-01-02 03:04 UTC"), "{web}");
+    let web = machine_block(&view(&store), "web-1");
+    assert!(web.contains("· read 2026-01-02 03:04 UTC"), "{web}");
 }
 
 #[test]
@@ -1340,7 +1326,6 @@ fn deleted_checkout_is_retracted_with_everything_inside_it_as_one_removed_event(
     assert!(next.contains("Since last run: no changes."), "{next}");
     let page = view(&store);
     assert!(!section(&page, "coverage").contains(id));
-    assert!(!section(&page, "machines").contains("dev/shop"));
 }
 
 /// Takes every permission off a folder and gives them back when dropped.
@@ -2003,38 +1988,84 @@ fn two_traces_that_name_the_same_address_are_one_machine_and_each_reader_keeps_w
         "{report}"
     );
 
-    let page = view(&h.store());
-    let machines = section(&page, "machines");
-    let blocks: Vec<&str> = machines.split("<details class=\"machine\">").collect();
-    let web = blocks
+    // One machine under each of its names, as `immunity owner` lists it and the page shows it.
+    let listed = machines_json(&h.home, &h.store());
+    let web = listed
         .iter()
-        .find(|b| b.contains("<strong>web-1</strong>"))
-        .expect("web-1 is not on the page");
-    assert!(web.contains("10.0.0.5"), "{web}");
-    assert!(
-        !machines.contains("<strong>10.0.0.5</strong>"),
-        "{machines}"
-    );
-    let never = blocks
-        .iter()
-        .find(|b| b.contains("Known and never read"))
-        .expect("no list of machines never read");
-    let names: Vec<&str> = never
-        .split("<tr><td class=\"mono\">")
-        .skip(1)
-        .map(|r| r.split('<').next().unwrap())
+        .find(|m| m["machine_text"] == "web-1")
+        .unwrap_or_else(|| panic!("{listed:#?}"));
+    let mut ids: Vec<&str> = (web["entities_text"].as_array().unwrap().iter())
+        .map(|id| id.as_str().unwrap())
         .collect();
-    assert_eq!(names, ["build", "phone", "retired-box"], "{never}");
-    let build = never.split("<tr>").find(|r| r.contains(">build<")).unwrap();
-    assert!(
-        build.contains("build-box") && build.contains("tailnet peers"),
-        "{build}"
+    ids.sort();
+    assert_eq!(ids, ["machine:10.0.0.5", "machine:web-1"]);
+    assert_eq!(web["names_text"], serde_json::json!(["10.0.0.5"]), "{web}");
+    let page = view(&h.store());
+    assert!(machine_block(&page, "web-1").contains("<bdi class=\"src\">10.0.0.5</bdi>"));
+    assert!(!page.contains("<strong><bdi class=\"src\">10.0.0.5</bdi></strong>"));
+    assert_eq!(
+        never_read(&page),
+        ["build", "phone", "retired-box"],
+        "{page}"
     );
+    assert!(machine_block(&page, "build").contains("<bdi class=\"src\">build-box</bdi>"));
 
     // The link goes when its evidence goes.
     std::fs::remove_file(h.home.join(".ssh/known_hosts")).unwrap();
     h.run(&servers, &tailscale);
     assert_eq!(rows(&h.store(), links), ["machine:build|machine:build-box"]);
+}
+
+#[test]
+fn servers_are_listed_in_the_order_of_the_name_shown_each_with_the_readings_that_name_it() {
+    // A list a person scans has one order, the same in `immunity owner` and on the page; and
+    // why a machine is on it is part of what an agent needs before a statement about it.
+    let h = Home::new(
+        "order",
+        Some(SSH_CONFIG),
+        Some("10.0.0.5 ssh-ed25519 AAAA\n"),
+    );
+    // A second alias of the same address: one reading names the machine twice, and says so once.
+    put(
+        &h.home.join(".ssh/config.d"),
+        "more",
+        "Host web-2\n    HostName 10.0.0.5\n",
+    );
+    let servers = h.dir.0.join("servers");
+    put(&servers, "web-1.txt", WEB_1);
+    let tailscale = fake(&h.dir.0.join("bin").join("tailscale"), TAILNET);
+    h.run(&servers, &tailscale);
+    let listed = machines_json(&h.home, &h.store());
+    let shown: Vec<&str> = (listed.iter())
+        .filter(|m| m["kind"] == "server")
+        .map(|m| m["machine_text"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        shown,
+        ["build", "phone", "retired-box", "web-1"],
+        "{listed:#?}"
+    );
+    let page = view(&h.store());
+    let blocks: Vec<usize> = (shown.iter())
+        .map(|n| {
+            page.find(&format!("<strong><bdi class=\"src\">{n}</bdi></strong>"))
+                .unwrap()
+        })
+        .collect();
+    assert!(blocks.is_sorted(), "{page}");
+    let web = listed
+        .iter()
+        .find(|m| m["machine_text"] == "web-1")
+        .unwrap();
+    assert_eq!(
+        web["known_from"],
+        serde_json::json!(["known hosts", "ssh configuration"]),
+        "{web}"
+    );
+    assert!(
+        machine_block(&page, "web-1")
+            .contains("<p class=\"muted\">Known from known hosts, ssh configuration.</p>")
+    );
 }
 
 #[test]
@@ -2879,38 +2910,33 @@ fn another_users_device_known_only_from_the_tailnet_is_not_a_server_and_never_of
     );
     assert_eq!(status_json(&h.store())["estate"]["other_devices"], 3);
 
-    let machines = view(&h.store());
-    // The page beyond this Mac lists them apart from the servers.
-    assert!(
-        section(&machines, "other-devices").contains("<tr><td class=\"mono\">friends-laptop</td>"),
-        "{machines}"
+    // `immunity owner` lists them apart from the servers, and so does the page beyond this Mac.
+    let kinds: Vec<(String, String)> = machines_json(&h.home, &h.store())
+        .iter()
+        .map(|m| (m["kind"].to_string(), m["machine_text"].to_string()))
+        .collect();
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|(kind, _)| kind == "\"other_device\"")
+            .count(),
+        3,
+        "{kinds:?}"
     );
-    let servers = section(&machines, "servers");
+    let page = view(&h.store());
+    let other = section(&page, "other-devices");
+    assert_eq!(other.matches("<tr><td").count(), 3, "{other}");
     assert!(
-        servers.contains("<tr><td class=\"mono\">shared</td>")
+        other.contains("<tr><td class=\"mono\"><bdi class=\"src\">friends-laptop</bdi></td>"),
+        "{other}"
+    );
+    let servers = section(&page, "servers");
+    assert!(
+        servers.contains("<strong><bdi class=\"src\">shared</bdi></strong>")
             && !servers.contains("friends-laptop"),
         "{servers}"
     );
-    let machines = section(&machines, "machines");
-    let blocks: Vec<&str> = machines.split("<details class=\"machine\">").collect();
-    let never = blocks
-        .iter()
-        .find(|b| b.contains("Known and never read"))
-        .expect("no list of machines never read");
-    assert!(!never.contains("friends-laptop"), "{never}");
-    assert!(
-        blocks[0].contains("4 known and never read; 3 are other users' devices on the tailnet."),
-        "{}",
-        blocks[0]
-    );
-    let devices = blocks
-        .iter()
-        .find(|b| b.contains("Other users' devices</strong>"))
-        .expect("no list of other users' devices");
-    assert!(
-        devices.contains("3 devices ·") && devices.contains(">friends-laptop<"),
-        "{devices}"
-    );
+    assert!(!never_read(&page).contains(&"friends-laptop".to_string()));
 }
 
 #[test]
@@ -2956,11 +2982,11 @@ fn another_users_device_also_known_from_the_ssh_configuration_known_hosts_or_a_s
         "{report}"
     );
     let page = view(&h.store());
-    let devices = section(&page, "machines")
-        .split("<details class=\"machine\">")
-        .find(|b| b.contains("Other users' devices</strong>"))
-        .expect("no list of other users' devices");
-    assert!(devices.contains("1 device ·"), "{devices}");
+    let other = section(&page, "other-devices");
+    assert_eq!(other.matches("<tr><td").count(), 1, "{other}");
+    for server in ["shared", "lab-box", "old-laptop"] {
+        machine_block(&page, server);
+    }
 }
 
 #[test]
@@ -3097,19 +3123,26 @@ fn the_owners_phones_and_laptops_that_nothing_else_names_are_their_other_devices
         "{printed}"
     );
 
-    // The page beyond this Mac: three sections.
+    // `immunity owner` says which server has no system given, and the page beyond this Mac lists
+    // them in three sections.
+    let not_given: Vec<serde_json::Value> = machines_json(&h.home, &h.store())
+        .into_iter()
+        .filter(|m| m["system_not_given"] == true)
+        .map(|m| m["machine_text"].clone())
+        .collect();
+    assert_eq!(not_given, ["mystery"]);
     let page = view(&h.store());
     let mine = section(&page, "your-devices");
     assert!(
         mine.contains("<h2>Your other devices</h2>\n<p class=\"muted\">Phones, tablets and computers on your private network that you do not log in to over SSH. They are not checked: this version looks at this Mac and at servers.</p>")
-            && mine.contains("<td class=\"mono\">pocket</td><td>iOS</td>")
-            && mine.contains("<td class=\"mono\">travel-laptop</td><td>macOS</td>"),
+            && mine.contains("<td class=\"mono\"><bdi class=\"src\">pocket</bdi></td><td><bdi class=\"src\">iOS</bdi></td>")
+            && mine.contains("<td class=\"mono\"><bdi class=\"src\">travel-laptop</bdi></td><td><bdi class=\"src\">macOS</bdi></td>"),
         "{mine}"
     );
     let listed_servers = section(&page, "servers");
     for name in ["studio", "pi", "mystery", "web-1"] {
         assert!(
-            listed_servers.contains(&format!("<td class=\"mono\">{name}</td>")),
+            listed_servers.contains(&format!("<strong><bdi class=\"src\">{name}</bdi></strong>")),
             "{name}: {listed_servers}"
         );
     }
@@ -4333,13 +4366,6 @@ fn a_checkout_seen_by_both_readers_is_one_entity() {
         ["1"]
     );
     assert!(report.contains("1 checkout,"), "{report}");
-    let page = view(&a.store());
-    assert_eq!(
-        section(&page, "machines")
-            .matches("<span class=\"mono\">dev/shop</span>")
-            .count(),
-        1
-    );
 }
 
 #[test]
@@ -5524,29 +5550,31 @@ fn now() -> i64 {
         .as_secs() as i64
 }
 
-/// The names in the view's table of machines known and never read.
+/// The servers the page beyond this Mac says were never checked, by name.
 fn never_read(page: &str) -> Vec<String> {
-    let machines = section(page, "machines");
-    let Some(never) = machines
+    section(page, "servers")
         .split("<details class=\"machine\">")
-        .find(|b| b.contains("Known and never read"))
-    else {
-        return Vec::new();
-    };
-    never
-        .split("<tr><td class=\"mono\">")
-        .skip(1)
-        .map(|r| r.split('<').next().unwrap().to_string())
+        .filter(|b| b.contains("<span class=\"badge bad\">never checked</span>"))
+        .map(|b| {
+            let start = "<strong><bdi class=\"src\">";
+            let name = &b[b.find(start).unwrap() + start.len()..];
+            name[..name.find('<').unwrap()].to_string()
+        })
         .collect()
 }
 
-/// The view's list of machines the owner set aside.
+/// What the page beyond this Mac lists as set aside by the owner's word.
 fn set_aside(page: &str) -> String {
-    section(page, "machines")
-        .split("<details class=\"machine\">")
-        .find(|b| b.contains("Retired or disowned by the owner</strong>"))
-        .unwrap_or_default()
-        .to_string()
+    section(page, "retired").to_string()
+}
+
+/// The machines beyond this Mac as `immunity owner --json` lists them.
+fn machines_json(home: &Path, store: &Path) -> Vec<serde_json::Value> {
+    let out = ok(immunity_cmd(home)
+        .args(["owner", "--json", "--store"])
+        .arg(store));
+    let m: serde_json::Value = serde_json::from_str(&out).unwrap();
+    m["machines"].as_array().unwrap().clone()
 }
 
 const OWNER_WORDS: &str = "SELECT entity, said, reason, withdrawn_at IS NOT NULL
@@ -5720,17 +5748,15 @@ fn a_retired_machine_is_not_counted_as_known_and_never_read_and_is_listed_with_i
     assert_eq!(printed.matches("old-box").count(), 1, "{printed}");
 
     assert_eq!(never_read(&page), ["web-1"]);
-    assert!(
-        section(&page, "machines")
-            .contains("1 known and never read; 1 retired or disowned by the owner."),
-        "{page}"
-    );
     let aside = set_aside(&page);
+    let old = machine_block(&aside, "old-box");
     assert!(
-        aside.contains("1 machine ·")
-            && aside.contains("<td class=\"mono\">old-box</td><td>retired</td>")
-            && aside
-                .contains("<td>Switched off in October</td><td class=\"mono\">203.0.113.8</td>"),
+        aside.matches("<details class=\"machine\">").count() == 1
+            && old.contains("<span class=\"badge good\">retired</span>")
+            && old.contains(
+                ", from the command line. Why: <bdi class=\"src\">Switched off in October</bdi>."
+            )
+            && old.contains("Also known as <bdi class=\"src\">203.0.113.8</bdi>."),
         "{aside}"
     );
 }
@@ -5796,15 +5822,11 @@ fn facts_about_a_retired_machine_are_not_retracted_and_its_readings_go_on() {
     );
     // The view still shows what was read on it, with the statement.
     let page = view(&h.store());
-    let web = section(&page, "machines")
-        .split("<details class=\"machine\">")
-        .find(|b| b.contains("<strong>web-1</strong>"))
-        .expect("web-1 is not on the page")
-        .to_string();
+    let web = machine_block(&set_aside(&page), "web-1");
     assert!(
-        web.contains("<span class=\"badge good\">not mine by the owner on ")
-            && web.contains("A client&#39;s server</span>")
-            && web.contains("openssl"),
+        web.contains("<span class=\"badge good\">not mine</span>")
+            && web.contains("Why: <bdi class=\"src\">A client&#39;s server</bdi>.")
+            && web.contains("<bdi class=\"src\">openssl</bdi>"),
         "{web}"
     );
 }
@@ -5905,24 +5927,14 @@ fn a_machine_swept_after_the_statement_is_shown_as_contradicted_counted_again_an
 
     let page = view(&h.store());
     assert!(
-        section(&page, "machines").contains(
-            "<p class=\"alert\">The owner's word is contradicted: <span class=\"mono\">web-1</span>"
-        ),
+        section(&page, "servers")
+            .contains("<p class=\"alert\">You said <bdi class=\"src\">web-1</bdi> is retired on ")
+            && section(&page, "servers").contains("It is counted as a server again"),
         "{page}"
     );
     // A word the machine contradicts sets nothing aside, on the summary either.
     assert!(!page.contains("Retired or not yours: "), "{page}");
-
-    assert!(set_aside(&page).is_empty());
-    let web = section(&page, "machines")
-        .split("<details class=\"machine\">")
-        .find(|b| b.contains("<strong>web-1</strong>"))
-        .expect("web-1 is not on the page")
-        .to_string();
-    assert!(
-        web.contains("<span class=\"badge bad\">the owner's word is contradicted</span>"),
-        "{web}"
-    );
+    assert!(set_aside(&page).contains("<p class=\"muted\">None.</p>"));
 }
 
 #[test]
@@ -6133,10 +6145,13 @@ fn a_statement_says_who_gave_it_in_the_app_through_an_agent_or_from_the_command_
         ("db-1", "in the app"),
         ("old-1", "from the command line"),
     ] {
-        let at = retired.find(&format!(">{name}</td>")).unwrap();
-        let row = &retired[at..at + retired[at..].find("</tr>").unwrap()];
-        assert!(row.contains(&format!("<td>{by}</td>")), "{row}");
+        let block = machine_block(retired, name);
+        assert!(block.contains(&format!(", {by}. Why: ")), "{block}");
     }
+    // One given through an agent says so where it is listed, without opening it.
+    let line = machine_block(retired, "web-1");
+    let line = &line[..line.find("</summary>").unwrap()];
+    assert!(line.contains(" UTC, through your agent ·"), "{line}");
 }
 
 #[test]
@@ -6245,7 +6260,7 @@ fn no_machine_is_set_aside_silently() {
             .all(|s| s["via"] == "unknown"),
         "{listed}"
     );
-    assert!(section(&view(&h.store()), "retired").contains("<td>how it came is not recorded</td>"));
+    assert!(section(&view(&h.store()), "retired").contains(", how it came is not recorded."));
 }
 
 #[test]
@@ -6457,13 +6472,17 @@ fn the_owners_reason_is_printed_and_shown_escaped_and_kept_as_typed() {
     );
 }
 
-/// The machine's block in the view's list of machines.
+/// A machine's block on the page beyond this Mac, or in a part of it, which opens to what was read
+/// on it.
 fn machine_block(page: &str, name: &str) -> String {
-    section(page, "machines")
+    let beyond = page
+        .find("<h1>Beyond this Mac</h1>")
+        .map_or(page, |at| &page[at..]);
+    let block = beyond
         .split("<details class=\"machine\">")
-        .find(|b| b.contains(&format!("<strong>{name}</strong>")))
-        .unwrap_or_else(|| panic!("{name} is not on the page"))
-        .to_string()
+        .find(|b| b.contains(&format!("<strong><bdi class=\"src\">{name}</bdi></strong>")))
+        .unwrap_or_else(|| panic!("{name} is not on the page"));
+    block[..block.find("</details>").unwrap()].to_string()
 }
 
 /// The row `immunity servers` prints for a server.
@@ -6660,19 +6679,21 @@ fn a_failed_visit_is_reported_with_when_and_why_next_to_the_earlier_reading_whic
     let page = view(&h.store());
     let web = machine_block(&page, "web-new");
     assert!(
-        web.contains("<span class=\"badge bad\">latest visit failed</span>")
-            && web.contains("· read 2026-01-02 03:04 UTC")
+        web.contains("<span class=\"badge bad\">could not be opened</span>")
+            && web.contains("· visited 2026-01-03 04:00 UTC · read 2026-01-02 03:04 UTC")
             && web.contains(
-                "<p class=\"alert\">Last read 2026-01-02 03:04 UTC; the latest visit failed 2026-01-03 04:00 UTC: ssh: connect to host web-new port 22: Operation timed out\\u{202e}.</p>"
+                "<p class=\"alert\">The latest visit failed 2026-01-03 04:00 UTC: <bdi class=\"src\">ssh: connect to host web-new port 22: Operation timed out\\u{202e}</bdi>.</p>"
             )
-            && web.contains("openssl"),
+            && web.contains("<bdi class=\"src\">openssl</bdi>"),
         "{web}"
     );
+    let db = machine_block(&page, "db-1");
     assert!(
-        machine_block(&page, "db-1").contains(
-            "<p class=\"alert\">Last read never; the latest visit failed 2026-01-03 04:00 UTC: Permission denied (publickey).</p>"
-        ),
-        "{page}"
+        db.contains("· nothing read")
+            && db.contains(
+                "<p class=\"alert\">The latest visit failed 2026-01-03 04:00 UTC: <bdi class=\"src\">Permission denied (publickey)</bdi>.</p>"
+            ),
+        "{db}"
     );
 
     // A visit that succeeds removes the failure, and nothing is said about it any more.
@@ -6740,7 +6761,7 @@ fn what_a_server_said_takes_no_word_of_the_core_s_with_it_and_no_secret_or_mark_
     assert!(page.contains(&web), "{page}");
     // The advice is decided from what the server said, and the reason is cut once.
     assert!(
-        machine_block(&page, "web-new").contains(&format!("?t={mark}. {advice}")),
+        machine_block(&page, "web-new").contains(&format!("?t={mark}</bdi>. {advice}")),
         "{page}"
     );
     assert!(
@@ -6808,7 +6829,10 @@ exit 255",
         "{report}"
     );
     assert!(server_row(&printed, "db-1").contains(said), "{printed}");
-    assert!(machine_block(&page, "db-1").contains(said), "{page}");
+    assert!(
+        machine_block(&page, "db-1").contains("The latest visit failed 2026-01-03 04:00 UTC: <bdi class=\"src\">Host key verification failed</bdi>. Connect to this server once by hand and check its host key: the sweep never accepts a key for you."),
+        "{page}"
+    );
     let script = std::fs::read_to_string(sweep.join("sweep.sh")).unwrap();
     for text in [&script, &report, &printed, &page] {
         for option in ["StrictHostKeyChecking", "UserKnownHostsFile", "accept-new"] {
@@ -8139,10 +8163,10 @@ fn the_release_the_source_and_the_kernel_package_are_shown_under_the_machine_esc
     let web = machine_block(&page, "web");
 
     for shown in [
-        "&lt;b&gt;x&lt;/b&gt; 1&amp;2",
-        "(&lt;u&gt;c&lt;/u&gt;)",
+        "<bdi class=\"src\">&lt;b&gt;x&lt;/b&gt; 1&amp;2</bdi>",
+        "Codename <bdi class=\"src\">&lt;u&gt;c&lt;/u&gt;</bdi>",
         "&lt;script&gt;k&lt;/script&gt;",
-        "&lt;i&gt;expat&lt;/i&gt; 2.5.0-1",
+        "<bdi class=\"src\">&lt;i&gt;expat&lt;/i&gt; 2.5.0-1</bdi>",
     ] {
         assert!(
             web.contains(shown),
@@ -8846,10 +8870,8 @@ fn a_checkout_that_is_gone_takes_its_hooks_with_it() {
         report.contains("not read in full: hooks in 2 checkouts (nothing read)."),
         "{report}"
     );
-    // Checkouts with hooks and no lockfile are still listed as having no lockfile, and a
-    // checkout's hooks read in full are counted under watched places, not listed in coverage.
+    // A checkout's hooks read in full are counted under watched places, not listed in coverage.
     let page = view(&w.store());
-    assert!(section(&page, "machines").contains("No lockfile found in 5 checkouts"));
     assert!(!section(&page, "coverage").contains("dev/plain"));
     assert!(section(&page, "coverage").contains("dev/tree"));
     assert!(section(&page, "watched").contains("<li>3 checkouts read in full</li>"));
@@ -12733,13 +12755,14 @@ fn a_server_that_cannot_be_opened_is_one_thing_the_owner_can_fix_with_its_reason
     assert_eq!(item["since_at"], 1767412800);
     // The page beyond this Mac says, server by server, what the last check did.
     let page = view(&h.store());
-    let listed = section(&page, "servers");
+    let db = machine_block(&page, "db-1");
     assert!(
-        listed.contains(
-            "<tr><td class=\"mono\">db-1</td><td>could not be opened: Permission denied (publickey).</td><td class=\"nowrap\">never</td>"
-        ) && listed.contains("<tr><td class=\"mono\">web-1</td><td>checked</td>"),
-        "{listed}"
+        db.contains("<span class=\"badge bad\">could not be opened</span>")
+            && db.contains("<bdi class=\"src\">Permission denied (publickey)</bdi>")
+            && db.contains("· nothing read"),
+        "{db}"
     );
+    assert!(machine_block(&page, "web-1").contains("<span class=\"badge good\">checked</span>"));
 
     std::fs::remove_file(servers.join("db-1.failed")).unwrap();
     put(&servers, "db-1.txt", WEB_1);
@@ -13688,7 +13711,10 @@ fn links_arrive(pages: &[(PathBuf, String)]) -> (Vec<(String, String)>, Vec<Path
         // number it says; none is a section with no list.
         if let (Ok(n), false) = (count.parse::<usize>(), anchor.is_empty()) {
             let shown = section(html, anchor);
-            if shown.contains("<table") {
+            let machines = shown.matches("<details class=\"machine\">").count();
+            if machines > 0 {
+                assert_eq!(machines, n, "{text}: {shown}");
+            } else if shown.contains("<table") {
                 assert_eq!(shown.matches("</td></tr>").count(), n, "{text}: {shown}");
             } else if n > 0 {
                 assert!(shown.contains(&format!(" {n} ")), "{text}: {shown}");

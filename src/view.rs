@@ -14,8 +14,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::Write;
 
-use crate::servers::VISIT;
-
 /// The runs the changes page lists (`store::listed_runs`).
 const RUNS_SHOWN: i64 = crate::store::RUNS_KEPT;
 /// The most kinds of watched places a watcher's reading is named by on the changes page.
@@ -89,7 +87,14 @@ pub struct Answers<'a> {
     pub finding: Box<FindingOf<'a>>,
     /// `immunity rules`, of the event level the status rests on.
     pub rules: crate::contract::v1::Rules,
+    /// `immunity owner`: the statements that stand, and the machines beyond this Mac.
+    pub statements: crate::contract::v1::Statements,
+    /// `immunity machine <id>` for a machine a page opens; `None` when it names no one machine.
+    pub machine: Box<MachineOf<'a>>,
 }
+
+/// `immunity machine <id>` as the pages ask it, by an id as the contract gives it.
+pub type MachineOf<'a> = dyn Fn(&str) -> rusqlite::Result<Option<crate::contract::v1::Known>> + 'a;
 
 /// `immunity finding <id>` as the pages ask it.
 pub type FindingOf<'a> =
@@ -103,6 +108,8 @@ impl Answers<'_> {
             findings: Default::default(),
             finding: Box::new(|_| Ok(None)),
             rules: Default::default(),
+            statements: Default::default(),
+            machine: Box::new(|_| Ok(None)),
         }
     }
 }
@@ -132,7 +139,7 @@ pub fn pages(
         ),
         (
             format!("{DETAILS}/{}.html", crate::pages::BEYOND),
-            crate::pages::beyond(conn, &latest, now)?,
+            crate::pages::beyond::page(result, &answers.statements, &answers.machine, now)?,
         ),
         (
             format!("{DETAILS}/{}.html", crate::pages::TECHNICAL),
@@ -155,7 +162,6 @@ pub fn pages(
         let mut body = String::new();
         match name {
             "coverage" => coverage(conn, &mut body, &latest, now)?,
-            "machines" => machines(conn, &mut body, &latest, now)?,
             "watched" => watched(conn, &mut body, &latest, now)?,
             "changes" => changes(conn, &mut body)?,
             "gone" => retracted(conn, &mut body)?,
@@ -241,9 +247,8 @@ fn section_page(anchor: &str, title: &str) -> String {
 }
 
 /// The pages of details, by file name and title.
-pub const DETAIL_PAGES: [(&str, &str); 6] = [
+pub const DETAIL_PAGES: [(&str, &str); 5] = [
     ("coverage", "What was read and how completely"),
-    ("machines", "Machines"),
     ("watched", "Watched places"),
     ("changes", "Changes"),
     ("gone", "No longer there"),
@@ -458,7 +463,7 @@ pub fn component_place(id: &str) -> &str {
 
 /// The time and how many whole days ago it was, or that it is ahead of the clock
 /// (`store::age`).
-fn utc_age(secs: i64, now: i64) -> String {
+pub(crate) fn utc_age(secs: i64, now: i64) -> String {
     match crate::store::age(secs, now).map(|age| age / 86_400) {
         Some(1) => format!("{} · 1 day ago", utc(secs)),
         Some(days) => format!("{} · {days} days ago", utc(secs)),
@@ -635,7 +640,7 @@ fn completeness_label<'a>(completeness: &'a str, note: Option<&str>) -> &'a str 
     }
 }
 
-fn badge(out: &mut String, completeness: &str, note: Option<&str>) -> Out {
+pub(crate) fn badge(out: &mut String, completeness: &str, note: Option<&str>) -> Out {
     write!(
         out,
         "<span class=\"badge {}\">{}</span>",
@@ -735,635 +740,8 @@ fn coverage(conn: &Connection, out: &mut String, rows: &[Latest], now: i64) -> O
     Ok(())
 }
 
-#[derive(Default)]
-struct Component {
-    versions: BTreeSet<String>,
-    /// The source package and version it was built from, where the reader knows them.
-    built_from: BTreeSet<String>,
-    bases: BTreeSet<String>,
-    sources: BTreeSet<String>,
-    first_seen: Option<i64>,
-}
-
-/// What is live in the store, arranged by where things are.
-#[derive(Default)]
-struct Estate {
-    components: BTreeMap<String, Component>,
-    /// Machine, container or checkout -> the components in it.
-    inside: BTreeMap<String, Vec<String>>,
-    /// Machine -> the containers on it.
-    containers: BTreeMap<String, Vec<String>>,
-    /// Machine -> the checkouts on it.
-    checkouts: BTreeMap<String, Vec<String>>,
-    /// Subject -> predicate -> objects, for literal attributes such as the OS.
-    attrs: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
-}
-
-impl Estate {
-    fn load(conn: &Connection) -> rusqlite::Result<Estate> {
-        // Only live rows: a component whose assertions were all retracted is not there.
-        let mut stmt = conn.prepare(
-            "SELECT subject, predicate, object, basis, observed_at, source_ref
-             FROM assertion WHERE layer = 'live'",
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, String>(5)?,
-            ))
-        })?;
-        let mut e = Estate::default();
-        for row in rows {
-            let (subject, predicate, object, basis, at, source) = row?;
-            if !subject.starts_with("component:") {
-                if predicate == "located_on" && subject.starts_with("container:") {
-                    e.containers.entry(object).or_default().push(subject);
-                } else if predicate == "located_on" && subject.starts_with("checkout:") {
-                    e.checkouts.entry(object).or_default().push(subject);
-                } else {
-                    e.attrs
-                        .entry(subject)
-                        .or_default()
-                        .entry(predicate)
-                        .or_default()
-                        .insert(object);
-                }
-                continue;
-            }
-            let c = e.components.entry(subject.clone()).or_default();
-            match predicate.as_str() {
-                "has_version" => {
-                    c.versions.insert(object);
-                }
-                "built_from" => {
-                    c.built_from.insert(object);
-                }
-                "part_of" => e.inside.entry(object).or_default().push(subject),
-                _ => {}
-            }
-            c.bases.insert(basis);
-            c.sources.insert(source);
-            c.first_seen = Some(c.first_seen.map_or(at, |t| t.min(at)));
-        }
-        // Two readers that found one checkout make two assertions about one entity.
-        for list in e.checkouts.values_mut() {
-            list.sort();
-            list.dedup();
-        }
-        for list in e.inside.values_mut().chain(e.containers.values_mut()) {
-            list.sort_by_key(|id| {
-                let (ecosystem, name) = component_name(id);
-                (name.to_lowercase(), ecosystem.to_string())
-            });
-        }
-        Ok(e)
-    }
-
-    fn attr(&self, subject: &str, predicate: &str) -> String {
-        self.attrs
-            .get(subject)
-            .and_then(|p| p.get(predicate))
-            .map(|set| set.iter().cloned().collect::<Vec<_>>().join(", "))
-            .unwrap_or_default()
-    }
-
-    fn inside(&self, id: &str) -> &[String] {
-        self.inside.get(id).map(Vec::as_slice).unwrap_or_default()
-    }
-}
-
-/// The table of components inside one place.
-fn components_table(out: &mut String, estate: &Estate, ids: &[String]) -> Out {
-    if ids.is_empty() {
-        out.push_str("<p class=\"muted\">No components known.</p>\n");
-        return Ok(());
-    }
-    out.push_str("<div class=\"scroll\"><table class=\"dense\">\n");
-    thead(
-        out,
-        &[
-            "Name",
-            "Ecosystem",
-            "Version",
-            "Built from",
-            "Basis",
-            "First seen",
-            "Source",
-        ],
-    );
-    let join = |set: &BTreeSet<String>| set.iter().cloned().collect::<Vec<_>>().join(", ");
-    for id in ids {
-        let Some(c) = estate.components.get(id) else {
-            continue;
-        };
-        out.push_str("<tr>");
-        td_component(out, id)?;
-        td(out, "nowrap", component_name(id).0)?;
-        td(out, "mono", &join(&c.versions))?;
-        td(out, "mono", &join(&c.built_from))?;
-        td(out, "", &join(&c.bases))?;
-        td(out, "nowrap", &utc_or(c.first_seen, ""))?;
-        td(out, "mono", &join(&c.sources))?;
-        out.push_str("</tr>\n");
-    }
-    out.push_str("</tbody></table></div>\n");
-    Ok(())
-}
-
 pub(crate) fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
-}
-
-/// Which traces name each machine entity: the kinds of its live `known_as` assertions.
-fn traces(conn: &Connection) -> rusqlite::Result<BTreeMap<String, BTreeSet<String>>> {
-    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT subject, kind FROM assertion
-         WHERE layer = 'live' AND predicate = 'known_as'",
-    )?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
-    for row in rows {
-        let (subject, kind) = row?;
-        out.entry(subject).or_default().insert(kind);
-    }
-    Ok(out)
-}
-
-/// One machine: the entities the resolver found to be it, and how the owner reads it.
-struct Machine<'a> {
-    members: &'a [String],
-    label: String,
-    /// Every other name and address it is known by.
-    others: Vec<String>,
-    traces: Vec<String>,
-}
-
-impl<'a> Machine<'a> {
-    fn new(
-        members: &'a [String],
-        estate: &Estate,
-        traces_of: &BTreeMap<String, BTreeSet<String>>,
-        read: impl Fn(&str) -> bool,
-    ) -> Machine<'a> {
-        let bare = |m: &'a String| m.strip_prefix("machine:").unwrap_or(m);
-        // The name it was read under, else the first.
-        let label = members
-            .iter()
-            .find(|m| read(m))
-            .or(members.first())
-            .map(bare)
-            .unwrap_or_default()
-            .to_string();
-        let mut others: BTreeSet<String> = members.iter().map(|m| bare(m).to_string()).collect();
-        let mut traces = BTreeSet::new();
-        for m in members {
-            if let Some(names) = estate.attrs.get(m).and_then(|p| p.get("known_as")) {
-                others.extend(names.iter().cloned());
-            }
-            traces.extend(traces_of.get(m).into_iter().flatten().cloned());
-        }
-        others.remove(&label);
-        Machine {
-            members,
-            label,
-            others: others.into_iter().collect(),
-            traces: traces.into_iter().collect(),
-        }
-    }
-}
-
-fn machines(conn: &Connection, out: &mut String, latest: &[Latest], now: i64) -> Out {
-    out.push_str("<section id=\"machines\">\n<h2>Machines</h2>\n");
-    let groups = crate::store::machine_groups(conn)?;
-    if groups.is_empty() {
-        out.push_str("<p>No machines known.</p>\n</section>\n");
-        return Ok(());
-    }
-    let estate = Estate::load(conn)?;
-    let traces_of = traces(conn)?;
-    let coverage_of =
-        |scope: &str| -> Vec<&Latest> { latest.iter().filter(|r| r.scope == scope).collect() };
-    let read = |m: &str| !coverage_of(m).is_empty();
-    let all: Vec<Machine> = groups
-        .iter()
-        .map(|g| Machine::new(g, &estate, &traces_of, read))
-        .collect();
-    // The owner's word covers a machine under every name. A statement nothing contradicts
-    // sets the machine aside; a contradicted one leaves it where it was, with an alert.
-    let standing = crate::owner::standing(conn)?;
-    let word_of = |m: &Machine| {
-        standing
-            .iter()
-            .find(|s| m.members.iter().any(|id| s.covers(id)))
-    };
-    let set_aside: Vec<&crate::owner::Standing> =
-        standing.iter().filter(|s| s.seen.is_none()).collect();
-    let (seen, never): (Vec<&Machine>, Vec<&Machine>) = all
-        .iter()
-        .partition(|m| m.members.iter().any(|id| read(id)));
-    let never: Vec<&Machine> = never
-        .into_iter()
-        .filter(|m| word_of(m).is_none_or(|w| w.seen.is_some()))
-        .collect();
-    // Another user's device known only from the tailnet is not a server never read.
-    let devices = crate::store::other_users_devices(conn)?;
-    let (theirs, never): (Vec<&Machine>, Vec<&Machine>) = never
-        .into_iter()
-        .partition(|m| crate::store::only_someone_elses(m.members, &devices));
-    // A machine is unread when every latest reading of it read nothing.
-    let unread = |m: &Machine| {
-        m.members
-            .iter()
-            .flat_map(|id| coverage_of(id))
-            .all(|r| r.completeness == "none")
-    };
-    let unread_count = seen.iter().filter(|m| unread(m)).count();
-    write!(
-        out,
-        "<p class=\"muted\">{}",
-        plural(all.len(), "machine", "machines")
-    )?;
-    if unread_count > 0 {
-        write!(
-            out,
-            "; {unread_count} could not be read at their latest reading"
-        )?;
-    }
-    if !never.is_empty() {
-        write!(out, "; {} known and never read", never.len())?;
-    }
-    if !set_aside.is_empty() {
-        write!(
-            out,
-            "; {} retired or disowned by the owner",
-            set_aside.len()
-        )?;
-    }
-    if !theirs.is_empty() {
-        write!(
-            out,
-            "; {} on the tailnet",
-            plural(
-                theirs.len(),
-                "is another user's device",
-                "are other users' devices"
-            )
-        )?;
-    }
-    out.push_str(". Open one to see what is on it.</p>\n");
-    for s in standing.iter().filter(|s| s.seen.is_some()) {
-        writeln!(
-            out,
-            "<p class=\"alert\">The owner's word is contradicted: <span class=\"mono\">{}</span>, {}, was seen alive after it: {}. It is counted again and still not offered for the sweep.</p>",
-            esc(s.name()),
-            esc(&s.summary()),
-            esc(&s.contradiction().unwrap_or_default())
-        )?;
-    }
-
-    let mut seen = seen;
-    seen.sort_by(|a, b| a.label.cmp(&b.label));
-    for machine in seen {
-        let word = word_of(machine);
-        machine_block(
-            out,
-            machine,
-            &estate,
-            &coverage_of,
-            unread(machine),
-            word,
-            now,
-        )?;
-    }
-
-    if !never.is_empty() {
-        let mut never = never;
-        never.sort_by(|a, b| a.label.cmp(&b.label));
-        write!(
-            out,
-            "<details class=\"machine\">\n<summary><strong>Known and never read</strong> <span class=\"muted\">· {} · traces on this machine name them, and nothing was ever read on them</span></summary>\n<div class=\"inner\">\n",
-            plural(never.len(), "machine", "machines")
-        )?;
-        out.push_str("<div class=\"scroll\"><table class=\"dense\">\n");
-        thead(out, &["Name", "Also known as", "Known from"]);
-        for m in never {
-            out.push_str("<tr>");
-            td(out, "mono", &m.label)?;
-            td(out, "mono", &m.others.join(", "))?;
-            td(out, "", &m.traces.join(", "))?;
-            out.push_str("</tr>\n");
-        }
-        out.push_str("</tbody></table></div>\n</div>\n</details>\n");
-    }
-
-    if !set_aside.is_empty() {
-        write!(
-            out,
-            "<details class=\"machine\">\n<summary><strong>Retired or disowned by the owner</strong> <span class=\"muted\">· {} · the owner's word, and nothing seen alive since; not counted as servers, never offered for the sweep, and what was read on them is kept</span></summary>\n<div class=\"inner\">\n",
-            plural(set_aside.len(), "machine", "machines")
-        )?;
-        out.push_str("<div class=\"scroll\"><table class=\"dense\">\n");
-        thead(out, &["Name", "Said", "Since", "Reason", "Also known as"]);
-        for s in set_aside {
-            out.push_str("<tr>");
-            td(out, "mono", s.name())?;
-            td(out, "", &s.word.said)?;
-            td(out, "nowrap", &utc(s.word.made_at))?;
-            td_said(out, "", &s.word.reason.said())?;
-            td(out, "mono", &s.names[1..].join(", "))?;
-            out.push_str("</tr>\n");
-        }
-        out.push_str("</tbody></table></div>\n</div>\n</details>\n");
-    }
-
-    if !theirs.is_empty() {
-        write!(
-            out,
-            "<details class=\"machine\">\n<summary><strong>Other users' devices</strong> <span class=\"muted\">· {} · the tailnet says they belong to another user, and no other trace names them; not counted as servers</span></summary>\n<div class=\"inner\">\n",
-            plural(theirs.len(), "device", "devices")
-        )?;
-        out.push_str("<div class=\"scroll\"><table class=\"dense\">\n");
-        thead(out, &["Name", "Also known as"]);
-        for m in theirs {
-            out.push_str("<tr>");
-            td(out, "mono", &m.label)?;
-            td(out, "mono", &m.others.join(", "))?;
-            out.push_str("</tr>\n");
-        }
-        out.push_str("</tbody></table></div>\n</div>\n</details>\n");
-    }
-    out.push_str("</section>\n");
-    Ok(())
-}
-
-/// One machine that something was read on, with every entity it is known as.
-fn machine_block<'a>(
-    out: &mut String,
-    machine: &Machine,
-    estate: &Estate,
-    coverage_of: &dyn Fn(&str) -> Vec<&'a Latest>,
-    not_read: bool,
-    word: Option<&crate::owner::Standing>,
-    now: i64,
-) -> Out {
-    let members = machine.members;
-    let count = |f: &dyn Fn(&String) -> usize| members.iter().map(f).sum::<usize>();
-    let own = count(&|m| estate.inside(m).len());
-    let containers = count(&|m| estate.containers.get(m).map_or(0, Vec::len));
-    let checkouts = count(&|m| estate.checkouts.get(m).map_or(0, Vec::len));
-    // A failed visit read nothing: the machine was read when its readings say.
-    let read_at = members
-        .iter()
-        .flat_map(|m| coverage_of(m))
-        .filter(|r| r.kind != VISIT)
-        .map(|r| r.at)
-        .max();
-
-    out.push_str("<details class=\"machine\">\n<summary>");
-    write!(out, "<strong>{}</strong>", esc(&machine.label))?;
-    if not_read {
-        out.push_str(" <span class=\"badge bad\">could not be read</span>");
-    }
-    if members
-        .iter()
-        .flat_map(|m| coverage_of(m))
-        .any(|r| r.kind == VISIT && r.completeness == "none")
-    {
-        out.push_str(" <span class=\"badge bad\">latest visit failed</span>");
-    }
-    match word {
-        Some(w) if w.seen.is_some() => {
-            out.push_str(" <span class=\"badge bad\">the owner's word is contradicted</span>");
-        }
-        Some(w) => write!(
-            out,
-            " <span class=\"badge good\">{}</span>",
-            esc(&w.summary())
-        )?,
-        None => {}
-    }
-    let os: BTreeSet<String> = members
-        .iter()
-        .map(|m| match estate.attr(m, "runs_os") {
-            os if os.is_empty() => estate.attr(m, "runs_platform"),
-            os => os,
-        })
-        .filter(|os| !os.is_empty())
-        .collect();
-    if !os.is_empty() {
-        write!(
-            out,
-            " · {}",
-            esc(&os.into_iter().collect::<Vec<_>>().join(", "))
-        )?;
-    }
-    write!(
-        out,
-        " <span class=\"muted\">· {}",
-        plural(own, "component", "components")
-    )?;
-    if containers > 0 {
-        write!(out, " · {}", plural(containers, "container", "containers"))?;
-    }
-    if checkouts > 0 {
-        write!(out, " · {}", plural(checkouts, "checkout", "checkouts"))?;
-    }
-    if let Some(at) = read_at {
-        write!(out, " · read {}", utc_age(at, now))?;
-    }
-    out.push_str("</span></summary>\n<div class=\"inner\">\n");
-    if !machine.others.is_empty() || !machine.traces.is_empty() {
-        out.push_str("<p class=\"muted\">");
-        if !machine.others.is_empty() {
-            write!(
-                out,
-                "Also known as <span class=\"mono\">{}</span>. ",
-                esc(&machine.others.join(", "))
-            )?;
-        }
-        if !machine.traces.is_empty() {
-            write!(out, "Known from {}.", esc(&machine.traces.join(", ")))?;
-        }
-        out.push_str("</p>\n");
-    }
-    for member in members {
-        let empty = coverage_of(member).is_empty()
-            && estate.inside(member).is_empty()
-            && !estate.containers.contains_key(member)
-            && !estate.checkouts.contains_key(member);
-        if !empty {
-            machine_body(out, member, estate, coverage_of, now)?;
-        }
-    }
-    out.push_str("</div>\n</details>\n");
-    Ok(())
-}
-
-/// What was read on one machine entity and what is on it.
-fn machine_body<'a>(
-    out: &mut String,
-    machine: &str,
-    estate: &Estate,
-    coverage_of: &dyn Fn(&str) -> Vec<&'a Latest>,
-    now: i64,
-) -> Out {
-    let own = estate.inside(machine);
-    let containers = estate
-        .containers
-        .get(machine)
-        .map(Vec::as_slice)
-        .unwrap_or_default();
-    let prefix = format!("checkout:{machine}/");
-    let mine: Vec<&String> = estate
-        .checkouts
-        .get(machine)
-        .map(|list| list.iter().collect())
-        .unwrap_or_default();
-
-    let kernel = estate.attr(machine, "runs_kernel");
-    write!(
-        out,
-        "<p class=\"muted\"><span class=\"mono\">{}</span>",
-        esc(machine)
-    )?;
-    let release = estate.attr(machine, "runs_release");
-    if !release.is_empty() {
-        write!(
-            out,
-            " · release <span class=\"mono\">{}</span>",
-            esc(&release)
-        )?;
-        let codename = estate.attr(machine, "release_codename");
-        if !codename.is_empty() {
-            write!(out, " ({})", esc(&codename))?;
-        }
-    }
-    if !kernel.is_empty() {
-        write!(
-            out,
-            " · kernel <span class=\"mono\">{}</span>",
-            esc(&kernel)
-        )?;
-    }
-    let package = estate.attr(machine, "runs_kernel_package");
-    if !package.is_empty() {
-        write!(
-            out,
-            " from package <span class=\"mono\">{}</span>",
-            esc(&package)
-        )?;
-    }
-    out.push_str("</p>\n");
-
-    // What was read here and how completely, so the lists below are read for what they are.
-    let all = coverage_of(machine);
-    let last = all.iter().filter_map(|r| r.last_full).max();
-    let (visits, readings): (Vec<&Latest>, Vec<&Latest>) =
-        all.into_iter().partition(|r| r.kind == VISIT);
-    // A failed visit is told next to the reading it left as it was.
-    if let Some(v) = visits.iter().find(|v| v.completeness == "none") {
-        writeln!(
-            out,
-            "<p class=\"alert\">Last read {}; {}</p>",
-            utc_or(last, "never"),
-            // As the server said it: the advice about a host key is decided from it, and the
-            // reason is cut where it is shown (`sweep::failed_visit`).
-            esc_said(&crate::sweep::failed_visit(
-                v.at,
-                v.reason.as_deref().unwrap_or_default()
-            ))
-        )?;
-    }
-    if readings.is_empty() {
-        out.push_str("<p class=\"alert\">Nothing was ever read on this machine itself.</p>\n");
-    } else {
-        out.push_str("<ul class=\"readings\">\n");
-        for r in readings {
-            write!(out, "<li>{} ", esc(&r.kind))?;
-            badge(out, &r.completeness, r.reason.as_deref())?;
-            if let Some(reason) = &r.reason {
-                write!(out, " {}", esc_said(&said(reason)))?;
-            }
-            writeln!(
-                out,
-                " <span class=\"muted nowrap\">{}</span></li>",
-                utc_age(r.at, now)
-            )?;
-        }
-        out.push_str("</ul>\n");
-    }
-
-    components_table(out, estate, own)?;
-
-    if !containers.is_empty() {
-        out.push_str("<h3>Containers</h3>\n");
-    }
-    for container in containers {
-        let name = container.rsplit('/').next().unwrap_or(container);
-        let inside = estate.inside(container);
-        write!(
-            out,
-            "<details class=\"sub\">\n<summary>{} <span class=\"muted\">· <span class=\"mono\">{}</span> · {}</span></summary>\n",
-            esc(name),
-            esc(&estate.attr(container, "runs_image")),
-            plural(inside.len(), "component", "components")
-        )?;
-        components_table(out, estate, inside)?;
-        out.push_str("</details>\n");
-    }
-
-    // The hooks of a checkout are shown under watched places, and a reading of lockfiles that
-    // found none is a checkout without a lockfile.
-    let (with, without): (Vec<&String>, Vec<&String>) = mine.iter().partition(|c| {
-        coverage_of(c).iter().any(|r| {
-            r.reader != crate::watched::READER
-                && r.reason.as_deref() != Some(crate::lockfiles::NONE_FOUND_NOTE)
-        })
-    });
-    if !mine.is_empty() {
-        out.push_str("<h3>Checkouts</h3>\n");
-    }
-    for checkout in with {
-        let rel = &checkout[prefix.len()..];
-        let inside = estate.inside(checkout);
-        write!(
-            out,
-            "<details class=\"sub\">\n<summary><span class=\"mono\">{}</span> <span class=\"muted\">· {}</span>",
-            esc(rel),
-            plural(inside.len(), "component", "components")
-        )?;
-        for r in coverage_of(checkout) {
-            out.push(' ');
-            badge(out, &r.completeness, r.reason.as_deref())?;
-        }
-        out.push_str("</summary>\n");
-        for r in coverage_of(checkout) {
-            if let Some(reason) = &r.reason {
-                writeln!(
-                    out,
-                    "<p class=\"alert\">{}: {}</p>",
-                    esc(&r.kind),
-                    esc_said(&said(reason))
-                )?;
-            }
-        }
-        components_table(out, estate, inside)?;
-        out.push_str("</details>\n");
-    }
-    if !without.is_empty() {
-        let names: Vec<String> = without.iter().map(|c| esc(&c[prefix.len()..])).collect();
-        writeln!(
-            out,
-            "<p class=\"muted\">No lockfile found in {}: <span class=\"mono\">{}</span></p>",
-            plural(without.len(), "checkout", "checkouts"),
-            names.join(", ")
-        )?;
-    }
-    Ok(())
 }
 
 /// One watched file as the view shows it.

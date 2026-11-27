@@ -585,6 +585,7 @@ pub fn by_rule_for(
         cause: Some(cause as i32),
         observed_at: None,
         lacks: Vec::new(),
+        last_full_at: None,
     };
     let key = |c: &v1::Coverage| (c.scope_text.clone(), c.reader.clone(), c.kind.clone());
     let at = known.coverage.partition_point(|c| key(c) < key(&reading));
@@ -768,25 +769,31 @@ fn reading_keys<'a>(
 }
 
 /// The latest reading of a reader, scope and kind, as the store keeps it.
-struct Reading {
+pub(crate) struct Reading {
     id: i64,
-    reader: String,
-    scope: String,
-    kind: String,
-    completeness: String,
+    pub reader: String,
+    pub scope: String,
+    pub kind: String,
+    pub completeness: String,
     reason: Option<String>,
     cause: Option<String>,
-    at: i64,
+    pub at: i64,
+    /// When it was last read in full.
+    last_full: Option<i64>,
     /// What it did not read (`store::unread_of`); none on a full reading.
     unread: Vec<store::Unread>,
 }
 
 /// The latest reading of every reader, scope and kind, with what each did not read.
-fn latest(conn: &Connection) -> rusqlite::Result<Vec<Reading>> {
+pub(crate) fn latest(conn: &Connection) -> rusqlite::Result<Vec<Reading>> {
     let mut latest: Vec<Reading> = conn
         .prepare(&format!(
             "{latest}
-         SELECT id, reader, scope, kind, completeness, reason, cause, observed_at FROM latest
+         SELECT id, reader, scope, kind, completeness, reason, cause, observed_at,
+                (SELECT MAX(f.observed_at) FROM coverage f
+                 WHERE f.reader = c.reader AND f.scope = c.scope AND f.kind = c.kind
+                   AND f.completeness = 'full')
+         FROM latest c
          ORDER BY scope, reader, kind",
             latest = store::LATEST
         ))?
@@ -800,6 +807,7 @@ fn latest(conn: &Connection) -> rusqlite::Result<Vec<Reading>> {
                 reason: r.get(5)?,
                 cause: r.get(6)?,
                 at: r.get(7)?,
+                last_full: r.get(8)?,
                 unread: Vec::new(),
             })
         })?
@@ -817,7 +825,7 @@ fn latest(conn: &Connection) -> rusqlite::Result<Vec<Reading>> {
 /// A reading as the contract gives it, with what it names as having no reader. A reading that
 /// is not full has the cause the status classes it by (`status::class`). Its reason is given
 /// whole: what was cut off could be what the reading did not cover.
-fn coverage(conn: &Connection, r: Reading) -> rusqlite::Result<v1::Coverage> {
+pub(crate) fn coverage(conn: &Connection, r: Reading) -> rusqlite::Result<v1::Coverage> {
     let cause = match r.completeness.as_str() {
         "full" => r.cause.as_deref(),
         c => status::class(c, r.reason.as_deref(), r.cause.as_deref()),
@@ -837,6 +845,7 @@ fn coverage(conn: &Connection, r: Reading) -> rusqlite::Result<v1::Coverage> {
         reason_text: r.reason.as_deref().map(whole),
         cause: cause.map(value_of::<v1::Cause>),
         observed_at: Some(r.at),
+        last_full_at: r.last_full,
         scope_text: whole(&r.scope),
         reader: r.reader,
         kind: r.kind,

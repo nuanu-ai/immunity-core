@@ -852,7 +852,7 @@ mod tests {
                 ..Default::default()
             },
             finding: Box::new(move |_| Ok(Some(whole.clone()))),
-            rules: v1::Rules::default(),
+            ..Answers::none()
         };
         let mut out = String::new();
         table(&mut out, &answers, 0).unwrap();
@@ -929,7 +929,7 @@ mod tests {
                     _ => None,
                 })
             }),
-            rules: v1::Rules::default(),
+            ..Answers::none()
         };
         let mut out = String::new();
         table(&mut out, &answers, 0).unwrap();
