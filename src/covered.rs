@@ -235,6 +235,17 @@ pub struct ThisMac {
     pub failed: Vec<crate::watch::Failure>,
     /// The machine its readings are scoped to (`this_machine`); `None` before any.
     pub machine: Option<String>,
+    /// Its name now, as the latest full check kept it (`store::held_mac`); `None` before one.
+    pub name: Option<String>,
+}
+
+impl ThisMac {
+    /// Its name for a person: the one the latest full check kept, else the name in its id.
+    pub fn named(&self) -> Option<&str> {
+        let id = self.machine.as_deref()?;
+        let in_id = id.strip_prefix("machine:").unwrap_or(id);
+        Some(self.name.as_deref().unwrap_or(in_id))
+    }
 }
 
 impl ThisMac {
@@ -248,6 +259,7 @@ impl ThisMac {
             watched: Vec::new(),
             failed: Vec::new(),
             machine: None,
+            name: None,
         }
     }
 }
@@ -377,6 +389,8 @@ pub fn this_mac(conn: &Connection, latest: &[Latest], live: bool) -> rusqlite::R
         watched,
         failed: Vec::new(),
         machine: Some(this),
+        // The id `this_machine` gave first is the one kept with this name.
+        name: crate::store::held_mac(conn)?.map(|(_, name)| name),
     })
 }
 

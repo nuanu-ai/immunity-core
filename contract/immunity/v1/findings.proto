@@ -179,6 +179,10 @@ message Finding {
   // the person had answered `seen` or the core had cleared. Absent for a finding found for the
   // first time. Since 1.34.0.
   EarlierOccurrence earlier = 26;
+  // What a source said of it, as `LookFinding.value_text` in `status.proto` gives it: such as
+  // what an application's seal became, or a published rule's title with its authors. Whole.
+  // Absent when no source said anything. Since 1.38.0.
+  optional string value_text = 27;
 }
 
 // An earlier occurrence of a finding, as it stands now. Since 1.34.0.

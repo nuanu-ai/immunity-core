@@ -11,10 +11,17 @@
 //! Every link on the summary leads to a section that lists exactly what its label says,
 //! under a heading that says it, first thing on arrival.
 //!
-//! Text from the store goes through `esc`, as on every page of the view.
+//! The band, the footer, the table of findings (`findings_table.rs`) and the page of rules
+//! (`rules.rs`) are drawn from the messages the commands answer (`view::Answers`), and print
+//! names and text from a source through `secrets::Name` and `secrets::Said`. Text the rest reads
+//! from the store goes through `esc`, as on every page of the view.
+
+pub(crate) mod findings_table;
+pub(crate) mod rules;
 
 use crate::contract::v1;
 use crate::covered::{self, Count, Uncovered, YOU};
+use crate::secrets::Name;
 use crate::view::{self, DETAILS, FOOT, Latest, Out, counted, esc, esc_said, utc, utc_or};
 use crate::{beyond, findings, integrity, servers, watched};
 use rusqlite::{Connection, params};
@@ -40,9 +47,6 @@ pub const VULNERABILITIES: &str = "vulnerabilities";
 
 /// The link back to the summary, on every page of details.
 const BACK: &str = "<nav class=\"meta\"><a href=\"../view.html\">← What needs a look</a></nav>\n";
-
-/// At most this many things that need a look are shown in full, so the summary stays small.
-const ITEMS_SHOWN: usize = 100;
 
 /// The anchor of a kind of watched thing: its words in lower case, joined by dashes.
 pub fn anchor(what: &str) -> String {
@@ -114,24 +118,23 @@ pub fn summary(
     conn: &Connection,
     st: &crate::status::State,
     r: &v1::Status,
+    answers: &view::Answers,
     now: i64,
 ) -> Result<String, Box<dyn Error>> {
     let mut out = view::head("What needs a look").replacen("<body>", "<body class=\"summary\">", 1);
     let latest = view::latest_coverage(conn)?;
     let map = crate::map::read(conn, st, &latest)?;
-    let mac = findings::This::of(conn, covered::this_machine(conn)?)?;
     let (faults, limits) = sorted(st, r);
     let fixable = fixable(&faults);
     // The scope of the answer, said once as a link to where each thing is named.
-    state(conn, &mut out, st, r, now)?;
-    findings_table(conn, &mut out, st, mac.as_ref(), now)?;
+    state(&mut out, r, now)?;
+    findings_table::table(&mut out, answers, now)?;
     let failed = failed_here(&faults).len();
     watched_table(conn, &mut out, st, &map, &latest, &faults, failed, now)?;
-    crate::happens::draw(&mut out, st, &r.rules.clone().unwrap_or_default(), now)?;
+    crate::happens::draw(&mut out, r, &answers.rules, &answers.findings, now)?;
     you_can_fix(&mut out, &fixable)?;
     crate::not_read_here::section(&mut out, &limits)?;
-    let name = crate::store::held_mac(conn)?.map(|(_, name)| name);
-    links(&mut out, name.as_deref(), now)?;
+    links(&mut out, r, now)?;
     out.push_str(FOOT);
     Ok(out)
 }
@@ -172,25 +175,20 @@ fn needs_you(urgent: u64, total: u64) -> String {
 /// The state band: the glyph and the headline in the panel's words, then one short line: this
 /// Mac's name as data, why the headline cannot say more when it cannot, the state the terminal
 /// says under its headline, the last full check and when the page was made; under it every
-/// fault the terminal lists (`band`). A state the page cannot work out is said as not known,
+/// fault the terminal lists (`band`). All of it is the status's: the findings counted as it
+/// counts them, each of a pair one. A state the page cannot work out is said as not known,
 /// never as calm.
-fn state(
-    conn: &Connection,
-    out: &mut String,
-    st: &crate::status::State,
-    r: &v1::Status,
-    now: i64,
-) -> Out {
-    let m = &st.this_mac;
+fn state(out: &mut String, r: &v1::Status, now: i64) -> Out {
+    let m = r.this_mac.clone().unwrap_or_default();
     let not_computed: Vec<&v1::NotComputed> = r
         .not_computed
         .iter()
         .filter(|n| n.section == "needs_a_look")
         .collect();
-    // Things as the rows show them, a pair one thing: the band says what the table draws.
-    let shown = shown(&rows_of(st));
-    let total = (shown.now + shown.look) as u64;
-    let urgent = shown.now as u64;
+    let (total, urgent) = r
+        .needs_a_look
+        .as_ref()
+        .map_or((0, 0), |n| (n.total, n.urgent_total));
     // Why the headline cannot say more, in the program's own words, set beside the name.
     let mut why: Vec<String> = not_computed.iter().map(|n| esc(&n.reason)).collect();
     // The glyph and the words by the status's own headline: calm only when it is calm.
@@ -199,7 +197,7 @@ fn state(
         // Red only for urgent ones; orange for things to look at, none urgent.
         Ok(H::NeedsALook) if urgent > 0 => (GLYPH_NOW, esc(&needs_you(urgent, total))),
         Ok(H::NeedsALook) => (GLYPH_LOOK, esc(&needs_you(urgent, total))),
-        Ok(H::NotChecked) if m.state == "not_checked" => {
+        Ok(H::NotChecked) if m.state == v1::ThisMacState::NotChecked as i32 => {
             (GLYPH_UNKNOWN, "Nothing has been checked yet.".to_string())
         }
         // Why it is not fresh is the state under it, as the terminal says it.
@@ -222,16 +220,8 @@ fn state(
             (GLYPH_UNKNOWN, "I can't tell".to_string())
         }
     };
-    let mut parts: Vec<String> = Vec::new();
     // Its name now, which can differ from the one in its id.
-    if let Some((_, name)) = crate::store::held_mac(conn)? {
-        parts.push(format!("<span class=\"name\">{}</span>", esc(&name)));
-    } else if let Some(id) = covered::this_machine(conn)? {
-        parts.push(format!(
-            "<span class=\"name\">{}</span>",
-            esc(id.strip_prefix("machine:").unwrap_or(&id))
-        ));
-    }
+    let mut parts: Vec<String> = m.name_text.iter().map(|n| Name::given(n).html()).collect();
     parts.extend(why);
     let (said, faults) = band(r);
     parts.extend(said);
@@ -293,839 +283,10 @@ pub(crate) fn band(r: &v1::Status) -> (Option<String>, String) {
     (state, faults)
 }
 
-/// One row of the table of findings: one thing. Its finding, whether that is open, and the
-/// response layer's own finding about the same thing with whether that is open: the two are one
-/// row, and the opened row shows both, each with its own answer.
-struct FindingRow<'a> {
-    item: &'a findings::Item,
-    open: bool,
-    under: Vec<(&'a findings::Item, bool)>,
-    /// The other findings of the item's group (`findings::group`) drawn in this row, in its
-    /// state and as urgent as it, none with a verdict or a pair: the row is their folder.
-    siblings: Vec<&'a findings::Item>,
-}
-
-impl FindingRow<'_> {
-    /// How many findings the row counts as: a pair is one thing, each finding of a group one.
-    fn weight(&self) -> usize {
-        1 + self.siblings.len()
-    }
-
-    /// The row is in Open while any finding in it is open, and in Answered while any is
-    /// answered: a verdict never takes a finding out of Open.
-    fn open(&self) -> bool {
-        self.open || self.under.iter().any(|(_, open)| *open)
-    }
-
-    fn answered(&self) -> bool {
-        !self.open || self.under.iter().any(|(_, open)| !*open)
-    }
-
-    /// It needs the person now: an open finding in it, the core's or the response layer's,
-    /// is one Immunity Core marks urgent.
-    fn urgent(&self) -> bool {
-        (self.open && self.item.urgent()) || self.under.iter().any(|(c, open)| *open && c.urgent())
-    }
-}
-
-/// The rows, open first in the order of `findings::order`, then the answered, the latest answer
-/// first. A finding of `verdict.suspicious` about a rule and a thing is shown in the row of that
-/// rule's finding about that thing, once, and is not a row of its own; every finding is in
-/// exactly one row.
-fn finding_rows<'a>(
-    open: &'a [findings::Item],
-    answered: &'a [findings::Item],
-) -> Vec<FindingRow<'a>> {
-    let all: Vec<(&findings::Item, bool)> = open
-        .iter()
-        .map(|i| (i, true))
-        .chain(answered.iter().map(|i| (i, false)))
-        .collect();
-    // Each finding of the response layer goes into the row of the first finding of the core it
-    // is one thing with (`findings::one_thing`: the rule its verdicts were about, and the same
-    // thing). One with no such partner is a row of its own. A row takes every partner, so no
-    // finding is ever left out of the rows.
-    let mut nested: BTreeSet<usize> = BTreeSet::new();
-    let mut under: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-    for (k, (own, _)) in all.iter().enumerate() {
-        if let Some(n) = (0..all.len()).find(|n| findings::one_thing(all[*n].0, own)) {
-            nested.insert(k);
-            under.entry(n).or_default().push(k);
-        }
-    }
-    let rows = all
-        .iter()
-        .enumerate()
-        .filter(|(n, _)| !nested.contains(n))
-        .map(|(n, (i, open))| FindingRow {
-            item: i,
-            open: *open,
-            under: under
-                .get(&n)
-                .into_iter()
-                .flatten()
-                .map(|k| all[*k])
-                .collect(),
-            siblings: Vec::new(),
-        });
-    // A row of a group in the same state as the first row of that group goes into the first's
-    // row, so the answer its summary shows is every member's. A row with anything under it or
-    // with the response layer's word is never folded nor folded into, so every finding stays in
-    // exactly one row. Its urgency is the first's: a group is of one rule, and a finding of the
-    // core with no verdict has its rule's levels.
-    fn key<'b>(r: &FindingRow<'b>) -> Option<([&'b str; 4], &'b str)> {
-        let alone = r.under.is_empty() && verdict_word(r.item).is_none();
-        let group = findings::group(r.item).filter(|_| alone)?;
-        Some((group, r.item.state.as_str()))
-    }
-    let mut out: Vec<FindingRow> = Vec::new();
-    for row in rows {
-        match out
-            .iter_mut()
-            .find(|o| key(&row).is_some() && key(o) == key(&row))
-        {
-            Some(first) => first.siblings.push(row.item),
-            None => out.push(row),
-        }
-    }
-    out
-}
-
-/// Every row of the table, from the state's open and answered findings.
-fn rows_of(st: &crate::status::State) -> Vec<FindingRow<'_>> {
-    finding_rows(&st.needs.items, &st.answered)
-}
-
-/// What the band and the tabs count: things, as the rows show them. A finding and the response
-/// layer's own finding about the same thing are one row, so one thing to the person; the store's
-/// totals count them as two. A row of a group's folder counts each finding of the group
-/// (`FindingRow::weight`). `now` and `look` are the open rows in the two groups; `open`,
-/// `answered` and `all` are the rows under each tab, a row with one finding open and one
-/// answered under both.
-#[derive(Debug, PartialEq)]
-struct Shown {
-    now: usize,
-    look: usize,
-    open: usize,
-    answered: usize,
-    all: usize,
-}
-
-/// The one count of what the page shows, which the band and the tabs both say.
-fn shown(rows: &[FindingRow]) -> Shown {
-    let counted = |keep: &dyn Fn(&FindingRow) -> bool| {
-        rows.iter()
-            .filter(|r| keep(r))
-            .map(FindingRow::weight)
-            .sum()
-    };
-    let now = counted(&|r| r.urgent());
-    let open = counted(&|r| r.open());
-    Shown {
-        now,
-        look: open - now,
-        open,
-        answered: counted(&|r| r.answered()),
-        all: counted(&|_| true),
-    }
-}
-
-/// The findings as a table with three tabs, Open, Answered and All, each with its count of
-/// things as the rows show them, the same count as the band's (`shown`). The tabs are links within
-/// the page, and the stylesheet shows the rows of the one in the address (`:target`), Open when
-/// none is; a browser that cannot select by what an element holds shows every row, so nothing
-/// is hidden by a browser's age. The open rows are in two groups, as the panel has them: what
-/// needs the person now, then what is to look at; then the answered. Each row opens in place to
-/// its facts and who said what.
-fn findings_table(
-    conn: &Connection,
-    out: &mut String,
-    st: &crate::status::State,
-    mac: Option<&findings::This>,
-    now: i64,
-) -> Out {
-    let rows = rows_of(st);
-    let counts = shown(&rows);
-    let found = findings::all(conn, now)?;
-    writeln!(
-        out,
-        "<section id=\"findings\" class=\"findings\">\n<div class=\"wsh\"><h2>Findings</h2><nav class=\"tabs\" aria-label=\"Findings\"><a id=\"open\" href=\"#open\">Open <span class=\"tn\">{}</span></a><a id=\"answered\" href=\"#answered\">Answered <span class=\"tn\">{}</span></a><a id=\"all\" href=\"#all\">All <span class=\"tn\">{}</span></a></nav></div>",
-        grouped(counts.open as i64),
-        grouped(counts.answered as i64),
-        grouped(counts.all as i64)
-    )?;
-    if counts.open == 0 {
-        out.push_str("<p class=\"empty open\">Nothing is open. A change in what is watched shows here when it is found.</p>\n");
-    }
-    if counts.answered == 0 {
-        out.push_str("<p class=\"empty answered\">Nothing is marked seen or expected now.</p>\n");
-    }
-    let (now_rows, rest): (Vec<&FindingRow>, Vec<&FindingRow>) =
-        rows.iter().partition(|r| r.urgent());
-    let (look, done): (Vec<&FindingRow>, Vec<&FindingRow>) =
-        rest.into_iter().partition(|r| r.open());
-    // The open rows drawn, the urgent first, and the answered, each cut at `ITEMS_SHOWN`.
-    let open_cut = now_rows.len().min(ITEMS_SHOWN);
-    let look_cut = look.len().min(ITEMS_SHOWN - open_cut);
-    if !rows.is_empty() {
-        out.push_str("<div class=\"fh open answered\" aria-hidden=\"true\"><span>Thing</span><span>What happened</span><span>Response layer</span><span class=\"fs\">Seen</span><span></span></div>\n");
-        for (group, class, rows) in [
-            // The one place on the page in the colour of what needs the person now.
-            ("Needs you now", "open now", &now_rows[..open_cut]),
-            ("To look at", "open", &look[..look_cut]),
-            ("Answered", "answered", &done[..done.len().min(ITEMS_SHOWN)]),
-        ] {
-            if rows.is_empty() {
-                continue;
-            }
-            writeln!(out, "<p class=\"fg {class}\">{group}</p>")?;
-            for row in rows {
-                finding_row(conn, out, &found, row, mac, now)?;
-            }
-        }
-    }
-    // What is not drawn, in findings as the tabs count them.
-    let weight = |rows: &[&FindingRow]| rows.iter().map(|r| r.weight()).sum::<usize>();
-    let urgent = weight(&now_rows[open_cut..]);
-    let hidden = urgent + weight(&look[look_cut..]);
-    if hidden > 0 {
-        // Urgent ones come first, so the rest are the mildest unless urgent ones overflow.
-        let which = match urgent {
-            0 => "the mildest".to_string(),
-            u => format!("{} of them urgent", grouped(u as i64)),
-        };
-        writeln!(
-            out,
-            "<p class=\"meta more open\">{} more, {which}; <span class=\"mono\">immunity findings</span> lists them.</p>",
-            grouped(hidden as i64)
-        )?;
-    }
-    let answered_hidden = weight(&done[done.len().min(ITEMS_SHOWN)..]);
-    if answered_hidden > 0 {
-        writeln!(
-            out,
-            "<p class=\"meta more answered\">{} more answered; <span class=\"mono\">immunity findings --all</span> lists them.</p>",
-            grouped(answered_hidden as i64)
-        )?;
-    }
-    out.push_str("</section>\n");
-    Ok(())
-}
-
-/// The response layer's verdict as one word: suspicious when any of its verdicts is, harmless
-/// when every one is harmless; `None` with no verdict.
-fn verdict_word(i: &findings::Item) -> Option<&'static str> {
-    let v = i.verdicts.as_ref()?;
-    if i.rule == crate::verdict::RULE || v.suspicious > 0 {
-        Some("Suspicious")
-    } else if v.total > 0 {
-        Some("Harmless")
-    } else {
-        None
-    }
-}
-
-/// Where a finding's thing is, in a few words: the project for a package of one, this Mac for
-/// what is on it, and another machine by its name.
-fn where_of(i: &findings::Item, mac: Option<&findings::This>) -> String {
-    let checkout = view::component_place(&i.about);
-    if !checkout.is_empty() {
-        return findings::place(checkout, mac);
-    }
-    let rest = ["file:", "checkout:", "container:"]
-        .iter()
-        .find_map(|p| i.about.strip_prefix(p))
-        .unwrap_or(&i.about);
-    let machine = rest.split('/').next().unwrap_or(rest);
-    if !machine.starts_with("machine:") || mac.is_some_and(|m| m.id == machine) {
-        "this Mac".to_string()
-    } else {
-        findings::place(machine, mac)
-    }
-}
-
-/// The thing a finding is about, as data: the package and its releases, the program or file a
-/// rule matched, else where it is. A finding whose thing no name from the Mac says, the item of
-/// places read for the first time, is about what it names in the program's words.
-fn thing_of(i: &findings::Item, f: Option<&v1::Finding>) -> String {
-    if let Some(thing) = &i.thing {
-        return thing.clone();
-    }
-    use v1::evidence::Body;
-    let events: &[v1::Event] = match f.and_then(|f| f.evidence.as_ref()?.body.as_ref()) {
-        Some(Body::VulnerablePackage(p)) => {
-            if let Some(name) = &p.package_text {
-                let releases: Vec<&str> =
-                    p.releases.iter().map(|r| r.version_text.as_str()).collect();
-                return format!("{name} {}", releases.join(", "))
-                    .trim_end()
-                    .to_string();
-            }
-            &[]
-        }
-        Some(Body::PublishedRuleMatched(p)) => &p.events,
-        Some(Body::VerdictGiven(v)) => &v.events,
-        _ => &[],
-    };
-    use v1::event::Body as E;
-    match events.first().and_then(|e| e.body.as_ref()) {
-        Some(E::ProgramStart(s)) => {
-            if let Some(p) = &s.process {
-                return p.executable_text.clone();
-            }
-        }
-        Some(E::FileEvent(e)) => return e.path_text.clone(),
-        None => {}
-    }
-    i.place.clone().unwrap_or_else(|| i.about.clone())
-}
-
-/// One row, one thing: the thing as data, its kind and what happened, the response layer's word
-/// as plain text, and when it was last seen. It opens to the facts and voices of each finding in
-/// it, each with the command that answers it.
-fn finding_row(
-    conn: &Connection,
-    out: &mut String,
-    found: &[findings::Found],
-    row: &FindingRow,
-    mac: Option<&findings::This>,
-    now: i64,
-) -> Out {
-    let i = row.item;
-    let whole = crate::finding_answer::of(conn, found, &i.id, now)?;
-    let id = if row.open {
-        esc(&i.id)
-    } else {
-        format!("answered-{}", esc(&i.id))
-    };
-    // The kind in the words a person reads, the same as the app's (`findings::kind_title`).
-    // What happened to a place, in the words of the list and the finding.
-    let mut kind = findings::kind_title(i.kind).to_string();
-    let change = match crate::finding_answer::place_change(&i.rule, i.change.as_deref()) {
-        Some(c) => Some(crate::finding_text::change_said(c)),
-        None => i.change.as_deref(),
-    };
-    if let Some(change) = change {
-        kind.push_str(" · ");
-        kind.push_str(change);
-    }
-    // A group's row is its folder, with how many findings it holds.
-    let members: Vec<&findings::Item> = std::iter::once(i).chain(row.siblings.clone()).collect();
-    let folder = findings::group_folder(i).filter(|_| members.len() > 1);
-    if folder.is_some() {
-        kind.push_str(&format!(
-            " · {}",
-            counted(members.len() as i64, "finding", "findings")
-        ));
-    }
-    let answer = i.answer.as_ref().filter(|_| !row.open).map(|a| {
-        let said = match a.until {
-            Some(u) => format!("expected until {}", view::when(u, now)),
-            None => "seen".to_string(),
-        };
-        format!(
-            "<span class=\"ans\">Answered: {said} {}</span>",
-            esc(view::given_by(a.via))
-        )
-    });
-    writeln!(
-        out,
-        "<details class=\"fr{}{}{}{}\" id=\"{id}\">\n<summary><span class=\"fw\">{}</span><span class=\"fk\">{}{}</span><span class=\"fv\">{}</span><span class=\"fs\">{}</span><span class=\"fch\" aria-hidden=\"true\"></span></summary>\n<div class=\"fx\">",
-        if row.open() { " open" } else { "" },
-        if row.answered() { " answered" } else { "" },
-        if row.urgent() { " urgent" } else { "" },
-        // The mark of the response layer's word, the word's own colour (`.fr.suspicious .fv`).
-        match verdict_word(i) {
-            Some("Suspicious") => " suspicious",
-            Some("Harmless") => " harmless",
-            _ => "",
-        },
-        esc(&folder
-            .clone()
-            .unwrap_or_else(|| thing_of(i, whole.as_ref()))),
-        esc(&kind),
-        answer.unwrap_or_default(),
-        verdict_word(i).map_or("<span class=\"none\">—</span>".to_string(), |w| format!(
-            "<span class=\"src\">Response layer: </span>{w}"
-        )),
-        i.last_seen.map_or(String::new(), |t| view::when(t, now)),
-    )?;
-    if folder.is_none() {
-        finding_body(out, i, whole.as_ref(), &where_of(i, mac), now)?;
-    }
-    // Each finding of a group under its own thing, the first by the row's own id.
-    for (k, m) in members.iter().enumerate().filter(|_| folder.is_some()) {
-        let anchor = match k {
-            0 => String::new(),
-            _ if row.open => format!(" id=\"{}\"", esc(&m.id)),
-            _ => format!(" id=\"answered-{}\"", esc(&m.id)),
-        };
-        let whole = crate::finding_answer::of(conn, found, &m.id, now)?;
-        writeln!(
-            out,
-            "<div class=\"also\"{anchor}>\n<p class=\"wsh2\">{}</p>",
-            esc(&thing_of(m, whole.as_ref()))
-        )?;
-        finding_body(out, m, whole.as_ref(), &where_of(m, mac), now)?;
-        out.push_str("</div>\n");
-    }
-    for (c, open) in &row.under {
-        let id = if *open {
-            esc(&c.id)
-        } else {
-            format!("answered-{}", esc(&c.id))
-        };
-        writeln!(
-            out,
-            "<div class=\"also\" id=\"{id}\">\n<p class=\"wsh2\">The response layer's own finding about it</p>"
-        )?;
-        let whole = crate::finding_answer::of(conn, found, &c.id, now)?;
-        finding_body(out, c, whole.as_ref(), &where_of(c, mac), now)?;
-        out.push_str("</div>\n");
-    }
-    out.push_str("</div>\n</details>\n");
-    Ok(())
-}
-
-/// What one finding says in an opened row: on the left its facts, where first, then the evidence
-/// as `immunity finding <id>` gives it; on the right who said what, each voice named: the rule's
-/// authors, the response layer, the person's answer, Immunity Core's own words, and what to do. Under
-/// them, when it was seen and the command an agent reads it with.
-fn finding_body(
-    out: &mut String,
-    i: &findings::Item,
-    whole: Option<&v1::Finding>,
-    place: &str,
-    now: i64,
-) -> Out {
-    let mut facts: Vec<(&str, String)> = vec![("Where", data(place))];
-    // A finding of a rule this build does not have names the rule as the store keeps it: the
-    // one thing beside where it is that says what found it.
-    if i.kind == findings::KEPT_KIND {
-        facts.push(("Rule", data(&i.rule)));
-    }
-    // What the source said, as data beside the sentences.
-    if let Some(value) = &i.value {
-        facts.push((
-            "Source said",
-            format!("<span class=\"said\">{}</span>", esc(value)),
-        ));
-    }
-    let mut voices: Vec<Voice> = Vec::new();
-    if let Some(f) = whole {
-        evidence(f, &mut facts, &mut voices, now);
-    }
-    if let Some(t) = i.technique {
-        facts.push(("ATT&amp;CK", data(t)));
-    }
-    out.push_str("<div>");
-    dl(out, &facts);
-    out.push_str("</div>\n<div><p class=\"wsh2\">Who said what</p><div class=\"voices\">");
-    voices.push(Voice {
-        name: "Immunity Core".to_string(),
-        said: esc(i.words.title),
-        detail: esc(i.words.meaning),
-        quote: None,
-    });
-    voices.push(Voice {
-        name: "What to do".to_string(),
-        said: format!("<span class=\"advice\">{}</span>", esc(i.words.advice)),
-        detail: String::new(),
-        quote: None,
-    });
-    for v in &voices {
-        write!(
-            out,
-            "<div class=\"voice\"><div class=\"vn\">{}</div><div class=\"vs\">{}</div>",
-            v.name, v.said
-        )?;
-        if !v.detail.is_empty() {
-            write!(out, "<div class=\"vd\">{}</div>", v.detail)?;
-        }
-        if let Some(q) = &v.quote {
-            write!(
-                out,
-                "\n<blockquote class=\"quote\">{}</blockquote>\n",
-                esc_said(q)
-            )?;
-        }
-        out.push_str("</div>");
-    }
-    out.push_str("</div></div>\n");
-    let seen = match (i.first_seen, i.last_seen) {
-        (Some(f), Some(l)) if f != l => format!(
-            "First seen {} · last seen {}",
-            view::when(f, now),
-            view::when(l, now)
-        ),
-        (_, Some(l)) => format!("Seen {}", view::when(l, now)),
-        _ => String::new(),
-    };
-    let command = format!("immunity finding {} --json", i.id);
-    writeln!(
-        out,
-        "<div class=\"fxb\"><span>{seen}</span><span>For your agent <span class=\"cmd\"><span class=\"mono\">{}</span>{COPY}</span></span></div>",
-        esc(&command)
-    )?;
-    Ok(())
-}
-
 /// The button beside the command an agent reads a finding with, fixed: the one script shows it
 /// and copies the text of the command beside it (`src/happens.js`), so without the script there
 /// is no button. Its icon is drawn by the style sheet, so a summary with many findings stays small.
-const COPY: &str = "<button class=\"copy\" type=\"button\" aria-label=\"Copy the command\" title=\"Copy the command\" hidden></button>";
-
-/// One voice of "Who said what": who, what they said and a quieter line, all safe HTML, and a
-/// quote of their own words, escaped when it is written.
-struct Voice {
-    name: String,
-    said: String,
-    detail: String,
-    quote: Option<String>,
-}
-
-/// Text from the Mac as data, in an element of its own.
-fn data(s: &str) -> String {
-    format!("<span class=\"mono\">{}</span>", esc(s))
-}
-
-/// Arguments as they come cut, each apart.
-fn arguments(args: &[String]) -> String {
-    let args: Vec<String> = args
-        .iter()
-        .map(|a| format!("<span class=\"arg\">{}</span>", esc_said(a)))
-        .collect();
-    format!("<span class=\"mono\">{}</span>", args.join(" "))
-}
-
-/// One event a rule matched: for a program start its program, each argument apart, its folder
-/// and the program that started it; for a file event the file, what was done, from where and by
-/// which program. Arguments come cut, as `immunity finding` prints them (`matches::event_cut`).
-fn event_facts(e: &v1::Event, now: i64) -> Vec<(&'static str, String)> {
-    use v1::event::Body;
-    let mut facts = Vec::new();
-    match e.body.as_ref() {
-        Some(Body::ProgramStart(s)) => {
-            if let Some(at) = s.happened_at {
-                facts.push(("When", view::when(at, now)));
-            }
-            if let Some(p) = &s.process {
-                facts.push(("Program", data(&p.executable_text)));
-            }
-            if !s.args_text.is_empty() {
-                facts.push(("Arguments", arguments(&s.args_text)));
-            }
-            if let Some(wd) = &s.working_directory_text {
-                facts.push(("Folder", data(wd)));
-            }
-            if let Some(p) = &s.instigator {
-                facts.push(("Started by", data(&p.executable_text)));
-            }
-        }
-        Some(Body::FileEvent(f)) => {
-            if let Some(at) = f.happened_at {
-                facts.push(("When", view::when(at, now)));
-            }
-            facts.push(("File", data(&f.path_text)));
-            let action = match v1::FileAction::try_from(f.action) {
-                Ok(v1::FileAction::Create) => "created",
-                Ok(v1::FileAction::Rename) => "renamed",
-                _ => "not known",
-            };
-            facts.push(("Done", action.to_string()));
-            if let Some(from) = &f.source_text {
-                facts.push(("From", data(from)));
-            }
-            if let Some(p) = &f.instigator {
-                facts.push(("By", data(&p.executable_text)));
-            }
-        }
-        None => {}
-    }
-    facts
-}
-
-/// Facts as a list of terms and values; each value is already safe.
-fn dl(out: &mut String, facts: &[(&str, String)]) {
-    if facts.is_empty() {
-        return;
-    }
-    out.push_str("<dl class=\"facts\">");
-    for (k, v) in facts {
-        let _ = write!(out, "<dt>{k}</dt><dd>{v}</dd>");
-    }
-    out.push_str("</dl>\n");
-}
-
-/// A process a sample saw, as `DetachedProcess` gives it, each fact only where the finding has
-/// it.
-fn process_facts(p: &v1::DetachedProcess, facts: &mut Vec<(&str, String)>, now: i64) {
-    if let Some(pid) = p.pid {
-        facts.push(("Process id", data(&pid.to_string())));
-    }
-    if let Some(start) = p.start_micros {
-        facts.push(("Started", view::when(start.div_euclid(1_000_000), now)));
-    }
-    if !p.args_text.is_empty() {
-        facts.push(("Arguments", arguments(&p.args_text)));
-    }
-    if let Some(wd) = &p.working_directory_text {
-        facts.push(("Folder", data(wd)));
-    }
-    for (label, l) in [
-        ("Parent", &p.parent),
-        ("Session led by", &p.session_leader),
-        ("Group led by", &p.process_group_leader),
-    ] {
-        if let Some(l) = l {
-            let signed = l
-                .signed_by_text
-                .as_deref()
-                .map_or("signer not known".to_string(), |s| {
-                    format!("signed by {}", data(s))
-                });
-            let said = format!("{}, pid {}, {signed}", data(&l.executable_text), l.pid);
-            facts.push((label, said));
-        }
-    }
-}
-
-/// A finding's evidence as `immunity finding <id>` gives it, from the same message: what it rests
-/// on by its kind as facts, and as voices the rule's authors, the response layer's verdicts with
-/// their reasons quoted, and the person's answer with who gave it and why. Every value from the
-/// Mac is escaped and set apart.
-fn evidence(f: &v1::Finding, facts: &mut Vec<(&str, String)>, voices: &mut Vec<Voice>, now: i64) {
-    use v1::evidence::Body;
-    let word = |s: &str| format!("<span class=\"w\">{}</span>", esc(s));
-    match f.evidence.as_ref().and_then(|e| e.body.as_ref()) {
-        Some(Body::PlaceChanged(p)) => {
-            facts.push((
-                "What happened",
-                word(crate::finding_text::change_said(p.change)),
-            ));
-            if let Some(at) = p.read_as_before_at {
-                let (before, after) = crate::finding_text::READ_AS_BEFORE;
-                let said = format!("{} {} {}", word(before), view::when(at, now), word(after));
-                facts.push(("Read back", said));
-            }
-            if p.presence_only == Some(true) {
-                facts.push((
-                    "Watched",
-                    word(&format!(
-                        "only for presence: {}",
-                        crate::watched::PRESENCE_ONLY
-                    )),
-                ));
-            }
-            if p.change == v1::Change::NotRead as i32 {
-                let latest = f.rests_on.last().map(|b| b.run_id.as_str());
-                let why = f
-                    .rests_on
-                    .iter()
-                    .rev()
-                    .take_while(|b| Some(b.run_id.as_str()) == latest)
-                    .find(|b| b.entry == "not_read")
-                    .and_then(|b| b.new_value_text.as_deref());
-                facts.push(("Why", why.map_or(word("the store gives no reason"), data)));
-            }
-            let runs = p.runs.iter().map(|t| ("Runs", t));
-            for (label, t) in runs.chain(p.started_by.iter().map(|t| ("Run by", t))) {
-                let said = word(crate::finding_text::tie_said(t.state));
-                let when = view::when(t.recorded_at, now);
-                facts.push((label, format!("{} {said} {when}", data(&t.path_text))));
-                if let Some(signer) = &t.signed_by_text {
-                    facts.push(("Signer", data(signer)));
-                }
-            }
-            if let Some(b) = crate::finding_text::signer_entry(f) {
-                let (until, from) = crate::finding_text::SIGNER_SAID;
-                let when = view::when(b.recorded_at, now);
-                for (label, said, value) in [
-                    ("Signer before", until, &b.old_value_text),
-                    ("Signer after", from, &b.new_value_text),
-                ] {
-                    if let Some(value) = value {
-                        facts.push((label, format!("{} {} {when}", data(value), word(said))));
-                    }
-                }
-            }
-            for b in f.rests_on.iter().filter(|b| b.entry == "place_first_read") {
-                if let Some(place) = &b.subject_text {
-                    facts.push(("First read", data(place)));
-                }
-            }
-        }
-        Some(Body::ChangedInPlace(p)) => {
-            match (&p.became_text, &p.files) {
-                (Some(value), _) => facts.push(("It became", data(value))),
-                // The files that changed, as the text names them; where a folder changed whole,
-                // its path is from the Mac and its number of files is Immunity Core's.
-                (None, Some(files)) => {
-                    let (counts, entries) = crate::finding_text::files_said(files);
-                    facts.push(("Files", word(&counts)));
-                    for (label, x) in entries {
-                        let shown = match x.folder {
-                            true => {
-                                let n = i64::try_from(x.files).unwrap_or(i64::MAX);
-                                let n = word(&format!("({})", counted(n, "file", "files")));
-                                format!("{} {n}", data(&format!("{}/", x.path_text)))
-                            }
-                            false => data(&x.path_text),
-                        };
-                        facts.push((label, shown));
-                    }
-                }
-                (None, None) => {
-                    if let Some(b) = f.rests_on.iter().rev().find(|b| {
-                        b.entry == "changed" && b.predicate.as_deref() == Some("has_digest")
-                    }) {
-                        facts.push((
-                            "Digest before",
-                            data(b.old_value_text.as_deref().unwrap_or("not known")),
-                        ));
-                        facts.push((
-                            "Digest after",
-                            data(b.new_value_text.as_deref().unwrap_or("not known")),
-                        ));
-                    }
-                }
-            }
-        }
-        Some(Body::IndicatorMatched(p)) => {
-            if let Some(value) = &p.indicators_text {
-                facts.push(("Matched", data(value)));
-            }
-            if let Some(port) = p.port {
-                facts.push(("Port", data(&port.to_string())));
-            }
-            if let Some(transport) = &p.transport {
-                facts.push(("Transport", word(transport)));
-            }
-            if let Some(p) = &p.process {
-                process_facts(p, facts, now);
-            }
-        }
-        Some(Body::DetachedProcess(p)) => process_facts(p, facts, now),
-        Some(Body::VulnerablePackage(p)) => {
-            if let Some(why) = p.no_longer_found {
-                let said = crate::finding_text::no_longer_found_said(why);
-                let as_then = crate::finding_text::as_then(p);
-                facts.push(("No longer found", word(&format!("{said}{as_then}"))));
-                if let Some(at) = p.no_longer_found_at {
-                    facts.push(("Since", view::when(at, now)));
-                }
-            }
-            if let Some(name) = &p.package_text {
-                facts.push(("Package", data(name)));
-            }
-            for r in &p.releases {
-                facts.push(("Version", data(&r.version_text)));
-                facts.push(("Declared at", data(&r.at_text)));
-            }
-            for r in &p.records {
-                facts.push(("Record", data(&r.id_text)));
-                if !r.fixed_text.is_empty() {
-                    facts.push(("Fixed in", data(&r.fixed_text.join(", "))));
-                }
-                voices.push(Voice {
-                    name: esc(&r.source),
-                    said: r.summary_text.as_deref().map_or(String::new(), data),
-                    detail: String::new(),
-                    quote: None,
-                });
-            }
-        }
-        Some(Body::PublishedRuleMatched(p)) => {
-            let rule = p.rule.clone().unwrap_or_default();
-            if let Some(n) = p.matches {
-                facts.push(("Matched", word(&counted(n as i64, "time", "times"))));
-            }
-            for (i, e) in p.events.iter().enumerate() {
-                // Beside the latest, the first is the event that raised the finding.
-                if i == 0 && p.events.len() > crate::events::EVIDENCE {
-                    facts.push(("Raised by", "the event below".to_string()));
-                }
-                facts.extend(event_facts(e, now));
-            }
-            voices.push(Voice {
-                name: format!("Published rule · {}", esc(&rule.set)),
-                said: format!("<span class=\"src\">{}</span>", esc(&rule.title_text)),
-                detail: if rule.level == v1::Level::NotStated as i32 {
-                    String::new()
-                } else {
-                    format!(
-                        "its authors rate it {}",
-                        esc(&crate::text::word::<v1::Level>(rule.level))
-                    )
-                },
-                quote: None,
-            });
-        }
-        Some(Body::VerdictGiven(v)) => {
-            facts.push(("About the rule", data(&v.rule)));
-            for e in &v.events {
-                facts.extend(event_facts(e, now));
-            }
-        }
-        None => {}
-    }
-    if let Some(v) = &f.verdicts {
-        for listed in &v.listed {
-            let verdict = listed.verdict.clone().unwrap_or_default();
-            let mut said = capital(&crate::text::word::<v1::VerdictKind>(verdict.kind));
-            if let Some(c) = verdict.confidence {
-                let _ = write!(said, ", how sure: {}", crate::text::word::<v1::Level>(c));
-            }
-            if listed.event_gone {
-                said.push_str(
-                    ". Its event was no longer in the log, so Immunity Core could not check that the rule matched it",
-                );
-            }
-            voices.push(Voice {
-                name: "Response layer".to_string(),
-                said: esc(&said),
-                detail: view::when(listed.recorded_at, now),
-                quote: Some(verdict.reason_text.clone()),
-            });
-        }
-    }
-    // The earlier occurrence by its id, answered or not; the person's answer, then its answer.
-    let earlier = (f.earlier.as_ref()).and_then(|e| Some((e.answer.as_ref(), e.finding.as_ref()?)));
-    if let Some((_, r)) = earlier {
-        facts.push(("Earlier", esc(&r.id)));
-    }
-    let then = earlier.and_then(|(a, r)| Some((a?, r)));
-    let answers = f.answer.as_ref().map(|a| (a, None));
-    for (a, before) in answers.into_iter().chain(then.map(|(a, r)| (a, Some(r)))) {
-        let said = match a.until_at {
-            Some(u) => format!("Expected until {}", view::when(u, now)),
-            None => "Seen".to_string(),
-        };
-        let via = match v1::Via::try_from(a.via) {
-            Ok(v1::Via::App) => findings::Via::App,
-            Ok(v1::Via::Agent) => findings::Via::Agent,
-            Ok(v1::Via::Command) => findings::Via::Command,
-            _ => findings::Via::Unknown,
-        };
-        let name = match via {
-            findings::Via::Agent => "Your agent",
-            _ => "Your answer",
-        };
-        voices.push(Voice {
-            name: match before {
-                Some(r) => format!("{name} before, to {}", esc(&r.id)),
-                None => name.to_string(),
-            },
-            said,
-            detail: format!(
-                "answered {} {}",
-                view::when(a.given_at, now),
-                esc(view::given_by(via))
-            ),
-            quote: a.reason_text.clone(),
-        });
-    }
-}
+pub(crate) const COPY: &str = "<button class=\"copy\" type=\"button\" aria-label=\"Copy the command\" title=\"Copy the command\" hidden></button>";
 
 /// How a row of what is watched stands: its dot's classes and its words, which are safe HTML.
 /// Read, in full or as far as this version reads here, is a filled dot of `--calm`; a fault a
@@ -1571,14 +732,15 @@ fn you_can_fix(out: &mut String, fixable: &[&Uncovered]) -> Out {
 }
 
 /// The links to the other pages, and when the page was made and on which Mac.
-fn links(out: &mut String, name: Option<&str>, now: i64) -> Out {
+fn links(out: &mut String, r: &v1::Status, now: i64) -> Out {
+    let name = r.this_mac.as_ref().and_then(|m| m.name_text.as_deref());
     writeln!(
         out,
         "<footer class=\"links\">\n<a href=\"{DETAILS}/{RULES}.html\">{RULES_TITLE}</a>\n<a href=\"{DETAILS}/{TECHNICAL}.html\">Technical details</a>\n</footer>\n<p class=\"wfoot\">Page made at {} by immunity view{}</p>",
         view::when(now, now),
         name.map_or(String::new(), |n| format!(
             " on <span class=\"mono\">{}</span>",
-            esc(n)
+            Name::given(n).html()
         ))
     )?;
     Ok(())
@@ -1982,233 +1144,6 @@ pub fn threat_data(conn: &Connection, r: &v1::Status, now: i64) -> Result<String
     }
     out.push_str(FOOT);
     Ok(out)
-}
-
-/// The two places of a rule this version checks, as the rules page names them: its anchor
-/// there, its heading, and what being there means. A rule that cannot be checked is not on the
-/// page: `immunity rules` counts those, and `docs/coverage.md` says what would open them.
-const PLACED: [(&str, &str, &str); 2] = [
-    (
-        "evaluated",
-        "Checked in full",
-        "Everything these rules look for is in what the event level gives: for a program start, the program, its command line and the program that started it; for a file created or renamed, its path and the program that did it.",
-    ),
-    (
-        "in-part",
-        "Checked in part",
-        "Each of these rules looks for one of several alternatives. Those an event can show are checked, and a rule's details name the rest.",
-    ),
-];
-
-/// Every published rule this build checks, in full or in part, for a person: by place, then
-/// by level, the most severe first. Each with its title, its level, what it looks for in its author's words, its
-/// ATT&CK techniques and its authors, and, where it is not checked in full, what is missing.
-/// Everything from a rule file is the rule's own text, each in an element of its own. The
-/// counts at the top are the status's; how many times each rule matched in the last day is
-/// the event level's, `events`.
-pub fn rules(r: &v1::RulesNow, events: Option<&crate::events::Level>, now: i64) -> String {
-    rules_page(crate::sigma::Rules::shipped(), r, events, now)
-}
-
-/// The rules page for these rules.
-fn rules_page(
-    shipped: &crate::sigma::Rules,
-    r: &v1::RulesNow,
-    events: Option<&crate::events::Level>,
-    now: i64,
-) -> String {
-    use crate::sigma::{self, Placement};
-    let from: Vec<String> = shipped
-        .sources()
-        .iter()
-        .map(|s| match s.commit_date {
-            Some(date) => format!("{}, as published on {date}", s.set),
-            None => format!("{}, at commit {}", s.set, &s.commit[..12]),
-        })
-        .collect();
-    let mut out = top(
-        RULES_TITLE,
-        &format!("From {} · this page made {}", from.join("; "), utc(now)),
-    );
-    let mut w = |s: String| out.push_str(&s);
-    w(format!(
-        "<p>{}</p>\n<div class=\"scale\">\n",
-        esc(&crate::text::rules_said(&shipped.sources_said(), r))
-    ));
-    for ((anchor, title, _), n) in PLACED.iter().zip([r.evaluated, r.in_part]) {
-        w(format!(
-            "<p><span class=\"num\">{n}</span> <a href=\"#{anchor}\">{}</a></p>\n",
-            esc(title)
-        ));
-    }
-    w("</div>\n".to_string());
-    let (evaluated, in_part, _) = shipped.groups();
-    let source = |s: &str| format!("<span class=\"src\">{}</span>", esc(s));
-    let mono = |list: &[String]| {
-        list.iter()
-            .map(|s| format!("<span class=\"mono\">{}</span>", esc(s)))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    for ((anchor, title, means), group) in PLACED.iter().zip([evaluated, in_part]) {
-        w(format!(
-            "<section id=\"{anchor}\">\n<h2>{}</h2>\n<p class=\"muted\">{}</p>\n",
-            esc(title),
-            esc(means)
-        ));
-        if group.is_empty() {
-            w("<p class=\"muted\">None.</p>\n".to_string());
-        }
-        let mut level: Option<&str> = None;
-        for l in group {
-            let (this, said) = match &l.meta {
-                None => ("unknown", "unknown"),
-                Some(m) => (m.level_name().unwrap_or("none"), sigma::level_said(m.level)),
-            };
-            // A heading for each level, from the most severe down; the rules of a set that states
-            // no level come last under their own, as a group and not as a level.
-            if level != Some(this) {
-                let heading = if l.states_no_level() {
-                    sigma::NO_LEVEL_GROUP
-                } else {
-                    said
-                };
-                w(format!("<h3>{}</h3>\n", esc(&capital(heading))));
-                level = Some(this);
-            }
-            let label = l
-                .meta
-                .as_ref()
-                .map_or_else(|| sigma::label(l.file, l.source), sigma::Meta::label);
-            w(format!(
-                "<article class=\"rule\">\n<h4>{} <span class=\"chip lvl-{this}\">{said}</span></h4>\n",
-                source(&label)
-            ));
-            // How many times it matched in the last day: any count there is, and while the
-            // rules watch, that a rule they evaluate did not match.
-            let matched = l
-                .meta
-                .as_ref()
-                .and_then(|m| events?.matches_last_day.get(&m.id))
-                .copied()
-                .unwrap_or(0);
-            // A rule for file events watches only while they are collected here, and a rule
-            // that reads what a collector may keep only while values of it arrive; while the
-            // level runs and they do not, the rule says so by name, with which.
-            let file_rule = l.kind == Some(sigma::Kind::File);
-            let on = r.watching == Some(true);
-            let files_unwatched = file_rule && r.file_events_collected != Some(true);
-            let not_arriving = events
-                .filter(|e| on && !files_unwatched && l.silenced_by(e.not_arriving()))
-                .map(|e| e.arrivals.worst(l.needs & e.not_arriving()));
-            let unwatched = files_unwatched || not_arriving.is_some();
-            if matched > 0 {
-                w(format!(
-                    "<p class=\"meta\">Matched {} in the last day.</p>\n",
-                    sigma::times(matched)
-                ));
-            } else if on && !unwatched {
-                w("<p class=\"meta\">No match in the last day.</p>\n".to_string());
-            }
-            if files_unwatched && on && l.placement == Placement::Evaluated {
-                w("<p class=\"missing\">Not watching on this Mac: the collector installed here records program starts only. Installing the event level again adds files created and renamed.</p>\n".to_string());
-            }
-            match not_arriving {
-                Some(crate::events::Arrival::NotKept) => w("<p class=\"missing\">Not watching on this Mac: it reads what the collector installed here does not keep. Installing the event level again adds it.</p>\n".to_string()),
-                Some(crate::events::Arrival::Kept(None)) => w("<p class=\"missing\">Not watching on this Mac: it reads what the collector keeps and no line has given a value for yet.</p>\n".to_string()),
-                Some(crate::events::Arrival::NoLonger(_)) => w("<p class=\"missing\">Not watching on this Mac: it reads what the collector keeps, and the latest lines give no value for it.</p>\n".to_string()),
-                Some(_) => w("<p class=\"missing\">Not watching on this Mac: it reads what no line read so far would carry, so whether the collector keeps it is not yet known.</p>\n".to_string()),
-                None => {}
-            }
-            // What a rule checked in part goes without is a detail of the rule, said with its
-            // other details.
-            let without: Vec<String> = match &l.placement {
-                Placement::InPart(branches) => branches
-                    .iter()
-                    .map(|b| match (&b.selection, &b.said) {
-                        (Some(selection), _) => format!(
-                            "<li>Checked without the alternative {}, which needs {}; {} does not give it.</li>\n",
-                            mono(std::slice::from_ref(selection)),
-                            mono(&b.fields),
-                            sigma::given_by(l.kind)
-                        ),
-                        (None, _) if !b.fields.is_empty() => format!(
-                            "<li>Checked without an alternative of the upstream rule, which needs {}; {} does not give it.</li>\n",
-                            mono(&b.fields),
-                            sigma::given_by(l.kind)
-                        ),
-                        (None, said) => format!(
-                            "<li>Checked without an alternative of the upstream rule, left out in translation, {}.</li>\n",
-                            source(said.as_deref().unwrap_or(""))
-                        ),
-                    })
-                    .collect(),
-                Placement::Evaluated | Placement::NotEvaluated(_) => Vec::new(),
-            };
-            let Some(m) = &l.meta else {
-                w("</article>\n".to_string());
-                continue;
-            };
-            w(format!(
-                "<details>\n<summary>{}</summary>\n<ul class=\"about\">\n",
-                m.description
-                    .as_deref()
-                    .map_or("Details".to_string(), |d| format!(
-                        "<span class=\"src desc\">{}</span>",
-                        esc(&d.split_whitespace().collect::<Vec<_>>().join(" "))
-                    ))
-            ));
-            if !m.techniques.is_empty() {
-                w(format!("<li>ATT&amp;CK: {}</li>\n", mono(&m.techniques)));
-            }
-            if let Some(a) = &m.author {
-                w(format!("<li>Author: {}</li>\n", source(a)));
-            }
-            w(without.concat());
-            w(format!(
-                "<li>Published as {}, in <span class=\"mono\">{}</span></li>\n</ul>\n</details>\n</article>\n",
-                source(m.status.as_str()),
-                esc(l.file)
-            ));
-        }
-        w("</section>\n".to_string());
-    }
-    // The licences' addresses, as the sets' NOTICEs give them. Addresses are named, not linked:
-    // no page of the view carries a web address to follow.
-    let named = |notice: &'static str, marker: &str| {
-        notice
-            .split_whitespace()
-            .find(|word| word.contains(marker))
-            .map_or("", |word| word.trim_end_matches([',', '.']))
-    };
-    let licence = named(
-        include_str!("../rules/sigma/NOTICE"),
-        "Detection-Rule-License",
-    );
-    let elastic_licence = named(
-        include_str!("../rules/elastic/NOTICE"),
-        "licensing/elastic-license",
-    );
-    let behaviour_licence = named(
-        include_str!("../rules/elastic-behaviour/NOTICE"),
-        "licensing/elastic-license",
-    );
-    let bare = |url: &'static str| url.strip_prefix("https://").unwrap_or(url);
-    w(format!(
-        "<footer class=\"licence\">\n<p class=\"meta\">SigmaHQ's rules are copied unchanged from its rule set, <span class=\"mono\">{}</span>, at commit <span class=\"mono\">{}</span> of {}. They are licensed under the Detection Rule License 1.1, <span class=\"mono\">{}</span>, and each keeps its authors, shown with it.</p>\n<p class=\"meta\">Elastic's rules are translated mechanically into Sigma from its detection rules, <span class=\"mono\">{}</span>, at commit <span class=\"mono\">{}</span>; none is edited by hand. They carry Elastic License 2.0, <span class=\"mono\">{}</span>, and each keeps its authors, shown with it.</p>\n<p class=\"meta\">Elastic's behaviour rules are translated the same way from <span class=\"mono\">{}</span> at commit <span class=\"mono\">{}</span>, under Elastic License 2.0, <span class=\"mono\">{}</span>. They state no level and name no authors.</p>\n</footer>\n",
-        esc(bare(sigma::SOURCE)),
-        sigma::COMMIT,
-        sigma::COMMIT_DATE,
-        esc(bare(licence)),
-        esc(bare(sigma::ELASTIC.url)),
-        sigma::ELASTIC.commit,
-        esc(bare(elastic_licence)),
-        esc(bare(sigma::ELASTIC_BEHAVIOUR.url)),
-        sigma::ELASTIC_BEHAVIOUR.commit,
-        esc(bare(behaviour_licence)),
-    ));
-    out.push_str(FOOT);
-    out
 }
 
 /// At most this many readings are named under a list that is not whole.
@@ -3068,145 +2003,15 @@ pub fn technical() -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_package_no_longer_found_says_why_first_and_its_kept_names_stay_escaped() {
-        let f = v1::Finding {
-            evidence: Some(v1::Evidence {
-                body: Some(v1::evidence::Body::VulnerablePackage(
-                    v1::VulnerablePackage {
-                        package_text: Some("<b>left-pad".to_string()),
-                        no_longer_found: Some(v1::NoLongerFound::ProjectGone as i32),
-                        no_longer_found_at: Some(1_800_000_000 - 3600),
-                        ..Default::default()
-                    },
-                )),
-            }),
-            ..Default::default()
-        };
-        let (mut facts, mut voices) = (Vec::new(), Vec::new());
-        evidence(&f, &mut facts, &mut voices, 1_800_000_000);
-        let names: Vec<&str> = facts.iter().map(|(k, _)| *k).collect();
-        assert_eq!(names, ["No longer found", "Since", "Package"]);
-        assert!(
-            facts[0]
-                .1
-                .contains("the project is no longer on this Mac; what follows")
-        );
-        assert!(facts[2].1.contains("&lt;b&gt;left-pad") && !facts[2].1.contains("<b>"));
-    }
-
-    #[test]
-    fn a_finding_with_two_signer_entries_says_the_latest_entry_s_two_values_with_its_time_and_nothing_of_the_first()
-     {
-        let (now, first, latest) = (1_800_000_000, 1_800_000_000 - 7200, 1_800_000_000 - 3600);
-        let signed = |at: i64, old: &str, new: &str| v1::JournalEntry {
-            recorded_at: at,
-            entry: "changed".to_string(),
-            predicate: Some("signed_by".to_string()),
-            old_value_text: Some(old.to_string()),
-            new_value_text: Some(new.to_string()),
-            ..Default::default()
-        };
-        let f = v1::Finding {
-            answered_at: now,
-            evidence: Some(v1::Evidence {
-                body: Some(v1::evidence::Body::PlaceChanged(v1::PlaceChanged {
-                    change: v1::Change::Changed as i32,
-                    ..Default::default()
-                })),
-            }),
-            rests_on: vec![
-                signed(first, "apple", "first signer"),
-                signed(latest, "second before", "second after"),
-            ],
-            ..Default::default()
-        };
-        let text = crate::finding_text::finding(&f, &crate::screen::Screen::pipe());
-        for line in [
-            format!(
-                "    Signer       until the reading of {}: \"second before\"\n",
-                view::utc(latest)
-            ),
-            format!(
-                "                 from the reading of {}: \"second after\"\n",
-                view::utc(latest)
-            ),
-        ] {
-            assert!(text.contains(&line), "{line}\n{text}");
-        }
-        let (mut facts, mut voices) = (Vec::new(), Vec::new());
-        evidence(&f, &mut facts, &mut voices, now);
-        let signers: Vec<(&str, String)> = (facts.iter())
-            .filter(|(k, _)| k.starts_with("Signer"))
-            .map(|(k, v)| (*k, v.clone()))
-            .collect();
-        let at = view::when(latest, now);
-        assert_eq!(
-            signers,
-            [
-                (
-                    "Signer before",
-                    format!(
-                        "{} <span class=\"w\">until the reading of</span> {at}",
-                        data("second before")
-                    )
-                ),
-                (
-                    "Signer after",
-                    format!(
-                        "{} <span class=\"w\">from the reading of</span> {at}",
-                        data("second after")
-                    )
-                ),
-            ]
-        );
-        for page_or_text in [text, format!("{signers:?}")] {
-            assert!(!page_or_text.contains("first signer") && !page_or_text.contains("apple"));
-            assert!(!page_or_text.contains(&view::utc(first)));
-        }
-    }
-
-    #[test]
-    fn a_published_rule_s_event_that_raised_its_finding_is_named_so_only_beside_the_latest() {
-        // The message holds the event that raised the finding first only when it holds more
-        // than the latest: then, and only then, the page says which it is.
-        let raised = |n: usize| {
-            let start = v1::Event {
-                body: Some(v1::event::Body::ProgramStart(v1::ProgramStart::default())),
-            };
-            let f = v1::Finding {
-                evidence: Some(v1::Evidence {
-                    body: Some(v1::evidence::Body::PublishedRuleMatched(
-                        v1::PublishedRuleMatched {
-                            events: vec![start; n],
-                            ..Default::default()
-                        },
-                    )),
-                }),
-                ..Default::default()
-            };
-            let (mut facts, mut voices) = (Vec::new(), Vec::new());
-            evidence(&f, &mut facts, &mut voices, 0);
-            facts.iter().position(|(k, _)| *k == "Raised by")
-        };
-        assert_eq!(raised(crate::events::EVIDENCE), None);
-        assert_eq!(raised(crate::events::EVIDENCE + 1), Some(0));
-    }
-
     /// The band's glyph is the status's headline: the calm disc only for `calm`, the ring for
     /// `in_part`, the clock for `stale`, and the question mark for a headline not known. How this
     /// Mac is watched is said by the message's watcher, and one not live is never said to be.
     #[test]
     fn a_page_draws_the_calm_disc_only_for_a_calm_headline() {
-        let dir = crate::common::Scratch::new("report-live");
-        let conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
         let now = 1_000_001;
-        let mut st = crate::status::state(&conn, &dir, now).unwrap();
-        st.this_mac.state = "watched";
-        st.this_mac.checked_at = Some(now - 1);
-        let draw = |st: &crate::status::State, r: &v1::Status| {
+        let draw = |r: &v1::Status| {
             let mut out = String::new();
-            state(&conn, &mut out, st, r, now).unwrap();
+            state(&mut out, r, now).unwrap();
             out
         };
         // A status that is calm by the core's rule: fresh, nothing to look at, this Mac watched
@@ -3224,17 +2029,16 @@ mod tests {
             ..Default::default()
         });
         assert_eq!(calm.headline, v1::Headline::Calm as i32);
-        st.this_mac.live = true;
-        let drawn = draw(&st, &calm);
+        let drawn = draw(&calm);
         assert!(
             drawn.contains(GLYPH_CALM) && drawn.contains("Watching live"),
             "{drawn}"
         );
         // Every other headline, set by hand to pick the glyph, never draws the calm disc.
-        let band = |st: &crate::status::State, headline: v1::Headline| {
+        let band = |headline: v1::Headline| {
             let mut r = calm.clone();
             r.headline = headline as i32;
-            draw(st, &r)
+            draw(&r)
         };
         for (headline, glyph) in [
             (v1::Headline::InPart, GLYPH_PART),
@@ -3242,24 +2046,38 @@ mod tests {
             (v1::Headline::Unknown, GLYPH_UNKNOWN),
             (v1::Headline::Unspecified, GLYPH_UNKNOWN),
         ] {
-            let drawn = band(&st, headline);
+            let drawn = band(headline);
             assert!(
                 drawn.contains(glyph) && !drawn.contains(GLYPH_CALM),
                 "{headline:?}: {drawn}"
             );
         }
+        // Not checked: a Mac never checked says so, and one checked before says since when, by
+        // the message's state of this Mac.
+        let before = band(v1::Headline::NotChecked);
+        assert!(
+            before.contains("Not checked since") && before.contains(GLYPH_STALE),
+            "{before}"
+        );
+        let mut r = calm.clone();
+        r.headline = v1::Headline::NotChecked as i32;
+        r.this_mac.as_mut().unwrap().state = v1::ThisMacState::NotChecked as i32;
+        let never = draw(&r);
+        assert!(
+            never.contains("Nothing has been checked yet.") && never.contains(GLYPH_UNKNOWN),
+            "{never}"
+        );
         // The watcher's case is the message's: one that is not live is never said to be.
         let mut stopped = calm.clone();
         stopped.headline = v1::Headline::InPart as i32;
         (stopped.this_mac.as_mut().unwrap().live, stopped.watching) = (false, None);
-        let stopped = draw(&st, &stopped);
+        let stopped = draw(&stopped);
         assert!(
             stopped.contains("No watcher runs") && !stopped.contains("live"),
             "{stopped}"
         );
         // A watcher's failure is a fault: said once, under the line, as the terminal says it, and
         // the line says nothing of how much is read or of the failure.
-        st.this_mac.state = "watched_in_part";
         for (what, words) in [
             (crate::watch::FULL_CHECK, "full check"),
             (crate::watch::EVENTS, "reading of program starts"),
@@ -3274,7 +2092,7 @@ mod tests {
                 }],
                 ..Default::default()
             });
-            let failed = draw(&st, &r);
+            let failed = draw(&r);
             let sub = failed.split("<p class=\"sub fault\">").next().unwrap();
             assert!(
                 sub.contains("<p class=\"sub\">Watching live · "),
@@ -3340,10 +2158,7 @@ mod tests {
     #[test]
     fn the_band_holds_the_state_faults_and_commands_the_status_decides_and_nothing_else() {
         use crate::watch::{Case, EVENTS, READ};
-        let dir = crate::common::Scratch::new("band-told");
-        let conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
         let now = 1_800_000_000;
-        let st = crate::status::state(&conn, &dir, now).unwrap();
         let on = now - 60;
         let failed = |what: &str| v1::Watcher {
             failed: vec![v1::WatcherFailure {
@@ -3454,7 +2269,7 @@ mod tests {
         });
         assert_eq!(crate::watch::case(&both), Case::Starting);
         let mut drawn_both = String::new();
-        state(&conn, &mut drawn_both, &st, &both, now).unwrap();
+        state(&mut drawn_both, &both, now).unwrap();
         assert!(!drawn_both.contains("restarting"), "{drawn_both}");
         // Faults with commands of their own: a check that died, then no watcher.
         let mut died = off(None, (None, None, None));
@@ -3476,7 +2291,7 @@ mod tests {
                 assert_eq!(crate::watch::case(&s), case);
             }
             let mut page = String::new();
-            state(&conn, &mut page, &st, &s, now).unwrap();
+            state(&mut page, &s, now).unwrap();
             let ((sub, sub_command), faults) = band_drawn(&page);
             let told = crate::overview::told(&s, &TERMINAL);
             // The state, in the line under the headline, its command after it.
@@ -3643,142 +2458,6 @@ mod tests {
         let mut out = String::new();
         coverage_of_list(&mut out, None, false, NONE_FOUND);
         assert!(out.is_empty());
-    }
-
-    #[test]
-    fn the_rules_page_never_says_no_match_of_a_rule_that_reads_what_does_not_arrive() {
-        // "No match in the last day" is calm. A rule, in full or in part, that reads what no
-        // line has given a value for has judged nothing, and says so instead, with which: the
-        // collector does not keep it, keeps it and never filled it, or no line was read yet.
-        use crate::events::{Arrival, Arrivals, Files, Level, RUNNING, Series, Tally};
-        use crate::sigma::{ELASTIC, Rules};
-        let rule = |id: &str, title: &str, detection: &str, left_out: &str| -> &'static str {
-            Box::leak(
-                format!(
-                    "title: {title}\nid: {id}\nstatus: test\nlevel: high\n\
-                     logsource: {{\"product\": \"macos\", \"category\": \"file_event\"}}\n\
-                     detection:\n{detection}{}",
-                    crate::sigma::testing::record_of(&ELASTIC, "\"high\"", left_out)
-                )
-                .into_boxed_str(),
-            )
-        };
-        let signer = "  s1: {\"process.code_signature.signing_id|cased\": [\"com.example\"]}\n  condition: s1\n";
-        let rules = Rules::load_as(
-            &ELASTIC,
-            &[
-                (
-                    "full.yml",
-                    rule(
-                        "00000000-0000-4000-8000-000000000001",
-                        "Invented in full",
-                        signer,
-                        "",
-                    ),
-                ),
-                (
-                    "part.yml",
-                    rule(
-                        "00000000-0000-4000-8000-000000000002",
-                        "Invented in part",
-                        signer,
-                        "\"needs_fields process.code_signature.trusted\"",
-                    ),
-                ),
-            ],
-        );
-        let on = Arrival::Kept(Some(1));
-        let sig = |a| Arrivals::from([on, on, a, on, a]);
-        let script = |a| Arrivals::from([on, a, on, on, on]);
-        let level_as = |state: &str, collected: bool, arrivals| Level {
-            state: state.to_string(),
-            read_at: 0,
-            stored: (state.to_string(), 0),
-            written: None,
-            said_by: None,
-            said: None,
-            reason: None,
-            version: None,
-            since_check: Tally::default(),
-            last_day: Tally::default(),
-            matches_last_day: BTreeMap::new(),
-            matches_last_week: BTreeMap::new(),
-            starts_by_hour: Series::default(),
-            starts_by_minute: Series::default(),
-            files: Files {
-                collected,
-                ..Files::default()
-            },
-            arrivals,
-            cap: None,
-        };
-        let level = |arrivals| level_as(RUNNING, true, arrivals);
-        let page = |l: &Level| {
-            let r = crate::status::rules_now_of(&rules, Some(l));
-            rules_page(&rules, &r, Some(l), 0)
-        };
-        let said = "Not watching on this Mac: it reads what the collector installed here does not keep. Installing the event level again adds it.";
-        let earlier = page(&level(sig(Arrival::NotKept)));
-        assert_eq!(earlier.matches(said).count(), 2, "{earlier}");
-        assert!(!earlier.contains("No match in the last day"), "{earlier}");
-        let empty = page(&level(sig(Arrival::Kept(None))));
-        assert_eq!(
-            empty
-                .matches("Not watching on this Mac: it reads what the collector keeps and no line has given a value for yet.")
-                .count(),
-            2,
-            "{empty}"
-        );
-        assert!(!empty.contains("No match in the last day"), "{empty}");
-        let stopped = page(&level(sig(Arrival::NoLonger(1))));
-        assert_eq!(
-            stopped
-                .matches("Not watching on this Mac: it reads what the collector keeps, and the latest lines give no value for it.")
-                .count(),
-            2,
-            "{stopped}"
-        );
-        assert!(!stopped.contains("No match in the last day"), "{stopped}");
-        let unknown = page(&level(sig(Arrival::Unknown)));
-        assert_eq!(
-            unknown
-                .matches("so whether the collector keeps it is not yet known")
-                .count(),
-            2,
-            "{unknown}"
-        );
-        assert!(!unknown.contains("No match in the last day"), "{unknown}");
-        // The count at the top counts neither among the rules watching file events.
-        let r = crate::status::rules_now_of(&rules, Some(&level(sig(Arrival::NotKept))));
-        let said_now = crate::text::rules_said("", &r);
-        assert!(
-            said_now.contains("0 every program start and 0 every file created or renamed"),
-            "{said_now}"
-        );
-        let now = page(&level(sig(on)));
-        assert!(!now.contains(said), "{now}");
-        assert_eq!(now.matches("No match in the last day.").count(), 2, "{now}");
-        // One reason at a time: while file events are not collected, that is the one said.
-        let no_files = page(&level_as(RUNNING, false, sig(Arrival::NotKept)));
-        assert!(!no_files.contains(said), "{no_files}");
-        assert!(
-            no_files.contains("records program starts only"),
-            "{no_files}"
-        );
-        // With no collector running there is no earlier collector to name, though nothing
-        // is known to arrive.
-        let off = page(&level_as("not_installed", false, Arrivals::default()));
-        assert!(!off.contains("Not watching on this Mac: it reads"), "{off}");
-        // The same for a rule about program starts, which no change of file events covers.
-        let starts = crate::sigma::testing::process_kept();
-        let page = |l: &Level| {
-            let r = crate::status::rules_now_of(&starts, Some(l));
-            rules_page(&starts, &r, Some(l), 0)
-        };
-        let earlier = page(&level(script(Arrival::NotKept)));
-        assert_eq!(earlier.matches(said).count(), 1, "{earlier}");
-        let off = page(&level_as("not_installed", false, Arrivals::default()));
-        assert!(!off.contains(said), "{off}");
     }
 
     #[test]
@@ -3970,41 +2649,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_command_for_an_agent_stays_escaped_with_the_fixed_copy_button_right_after_it() {
-        let rules = findings::rules();
-        let r = rules.first().unwrap();
-        let i = findings::Item {
-            id: "<b>\"x".to_string(),
-            kind: r.kind,
-            rule: r.id.to_string(),
-            technique: None,
-            severity: None,
-            confidence: None,
-            state: "open".to_string(),
-            change: None,
-            first_seen: None,
-            last_seen: None,
-            words: r.words,
-            value: None,
-            place: None,
-            thing: None,
-            about: String::new(),
-            answer: None,
-            verdicts: None,
-            subject: None,
-        };
-        let mut out = String::new();
-        finding_body(&mut out, &i, None, "", 0).unwrap();
-        let line = &out[out.find("<div class=\"fxb\">").unwrap()..];
-        assert!(
-            line.contains(&format!(
-                "For your agent <span class=\"cmd\"><span class=\"mono\">immunity finding &lt;b&gt;&quot;x --json</span>{COPY}</span></span>"
-            )) && !line.contains("<b>"),
-            "{line}"
-        );
-    }
-
     /// The part of a page from the section with `id` to its end, or nothing.
     fn section_of<'a>(html: &'a str, id: &str) -> &'a str {
         let rest = html
@@ -4041,7 +2685,8 @@ mod tests {
             for u in &mut r.not_covered {
                 u.fault = (u.class == v1::Cause::Failed as i32) != flip;
             }
-            let pages = view::pages(&conn, &st, &r, "store.db", now).unwrap();
+            let pages =
+                view::pages(&conn, &st, &r, &view::Answers::none(), "store.db", now).unwrap();
             let page = |name: &str| &pages.iter().find(|(n, _)| n == name).unwrap().1;
             let summary = page(view::SUMMARY);
             let limits = section_of(summary, crate::not_read_here::ANCHOR);

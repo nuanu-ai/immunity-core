@@ -345,6 +345,12 @@ message ThisMac {
   bool fresh = 6;
   optional string stale_reason = 7;
   uint64 fresh_for_seconds = 8;
+  // This Mac's id in the store, an entity id such as `machine:<name>`, and its name now: the one
+  // the latest full check kept, which differs from the name in the id once the Mac was renamed,
+  // else the name in the id. Whole. Both absent before anything of this Mac was read. Since
+  // 1.38.0.
+  optional string id_text = 9;
+  optional string name_text = 10;
 }
 
 // Whether this Mac is watched. `UNSPECIFIED`, or a value the reader does not know, is read as

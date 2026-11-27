@@ -111,6 +111,10 @@ message ShippedRule {
   // or in part. Absent before any reading of the event level.
   optional uint64 matches_last_day = 13;
   optional uint64 matches_last_week = 14;
+  // Its `description` as published: what it looks for, in its authors' words, each run of white
+  // space written as one space. Whole. Absent for a rule that gives none and for one that could
+  // not be read. Since 1.38.0.
+  optional string description_text = 15;
 }
 
 message NeverMatches {

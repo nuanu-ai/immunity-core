@@ -249,7 +249,8 @@ impl Text {
 /// A reference that came from outside the core: a path, a package, a lockfile's key, an entity's
 /// id, a disk's name, a rule's title. Whole: never cut, as the contract gives a reference. It has
 /// no `Display` and gives up no `&str`, so it reaches the text for a person only through the
-/// printer, `quoted` in a sentence or a list and `bare` alone beside a label or in a cell.
+/// printer, `quoted` in a sentence or a list and `bare` alone beside a label or in a cell, and a
+/// page only through `html`, or `attr` inside an attribute's quotes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Name(String);
 
@@ -277,6 +278,16 @@ impl Name {
     pub fn bare(&self) -> String {
         bare(self.shown())
     }
+
+    /// On a page (`html`).
+    pub fn html(&self) -> String {
+        html(&self.shown())
+    }
+
+    /// Inside an attribute's double quotes on a page: the entities of its shown form.
+    pub fn attr(&self) -> String {
+        crate::view::esc_said(&self.shown())
+    }
 }
 
 impl Said {
@@ -297,6 +308,10 @@ impl Said {
 
     pub fn bare(&self) -> String {
         bare(self.0.said())
+    }
+
+    pub fn html(&self) -> String {
+        html(&self.0.said())
     }
 }
 
@@ -319,6 +334,13 @@ fn bare(mut shown: String) -> String {
         shown.replace_range(..1, "\\u{20}");
     }
     shown
+}
+
+/// Text from outside on a page, already escaped one to one: the entities of it in an element of
+/// its own, `<bdi class="src">`, so a tag in it is shown as text and right-to-left letters in it
+/// never reorder the core's words around it. The core's own words are never inside one.
+fn html(shown: &str) -> String {
+    format!("<bdi class=\"src\">{}</bdi>", crate::view::esc_said(shown))
 }
 
 /// One text cut by `set`, or withheld whole without one.

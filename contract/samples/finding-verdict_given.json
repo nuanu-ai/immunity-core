@@ -49,6 +49,7 @@
   "technique_text": null,
   "thing": null,
   "title": "The response layer judged something on this Mac suspicious.",
+  "value_text": "Files of an installed command-line tool or package were changed in place, while its version stayed the same.",
   "verdicts": {
     "listed": [
       {
