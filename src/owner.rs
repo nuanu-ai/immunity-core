@@ -283,11 +283,10 @@ fn withdraw_in(
 /// Makes a statement about the entity. One that stood about the same machine is withdrawn
 /// in the same transaction: a machine has one standing statement. The reason is taken whatever
 /// it holds and kept cut, in its row and its journal entry (`secrets::Kept::OwnerReason`);
-/// returned with how many
-/// statements it replaced, as it is kept.
+/// returned with how many statements it replaced, as it is kept.
 #[allow(clippy::too_many_arguments)]
 pub fn say(
-    conn: &mut Connection,
+    tx: &Transaction,
     entity: &str,
     machine: &[String],
     said: &str,
@@ -299,9 +298,8 @@ pub fn say(
     let kept = crate::secrets::Text::source(reason);
     let reason = kept.store();
     let reason = reason.as_str();
-    let tx = conn.transaction()?;
     let replaced = withdraw_in(
-        &tx,
+        tx,
         machine,
         at,
         run_id,
@@ -315,7 +313,7 @@ pub fn say(
         params![entity, said, reason, at, via.literal()],
     )?;
     store::journal_owner(
-        &tx,
+        tx,
         at,
         run_id,
         "owner_said",
@@ -324,23 +322,19 @@ pub fn say(
         reason,
         via.literal(),
     )?;
-    tx.commit()?;
     Ok((replaced, kept))
 }
 
 /// Withdraws what stands about the machine. Returns what was withdrawn: entity and what was
 /// said about it.
 pub fn withdraw(
-    conn: &mut Connection,
+    tx: &Transaction,
     machine: &[String],
     via: Via,
     at: i64,
     run_id: &str,
 ) -> rusqlite::Result<Vec<(String, String)>> {
-    let tx = conn.transaction()?;
-    let n = withdraw_in(&tx, machine, at, run_id, "withdrawn by the owner", via)?;
-    tx.commit()?;
-    Ok(n)
+    withdraw_in(tx, machine, at, run_id, "withdrawn by the owner", via)
 }
 
 /// How many statements were withdrawn and are kept.

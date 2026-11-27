@@ -50,6 +50,32 @@ else
   fail "could not read the sources, whose reads of files are checked"
 fi
 
+# Every write to the store goes through one of its two ways in src/store.rs: `store::write`, which
+# checks the store and takes the run lock, or `store::write_held`, for a step of the watcher, which
+# holds the lock across its steps. Only a connection that can write writes, so the rule is held on
+# where one is opened, in the same files and with the same tests left out as the rule above. Left
+# out by name: the full check (`run`) and the watcher's two readings, which hold the lock and open
+# the store themselves. A `use` of those functions, which would hide them under another name, is
+# refused anywhere.
+if writes=$(printf '%s\n' "$sources" | /usr/bin/grep -vxE \
+  'src/store\.rs|src/.*/tests(\.rs|/.*)' | /usr/bin/tr '\n' '\0' |
+  /usr/bin/xargs -0 /usr/bin/awk '
+  FNR == 1 { fn = "" }
+  skip { if ($0 ~ /^}/) skip = 0; next }
+  test { test = 0; if ($0 ~ /^(pub(\([a-z]+\))? )?mod [a-z0-9_]+ \{$/) { skip = 1; next } }
+  /^#\[cfg\(test\)\]$/ { test = 1 }
+  match($0, /^ *(pub(\([a-z]+\))? )?fn [a-z0-9_]+/) {
+    fn = substr($0, RSTART, RLENGTH); sub(/.* /, "", fn) }
+  /store::(open|open_or_make)\(|Connection::open/ &&
+    FILENAME ":" fn !~ /^src\/(main\.rs:(run|read_events_held)|watch\.rs:read_held)$/ ||
+    /store::write_held\(/ && FILENAME ":" fn !~ /^src\/watch\.rs:(sample|mark)$/ ||
+    /^ *use crate::store::.*(open|write_held)/ {
+    print FILENAME ":" FNR ": " $0 }'); then
+  [ -z "$writes" ] || fail "a write to the store outside store::write and store::write_held: $writes"
+else
+  fail "could not read the sources, whose writes to the store are checked"
+fi
+
 # The rules in the header of the check's workflow. Comments may name what is refused.
 # A pull request from a fork never runs with the base repository's token and secrets.
 absent "pull_request_target in a workflow" -rnE '^[^#]*pull_request_target' .github/workflows

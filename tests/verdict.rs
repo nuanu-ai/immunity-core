@@ -3452,38 +3452,88 @@ fn a_refused_verdict_changes_not_a_byte_of_the_store_and_makes_no_store_of_a_fil
 }
 
 #[test]
-fn a_verdict_or_an_answer_while_another_writer_holds_the_store_fails_as_one_to_ask_again() {
+fn a_verdict_an_answer_or_a_statement_while_another_writer_holds_the_store_is_one_to_ask_again() {
     let mac = Mac::new("held");
     mac.package(true);
     mac.run();
     let id = mac.latest(MALICIOUS).unwrap();
     let v = about_finding(&mac.store_id(), &id, "suspicious", "case-busy");
-    // The verdict and the answer, each waiting for the store as every writer waits, side by
-    // side: the answer as it ran.
-    let both_refused = || {
-        std::thread::scope(|s| {
+    let statement = ["owner", "mac", "retired", "--reason", "invented", "--json"];
+    // The verdict, the answer and the statement, each waiting for the store as every writer
+    // waits, side by side, each saying what held it.
+    let all_refused = || {
+        let outs = std::thread::scope(|s| {
             let answer = s.spawn(|| mac.answer(&id, &["seen"]));
-            mac.refused(v.to_string().as_bytes(), "run_in_progress", 4);
-            answer.join().unwrap()
+            let said = s.spawn(|| mac.command(&statement).output().unwrap());
+            let verdict = mac.refused(v.to_string().as_bytes(), "run_in_progress", 4);
+            [verdict, answer.join().unwrap(), said.join().unwrap()]
+        });
+        assert_eq!(mac.json(&["owner"])["statements"], json!([]));
+        outs.map(|out| {
+            assert_eq!(out.status.code(), Some(4));
+            let said: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(said["errors"][0]["code"], "run_in_progress");
+            said["errors"][0]["outcome"].as_str().unwrap().to_string()
         })
     };
     // A run holds the run lock on the store's folder for as long as it runs.
     let folder = std::fs::File::open(mac.store().parent().unwrap()).unwrap();
     folder.lock().unwrap();
-    let out = both_refused();
-    assert_eq!(out.status.code(), Some(4));
-    let said: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(said["errors"][0]["code"], "run_in_progress");
+    assert_eq!(all_refused(), ["run_lock_held"; 3]);
     common::release(folder);
-    // A writer without the run lock holds the store's write lock: the same code.
+    // A writer without the run lock holds the store's write lock. The first of the three to take
+    // the run lock waits for the store, and the others for the run lock while it holds it.
     let mut db = rusqlite::Connection::open(mac.store()).unwrap();
     let held = db
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .unwrap();
-    assert_eq!(both_refused().status.code(), Some(4));
+    let said = all_refused();
+    assert!(said.contains(&"store_busy".to_string()), "{said:?}");
+    assert!(
+        said.iter()
+            .all(|o| ["store_busy", "run_lock_held"].contains(&&**o))
+    );
     drop(held);
     mac.send(&v);
     assert_eq!(mac.recorded(), (1, 1));
+}
+
+#[test]
+fn a_verdict_an_answer_or_a_statement_given_during_a_check_is_taken_once_the_check_lets_go() {
+    let mac = Mac::new("let-go");
+    mac.package(true);
+    mac.run();
+    let id = mac.latest(MALICIOUS).unwrap();
+    let v = about_finding(&mac.store_id(), &id, "suspicious", "case-let-go");
+    // As a check holds the store: the run lock, and its write left open.
+    let folder = std::fs::File::open(mac.store().parent().unwrap()).unwrap();
+    folder.lock().unwrap();
+    let mut db = rusqlite::Connection::open(mac.store()).unwrap();
+    let held = db
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .unwrap();
+    let outs = std::thread::scope(|s| {
+        let verdict = s.spawn(|| mac.send_output(&v));
+        let answer = s.spawn(|| mac.answer(&id, &["seen"]));
+        let said = s.spawn(|| {
+            let statement = ["owner", "mac", "retired", "--reason", "invented", "--json"];
+            mac.command(&statement).output().unwrap()
+        });
+        // The check ends well within the 2 s every command waits for the run lock.
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        drop(held);
+        common::release(folder);
+        [verdict, answer, said].map(|w| w.join().unwrap())
+    });
+    for out in outs {
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+    assert_eq!(mac.recorded(), (1, 1));
+    assert_eq!(mac.json(&["owner"])["statements"][0]["said"], "retired");
 }
 
 #[test]

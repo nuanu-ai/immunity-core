@@ -77,6 +77,7 @@ pub const RULE_READER: &str = "immunity";
 
 /// A question the store cannot answer with one thing of the kind asked for: a misuse, told with
 /// the ids of what it found, so that the caller can ask again for one.
+#[derive(Debug)]
 pub struct Refused {
     pub code: &'static str,
     /// The core's own words.
@@ -103,6 +104,15 @@ pub fn not_judged(spelled: bool, inside: Option<&str>) -> Option<String> {
         (false, inside) => inside.map(str::to_string),
     }
 }
+
+/// An error, so that a write that ends in it commits nothing (`store::write`).
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(self.message)
+    }
+}
+
+impl std::error::Error for Refused {}
 
 impl Refused {
     /// The refusal as the contract's error, with the ids it fits whole.
