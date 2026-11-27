@@ -219,6 +219,7 @@ fn question<'a>(
         machine,
         found_by: &FOUND_BY,
         inside,
+        files_anywhere: false,
     }
 }
 

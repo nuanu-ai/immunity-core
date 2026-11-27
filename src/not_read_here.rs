@@ -1,11 +1,11 @@
 //! The last section of the summary: what this version does not read here. Every limit the status
 //! holds is told in it once, and nowhere else on the pages, in one section that starts
-//! collapsed. A limit is a thing not covered that the message does not mark a fault
-//! (`Uncovered.fault`, taken by `pages::sorted`); this file decides nothing of that, and its
-//! words are the catalogue's (`covered.rs`). Every name and what a source said goes through the
-//! page's own escaping (`pages::apart`), as on every page.
+//! collapsed. A limit is a thing not covered that the status does not mark a fault
+//! (`Uncovered.fault`); this file decides nothing of that, and its words are the status's. Every
+//! name and what a source said goes through the printer (`pages::apart`), as on every page.
 
-use crate::covered::{Uncovered, YOU};
+use crate::contract::v1::Uncovered;
+use crate::covered::YOU;
 use crate::view::{Out, counted, esc};
 use std::fmt::Write;
 
@@ -55,25 +55,13 @@ pub fn section(out: &mut String, limits: &[&Uncovered]) -> Out {
 /// One limit: its title, the things it names with what their source said, as data, and what the
 /// person can do where the person can do something.
 fn line(out: &mut String, u: &Uncovered) -> Out {
-    write!(out, "<li id=\"{}\">{}", esc(u.cause.id), esc(&u.title()))?;
+    write!(out, "<li id=\"{}\">{}", esc(&u.id), esc(&u.title))?;
     let apart = crate::pages::apart(u);
-    let shown = apart.len().min(crate::pages::EXAMPLES_SHOWN);
-    if shown > 0 {
-        write!(
-            out,
-            " <span class=\"mono\">{}</span>",
-            apart[..shown].join("; ")
-        )?;
+    if !apart.is_empty() {
+        write!(out, " <span class=\"mono\">{}</span>", apart.join("; "))?;
     }
-    if apart.len() > shown {
-        write!(
-            out,
-            " <span class=\"muted\">and {} more</span>",
-            apart.len() - shown
-        )?;
-    }
-    if u.cause.who == YOU {
-        write!(out, "<span class=\"advice\">{}</span>", esc(u.cause.advice))?;
+    if u.who == YOU {
+        write!(out, "<span class=\"advice\">{}</span>", esc(&u.advice))?;
     }
     out.push_str("</li>\n");
     Ok(())

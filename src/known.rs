@@ -70,6 +70,10 @@ pub struct Question<'a> {
     /// The readings of this Mac, as reader and kind, that read inside every thing of its kind:
     /// they speak for every one the store knows, whatever was found in it.
     pub inside: &'a [(&'a str, String)],
+    /// For a machine, `immunity machine --files-anywhere`: its watched files are its parts
+    /// wherever they are kept, those of its checkouts, such as their hooks, among them. Without
+    /// it a machine's parts are one level.
+    pub files_anywhere: bool,
 }
 
 /// The reader of the reading made by rule for a path no reading looks at: the core itself.
@@ -308,11 +312,15 @@ pub fn known_of(
         }
         let mut all = Parts::new();
         let mut with_parts = false;
+        let machine = q.question == v1::Question::Machine;
         for own_id in own.keys() {
             let (inside, in_folder) = parts(conn, own_id, q.folder)?;
             with_parts = with_parts || !inside.is_empty();
             all.extend(inside);
             all.extend(in_folder);
+            if q.files_anywhere {
+                all.extend(watched_files_on(conn, own_id)?);
+            }
         }
         own_ids.extend(own.keys().cloned());
         let (presence, readings) = presence(conn, own.keys(), with_parts, &latest, q.found_by)?;
@@ -324,7 +332,18 @@ pub fn known_of(
             .filter(|(other, _)| other.as_str() != *id)
             .map(|(other, ty)| entity(other, ty))
             .collect();
-        known.parts = all.iter().map(|(id, ty)| entity(id, ty)).collect();
+        // Of a machine's parts, how many things each holds, such as a checkout's packages.
+        let held = if machine {
+            parts_held(conn)?
+        } else {
+            BTreeMap::new()
+        };
+        known.parts = (all.iter())
+            .map(|(id, ty)| v1::Entity {
+                parts_total: machine.then(|| held.get(id).copied().unwrap_or_default() as u64),
+                ..entity(id, ty)
+            })
+            .collect();
         subjects.extend(own);
         subjects.extend(all);
     }
@@ -586,6 +605,7 @@ pub fn by_rule_for(
         observed_at: None,
         lacks: Vec::new(),
         last_full_at: None,
+        run_id: None,
     };
     let key = |c: &v1::Coverage| (c.scope_text.clone(), c.reader.clone(), c.kind.clone());
     let at = known.coverage.partition_point(|c| key(c) < key(&reading));
@@ -635,6 +655,7 @@ fn entity(id: &str, ty: &str) -> v1::Entity {
     v1::Entity {
         id_text: whole(id),
         r#type: ty.to_string(),
+        parts_total: None,
     }
 }
 
@@ -678,6 +699,32 @@ fn parts(
     Ok((inside, in_folder))
 }
 
+/// The files watched on a machine, wherever they are kept: every live `watched_as` of a file id
+/// on it.
+fn watched_files_on(conn: &Connection, machine: &str) -> rusqlite::Result<Parts> {
+    conn.prepare(
+        "SELECT DISTINCT a.subject, e.type FROM assertion a JOIN entity e ON e.id = a.subject
+         WHERE +a.layer = 'live' AND a.subject > ?1 AND a.subject < ?2
+           AND a.predicate = 'watched_as'",
+    )?
+    .query_map(
+        [format!("file:{machine}/"), format!("file:{machine}0")],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?
+    .collect()
+}
+
+/// How many things with facts in force are `part_of` each thing, by its id, in one pass: no
+/// index leads from a thing to what is part of it.
+fn parts_held(conn: &Connection) -> rusqlite::Result<BTreeMap<String, i64>> {
+    conn.prepare(
+        "SELECT object, COUNT(DISTINCT subject) FROM assertion
+         WHERE layer = 'live' AND predicate = 'part_of' GROUP BY object",
+    )?
+    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+    .collect()
+}
+
 /// Whether the path `rel` is the folder `folder` or inside it when both are compared by the key a
 /// Mac's volumes compare names by (`spelling::key`): to find what a caller meant, and to tell
 /// that it is spelled otherwise.
@@ -712,7 +759,7 @@ fn facts<'a>(
     subjects: impl Iterator<Item = &'a String>,
 ) -> rusqlite::Result<Vec<v1::Fact>> {
     let mut q = conn.prepare(
-        "SELECT predicate, object, reader, basis, source_ref, observed_at, scope, kind
+        "SELECT predicate, object, reader, basis, source_ref, observed_at, scope, kind, run_id
          FROM assertion WHERE layer = 'live' AND subject = ?1
          ORDER BY predicate, object, reader, id",
     )?;
@@ -730,6 +777,7 @@ fn facts<'a>(
                 observed_at: r.get(5)?,
                 scope_text: whole(&r.get::<_, String>(6)?),
                 kind: r.get(7)?,
+                run_id: r.get(8)?,
             };
             let key = Some((predicate.clone(), object.clone()));
             match out.last_mut() {
@@ -780,6 +828,8 @@ pub(crate) struct Reading {
     pub at: i64,
     /// When it was last read in full.
     last_full: Option<i64>,
+    /// The run that took it.
+    run: String,
     /// What it did not read (`store::unread_of`); none on a full reading.
     unread: Vec<store::Unread>,
 }
@@ -792,7 +842,8 @@ pub(crate) fn latest(conn: &Connection) -> rusqlite::Result<Vec<Reading>> {
          SELECT id, reader, scope, kind, completeness, reason, cause, observed_at,
                 (SELECT MAX(f.observed_at) FROM coverage f
                  WHERE f.reader = c.reader AND f.scope = c.scope AND f.kind = c.kind
-                   AND f.completeness = 'full')
+                   AND f.completeness = 'full'),
+                run_id
          FROM latest c
          ORDER BY scope, reader, kind",
             latest = store::LATEST
@@ -808,6 +859,7 @@ pub(crate) fn latest(conn: &Connection) -> rusqlite::Result<Vec<Reading>> {
                 cause: r.get(6)?,
                 at: r.get(7)?,
                 last_full: r.get(8)?,
+                run: r.get(9)?,
                 unread: Vec::new(),
             })
         })?
@@ -846,6 +898,7 @@ pub(crate) fn coverage(conn: &Connection, r: Reading) -> rusqlite::Result<v1::Co
         cause: cause.map(value_of::<v1::Cause>),
         observed_at: Some(r.at),
         last_full_at: r.last_full,
+        run_id: Some(r.run),
         scope_text: whole(&r.scope),
         reader: r.reader,
         kind: r.kind,
@@ -1084,6 +1137,7 @@ mod tests {
             machine: Some("machine:mac"),
             found_by: &[],
             inside: &[],
+            files_anywhere: false,
         };
         let known = known_of(&conn, &q, home, 1).unwrap();
         let kinds: Vec<&str> = known.coverage.iter().map(|c| c.kind.as_str()).collect();

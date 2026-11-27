@@ -1655,7 +1655,10 @@ pub fn totals(conn: &Connection, now: i64) -> rusqlite::Result<Totals> {
         .collect();
     // What cannot be told of each project, as every answer gives it.
     let unread = unread_places(conn)?;
-    let untold: HashSet<String> = unread.iter().map(|p| p.0.clone()).collect();
+    let untold: HashSet<String> = (unread.iter())
+        .filter(|p| p.1 != NO_ECOSYSTEM)
+        .map(|p| p.0.clone())
+        .collect();
     let mut counts: Vec<(String, String, i64)> = Vec::new();
     let rows: Vec<(String, String, String, String, i64)> = conn
         .prepare(
@@ -1803,8 +1806,9 @@ pub fn totals(conn: &Connection, now: i64) -> rusqlite::Result<Totals> {
         .map(|((c, e, p), r)| (c, e, p, REASONS.get(r).copied().unwrap_or_default()))
         .collect();
     // A project counts as compared where a place of it was read in full against data current
-    // at the check and now, it has no place not wholly read, and none of its packages is
-    // "don't know", whatever the reason: one such package and it was not compared in full.
+    // at the check and now, it has no place not wholly read, of the ecosystem `none` too, and
+    // none of its packages is "don't know", whatever the reason: one such package and it was
+    // not compared in full.
     let untold_package: HashSet<&str> = t.unknown_packages.iter().map(|u| u.0.as_str()).collect();
     let mut compared: BTreeMap<String, bool> = BTreeMap::new();
     for (c, e, lockfiles, feed) in conn
@@ -1824,7 +1828,9 @@ pub fn totals(conn: &Connection, now: i64) -> rusqlite::Result<Totals> {
     }
     t.projects_compared = compared
         .into_iter()
-        .filter(|(c, whole)| *whole && !untold.contains(c) && !untold_package.contains(c.as_str()))
+        .filter(|(c, whole)| {
+            *whole && !unread.iter().any(|p| &p.0 == c) && !untold_package.contains(c.as_str())
+        })
         .count();
     t.unread_places = unread;
     t.informational = conn.query_row(
@@ -1974,6 +1980,11 @@ fn totals_of(conn: &Connection, now: i64, t: &Totals) -> rusqlite::Result<v1::Vu
         projects_without_lockfile: n(project_counts(&t.unread_places).0),
         projects_compared: n(t.projects_compared),
         projects_found: Some(projects_found(conn)?),
+        affected_exploited: n((affecting(conn)?.iter())
+            .filter(|a| a.exploited)
+            .map(|a| a.advisory.as_str())
+            .collect::<HashSet<&str>>()
+            .len()),
     })
 }
 
@@ -1989,7 +2000,8 @@ pub fn projects_found(conn: &Connection) -> rusqlite::Result<v1::ProjectsFound> 
 /// Why the totals and the "affects" answers are absent from a store that has them not.
 pub const NEVER_MATCHED: &str = "the projects' lockfiles have never been matched against vulnerability data in this store; the next check does";
 
-/// The most "affects me" answers `immunity vulnerabilities` lists; the total is always given.
+/// The most "affects me" answers, unknown packages and unread places `immunity vulnerabilities`
+/// lists of each; the total is always given, and `--all` lists every one.
 pub const SHOWN: usize = 200;
 
 /// A record the data holds, as `immunity vulnerability` reads it.
@@ -2070,6 +2082,25 @@ pub fn unread_places(conn: &Connection) -> rusqlite::Result<Vec<UnreadPlace>> {
             .into_iter()
             .map(|(c, e, names)| (c, e, NO_READER.to_string(), Some(no_reader_said(&names)))),
     );
+    // A latest reading of lockfiles that was not full and left no place above, such as one that
+    // met a lockfile of no ecosystem a record names: the list of what the projects use is not
+    // whole, though no record's answer changes (`NO_ECOSYSTEM`).
+    let placed: HashSet<String> = out.iter().map(|p| p.0.clone()).collect();
+    for (checkout, completeness, reason) in not_full_readings(conn)? {
+        if !placed.contains(&checkout) {
+            let lockfiles = if completeness == "partial" {
+                "partial"
+            } else {
+                NOT_READ
+            };
+            out.push((
+                checkout,
+                NO_ECOSYSTEM.to_string(),
+                lockfiles.to_string(),
+                reason,
+            ));
+        }
+    }
     // Each project the store holds, with its latest reading of lockfiles, if any: none found
     // only where that reading opened it in the latest check and found nothing; not read where
     // no reading opened it then.
@@ -2139,13 +2170,31 @@ pub fn project_counts(places: &[UnreadPlace]) -> (usize, usize) {
 
 /// The ecosystem of a place that stands for every ecosystem of a project.
 const ANY_ECOSYSTEM: &str = "any";
+/// The ecosystem of a place that stands for none a record can be about: what was not read there
+/// leaves the list of what the projects use short, and no record's answer unknown.
+const NO_ECOSYSTEM: &str = "none";
+
+/// The latest reading of lockfiles of each project the store holds that was not full: checkout,
+/// completeness and why.
+fn not_full_readings(conn: &Connection) -> rusqlite::Result<Vec<(String, String, Option<String>)>> {
+    conn.prepare(&format!(
+        "SELECT c.scope, c.completeness, c.reason FROM coverage c
+         WHERE c.reader = ?1 AND c.completeness != 'full'
+           AND c.id = (SELECT MAX(l.id) FROM coverage l WHERE l.reader = c.reader AND l.scope = c.scope)
+           AND NOT {}
+         ORDER BY c.scope",
+        crate::store::gone_entity("c.scope")
+    ))?
+    .query_map([crate::lockfiles::READER], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+    .collect()
+}
 /// Why a project with no lockfile is not compared.
 const NONE_FOUND_SAID: &str = "no lockfile this version knows of was found in it";
 
 /// Each project with a place whose lockfiles were not all read, with why, every place said.
 fn untold(places: &[UnreadPlace]) -> BTreeMap<String, String> {
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (checkout, ecosystem, lockfiles, why) in places {
+    for (checkout, ecosystem, lockfiles, why) in places.iter().filter(|p| p.1 != NO_ECOSYSTEM) {
         out.entry(checkout.clone()).or_default().push(match why {
             Some(why) => format!("{ecosystem} lockfiles {lockfiles}: {why}"),
             None => format!("{ecosystem} lockfiles {lockfiles}"),
@@ -2215,12 +2264,16 @@ fn no_reader_said(names: &str) -> String {
     format!("this version has no reader for {names}")
 }
 
-/// The places whose lockfiles were not all read as the contract gives them, at most `SHOWN`.
-fn unread_of(places: &[UnreadPlace], this: Option<&crate::findings::This>) -> v1::UnreadPlaces {
+/// The places whose lockfiles were not all read as the contract gives them, at most `shown`.
+fn unread_of(
+    places: &[UnreadPlace],
+    this: Option<&crate::findings::This>,
+    shown: usize,
+) -> v1::UnreadPlaces {
     v1::UnreadPlaces {
         items: places
             .iter()
-            .take(SHOWN)
+            .take(shown)
             .map(|(checkout, ecosystem, lockfiles, why)| v1::UnreadPlace {
                 project_text: whole(&crate::findings::place(checkout, this)),
                 ecosystem: ecosystem.clone(),
@@ -2248,9 +2301,15 @@ type Place = (
 /// The version of the contract this build prints.
 const FORMAT: u32 = 1;
 
-/// `immunity vulnerabilities`: the "affects" answers, most severe first, at most `SHOWN`, with the
-/// totals. Without a store there is nothing to count, and `not_computed` says so.
-pub fn list(conn: Option<&Connection>, now: i64) -> rusqlite::Result<v1::Vulnerabilities> {
+/// `immunity vulnerabilities`: the "affects" answers, most severe first, at most `SHOWN` or every
+/// one with `all`, with the totals. Without a store there is nothing to count, and
+/// `not_computed` says so.
+pub fn list(
+    conn: Option<&Connection>,
+    all_listed: bool,
+    now: i64,
+) -> rusqlite::Result<v1::Vulnerabilities> {
+    let shown = if all_listed { usize::MAX } else { SHOWN };
     let mut out = v1::Vulnerabilities {
         format: FORMAT,
         answered_at: now,
@@ -2282,7 +2341,7 @@ pub fn list(conn: Option<&Connection>, now: i64) -> rusqlite::Result<v1::Vulnera
         items: t
             .unknown_packages
             .iter()
-            .take(SHOWN)
+            .take(shown)
             .map(
                 |(checkout, ecosystem, package, reason)| v1::UnknownPackage {
                     project_text: whole(&crate::findings::place(checkout, this.as_ref())),
@@ -2294,11 +2353,11 @@ pub fn list(conn: Option<&Connection>, now: i64) -> rusqlite::Result<v1::Vulnera
             .collect(),
         total: t.unknown_packages.len() as u64,
     });
-    out.unread = Some(unread_of(&t.unread_places, this.as_ref()));
+    out.unread = Some(unread_of(&t.unread_places, this.as_ref(), shown));
     out.affected = Some(v1::AffectedPackages {
         items: all
             .iter()
-            .take(SHOWN)
+            .take(shown)
             .map(|a| affected_message(a, this.as_ref(), listed))
             .collect(),
         total: all.len() as u64,
@@ -2318,7 +2377,12 @@ pub fn exploited(on_list: bool, current: bool) -> Option<bool> {
 /// current catalogue says a record is off its list.
 pub fn catalogue_current(conn: &Connection, now: i64) -> rusqlite::Result<bool> {
     let read = crate::threats::last_good(conn)?.map(|(at, _)| at);
-    Ok(read_not_current(read, now, crate::threats::CURRENT_FOR).is_none())
+    Ok(catalogue_current_at(read, now))
+}
+
+/// The same rule over when the catalogue was last read whole, as `Threats.read_at` gives it.
+pub fn catalogue_current_at(read_at: Option<i64>, now: i64) -> bool {
+    read_not_current(read_at, now, crate::threats::CURRENT_FOR).is_none()
 }
 
 fn no_store(section: &str) -> v1::NotComputed {
@@ -2792,7 +2856,7 @@ mod tests {
                 )
             })
             .collect();
-        let m = super::unread_of(&places, None);
+        let m = super::unread_of(&places, None, super::SHOWN);
         assert_eq!(m.items.len(), super::SHOWN);
         assert_eq!(m.total, super::SHOWN as u64 + 1);
     }
@@ -3380,6 +3444,49 @@ mod tests {
             })
             .collect();
         assert_eq!((why, kept), (NOT_NAMED, vec![(first, "1.0.0")]));
+    }
+
+    #[test]
+    fn asked_for_all_the_answer_lists_every_row_past_those_it_lists_by_itself() {
+        // The pages ask with `--all`, so every affected package, package that cannot be told
+        // and place not read is on them, as before.
+        let dir = crate::common::Scratch::new("listed-whole");
+        let mut conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
+        let tx = conn.transaction().unwrap();
+        let at = "package-lock.json#node_modules/left-pad";
+        // Projects that hold a release the record affects, read in part, and as many that hold
+        // a release that cannot be compared.
+        let projects: Vec<(String, &[&str])> = (0..=SHOWN)
+            .flat_map(|i| {
+                [
+                    (format!("shop{i}"), &["1.2.0"][..]),
+                    (format!("odd{i}"), &["x"][..]),
+                ]
+            })
+            .collect();
+        let entries: Vec<_> = (projects.iter())
+            .map(|(p, releases)| (p.as_str(), Source::Registry, *releases, at))
+            .collect();
+        by_hand(&tx, "left-pad", &entries, &[(LEFT_PAD, LEFT_PAD_RANGES)]);
+        match_all(&tx, "r1", NOW).unwrap();
+        let part = "UPDATE coverage SET completeness = 'partial', reason = 'a lockfile not read'
+                    WHERE scope LIKE '%shop%'";
+        tx.execute(part, []).unwrap();
+        crate::store::journal_note(&tx, NOW, "r1", "run_finished", "").unwrap();
+        let listed = |all| {
+            let m = list(Some(&tx), all, NOW).unwrap();
+            let (a, u, r) = (m.affected.unwrap(), m.unknown.unwrap(), m.unread.unwrap());
+            [
+                (a.items.len(), a.total),
+                (u.items.len(), u.total),
+                (r.items.len(), r.total),
+            ]
+        };
+        let total = SHOWN as u64 + 1;
+        assert_eq!(
+            (listed(false), listed(true)),
+            ([(SHOWN, total); 3], [(SHOWN + 1, total); 3])
+        );
     }
 
     #[test]

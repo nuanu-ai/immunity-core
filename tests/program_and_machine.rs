@@ -1544,6 +1544,19 @@ fn a_machines_parts_are_one_level_and_a_project_on_it_is_a_part_without_its_own_
         assert!(mac.facts.iter().all(|f| f.subject_text != deeper));
     }
     assert!(mac.findings.iter().any(|f| f.about_text == hook));
+    // Asked with `--files-anywhere`, as any client may ask and as the page of this Mac does, the
+    // hook is a part too, with its facts; the packages of the project are still not.
+    let out = e.ask("machine", None, &["--files-anywhere", "--proto"]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let anywhere = v1::Known::decode(out.stdout.as_slice()).unwrap();
+    let parts: Vec<&str> = anywhere.parts.iter().map(|p| p.id_text.as_str()).collect();
+    assert!(parts.contains(&hook) && parts.contains(&shop), "{parts:?}");
+    assert!(!parts.contains(&left_pad), "{parts:?}");
+    assert!(anywhere.facts.iter().any(|f| f.subject_text == hook));
 
     let project = e.known("project", Some("~/dev/shop"));
     let inside: Vec<&str> = project.parts.iter().map(|p| p.id_text.as_str()).collect();

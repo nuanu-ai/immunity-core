@@ -813,6 +813,11 @@ pub struct Entity {
     /// Its type, such as `checkout`, `component` or `file`.
     #[prost(string, tag = "2")]
     pub r#type: ::prost::alloc::string::String,
+    /// For a part of the thing asked about, how many things with facts in force are `part_of` it,
+    /// such as the packages a checkout's lockfiles declare in `immunity machine`. Absent for the
+    /// thing itself and its other ids. Since 1.40.0.
+    #[prost(uint64, optional, tag = "3")]
+    pub parts_total: ::core::option::Option<u64>,
 }
 /// A fact: the statements of one or more readers with the same subject, predicate and object.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -855,6 +860,10 @@ pub struct Assertion {
     pub scope_text: ::prost::alloc::string::String,
     #[prost(string, tag = "6")]
     pub kind: ::prost::alloc::string::String,
+    /// The run that first read it, as `Coverage.run_id` names runs: two assertions first read by
+    /// one run share it, also where two runs began in the same second. Since 1.40.0.
+    #[prost(string, tag = "7")]
+    pub run_id: ::prost::alloc::string::String,
 }
 /// The latest reading of one kind by one reader in one scope.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -896,6 +905,10 @@ pub struct Coverage {
     /// was not. Absent when it was never read in full, and on a reading made by rule. Since 1.39.0.
     #[prost(int64, optional, tag = "9")]
     pub last_full_at: ::core::option::Option<i64>,
+    /// The run that took it, as the journal names runs: the readings of one run share it, also
+    /// where two runs began in the same second. Absent for a reading made by rule. Since 1.40.0.
+    #[prost(string, optional, tag = "10")]
+    pub run_id: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// Something this build has no reader for.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -2812,7 +2825,8 @@ pub struct Vulnerabilities {
 #[serde(default)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UnreadPlaces {
-    /// One per project and ecosystem, at most 200, by project.
+    /// One per project and ecosystem, at most 200 or every one with `--all` (since 1.40.0), by
+    /// project.
     #[prost(message, repeated, tag = "1")]
     pub items: ::prost::alloc::vec::Vec<UnreadPlace>,
     /// How many there are.
@@ -2836,6 +2850,9 @@ pub struct UnreadPlace {
     /// version knows of was found in it, with the ecosystem `any`. A project with any such place
     /// is never answered "does not affect" for any record, since the store does not keep every
     /// ecosystem a record names. One with `none_found` is counted, never answered for a record.
+    /// A reading of lockfiles not full that left no other place, such as one that met a lockfile
+    /// of no ecosystem a record names, is a place with the ecosystem `none`: the projects' list is
+    /// not whole, and no record's answer changes for it. Since 1.40.0.
     #[prost(string, tag = "3")]
     pub lockfiles: ::prost::alloc::string::String,
     /// Why, as the reading of lockfiles gave it, or for `no_reader` the kinds by name. Whole.
@@ -2847,7 +2864,8 @@ pub struct UnreadPlace {
 #[serde(default)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UnknownPackages {
-    /// One per package in a project, each under the first of its reasons, at most 200, by project.
+    /// One per package in a project, each under the first of its reasons, at most 200 or every one
+    /// with `--all` (since 1.40.0), by project.
     #[prost(message, repeated, tag = "1")]
     pub items: ::prost::alloc::vec::Vec<UnknownPackage>,
     /// How many there are.
@@ -2876,7 +2894,7 @@ pub struct UnknownPackage {
 #[serde(default)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct AffectedPackages {
-    /// One per package and record, at most 200.
+    /// One per package and record, at most 200 or every one with `--all` (since 1.40.0).
     #[prost(message, repeated, tag = "1")]
     pub items: ::prost::alloc::vec::Vec<AffectedPackage>,
     /// How many there are.
@@ -2954,6 +2972,12 @@ pub struct VulnerabilityTotals {
     /// not known, never as `all`. Since 1.21.0.
     #[prost(message, optional, tag = "20")]
     pub projects_found: ::core::option::Option<ProjectsFound>,
+    /// Records that affect something and that the catalogue of exploited vulnerabilities lists as
+    /// used in attacks, each counted once, however old the catalogue. Zero says none is listed;
+    /// whether none is used in attacks rests on the catalogue being current, which `Threats` in the
+    /// status says. Since 1.40.0.
+    #[prost(uint64, tag = "21")]
+    pub affected_exploited: u64,
 }
 /// Whether the projects found are every project in the places this version looks for them in.
 /// While not, what is said of the projects as a whole (none, zero, a count) speaks only for the
@@ -3632,6 +3656,23 @@ pub struct ThisMac {
     pub id_text: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag = "10")]
     pub name_text: ::core::option::Option<::prost::alloc::string::String>,
+    /// The latest sample of running programs, whether or not a watcher samples them now: `watched`
+    /// holds `running programs and their connections` only while one does. Absent when no sample
+    /// was ever taken. Since 1.40.0.
+    #[prost(message, optional, tag = "11")]
+    pub latest_sample: ::core::option::Option<LatestSample>,
+}
+/// One sample of the programs running under this user, as counts: no list is kept.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LatestSample {
+    #[prost(int64, tag = "1")]
+    pub at: i64,
+    #[prost(uint64, tag = "2")]
+    pub programs: u64,
+    #[prost(uint64, tag = "3")]
+    pub connections: u64,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -3887,6 +3928,13 @@ pub struct Uncovered {
     /// a kind of file with no reader. Since 1.33.0.
     #[prost(bool, tag = "15")]
     pub fault: bool,
+    /// The kinds of watched place it is about, each the word of a `WatchedKind.kind` or an
+    /// `IntegrityReading.kind`, or `packages your projects depend on` for the projects' lockfiles: a
+    /// reading of that kind on this Mac that failed or was not given, the search for projects for
+    /// the kinds kept in projects and their packages, or a watched file of that kind read before and
+    /// not read now. Empty for a cause about no kind of place. Since 1.40.0.
+    #[prost(string, repeated, tag = "16")]
+    pub watched_kinds: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// One thing a cause of what is not covered is about.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -4000,6 +4048,10 @@ pub struct Estate {
     pub checkouts: u64,
     #[prost(uint64, tag = "13")]
     pub components: u64,
+    /// When the server check last visited a server: the latest of every server's latest visit.
+    /// Absent when no server was ever visited. Since 1.40.0.
+    #[prost(int64, optional, tag = "14")]
+    pub server_check_at: ::core::option::Option<i64>,
 }
 /// The watched places.
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -4068,6 +4120,14 @@ pub struct WatchedKind {
     /// `ReadingGroup.reason_text` is.
     #[prost(string, optional, tag = "7")]
     pub reason_text: ::core::option::Option<::prost::alloc::string::String>,
+    /// When its latest reading here was taken. Absent when it has no reading. Since 1.40.0.
+    #[prost(int64, optional, tag = "8")]
+    pub read_at: ::core::option::Option<i64>,
+    /// Every reading of it here was taken by the latest full check and is not dated ahead of this
+    /// Mac's clock. False when it has no reading, and before any full check: only a kind read in full
+    /// and fresh may be said to hold nothing. Since 1.40.0.
+    #[prost(bool, tag = "9")]
+    pub fresh: bool,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -4138,6 +4198,11 @@ pub struct Threats {
     /// Whether its entries are matched against what the store knows: not yet.
     #[prost(bool, tag = "10")]
     pub matched: bool,
+    /// The ecosystems whose packages in the projects' lockfiles were compared, at the latest
+    /// check, with current data whose records the catalogue's entries are linked through: only
+    /// through them is an entry compared with anything here. Empty when none was. Since 1.40.0.
+    #[prost(string, repeated, tag = "11")]
+    pub compared_ecosystems: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]

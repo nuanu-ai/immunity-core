@@ -920,7 +920,8 @@ fn this_mac_lists_every_project_with_how_many_dependencies_are_known_none_known_
         .1;
     let projects = section(this_mac, "projects");
     assert!(
-        projects.contains("notes</td><td>0</td>") && projects.contains("shop</td><td>2</td>"),
+        projects.contains("notes</bdi></td><td>0</td>")
+            && projects.contains("shop</bdi></td><td>2</td>"),
         "{projects}"
     );
 }
@@ -3199,6 +3200,24 @@ fn the_servers_row_says_checked_only_when_every_server_was_read_in_full_whatever
         row.contains("checked at the last server check") && !row.contains("not checked"),
         "{row}"
     );
+    // The row says when the server check last visited a server, as the status says it: the
+    // latest of the servers' latest visits.
+    let visited: i64 = rusqlite::Connection::open(&store)
+        .unwrap()
+        .query_row(
+            "SELECT MAX(observed_at) FROM coverage WHERE reader = 'servers' AND kind = 'sweep visit'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        status_json(&store)["estate"]["server_check_at"],
+        serde_json::json!(visited)
+    );
+    assert!(
+        row.contains("<span class=\"wl\"><time datetime=") && !row.contains("—"),
+        "{row}"
+    );
 
     // The sweep of db-1 did not finish.
     put(&servers, "db-1.txt", &cut(WEB_1));
@@ -3242,6 +3261,19 @@ fn the_servers_row_says_checked_only_when_every_server_was_read_in_full_whatever
             && row.contains("1 not checked")
             && !row.contains("checked at the last server check"),
         "{row}"
+    );
+    // Visits of different times: the latest of them.
+    let latest: i64 = rusqlite::Connection::open(&store)
+        .unwrap()
+        .query_row(
+            "SELECT MAX(observed_at) FROM coverage WHERE reader = 'servers' AND kind = 'sweep visit'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        status_json(&store)["estate"]["server_check_at"],
+        serde_json::json!(latest)
     );
 }
 
@@ -7268,15 +7300,6 @@ fn requests(dir: &Path) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// The CVE ids the view marks as new.
-fn marked_new(page: &str) -> Vec<String> {
-    section(page, "threats")
-        .split("<tr class=\"added\"><td class=\"mono\">")
-        .skip(1)
-        .map(|r| r.split(' ').next().unwrap().to_string())
-        .collect()
-}
-
 #[test]
 fn a_new_catalogue_entry_is_reported_as_new_exactly_once() {
     // A fresh exploited vulnerability is the news the owner reads the line for. Told twice,
@@ -7297,13 +7320,11 @@ fn a_new_catalogue_entry_is_reported_as_new_exactly_once() {
             .contains("CISA catalogue: 4 exploited vulnerabilities, 1 new since the last reading;"),
         "{second}"
     );
-    assert_eq!(marked_new(&page), ["CVE-2099-0100"]);
     assert!(
         third
             .contains("CISA catalogue: 4 exploited vulnerabilities, 0 new since the last reading;"),
         "{third}"
     );
-    assert!(marked_new(&view(&f.store())).is_empty());
     let added: Vec<String> = rows(&f.store(), THREAT_EVENTS)
         .into_iter()
         .filter(|r| r.starts_with("threat_added"))
@@ -7397,14 +7418,14 @@ fn the_first_reading_of_the_catalogue_is_a_baseline_and_not_a_flood_of_events() 
         ["threats_first_read|NULL|NULL|3"]
     );
     assert_eq!(rows(&f.store(), THREATS).len(), 3);
+    // The page of threat data counts the list and lists none of it.
     let page = view(&f.store());
-    assert!(marked_new(&page).is_empty());
     let threats = section(&page, "threats");
-    let order: Vec<usize> = ["CVE-2099-0002", "CVE-2099-0001", "CVE-2098-1234"]
-        .iter()
-        .map(|id| threats.find(id).unwrap())
-        .collect();
-    assert!(order.is_sorted(), "newest first: {order:?}");
+    assert!(
+        threats.contains("<strong>3</strong> on the list"),
+        "{threats}"
+    );
+    assert!(!threats.contains("CVE-2099-0002"), "{threats}");
 }
 
 #[test]
@@ -7446,11 +7467,9 @@ fn a_catalogue_that_could_not_be_read_is_reported_as_not_read_and_adds_nothing_a
     let page = view(&f.store());
     assert!(
         section(&page, "threats")
-            .contains("The latest reading of the catalogue failed: curl failed"),
+            .contains("The latest reading of the list failed: <bdi class=\"src\">curl failed"),
         "{page}"
     );
-    // What was new when it was last read stays marked: nothing newer is known.
-    assert_eq!(marked_new(&page), ["CVE-2099-0100"]);
 
     // A saved copy that is not there is the same.
     let report = f.run_with(&[
@@ -7516,11 +7535,10 @@ fn an_entry_that_left_the_catalogue_is_recorded_as_gone_and_kept() {
         "threat_gone|CVE-2099-0100|Madeup Systems Fictional Router Remote Code Execution Vulnerability|NULL"
     );
     let page = view(&f.store());
-    let left = section(&page, "threats")
-        .split("left the catalogue and is kept")
-        .nth(1)
-        .unwrap_or_else(|| panic!("{page}"));
-    assert!(left.contains("CVE-2099-0100"), "{left}");
+    assert!(
+        section(&page, "threats").contains("<strong>3</strong> on the list"),
+        "{page}"
+    );
     // What the catalogue holds no longer counts it, even when it cannot be read.
     let failed = f.run_with(&[
         "--threats-input".as_ref(),
@@ -7672,16 +7690,9 @@ fn text_from_the_catalogue_is_shown_escaped_and_kept_as_read() {
         !report.contains('\u{202E}') && !report.contains("<script"),
         "{report}"
     );
-    let threats = section(&page, "threats");
-    assert!(!threats.contains("<script") && !threats.contains('\u{202E}'));
-    assert!(
-        threats.contains("&lt;script&gt;alert(&#39;x&#39;)&lt;/script&gt;"),
-        "{threats}"
-    );
-    assert!(
-        threats.contains("<td>Gate&quot;way\\u{202e}yawetag</td>"),
-        "{threats}"
-    );
+    // The pages list none of the catalogue's entries, so none of its text reaches them.
+    assert!(!page.contains("<script>alert") && !page.contains('\u{202E}'));
+    assert!(!page.contains("yawetag"), "{page}");
     assert_eq!(
         rows(
             &f.store(),
@@ -8606,28 +8617,36 @@ fn a_changed_watched_file_is_one_changed_event_and_new_changed_and_gone_files_ar
     );
     assert!(!printed.contains('\u{202e}'));
 
-    // The view shows each file with when it was first seen and when its content changed.
+    // The page of this Mac shows each file with when it was first seen and when its content
+    // changed, a link retargeted among them.
     let page = view(&w.store());
-    let watched = section(&page, "watched");
-    assert!(watched.contains(&after[0]) && !watched.contains(&before[0]));
-    assert!(!watched.contains("com.example.old.plist"));
-    let row = |path: &str| {
-        let start = watched.find(&format!(">{path}</td>")).unwrap();
-        &watched[start..start + watched[start..].find("</tr>").unwrap()]
-    };
-    assert!(!row(".zshrc").contains("not since first seen"));
-    assert!(
-        !row(".profile").contains("not since first seen") && row(".profile").contains("profile-b")
+    let (startup, shell) = (
+        section(&page, "startup-items"),
+        section(&page, "shell-startup-files"),
     );
+    assert!(!startup.contains("com.example.old.plist"));
+    let row = |of: &str, path: &str| {
+        let start = of.find(&format!("~/{path}</bdi></td>")).unwrap();
+        of[start..start + of[start..].find("</tr>").unwrap()].to_string()
+    };
+    assert!(!row(shell, ".zshrc").contains("not since first seen"));
+    assert!(!row(shell, ".profile").contains("not since first seen"));
     // A kind with none of its places here says so, and shows no table of files.
     assert_eq!(
         w.coverage("machine:mac", "ssh access files"),
         ["full|none of these places is on this machine"]
     );
-    assert_eq!(watched.matches("<table").count(), 2);
+    let ssh = section(&page, "ssh-files");
     assert!(
-        row("Library/LaunchAgents/com.example.\\u{202e}tsilp.plist")
-            .contains("not since first seen")
+        !ssh.contains("<table") && ssh.contains("None found here."),
+        "{ssh}"
+    );
+    assert!(
+        row(
+            startup,
+            "Library/LaunchAgents/com.example.\\u{202e}tsilp.plist"
+        )
+        .contains("not since first seen")
     );
 
     // A file that comes back is new, not changed.
@@ -8890,17 +8909,14 @@ fn nothing_but_a_regular_file_is_read_and_a_named_pipe_or_a_link_loop_never_hold
             format!("{}|{}", id("to-pipe"), agents.join("pipe").display()),
         ]
     );
-    // The view shows a link's target and why a file's content was not read.
+    // The page of this Mac shows why a file's content was not read.
     let page = view(&w.store());
-    let watched = section(&page, "watched");
-    let row = |name: &str| {
-        let start = watched
-            .find(&format!(">Library/LaunchAgents/{name}</td>"))
-            .unwrap();
-        &watched[start..start + watched[start..].find("</tr>").unwrap()]
-    };
-    assert!(row("dangling").contains("nowhere.plist"));
-    assert!(row("loop-a").contains("link loop"));
+    let startup = section(&page, "startup-items");
+    let start = startup
+        .find("~/Library/LaunchAgents/loop-a</bdi></td>")
+        .unwrap();
+    let row = &startup[start..start + startup[start..].find("</tr>").unwrap()];
+    assert!(row.contains("link loop"), "{row}");
 }
 
 #[test]
@@ -8968,8 +8984,6 @@ fn a_checkout_that_is_gone_takes_its_hooks_with_it() {
     let page = view(&w.store());
     assert!(!section(&page, "coverage").contains("dev/plain"));
     assert!(section(&page, "coverage").contains("dev/tree"));
-    assert!(section(&page, "watched").contains("<li>3 checkouts read in full</li>"));
-    assert!(section(&page, "watched").contains("<li><span class=\"mono\">machine:mac</span>"));
 
     // A hook removed from a checkout that is still there is gone, the last one too.
     std::fs::remove_file(shop.join(".git/hooks/post-merge")).unwrap();
@@ -12925,7 +12939,7 @@ fn a_name_and_what_its_source_said_stay_apart_as_data_and_a_secret_in_what_it_sa
     let page = view(&h.store());
     assert!(
         page.contains(
-            "<li>odd: &lt;img src=x&gt;\\u{7}: &lt;i&gt;refused&lt;/i&gt;\\u{1b} tool --password \\cut{immunity:flag-value 16} done</li>"
+            "<li><bdi class=\"src\">odd: &lt;img src=x&gt;\\u{7}</bdi>: <bdi class=\"src\">&lt;i&gt;refused&lt;/i&gt;\\u{1b} tool --password \\cut{immunity:flag-value 16} done</bdi></li>"
         ),
         "{page}"
     );
@@ -12974,7 +12988,7 @@ fn a_secret_in_why_a_reading_failed_is_cut_wherever_the_status_gives_the_reason(
     let page = view(&w.store());
     let not_read = section(&page, "not-read");
     assert!(
-        not_read.contains("<li>mac: cannot read ")
+        not_read.contains("<li><bdi class=\"src\">mac</bdi>: <bdi class=\"src\">cannot read ")
             && not_read.contains("\\cut{gitleaks:github-pat 40}")
             && !not_read.contains(token),
         "{not_read}"
@@ -13925,13 +13939,15 @@ fn each_link_on_the_summary_shows_what_its_label_says_first_thing_on_arrival() {
     let apps = section(this_mac, "applications");
     assert!(
         apps.contains("<thead><tr><th>Name</th><th>Signed by</th>")
-            && apps.contains("<tr><td>Tiny</td>"),
+            && apps.contains("<tr><td><bdi class=\"src\">Tiny</bdi></td>"),
         "{apps}"
     );
     // A Homebrew package by its name and version; nobody signs it.
     let kegs = section(this_mac, "homebrew-packages");
     assert!(
-        kegs.contains("<tr><td>wget</td><td class=\"mono\">1.24.5</td>")
+        kegs.contains(
+            "<tr><td><bdi class=\"src\">wget</bdi></td><td class=\"mono\"><bdi class=\"src\">1.24.5</bdi></td>"
+        )
             && !kegs.contains("Signed by"),
         "{kegs}"
     );
@@ -14351,7 +14367,8 @@ fn on_a_mac_where_nothing_was_found_and_no_watcher_ran_every_rule_is_on_the_page
     let running = section(this_mac, "running-programs-and-their-connections");
     assert!(
         running.contains("<ul class=\"rules\">")
-            && running.contains("No sample has been taken yet."),
+            && running.contains("No sample has been taken yet.")
+            && running.contains("No watcher samples them now."),
         "{running}"
     );
     // The page of what is watched says the same, with no empty table.

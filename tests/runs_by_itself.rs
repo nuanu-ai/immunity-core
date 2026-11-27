@@ -4401,6 +4401,24 @@ fn state(e: &Estate, starts: u32, project: &str) {
     );
 }
 
+/// The page of this Mac lists the hooks kept in its projects among the git hooks it watches: it
+/// is drawn from `immunity machine --files-anywhere`, whose parts hold them, so a hook read is
+/// never missing from its list.
+#[test]
+fn the_page_of_this_mac_lists_the_hooks_kept_in_its_projects() {
+    let e = Estate::new("page-hooks");
+    let shop = e.checkout("dev/shop");
+    put(&shop.join(".git/hooks/pre-commit"), "#!/bin/sh\nexit 0\n");
+    e.full();
+    let page = e.this_mac_page();
+    let hooks = section(&page, "git-hooks-in-projects");
+    assert!(
+        hooks.contains("~/dev/shop/.git/hooks/pre-commit</bdi></td>")
+            && !hooks.contains("None found here."),
+        "{hooks}"
+    );
+}
+
 const DESKTOP: &str = "Library/Application Support/Claude/claude_desktop_config.json";
 
 #[test]
@@ -7279,12 +7297,12 @@ fn an_entry_the_last_check_did_not_read_is_never_said_unchanged_and_shows_that_r
             assert!(!row.contains("not since first seen"), "{row}");
             assert!(!row.contains("badge good"), "{row}");
         }
-        // The page of this Mac and the technical page each say it, with why.
+        // The page of this Mac says it, with why.
         let said = rows
             .iter()
             .filter(|r| r.contains("not read at the last check") && r.contains(why))
             .count();
-        assert_eq!(said, 2, "{name}: {rows:?}");
+        assert_eq!(said, 1, "{name}: {rows:?}");
     }
 }
 
@@ -7346,7 +7364,7 @@ fn a_part_that_failed_and_was_answered_never_silences_losing_sight_of_the_whole_
         .iter()
         .filter(|r| r.contains("not read at the last check") && r.contains("size cap"))
         .count();
-    assert_eq!(said, 2, "{rows:?}");
+    assert_eq!(said, 1, "{rows:?}");
 }
 
 #[test]

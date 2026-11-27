@@ -226,6 +226,7 @@ fn unknown_known_and_quiet_and_known_but_not_read_are_three_different_answers() 
         Some(v1::Entity {
             id_text: "checkout:machine:mac/dev/shop".to_string(),
             r#type: "checkout".to_string(),
+            parts_total: None,
         })
     );
 

@@ -39,7 +39,8 @@ const IDS_SHOWN: usize = 3;
 const NAMED: usize = 6;
 /// At most this many readings that are not full are listed; the rest are counted.
 const NOT_FULL_SHOWN: usize = 8;
-/// At most this many packages that cannot be told, or places not read, are listed.
+/// At most this many packages that cannot be told, or places not read, are listed without
+/// `--all`; the rest are counted.
 const ROWS_SHOWN: usize = 10;
 /// The widest an item named in a labelled line is on a terminal, cut in the middle.
 const ITEM_WIDTH: usize = 40;
@@ -876,7 +877,9 @@ fn fix_cell(screen: &Screen, fixed: &[String]) -> Cell {
 }
 
 /// `immunity vulnerabilities` for a person.
-pub fn vulnerabilities(m: &v1::Vulnerabilities, screen: &Screen) -> String {
+pub fn vulnerabilities(m: &v1::Vulnerabilities, all: bool, screen: &Screen) -> String {
+    // With `--all`, every row the message carries; without it, the first `ROWS_SHOWN`.
+    let rows_shown = if all { usize::MAX } else { ROWS_SHOWN };
     let mut out: Vec<String> = Vec::new();
     let Some(t) = &m.totals else {
         // Nothing was counted: why, in the core's words, and never a 0. No store is said in the
@@ -1147,7 +1150,7 @@ pub fn vulnerabilities(m: &v1::Vulnerabilities, screen: &Screen) -> String {
         let rows: Vec<Vec<Cell>> = u
             .items
             .iter()
-            .take(ROWS_SHOWN)
+            .take(rows_shown)
             .map(|p| {
                 vec![
                     Cell::plain(Name::given(&p.project_text).bare()),
@@ -1198,7 +1201,7 @@ pub fn vulnerabilities(m: &v1::Vulnerabilities, screen: &Screen) -> String {
         let rows: Vec<Vec<Cell>> = u
             .items
             .iter()
-            .take(ROWS_SHOWN)
+            .take(rows_shown)
             .map(|p| {
                 let ecosystem = if p.ecosystem == "any" {
                     String::new()
@@ -1669,6 +1672,7 @@ mod tests {
             thing: thing.then(|| v1::Entity {
                 id_text: "checkout:machine:example-host/dev/shop".to_string(),
                 r#type: "checkout".to_string(),
+                parts_total: None,
             }),
             question: v1::Question::Project as i32,
             latest_run_at: Some(1_794_800_000),
@@ -1975,10 +1979,12 @@ mod tests {
             v1::Entity {
                 id_text: part.to_string(),
                 r#type: "component".to_string(),
+                parts_total: None,
             },
             v1::Entity {
                 id_text: file.to_string(),
                 r#type: "file".to_string(),
+                parts_total: None,
             },
         ];
         let fact = |s: &str, p: &str, o: &str| v1::Fact {
@@ -2023,6 +2029,7 @@ mod tests {
             .map(|i| v1::Entity {
                 id_text: format!("component:{shop}/npm/p{i}"),
                 r#type: "component".to_string(),
+                parts_total: None,
             })
             .collect();
         let text = known(&k, &Screen::pipe());
@@ -2037,10 +2044,12 @@ mod tests {
         mac.thing = Some(v1::Entity {
             id_text: "machine:example-host".to_string(),
             r#type: "machine".to_string(),
+            parts_total: None,
         });
         mac.same_as = vec![v1::Entity {
             id_text: "machine:web-1".to_string(),
             r#type: "machine".to_string(),
+            parts_total: None,
         }];
         let text = known(&mac, &Screen::pipe());
         assert!(
@@ -2058,6 +2067,7 @@ mod tests {
         app.thing = Some(v1::Entity {
             id_text: app.asked_text.clone(),
             r#type: "component".to_string(),
+            parts_total: None,
         });
         let text = known(&app, &Screen::pipe());
         assert!(text.starts_with("Program  \"component:"), "{text}");
@@ -2072,14 +2082,17 @@ mod tests {
         k.thing = Some(v1::Entity {
             id_text: thing.clone(),
             r#type: "checkout".to_string(),
+            parts_total: None,
         });
         k.same_as = vec![v1::Entity {
             id_text: format!("machine:{h}"),
             r#type: "machine".to_string(),
+            parts_total: None,
         }];
         k.parts = vec![v1::Entity {
             id_text: format!("component:{thing}/npm/{h}"),
             r#type: "component".to_string(),
+            parts_total: None,
         }];
         k.facts = vec![v1::Fact {
             subject_text: thing.clone(),
@@ -2194,7 +2207,7 @@ mod tests {
         for screen in screens() {
             for text in [
                 known(&k, &screen),
-                vulnerabilities(&m, &screen),
+                vulnerabilities(&m, false, &screen),
                 vulnerability(&one, &screen),
                 vulnerability(&no_record, &screen),
             ] {
@@ -2257,7 +2270,7 @@ mod tests {
             );
             let words = vulnerability(&one, &screen);
             assert!(words.contains("GHSA-0000-0000-0000"), "{words}");
-            let counts = vulnerabilities(&list, &screen);
+            let counts = vulnerabilities(&list, false, &screen);
             assert!(counts.contains("1,234,567 not wholly read"), "{counts}");
             if width < 40 {
                 continue;
@@ -2552,7 +2565,7 @@ mod tests {
             totals: Some(t),
             ..Default::default()
         };
-        vulnerabilities(&m, &Screen::pipe())
+        vulnerabilities(&m, false, &Screen::pipe())
     }
 
     #[test]
@@ -2694,7 +2707,7 @@ mod tests {
             declared_note: "What the lockfiles declare.".to_string(),
             ..Default::default()
         };
-        let text = vulnerabilities(&m, &Screen::pipe());
+        let text = vulnerabilities(&m, false, &Screen::pipe());
         assert!(
             text.starts_with("Nothing is known yet: the lockfiles were never matched\n"),
             "{text}"
@@ -2706,7 +2719,7 @@ mod tests {
             "{text}"
         );
         // No store, in the one wording every command gives it, and nothing after it to run.
-        let text = vulnerabilities(&v1::Vulnerabilities::default(), &Screen::pipe());
+        let text = vulnerabilities(&v1::Vulnerabilities::default(), false, &Screen::pipe());
         assert_eq!(
             text,
             "There is no store here yet.\nimmunity run makes one, or immunity on, which also keeps it checked.\n"
@@ -2744,7 +2757,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let text = vulnerabilities(&m, &Screen::terminal(80, false));
+        let text = vulnerabilities(&m, false, &Screen::terminal(80, false));
         let lines: Vec<&str> = text.lines().collect();
         let at = lines
             .iter()
@@ -2770,7 +2783,7 @@ mod tests {
         assert!(second.contains(r#"fixed in "19.0.1""#), "{text}");
         assert!(lines.iter().all(|l| screen::columns(l) <= 80), "{text}");
         // Where the row fits whole, one line.
-        let wide = vulnerabilities(&m, &Screen::terminal(140, false));
+        let wide = vulnerabilities(&m, false, &Screen::terminal(140, false));
         let row = wide
             .lines()
             .find(|l| l.contains("GHSA-fv66-9v8q-g76r"))
@@ -2817,7 +2830,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let text = vulnerabilities(&m, &Screen::terminal(80, false));
+        let text = vulnerabilities(&m, false, &Screen::terminal(80, false));
         let lines: Vec<&str> = text.lines().collect();
         let at = |w: &str| lines.iter().position(|l| l.contains(w)).unwrap();
         // Each group's head, its row's first line, then its second line.
@@ -2886,7 +2899,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let text = vulnerabilities(&m, &Screen::pipe());
+        let text = vulnerabilities(&m, false, &Screen::pipe());
         assert!(
             text.starts_with(
                 "✗ 2 known vulnerabilities affect 1 project, 1 of those listed used in attacks"
@@ -2903,7 +2916,7 @@ mod tests {
         assert!(text.contains("no fix named"), "{text}");
         assert!(text.contains("    … 1 more not listed here\n"), "{text}");
         // On a terminal the first fix and how many more.
-        let wide = vulnerabilities(&m, &Screen::terminal(120, false));
+        let wide = vulnerabilities(&m, false, &Screen::terminal(120, false));
         assert!(wide.contains(r#"fixed in "19.0.1" +1"#), "{wide}");
         // The first ten that cannot be told are named, the rest counted with every reason, in
         // words.
@@ -2920,6 +2933,12 @@ mod tests {
             !text.contains(crate::vulnerabilities::NOT_COMPARABLE),
             "{text}"
         );
+        // With `--all`, every package the message carries is named.
+        let all = vulnerabilities(&m, true, &Screen::pipe());
+        assert!(
+            all.contains("pkg-11") && !all.contains("all of them by reason"),
+            "{all}"
+        );
         assert!(
             text.ends_with("→ immunity vulnerability GHSA-0001   one record in every project\n"),
             "{text}"
@@ -2929,7 +2948,7 @@ mod tests {
             items: vec![item("MAL-0002", None, &[])],
             total: 1,
         });
-        let text = vulnerabilities(&m, &Screen::pipe());
+        let text = vulnerabilities(&m, false, &Screen::pipe());
         assert!(text.contains("\n  Affected\n    critical"), "{text}");
         assert!(
             !text.contains("Other") && !text.contains("used in attacks"),
@@ -2940,7 +2959,7 @@ mod tests {
             items: vec![item("GHSA-0001", Some(true), &["1"])],
             total: 1,
         });
-        let text = vulnerabilities(&m, &Screen::pipe());
+        let text = vulnerabilities(&m, false, &Screen::pipe());
         assert!(text.contains(", 1 used in attacks"), "{text}");
         assert!(!text.contains("\n  Other\n"), "{text}");
     }
@@ -2981,7 +3000,7 @@ mod tests {
             unread: Some(v1::UnreadPlaces { items, total: 13 }),
             ..Default::default()
         };
-        let text = vulnerabilities(&m, &Screen::pipe());
+        let text = vulnerabilities(&m, false, &Screen::pipe());
         for said in [
             "  Not read  13 places\n",
             "    ~/dev/notes       no lockfile this version reads\n",
@@ -2996,6 +3015,12 @@ mod tests {
         }
         assert!(!text.contains("~/dev/p5"), "{text}");
         assert_eq!(calm_in(&text), Vec::<&str>::new(), "{text}");
+        // With `--all`, every place the message carries is named.
+        let all = vulnerabilities(&m, true, &Screen::pipe());
+        assert!(
+            all.contains("~/dev/p7") && !all.contains("more not listed here"),
+            "{all}"
+        );
     }
 
     #[test]
@@ -3055,7 +3080,7 @@ mod tests {
             }),
             ..Default::default()
         };
-        let text = vulnerabilities(&m, &screen);
+        let text = vulnerabilities(&m, false, &screen);
         assert!(text.contains("\u{1b}[31mmalicious\u{1b}[0m"), "{text}");
         assert!(text.contains("\u{1b}[31mcritical\u{1b}[0m"), "{text}");
         assert!(text.contains("\u{1b}[33mhigh\u{1b}[0m"), "{text}");
@@ -3090,6 +3115,7 @@ mod tests {
                 "n/".repeat(30)
             ),
             r#type: "file".to_string(),
+            parts_total: None,
         }];
         let screen = Screen::terminal(80, false);
         let text = known(&k, &screen);

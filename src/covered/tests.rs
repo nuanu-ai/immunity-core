@@ -1,3 +1,4 @@
+use super::watched_kinds::watched_readings;
 use super::*;
 use crate::store::Gap;
 use std::path::{Path, PathBuf};
@@ -426,7 +427,7 @@ fn a_kind_of_watched_files_is_full_only_when_every_kind_of_its_list_was_read_in_
         )
     };
     let of = |latest: &[Latest], as_: &str| {
-        let all = watched_readings(latest, Some(MAC));
+        let all = watched_readings(latest, Some(MAC), None, 0);
         let k = all.into_iter().find(|k| k.watched_as == as_).unwrap();
         (k.coverage, k.full, k.partial, k.none, k.reason)
     };
@@ -449,4 +450,149 @@ fn a_kind_of_watched_files_is_full_only_when_every_kind_of_its_list_was_read_in_
     assert_eq!(of(&mine, watched::HOOK).0, Some("full"));
     let other = hooks(&format!("checkout:{MAC}-2/dev/app"));
     assert_eq!(of(&other, watched::HOOK).0, None);
+}
+
+#[test]
+fn a_kind_of_watched_files_is_fresh_only_when_every_reading_of_it_here_is_of_the_latest_check() {
+    // No false calm: only a kind read in full and fresh may be said to hold nothing. A reading
+    // taken before the latest full check began, one dated ahead of the clock, a kind of its list
+    // never read here, and a kind with no reading at all are not fresh; when it was last read is
+    // its latest reading's time.
+    let (_dir, conn) = store_of("covered-watched-fresh");
+    let (run, now) = (1_000_000, 1_000_100);
+    let as_ = watched::PROFILE;
+    let at = |at: i64| Latest {
+        at,
+        ..stored(
+            &conn,
+            MAC,
+            (watched::READER, watched::PROFILE_KIND),
+            ("full", None, Gap::default()),
+        )
+    };
+    let of = |latest: &[Latest], run: Option<i64>| {
+        let k = (watched_readings(latest, Some(MAC), run, now).into_iter())
+            .find(|k| k.watched_as == as_)
+            .unwrap();
+        (k.fresh, k.read_at)
+    };
+    assert_eq!(of(&[at(run + 1)], Some(run)), (true, Some(run + 1)));
+    assert_eq!(of(&[at(run - 1)], Some(run)), (false, Some(run - 1)));
+    let ahead = now + crate::store::AHEAD_ALLOWED + 1;
+    assert_eq!(of(&[at(ahead)], Some(run)), (false, Some(ahead)));
+    assert!(!of(&[at(run + 1)], None).0);
+    assert_eq!(of(&[], Some(run)), (false, None));
+    let agent = autorun::AGENT_SETTINGS.0;
+    let one = stored(
+        &conn,
+        MAC,
+        (watched::READER, &autorun::kinds_of(agent)[0]),
+        ("full", None, Gap::default()),
+    );
+    let k = (watched_readings(&[Latest { at: run + 1, ..one }], Some(MAC), Some(run), now))
+        .into_iter()
+        .find(|k| k.watched_as == agent)
+        .unwrap();
+    assert!(!k.fresh);
+}
+
+#[test]
+fn a_reading_names_the_kinds_of_watched_place_it_speaks_for_and_no_other() {
+    // A row of what is watched is drawn as a fault by these words alone: a reading of a kind of
+    // watched files names that kind, one of installed software its kind, a lockfile's the
+    // packages, the search for projects every kind kept in projects and the packages, and a
+    // reading of nothing watched names nothing. A reading of another machine names nothing of
+    // this Mac's.
+    let (_dir, conn) = store_of("covered-kinds-read-by");
+    let of = |readings: &[(&str, &str, &str)]| {
+        kinds_read_by(&conn, readings.iter().copied(), Some(MAC)).unwrap()
+    };
+    assert_eq!(
+        of(&[(watched::READER, watched::PROFILE_KIND, MAC)]),
+        [watched::PROFILE]
+    );
+    assert_eq!(
+        of(&[(integrity::READER, integrity::KEGS, MAC)]),
+        [integrity::KEGS]
+    );
+    assert_eq!(
+        of(&[(crate::lockfiles::READER, "any kind", MAC)]),
+        [DEPENDENCIES]
+    );
+    assert!(of(&[(watched::READER, watched::PROFILE_KIND, "machine:other")]).is_empty());
+    // The content of a watched file speaks for every kind the file is watched as.
+    let file = format!("file:{MAC}/.zshrc");
+    let theirs = file.replace(MAC, "machine:other");
+    let tx = rusqlite::Transaction::new_unchecked(&conn, rusqlite::TransactionBehavior::Deferred)
+        .unwrap();
+    store::put_entity(&tx, &file).unwrap();
+    store::put_entity(&tx, &theirs).unwrap();
+    tx.commit().unwrap();
+    let watched_as_of = |file: &str, layer: &str, as_: &str| {
+        conn.execute(
+            "INSERT INTO assertion (layer, subject, predicate, object, reader, scope, kind,
+                                    source_ref, basis, observed_at, run_id, retracted_at,
+                                    retracted_by)
+             VALUES (?1, ?2, 'watched_as', ?3, ?4, ?5, ?6, 'invented:1', 'observed',
+                     1, 'run-1', CASE ?1 WHEN 'retracted' THEN 2 END,
+                     CASE ?1 WHEN 'retracted' THEN 'run-2' END)",
+            params![
+                layer,
+                file,
+                as_,
+                watched::READER,
+                MAC,
+                watched::PROFILE_KIND
+            ],
+        )
+        .unwrap()
+    };
+    let watched_as = |layer: &str, as_: &str| watched_as_of(&file, layer, as_);
+    watched_as("retracted", watched::SSH);
+    watched_as("live", watched::PROFILE);
+    assert_eq!(
+        of(&[(watched::READER, watched::CONTENT, &file)]),
+        [watched::PROFILE]
+    );
+    // Live under a second kind, as a shell startup file a project's Git settings name as its
+    // hooks file: the reading speaks for both, and both rows show its fault.
+    watched_as("live", watched::HOOK);
+    let both = of(&[(watched::READER, watched::CONTENT, &file)]);
+    assert!(
+        both.len() == 2 && both.contains(&watched::PROFILE) && both.contains(&watched::HOOK),
+        "{both:?}"
+    );
+    // A file watched no longer speaks for the kind it was last watched as.
+    conn.execute(
+        "UPDATE assertion SET layer = 'retracted', retracted_at = 3, retracted_by = 'run-3'
+         WHERE subject = ?1 AND object = ?2",
+        params![file, watched::HOOK],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE assertion SET layer = 'retracted', retracted_at = 3, retracted_by = 'run-3'
+         WHERE subject = ?1 AND object = ?2",
+        params![file, watched::PROFILE],
+    )
+    .unwrap();
+    assert_eq!(
+        of(&[(watched::READER, watched::CONTENT, &file)]),
+        [watched::HOOK]
+    );
+    // A file of another machine, watched live as a kind of this Mac's, speaks for none of them:
+    // only the scope keeps it out.
+    watched_as_of(&theirs, "live", watched::PROFILE);
+    assert!(of(&[(watched::READER, watched::CONTENT, &theirs)]).is_empty());
+    assert!(of(&[(watched::READER, watched::CONTENT, "file:machine:none")]).is_empty());
+    let (by, kind) = crate::project::FOUND_BY[0];
+    let found = of(&[(by, kind, MAC), (by, kind, MAC)]);
+    let kept: Vec<&str> = (watched().into_iter())
+        .filter_map(|(c, ..)| match c {
+            Count::Files(as_) if in_projects(c) => Some(as_),
+            _ => None,
+        })
+        .chain([DEPENDENCIES])
+        .collect();
+    assert_eq!(found, kept);
+    assert!(of(&[(crate::tailnet::READER, crate::tailnet::KIND, MAC)]).is_empty());
 }

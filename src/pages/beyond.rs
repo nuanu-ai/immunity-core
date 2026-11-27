@@ -9,7 +9,7 @@
 //! `secrets::Name` and `secrets::Said`, each in an element of its own; a reason `Known` gives
 //! whole is cut here (`Said::of`).
 
-use super::top;
+use super::{names, said, top};
 use crate::contract::{unescape, v1};
 use crate::secrets::{Name, Said};
 use crate::view::{FOOT, MachineOf, Out, badge, esc, thead, utc, utc_age, utc_or};
@@ -46,17 +46,6 @@ const SYSTEM: [(&str, &str); 6] = [
     ("runs_kernel", "Kernel"),
     ("runs_kernel_package", "Kernel package"),
 ];
-
-/// Names from `_text` fields, each in its own element, joined by commas.
-fn names(all: &[String]) -> String {
-    let shown: Vec<String> = all.iter().map(|n| Name::given(n).html()).collect();
-    shown.join(", ")
-}
-
-/// A reason a message gives whole, cut where it is shown.
-fn said(whole: &str) -> String {
-    Said::of(&unescape(whole)).html()
-}
 
 /// Whether a reading is full; a value this build does not know is read as not full.
 fn full(c: &v1::Coverage) -> bool {
@@ -151,7 +140,11 @@ pub fn page(
         )?;
     }
     for m in &servers {
-        let known = m.entities_text.first().map(|id| machine(id)).transpose()?;
+        let known = m
+            .entities_text
+            .first()
+            .map(|id| machine(id, false))
+            .transpose()?;
         let known = known.flatten();
         let names = (
             m.machine_text.as_str(),
@@ -189,7 +182,7 @@ pub fn page(
         out.push_str("<p class=\"muted\">None.</p>\n");
     }
     for w in aside {
-        let known = machine(&w.entity_text)?;
+        let known = machine(&w.entity_text, false)?;
         let names = (w.machine_text.as_str(), &w.names_text[..], &[][..]);
         block(&mut out, names, known.as_ref(), Some(w), now)?;
     }
@@ -511,6 +504,7 @@ mod tests {
             thing: Some(v1::Entity {
                 id_text: "machine:web-1".to_string(),
                 r#type: "machine".to_string(),
+                ..Default::default()
             }),
             coverage,
             ..Default::default()
@@ -528,7 +522,7 @@ mod tests {
 
     /// The page with these statements and machines, every machine answered with `k`.
     fn drawn(s: &v1::Statements, k: Option<v1::Known>) -> String {
-        let machine = move |_: &str| Ok(k.clone());
+        let machine = move |_: &str, _: bool| Ok(k.clone());
         page(&v1::Status::default(), s, &machine, NOW).unwrap()
     }
 
@@ -579,6 +573,7 @@ mod tests {
         two.same_as.push(v1::Entity {
             id_text: "machine:203.0.113.5".to_string(),
             r#type: "machine".to_string(),
+            ..Default::default()
         });
         let said = summary(&drawn(&s, Some(two))).to_string();
         assert!(said.contains("could not be opened"), "{said}");
@@ -901,6 +896,7 @@ mod tests {
         k.parts.push(v1::Entity {
             id_text: package.clone(),
             r#type: "component".to_string(),
+            ..Default::default()
         });
         for (subject, predicate) in [
             ("machine:web-1", "runs_os"),

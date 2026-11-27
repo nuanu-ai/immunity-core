@@ -21,7 +21,9 @@
 //!
 //! Its parts are one level: what is `part_of` or `located_on` the machine, such as its
 //! containers, packages, checkouts and watched files. Their own parts are not given; a project
-//! is asked about with `immunity project`. Its findings are of every depth (`known.rs`).
+//! is asked about with `immunity project`. With `--files-anywhere`, every file watched on the
+//! machine is among them, those kept in its checkouts too. Its findings are of every depth
+//! (`known.rs`).
 
 use crate::contract::{self, v1};
 use crate::known::{self, Question, Refused};
@@ -39,7 +41,10 @@ pub const FOUND_BY: [(&str, &str); 3] = [
 ];
 
 /// What `immunity machine` takes as a machine.
-const WHAT: &str = "immunity machine takes nothing for this Mac, or one machine: its name as the store shows it, a name or address it is known by, or its id, beginning with machine:";
+const WHAT: &str = "immunity machine takes nothing for this Mac, or one machine: its name as the store shows it, a name or address it is known by, or its id, beginning with machine:, and --files-anywhere to give every file watched on it among its parts";
+
+/// The option that puts every file watched on the machine among its parts.
+const FILES_ANYWHERE: &str = "--files-anywhere";
 
 /// `immunity machine [<what>]`.
 pub struct MachineArgs {
@@ -49,6 +54,9 @@ pub struct MachineArgs {
     pub asked: Option<String>,
     /// The home folder: ids name a path inside it relative to it.
     pub home: PathBuf,
+    /// `--files-anywhere`: every file watched on the machine among its parts, those kept in its
+    /// checkouts, such as their hooks, too (`Question.files_anywhere`).
+    pub files_anywhere: bool,
 }
 
 /// Reads the arguments after `machine`.
@@ -56,7 +64,15 @@ pub fn parse(
     it: impl Iterator<Item = String>,
     options: &mut crate::answer::Options,
 ) -> Result<MachineArgs, String> {
-    let words = known::words(it, options)?;
+    let mut files_anywhere = false;
+    let words = known::words(
+        it.filter(|arg| {
+            let given = arg == FILES_ANYWHERE;
+            files_anywhere |= given;
+            !given
+        }),
+        options,
+    )?;
     let asked = match <[String; 1]>::try_from(words) {
         Ok([asked]) => Some(asked),
         Err(words) if words.is_empty() => None,
@@ -67,6 +83,7 @@ pub fn parse(
         form: options.form(),
         asked,
         home: crate::user_home()?,
+        files_anywhere,
     })
 }
 
@@ -76,17 +93,27 @@ pub fn machine_cmd(args: &MachineArgs) -> ExitCode {
         "machine",
         &args.store,
         args.form,
-        |conn, now| answer(conn, args.asked.as_deref(), &args.home, now),
+        |conn, now| {
+            answer(
+                conn,
+                args.asked.as_deref(),
+                &args.home,
+                args.files_anywhere,
+                now,
+            )
+        },
         |k| crate::answers_text::known(k, &crate::screen::Screen::of_stdout()),
     )
 }
 
 /// The answer of `immunity machine` for `asked`, as given on the command line, or for this Mac
-/// without it; a refusal when it names no one machine. The pages ask it too.
+/// without it; a refusal when it names no one machine. With `files_anywhere`, every file watched
+/// on the machine is among its parts, those kept in its checkouts too. The pages ask it too.
 pub fn answer(
     conn: &Connection,
     asked_text: Option<&str>,
     home: &Path,
+    files_anywhere: bool,
     now: i64,
 ) -> rusqlite::Result<Result<v1::Known, Refused>> {
     let this = covered::this_machine(conn)?;
@@ -137,6 +164,7 @@ pub fn answer(
         machine: this.as_deref(),
         found_by: &found_by,
         inside: &[],
+        files_anywhere,
     };
     let mut known = known::known_of(conn, &q, home, now)?;
     if let Some(id) = &id {

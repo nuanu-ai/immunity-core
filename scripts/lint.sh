@@ -139,11 +139,9 @@ src/findings.rs
 src/lists.rs
 src/main.rs
 src/overview.rs
-src/pages.rs
 src/secrets.rs
 src/sigma.rs
 src/store.rs
-src/view.rs
 src/vulnerabilities.rs
 src/watch.rs
 tests/event_level.rs

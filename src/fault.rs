@@ -74,6 +74,8 @@ pub struct Lost {
     /// Whether the readings of its kind are of a checkout, as a checkout's hooks are, rather
     /// than of this Mac (`covered::this_mac`).
     pub project: bool,
+    /// The reader and the kind of the reading that read it before.
+    pub of: (String, String),
 }
 
 /// Every unit read here before and not read now, each once, by rule 1, less those a failed
@@ -119,6 +121,7 @@ pub fn lost(conn: &Connection, latest: &[Latest]) -> rusqlite::Result<Vec<Lost>>
             out.push(Lost {
                 id: format!("{file}{unit}"),
                 project: kind == watched::HOOK_KIND,
+                of: (reader.clone(), kind.clone()),
             });
         }
     }
@@ -129,6 +132,7 @@ pub fn lost(conn: &Connection, latest: &[Latest]) -> rusqlite::Result<Vec<Lost>>
     out.extend(content.map(|r| Lost {
         id: r.scope.clone(),
         project: false,
+        of: (r.reader.clone(), r.kind.clone()),
     }));
     out.sort();
     out.dedup();
@@ -156,6 +160,7 @@ pub const NO_LONGER_READ: Cause = Cause {
 pub fn item(
     conn: &Connection,
     latest: &[Latest],
+    this: Option<&str>,
     place: impl Fn(&str) -> String,
 ) -> rusqlite::Result<Option<Uncovered>> {
     let lost = lost(conn, latest)?;
@@ -163,9 +168,14 @@ pub fn item(
         true => "projects",
         false => "this_mac",
     };
+    let of = lost
+        .iter()
+        .map(|l| (l.of.0.as_str(), l.of.1.as_str(), l.id.as_str()));
+    let kinds = covered::kinds_read_by(conn, of, this)?;
     Ok((!lost.is_empty()).then(|| Uncovered {
         scope,
         examples: lost.iter().map(|l| Example::named(place(&l.id))).collect(),
+        kinds,
         ..Uncovered::new(&NO_LONGER_READ, lost.len())
     }))
 }
@@ -355,6 +365,7 @@ mod tests {
         let hook = Lost {
             id: format!("file:{MAC}/{hook}"),
             project: true,
+            of: (watched::READER.to_string(), watched::HOOK_KIND.to_string()),
         };
         let latest = crate::view::latest_coverage(&conn).unwrap();
         assert!(lost(&conn, &latest).unwrap().contains(&hook));

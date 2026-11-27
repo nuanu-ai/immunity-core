@@ -265,6 +265,11 @@ impl Name {
         Name(crate::contract::unescape(text))
     }
 
+    /// A name as the Mac gave it, such as a place made of an id a contract's field gave.
+    pub fn of(raw: &str) -> Name {
+        Name(raw.to_string())
+    }
+
     fn shown(&self) -> String {
         crate::contract::escape(&self.0, crate::icu::hidden)
     }

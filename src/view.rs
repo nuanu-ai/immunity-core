@@ -10,7 +10,6 @@
 //! partly written by an attacker and must never become markup.
 
 use rusqlite::{Connection, OptionalExtension, params};
-use std::collections::{BTreeMap, BTreeSet};
 use std::error::Error;
 use std::fmt::Write;
 
@@ -89,12 +88,18 @@ pub struct Answers<'a> {
     pub rules: crate::contract::v1::Rules,
     /// `immunity owner`: the statements that stand, and the machines beyond this Mac.
     pub statements: crate::contract::v1::Statements,
-    /// `immunity machine <id>` for a machine a page opens; `None` when it names no one machine.
+    /// `immunity machine <id>` for a machine a page opens, with `--files-anywhere` when asked;
+    /// `None` when it names no one machine.
     pub machine: Box<MachineOf<'a>>,
+    /// `immunity vulnerabilities`: `None` where only the pages that show the event level are
+    /// written.
+    pub vulnerabilities: Option<crate::contract::v1::Vulnerabilities>,
 }
 
-/// `immunity machine <id>` as the pages ask it, by an id as the contract gives it.
-pub type MachineOf<'a> = dyn Fn(&str) -> rusqlite::Result<Option<crate::contract::v1::Known>> + 'a;
+/// `immunity machine <id>` as the pages ask it, by an id as the contract gives it, and with
+/// `--files-anywhere` when the second is true.
+pub type MachineOf<'a> =
+    dyn Fn(&str, bool) -> rusqlite::Result<Option<crate::contract::v1::Known>> + 'a;
 
 /// `immunity finding <id>` as the pages ask it.
 pub type FindingOf<'a> =
@@ -109,33 +114,42 @@ impl Answers<'_> {
             finding: Box::new(|_| Ok(None)),
             rules: Default::default(),
             statements: Default::default(),
-            machine: Box::new(|_| Ok(None)),
+            machine: Box::new(|_, _| Ok(None)),
+            vulnerabilities: None,
         }
     }
 }
 
 /// Every page the view writes, as its path relative to the store's folder and its HTML: the
 /// summary first, then the pages its links lead a person to (`pages.rs`), then one technical
-/// page for each of the big tables. The summary is built from the state and the
-/// machine-readable result `immunity status --json` gives, so the two say the same; the technical
-/// pages are what the store holds, reached from one line at the bottom of the summary.
+/// page for each of the big tables. The summary and the pages of this Mac, of vulnerabilities and
+/// of threat data are drawn from what the commands answer (`Answers`, and the result `immunity
+/// status --json` gives), so the two say the same; the technical pages are what the store holds,
+/// reached from one line at the bottom of the summary.
 pub fn pages(
     conn: &Connection,
-    st: &crate::status::State,
     result: &crate::contract::v1::Status,
     answers: &Answers,
     store: &str,
     now: i64,
 ) -> Result<Vec<(String, String)>, Box<dyn Error>> {
     let latest = latest_coverage(conn)?;
+    // This Mac's page lists every watched file on it, so it asks as `immunity machine <this Mac>
+    // --files-anywhere` does.
+    let this = (result.this_mac.as_ref()).and_then(|m| m.id_text.as_deref());
+    let machine = match this {
+        Some(id) => (answers.machine)(id, true)?,
+        None => None,
+    };
+    let vulnerabilities = answers.vulnerabilities.clone().unwrap_or_default();
     let mut pages = vec![
         (
             SUMMARY.to_string(),
-            crate::pages::summary(conn, st, result, answers, now)?,
+            crate::pages::summary(result, answers, now)?,
         ),
         (
             format!("{DETAILS}/{}.html", crate::pages::THIS_MAC),
-            crate::pages::this_mac(conn, st, result, now)?,
+            crate::pages::this_mac::page(result, machine.as_ref(), now),
         ),
         (
             format!("{DETAILS}/{}.html", crate::pages::BEYOND),
@@ -147,11 +161,11 @@ pub fn pages(
         ),
         (
             format!("{DETAILS}/{}.html", crate::pages::VULNERABILITIES),
-            crate::pages::vulnerabilities(conn, now)?,
+            crate::pages::vulnerabilities::page(&vulnerabilities, result, now),
         ),
         (
             format!("{DETAILS}/{}.html", crate::pages::THREAT_DATA),
-            crate::pages::threat_data(conn, result, now)?,
+            crate::pages::vulnerabilities::threat_data(result, now),
         ),
         (
             format!("{DETAILS}/{}.html", crate::pages::RULES),
@@ -162,7 +176,6 @@ pub fn pages(
         let mut body = String::new();
         match name {
             "coverage" => coverage(conn, &mut body, &latest, now)?,
-            "watched" => watched(conn, &mut body, &latest, now)?,
             "changes" => changes(conn, &mut body)?,
             "gone" => retracted(conn, &mut body)?,
             _ => vocabulary(conn, &mut body)?,
@@ -186,8 +199,6 @@ pub fn pages(
 /// page of rules. When only `events::basis` moved since the pages were made, these alone are
 /// written again.
 pub fn event_pages(
-    conn: &Connection,
-    st: &crate::status::State,
     result: &crate::contract::v1::Status,
     answers: &Answers,
     now: i64,
@@ -195,7 +206,7 @@ pub fn event_pages(
     Ok(vec![
         (
             SUMMARY.to_string(),
-            crate::pages::summary(conn, st, result, answers, now)?,
+            crate::pages::summary(result, answers, now)?,
         ),
         (
             format!("{DETAILS}/{}.html", crate::pages::RULES),
@@ -247,9 +258,8 @@ fn section_page(anchor: &str, title: &str) -> String {
 }
 
 /// The pages of details, by file name and title.
-pub const DETAIL_PAGES: [(&str, &str); 5] = [
+pub const DETAIL_PAGES: [(&str, &str); 4] = [
     ("coverage", "What was read and how completely"),
-    ("watched", "Watched places"),
     ("changes", "Changes"),
     ("gone", "No longer there"),
     ("vocabulary", "Vocabulary"),
@@ -497,7 +507,7 @@ pub fn td_said(out: &mut String, class: &str, text: &str) -> Out {
     cell(out, class, &esc_said(text))
 }
 
-fn cell(out: &mut String, class: &str, html: &str) -> Out {
+pub(crate) fn cell(out: &mut String, class: &str, html: &str) -> Out {
     if class.is_empty() {
         write!(out, "<td>{html}</td>")?;
     } else {
@@ -742,382 +752,6 @@ fn coverage(conn: &Connection, out: &mut String, rows: &[Latest], now: i64) -> O
 
 pub(crate) fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
-}
-
-/// One watched file as the view shows it.
-#[derive(Default)]
-struct WatchedFile {
-    first_seen: i64,
-    content: String,
-    link: String,
-    /// When the current content or link target was first seen.
-    content_since: i64,
-}
-
-/// Watched files whose content or link target was ever replaced.
-fn watched_changed(conn: &Connection) -> rusqlite::Result<BTreeSet<String>> {
-    conn.prepare(
-        "SELECT DISTINCT subject FROM assertion
-         WHERE layer = 'retracted' AND reader = ?1 AND predicate IN ('has_content', 'links_to')",
-    )?
-    .query_map([crate::watched::READER], |r| r.get(0))?
-    .collect()
-}
-
-/// Watched places: per kind, each file with when it was first seen and when its content last
-/// changed, and the coverage of each reading. Only checksums are in the store, never content.
-fn watched(conn: &Connection, out: &mut String, latest: &[Latest], now: i64) -> Out {
-    use crate::watched::READER;
-    out.push_str("<section id=\"watched\">\n<h2>Watched places</h2>\n");
-    out.push_str("<p class=\"muted\">Places where persistence lives. Each file is kept as a checksum of its content, never the content.</p>\n");
-    let mut stmt = conn.prepare(
-        "SELECT subject, predicate, object, observed_at FROM assertion
-         WHERE layer = 'live' AND reader = ?1 ORDER BY subject, observed_at",
-    )?;
-    let rows = stmt.query_map([READER], |r| {
-        Ok((
-            r.get::<_, String>(0)?,
-            r.get::<_, String>(1)?,
-            r.get::<_, String>(2)?,
-            r.get::<_, i64>(3)?,
-        ))
-    })?;
-    // Kind -> file id -> what is known of it.
-    let mut files: BTreeMap<String, BTreeMap<String, WatchedFile>> = BTreeMap::new();
-    let mut kind_of: BTreeMap<String, String> = BTreeMap::new();
-    let mut facts = Vec::new();
-    for row in rows {
-        let (subject, predicate, object, at) = row?;
-        if predicate == "watched_as" {
-            kind_of.insert(subject.clone(), object.clone());
-            files
-                .entry(object)
-                .or_default()
-                .entry(subject)
-                .or_default()
-                .first_seen = at;
-        } else {
-            facts.push((subject, predicate, object, at));
-        }
-    }
-    for (subject, predicate, object, at) in facts {
-        let Some(f) = kind_of
-            .get(&subject)
-            .and_then(|k| files.get_mut(k))
-            .and_then(|m| m.get_mut(&subject))
-        else {
-            continue;
-        };
-        match predicate.as_str() {
-            "has_content" => f.content = object,
-            "links_to" => f.link = object,
-            _ => continue,
-        }
-        // Rows come oldest first: the last is when the current content was first seen.
-        f.content_since = at;
-    }
-    let changed = watched_changed(conn)?;
-    let now_known = crate::watched::content_now(conn)?;
-    let read_by_us: Vec<&Latest> = latest.iter().filter(|r| r.reader == READER).collect();
-    for (watched_as, kind) in crate::watched::kinds() {
-        let readings: Vec<&&Latest> = read_by_us.iter().filter(|r| r.kind == kind).collect();
-        let of_kind = files.remove(watched_as).unwrap_or_default();
-        writeln!(
-            out,
-            "<h3>{} <span class=\"muted\">· {}</span></h3>",
-            esc(kind),
-            plural(of_kind.len(), "file", "files")
-        )?;
-        out.push_str("<ul class=\"readings\">\n");
-        // One reading per checkout: those read in full are counted, the rest are listed.
-        let (listed, full): (Vec<&&Latest>, Vec<&&Latest>) = readings
-            .iter()
-            .partition(|r| kind != crate::watched::HOOK_KIND || r.completeness != "full");
-        if !full.is_empty() {
-            writeln!(
-                out,
-                "<li>{} read in full</li>",
-                plural(full.len(), "checkout", "checkouts")
-            )?;
-        }
-        for r in listed {
-            write!(out, "<li><span class=\"mono\">{}</span> ", esc(&r.scope))?;
-            badge(out, &r.completeness, r.reason.as_deref())?;
-            if let Some(reason) = &r.reason {
-                write!(out, " {}", esc_said(&said(reason)))?;
-            }
-            writeln!(
-                out,
-                " <span class=\"muted nowrap\">{}</span></li>",
-                utc_age(r.at, now)
-            )?;
-        }
-        out.push_str("</ul>\n");
-        if of_kind.is_empty() {
-            continue;
-        }
-        out.push_str("<div class=\"scroll\"><table class=\"dense\">\n");
-        thead(
-            out,
-            &[
-                "Path",
-                "Content",
-                "Link to",
-                "First seen",
-                "Content last changed",
-                "Latest reading of its content",
-            ],
-        );
-        for (id, f) in &of_kind {
-            let path = id
-                .strip_prefix("file:")
-                .and_then(|rest| rest.split_once('/'))
-                .map_or(id.as_str(), |(_, path)| path);
-            write!(
-                out,
-                "<tr><td class=\"mono\" title=\"{}\">{}</td>",
-                esc(id),
-                esc(path)
-            )?;
-            td(out, "mono", &f.content)?;
-            td(out, "mono", &f.link)?;
-            td(out, "nowrap", &utc(f.first_seen))?;
-            // Never "unchanged" where the content is not compared: what the latest check did
-            // not read in full, a folder watched only for whether it is there, and content no
-            // reading read.
-            let now = now_known.get(id).filter(|n| !n.read());
-            let (class, last) = if let Some(n) = now {
-                ("", n.not_read())
-            } else if f.content.starts_with(crate::watched::NOT_A_FILE) {
-                ("", crate::watched::PRESENCE_ONLY.to_string())
-            } else if changed.contains(id) {
-                ("nowrap", utc(f.content_since))
-            } else if f.content.is_empty() && f.link.is_empty() {
-                ("", crate::watched::NEVER_READ.to_string())
-            } else {
-                ("nowrap", "not since first seen".to_string())
-            };
-            td_said(out, class, &last)?;
-            // The latest reading that speaks of it, never an earlier one.
-            out.push_str("<td>");
-            if let Some(n) = now_known.get(id) {
-                badge(out, &n.completeness, None)?;
-                if let Some(reason) = &n.reason {
-                    write!(out, " {}", esc_said(&said(reason)))?;
-                }
-            }
-            out.push_str("</td></tr>\n");
-        }
-        out.push_str("</tbody></table></div>\n");
-    }
-    out.push_str("</section>\n");
-    Ok(())
-}
-
-/// What the list of vulnerabilities used in attacks is, why it is short, and what the program
-/// does with it, in words a person without security training follows.
-pub const CATALOGUE_IS: &str = "A list kept by CISA, a US government agency, of vulnerabilities that attackers are known to have used in real attacks. It is short because most published vulnerabilities are never seen used in one. When a package your projects use has one of them, the program shows it as something that needs a look.";
-
-/// The list of vulnerabilities used in real attacks, as one source of threat data: what it is,
-/// how many it holds, when it was read and whether it is current, what it is compared with, and,
-/// closed, the list itself newest first with those new in the latest reading marked, and those
-/// that left it. No threat is judged against the estate.
-pub fn catalogue(conn: &Connection, out: &mut String, now: i64) -> Out {
-    writeln!(
-        out,
-        "<section id=\"threats\">\n<h2>Vulnerabilities used in real attacks</h2>\n<p>{}</p>",
-        esc(CATALOGUE_IS)
-    )?;
-    // The latest reading, and the latest one that read the catalogue.
-    type Reading = (
-        String,
-        String,
-        i64,
-        Option<String>,
-        Option<String>,
-        Option<String>,
-    );
-    let reading = |outcomes: &str| -> rusqlite::Result<Option<Reading>> {
-        conn.query_row(
-            &format!(
-                "SELECT run_id, outcome, at, reason, raw_path, sha256 FROM feed_reading
-                 WHERE source = ?1 AND outcome IN ({outcomes}) ORDER BY id DESC LIMIT 1"
-            ),
-            [crate::threats::SOURCE],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                ))
-            },
-        )
-        .map(Some)
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            e => Err(e),
-        })
-    };
-    let (latest, good) = (
-        reading("'read', 'unchanged', 'failed'")?,
-        reading("'read', 'unchanged'")?,
-    );
-    let Some((_, outcome, _, reason, _, _)) = latest else {
-        out.push_str("<p class=\"quiet\">This list has never been read, so which vulnerabilities attackers use is not known here, and nothing is compared with it.</p>\n</section>\n");
-        return Ok(());
-    };
-    // Threats new in the latest reading that read the catalogue are marked.
-    let new_in = good.as_ref().map(|g| g.0.clone()).unwrap_or_default();
-    type Threat = (
-        String,
-        String,
-        String,
-        String,
-        String,
-        i64,
-        Option<i64>,
-        bool,
-    );
-    let list: Vec<Threat> = conn
-        .prepare(
-            "SELECT t.id, t.vendor, t.product, t.name, t.date_added, t.first_seen_at, t.gone_at,
-                    EXISTS (SELECT 1 FROM journal j WHERE j.entry = 'threat_added'
-                              AND j.run_id = ?2 AND j.reader = t.source AND j.subject = t.id)
-             FROM threat t WHERE t.source = ?1
-             ORDER BY t.date_added DESC, t.id DESC",
-        )?
-        .query_map(params![crate::threats::SOURCE, new_in], |r| {
-            Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-                r.get(7)?,
-            ))
-        })?
-        .collect::<rusqlite::Result<_>>()?;
-    let (gone, present): (Vec<&Threat>, Vec<&Threat>) = list.iter().partition(|t| t.6.is_some());
-    let new = present.iter().filter(|t| t.7).count();
-    // How many it holds, when it was read, and whether that is current.
-    match &good {
-        Some((_, _, at, ..)) => writeln!(
-            out,
-            "<p class=\"facts\"><strong>{}</strong> on the list · last read {}{}</p>",
-            counted(present.len() as i64, "", "").trim_end(),
-            utc_age(*at, now),
-            if outcome == "failed" {
-                ""
-            } else {
-                " · current"
-            }
-        )?,
-        None => out.push_str("<p class=\"quiet\">Never read in full, so which vulnerabilities attackers use is not known here.</p>\n"),
-    }
-    if outcome == "failed" {
-        writeln!(
-            out,
-            "<p class=\"quiet\">Not current. The latest reading of the catalogue failed: {}. What is new since {} is unknown.</p>",
-            esc_said(
-                &reason
-                    .as_deref()
-                    .map_or("no reason given".to_string(), said)
-            ),
-            good.as_ref().map_or("then".to_string(), |g| utc(g.2))
-        )?;
-    }
-    writeln!(
-        out,
-        "<p>These are {}.</p>",
-        esc(&crate::vulnerabilities::catalogue_said(
-            &crate::vulnerabilities::catalogue_compared(conn)?
-        ))
-    )?;
-    let table = |out: &mut String, rows: &[&Threat], last: &str| -> Out {
-        out.push_str("<div class=\"scroll\"><table class=\"dense\">\n");
-        thead(
-            out,
-            &[
-                "CVE",
-                "Vendor",
-                "Product",
-                "Name",
-                "Added to the catalogue",
-                last,
-            ],
-        );
-        for (id, vendor, product, name, added, seen, left, is_new) in rows.iter().copied() {
-            out.push_str(if *is_new {
-                "<tr class=\"added\">"
-            } else {
-                "<tr>"
-            });
-            write!(out, "<td class=\"mono\">{}", esc(id))?;
-            if *is_new {
-                out.push_str(" <span class=\"badge bad\">new</span>");
-            }
-            out.push_str("</td>");
-            td(out, "", vendor)?;
-            td(out, "", product)?;
-            td(out, "", name)?;
-            td(out, "nowrap", added)?;
-            td(out, "nowrap", &utc(left.unwrap_or(*seen)))?;
-            out.push_str("</tr>\n");
-        }
-        out.push_str("</tbody></table></div>\n");
-        Ok(())
-    };
-    if good.is_some() {
-        write!(
-            out,
-            "<details>\n<summary>The list: {}, newest first; {} new when it was last read</summary>\n",
-            plural(
-                present.len(),
-                "vulnerability used in attacks",
-                "vulnerabilities used in attacks"
-            ),
-            new
-        )?;
-        table(out, &present, "First seen here")?;
-        out.push_str("</details>\n");
-    }
-    if !gone.is_empty() {
-        write!(
-            out,
-            "<details>\n<summary>{} left the catalogue and {} kept</summary>\n",
-            plural(gone.len(), "threat", "threats"),
-            if gone.len() == 1 { "is" } else { "are" }
-        )?;
-        table(out, &gone, "Left the catalogue")?;
-        out.push_str("</details>\n");
-    }
-    // The copy that was read, for a closer look.
-    if let Some((_, _, _, _, raw_path, sha256)) = &good {
-        let mut kept = Vec::new();
-        if let Some(path) = raw_path {
-            kept.push(format!(
-                "copy kept at <span class=\"mono\">{}</span>",
-                esc(path)
-            ));
-        }
-        if let Some(hash) = sha256 {
-            kept.push(format!("SHA-256 <span class=\"mono\">{}</span>", esc(hash)));
-        }
-        if !kept.is_empty() {
-            writeln!(
-                out,
-                "<p class=\"meta\">The reading: {}.</p>",
-                kept.join(", ")
-            )?;
-        }
-    }
-    out.push_str("</section>\n");
-    Ok(())
 }
 
 fn changes(conn: &Connection, out: &mut String) -> Out {
@@ -2197,7 +1831,15 @@ mod tests {
             );
         }
 
-        let pages = super::pages(&conn, &st, &m, &super::Answers::none(), "store.db", now).unwrap();
+        // This Mac's page from the answer of `immunity machine`, whose reasons are given whole.
+        let answers = super::Answers {
+            machine: Box::new(|id, files_anywhere| {
+                let home = std::path::Path::new("/");
+                Ok(crate::machine::answer(&conn, Some(id), home, files_anywhere, now)?.ok())
+            }),
+            ..super::Answers::none()
+        };
+        let pages = super::pages(&conn, &m, &answers, "store.db", now).unwrap();
         let page = |name: &str| {
             pages
                 .iter()
@@ -2242,6 +1884,13 @@ mod tests {
                 .any(|u| u.value_text.as_deref() == Some("the log said \\u{5c}n")),
             "{m:#?}"
         );
+        // A reason `immunity machine` gives whole is cut on the page of this Mac.
+        let this_mac = page(&format!(
+            "{}/{}.html",
+            super::DETAILS,
+            crate::pages::THIS_MAC
+        ));
+        assert!(this_mac.contains(&mark), "{this_mac}");
         for (name, html) in &pages {
             assert!(!html.contains(&token), "{name}");
             assert!(!html.contains("\\u{5c}cut{gitleaks"), "{name}");

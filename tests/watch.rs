@@ -3739,7 +3739,9 @@ fn a_watched_file_its_permissions_keep_closed_leaves_this_mac_watched_in_part_an
     let fix = &page[page.find("<section id=\"you-can-fix\"").unwrap()..];
     let fix = &fix[..fix.find("</section>").unwrap()];
     assert!(
-        fix.contains("~/.zprofile: Permission denied (os error 13)"),
+        fix.contains(
+            "<bdi class=\"src\">~/.zprofile</bdi>: <bdi class=\"src\">Permission denied (os error 13)</bdi>"
+        ),
         "{fix}"
     );
     // The row of its kind among what is watched says so and leads there.
@@ -3747,7 +3749,7 @@ fn a_watched_file_its_permissions_keep_closed_leaves_this_mac_watched_in_part_an
     let watched = &watched[..watched.find("</section>").unwrap()];
     assert!(
         watched.contains(
-            "<a href=\"#you-can-fix\" aria-label=\"You can fix: 1 can&#39;t be read now\">1 can&#39;t be read now</a>"
+            "<a href=\"#you-can-fix\" aria-label=\"You can fix: not all can be read now\">not all can be read now</a>"
         ),
         "{watched}"
     );
@@ -4119,14 +4121,16 @@ fn a_sample_that_opens_a_finding_says_so_in_one_line_and_a_quiet_sample_says_not
         ],
         "{r:#}"
     );
-    // The page of what is watched says what the latest sample saw in numbers: no list of
-    // running programs is kept.
+    // The page of what is watched says when the latest sample was taken and how many programs
+    // it saw, as the status counts them, and that a watcher samples them: no list is kept.
     let at = page
         .find("<section id=\"running-programs-and-their-connections\">")
         .unwrap();
     let shown = &page[at..at + page[at..].find("</section>").unwrap()];
     assert!(
-        shown.contains("saw 2 running programs and ") && shown.contains("no list of them is"),
+        shown.contains("saw 2 running programs and ")
+            && shown.contains("A watcher samples them now.")
+            && shown.contains("no list of them is"),
         "{shown}"
     );
     assert!(w.stop().success());

@@ -46,7 +46,6 @@ mod lockfiles;
 mod look;
 mod machine;
 mod managers;
-mod map;
 mod matches;
 mod not_read_here;
 mod open;
@@ -143,6 +142,8 @@ struct VulnerabilityArgs {
     store: PathBuf,
     form: answer::Form,
     id: Option<String>,
+    /// `--all`: every answer, unknown package and unread place, not the first `SHOWN` of each.
+    all: bool,
 }
 
 /// `immunity findings`: every finding as the contract's message, in the form named; for a person
@@ -590,11 +591,15 @@ fn parse_args(
         }
         "vulnerabilities" | "vulnerability" => {
             let mut words = Vec::new();
+            let mut all = false;
             options.read(it, |arg, _| {
-                if arg.starts_with("--") {
+                if arg == "--all" && cmd == "vulnerabilities" {
+                    all = true;
+                } else if arg.starts_with("--") {
                     return Err(format!("unexpected argument: {arg}"));
+                } else {
+                    words.push(arg);
                 }
-                words.push(arg);
                 Ok(())
             })?;
             let (store, form) = (options.store()?, options.form());
@@ -603,11 +608,13 @@ fn parse_args(
                     store,
                     form,
                     id: None,
+                    all,
                 })),
                 ("vulnerability", [id]) => Ok(Cmd::Vulnerability(VulnerabilityArgs {
                     store,
                     form,
                     id: Some(id.clone()),
+                    all: false,
                 })),
                 ("vulnerability", _) => Err(
                     "immunity vulnerability takes one record id or CVE id, as in: immunity vulnerability CVE-2023-4863"
@@ -1356,9 +1363,9 @@ fn vulnerabilities_cmd(args: &VulnerabilityArgs) -> ExitCode {
     };
     let now = now_secs();
     match &args.id {
-        None => match read_or_none(&args.store, |c| vulnerabilities::list(c, now)) {
+        None => match read_or_none(&args.store, |c| vulnerabilities::list(c, args.all, now)) {
             Ok(m) => answer::print(op, args.form, &m, |m| {
-                answers_text::vulnerabilities(m, &screen::Screen::of_stdout())
+                answers_text::vulnerabilities(m, args.all, &screen::Screen::of_stdout())
             }),
             Err(o) => failed(o),
         },
@@ -1597,19 +1604,23 @@ fn write_view(store: &Path, if_stale: bool) -> Result<Vec<PathBuf>, Box<dyn Erro
         let (state, result) = status_read(tx, store, now)?;
         let found = findings::all(tx, now)?;
         let level = state.event_level.as_ref();
+        // Where every page is written, `immunity vulnerabilities --all` too: a page lists every row.
+        let all = !matches!(current, Current::Events(_));
         let answers = view::Answers {
             findings: finding_answer::list_of(tx, &found, now)?,
             finding: Box::new(|id| finding_answer::of(tx, &found, id, now)),
             rules: rules_answer(level, result.store_id.clone(), true, now),
             statements: owner::statements(tx, now)?,
-            machine: Box::new(|id| Ok(machine::answer(tx, Some(id), &home_folder, now)?.ok())),
+            machine: Box::new(|id, files_anywhere| {
+                Ok(machine::answer(tx, Some(id), &home_folder, files_anywhere, now)?.ok())
+            }),
+            vulnerabilities: all
+                .then(|| vulnerabilities::list(Some(tx), true, now))
+                .transpose()?,
         };
         let pages = match current {
-            Current::Events(_) => view::event_pages(tx, &state, &result, &answers, now)?,
-            _ => {
-                let store = store.display().to_string();
-                view::pages(tx, &state, &result, &answers, &store, now)?
-            }
+            Current::Events(_) => view::event_pages(&result, &answers, now)?,
+            _ => view::pages(tx, &result, &answers, &store.display().to_string(), now)?,
         };
         // The time until which the headline drawn can stand: the status is fresh until its
         // check is older than `FRESH_FOR`. One already stale stays so.
@@ -3684,6 +3695,8 @@ struct ServerCounts {
     /// Servers the latest server check has a visit of, and of them those it read.
     in_last_check: usize,
     checked_in_last_check: usize,
+    /// When the server check last visited a server: the latest of each server's latest visit.
+    last_check_at: Option<i64>,
     /// The owner's own phones, tablets and computers in the private network.
     own_devices: usize,
     /// Other people's computers and phones seen in the private network.
@@ -3707,16 +3720,16 @@ fn server_counts(
         aliases.contains(id)
             && sweep::not_offered(id.strip_prefix("machine:").unwrap_or(id), skip).is_none()
     };
-    // The latest visit of each server, and whether it read the server.
-    let visits: BTreeMap<String, bool> = conn
+    // The latest visit of each server, whether it read the server, and when it was.
+    let visits: BTreeMap<String, (bool, i64)> = conn
         .prepare(
-            "SELECT scope, completeness = 'full' FROM coverage
+            "SELECT scope, completeness = 'full', observed_at FROM coverage
              WHERE reader = ?1 AND kind = ?2
                AND id IN (SELECT MAX(id) FROM coverage WHERE reader = ?1 AND kind = ?2
                           GROUP BY scope)",
         )?
         .query_map([servers::READER, servers::VISIT], |r| {
-            Ok((r.get(0)?, r.get(1)?))
+            Ok((r.get(0)?, (r.get(1)?, r.get(2)?)))
         })?
         .collect::<rusqlite::Result<_>>()?;
     let standing = owner::standing(conn)?;
@@ -3727,6 +3740,7 @@ fn server_counts(
         read: 0,
         in_last_check: 0,
         checked_in_last_check: 0,
+        last_check_at: visits.values().map(|(_, at)| *at).max(),
         own_devices: beyond.own_devices.len(),
         other_devices: beyond.other_devices.len(),
         system_not_given: beyond.system_not_given.len(),
@@ -3743,7 +3757,7 @@ fn server_counts(
         counts.read += usize::from(group.iter().any(|m| read.contains(m)));
         let visited: Vec<bool> = group
             .iter()
-            .filter_map(|m| visits.get(m).copied())
+            .filter_map(|m| visits.get(m).map(|(full, _)| *full))
             .collect();
         counts.in_last_check += usize::from(!visited.is_empty());
         counts.checked_in_last_check += usize::from(visited.contains(&true));
