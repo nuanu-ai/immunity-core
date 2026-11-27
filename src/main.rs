@@ -992,17 +992,19 @@ fn sample_cmd(args: &SampleArgs) -> ExitCode {
             })
         }
         Err(e) => {
-            let (error, exit) = match e.downcast_ref::<Outcome>() {
-                Some(o) => (o.error("sample", "immunity sample --json"), o.exit()),
-                None => (
-                    answer::error(
-                        "sample_failed",
-                        "the sample failed and nothing was committed to the store",
-                        "immunity sample --json",
-                        &e.to_string(),
-                    ),
-                    1,
-                ),
+            // As `not_run`: an outcome the write made itself, and a skip wherever it was met, its
+            // transaction's start and commit included, are said as that outcome.
+            let o = outcome::of(&*e);
+            let (error, exit) = if e.is::<Outcome>() || o.kind == outcome::Kind::Skip {
+                (o.error("sample", "immunity sample --json"), o.exit())
+            } else {
+                let error = answer::error(
+                    "sample_failed",
+                    "the sample failed and nothing was committed to the store",
+                    "immunity sample --json",
+                    &e.to_string(),
+                );
+                (error, 1)
             };
             answer::fail("sample", args.form, error, exit)
         }
