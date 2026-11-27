@@ -8742,6 +8742,43 @@ fn a_program_another_kind_watches_and_did_not_read_is_not_read_here_and_leaves_t
 }
 
 #[test]
+fn a_program_that_is_also_a_hook_is_judged_by_the_hooks_alone_and_raises_nothing_while_it_stays() {
+    // A file has one owner. A program a startup item runs that a checkout's hooks also read is
+    // read after every other kind and is the hooks' alone; the items still say which run it.
+    // Read by both, its content was written twice in each check and raised a finding at each.
+    let e = Estate::new("target-hook");
+    let root = std::fs::canonicalize(&e.0).unwrap().join("work");
+    let hook = root.join("shop/.git/hooks/pre-commit");
+    put(&root.join("shop/.git/HEAD"), "ref: refs/heads/main\n");
+    put(&hook, "#!/bin/sh\nexit 0\n");
+    // Named by its full path, which leads from the system root to the hook.
+    let named = hook.to_str().unwrap();
+    link(named, &e.system().join(&named[1..]));
+    launch_item(&e.agent("hook"), &[named]);
+    e.run_in(&root);
+    e.run_in(&root);
+    assert!(e.rules().is_empty(), "{:?}", e.findings(false));
+    assert_eq!(
+        e.coverage(TARGET_KIND),
+        format!("full|startup programs watched as another kind and judged there: 1; {AT_CHECKS}")
+    );
+    assert_eq!(
+        e.rows(&format!(
+            "SELECT object FROM assertion WHERE layer = 'live' AND predicate = 'started_by'
+               AND subject = 'file:machine:mac/{named}'"
+        )),
+        ["file:machine:mac/Library/LaunchAgents/org.example.hook.plist"]
+    );
+    put(&hook, "#!/bin/sh\nexit 1\n");
+    e.run_in(&root);
+    assert_eq!(e.rules(), ["watched.git-hook"]);
+    let told = "SELECT CAST(count(*) AS TEXT) FROM journal WHERE entry LIKE 'finding_%'";
+    let before = e.rows(told);
+    e.run_in(&root);
+    assert_eq!(e.rows(told), before);
+}
+
+#[test]
 fn what_was_known_of_a_programs_code_before_a_reading_that_failed_is_asked_again() {
     use std::os::unix::fs::PermissionsExt;
     let e = Estate::new("target-failed-between");
@@ -8793,6 +8830,29 @@ fn a_program_a_startup_item_runs_whose_hash_is_on_the_list_is_matched() {
             format!("[file:hashes.'SHA-256' = '{sha}']")
         )]
     );
+}
+
+#[test]
+fn an_indicator_is_never_matched_on_a_watched_file_that_went_in_the_same_check() {
+    // Matching runs after the run has settled what is gone: a digest the check retracts with
+    // its file is no match, in the check that finds it gone.
+    let e = Estate::new("indicator-gone");
+    let profile = e.home().join(".zshrc");
+    put(&profile, "export EXAMPLE=1\n");
+    let sha = sha256_of(std::fs::read(&profile).unwrap());
+    e.list(&format!(
+        r#"[{{"kind": "file:hashes.'SHA-256'", "value": "{sha}"}}]"#
+    ));
+    let matched = format!(
+        "SELECT subject FROM assertion WHERE layer = 'live' AND kind = '{}'
+           AND subject = 'file:machine:mac/.zshrc'",
+        "indicators matched against watched files and texts read in checkouts"
+    );
+    e.run();
+    assert_eq!(e.rows(&matched).len(), 1);
+    std::fs::remove_file(&profile).unwrap();
+    e.run();
+    assert!(e.rows(&matched).is_empty());
 }
 
 /// `immunity status` for a person and as JSON, with the estate's home folder as `HOME`.
