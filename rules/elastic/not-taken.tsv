@@ -48,13 +48,12 @@ macos/persistence_periodic_tasks_file_modify.toml	48ec9452-e1fd-4513-a376-10a1a2
 macos/persistence_python_launch_agent_or_daemon_creation_first_occurrence.toml	25368123-b7b8-4344-9fd4-df28051b4c6e	First Time Python Created a LaunchAgent or LaunchDaemon	medium	not_eql	language kuery, type new_terms
 macos/persistence_screensaver_plist_file_modification.toml	e6e8912f-283f-4d0d-8442-e0dcaf49944b	Screensaver Plist File Modified by Unexpected Process	medium	needs_events	file: modification
 macos/persistence_ssfilecopyreceiver_file_writes.toml	5773cef4-11a5-4d51-a40b-0e0a79d68432	SSFileCopyReceiver Writing to Common Persistence Locations	high	not_eql	language esql, type esql
-macos/persistence_startup_item_plist_creation.toml	15606250-449d-46a8-aaff-4043e42aefb9	Suspicious StartupItem Plist Creation	high	needs_fields	needs_fields process.code_signature.signing_id; needs_fields process.code_signature.trusted
+macos/persistence_startup_item_plist_creation.toml	15606250-449d-46a8-aaff-4043e42aefb9	Suspicious StartupItem Plist Creation	high	needs_fields	needs_fields process.code_signature.trusted
 macos/persistence_suspicious_calendar_modification.toml	cb71aa62-55c8-42f0-b0dd-afb0bb0b1f51	Suspicious Calendar File Modification	medium	needs_events	file: modification
 macos/persistence_suspicious_file_creation_via_pkg_install_script.toml	1955e925-6679-4535-9c1b-28ebf369f35f	Suspicious File Creation via Pkg Install Script	high	sequence	Sequence
-macos/persistence_suspicious_launch_agent_or_launch_daemon.toml	62ba8542-1246-4647-9b84-98aa1bc0760a	Persistence via Suspicious Launch Agent or Launch Daemon	high	needs_fields	needs_fields process.code_signature.signing_id; needs_fields process.code_signature.trusted
+macos/persistence_suspicious_launch_agent_or_launch_daemon.toml	62ba8542-1246-4647-9b84-98aa1bc0760a	Persistence via Suspicious Launch Agent or Launch Daemon	high	needs_fields	needs_fields process.code_signature.trusted
 macos/persistence_via_atom_init_file_modification.toml	b4449455-f986-4b5a-82ed-e36b129331f7	Potential Persistence via Atom Init Script Modification	low	needs_events	file: modification
 macos/privilege_escalation_applescript_with_admin_privs.toml	827f8d8f-4117-4ae4-b551-f56d54b9da6b	Apple Scripting Execution with Administrator Privileges	medium	needs_fields	needs_fields process.Ext.effective_parent.executable; needs_fields process.parent.code_signature.exists; needs_fields process.parent.code_signature.trusted
-macos/privilege_escalation_exploit_adobe_acrobat_updater.toml	f85ce03f-d8a8-4c83-acdc-5c8cd0592be7	Suspicious Child Process of Adobe Acrobat Reader Update Service	high	needs_fields	needs_fields user.name
 macos/privilege_escalation_local_user_added_to_admin.toml	565c2b44-7a21-4818-955f-8d4737967d2e	Potential Admin Group Account Addition	medium	needs_fields	needs_fields process.Ext.effective_parent.executable
 macos/privilege_escalation_parallels_appliance_tar_arg_injection_esql.toml	448dbe05-07b1-46bb-b3e3-ac9790387948	Privilege Escalation via Parallels Appliance Extract Argument Injection	high	not_eql	language esql, type esql
 macos/privilege_escalation_root_crontab_filemod.toml	0ff84c42-873d-41a2-a4ed-08d74d352d01	Privilege Escalation via Root Crontab File Modification	high	needs_events	file: modification
@@ -71,7 +70,6 @@ cross-platform/command_and_control_socks_fortigate_endpoint.toml	6926b708-7964-4
 cross-platform/command_and_control_suricata_elastic_defend_c2.toml	9edd000e-cbd1-4d6a-be72-2197b5625a05	Suricata and Elastic Defend Network Correlation	medium	sequence	Sequence
 cross-platform/command_and_control_uncommon_dns_request_via_bun_or_nodejs.toml	55be0398-e72d-4c02-a916-b11d62af0e29	Uncommon DNS Request via Bun or Node.js	low	not_eql	language kuery, type new_terms
 cross-platform/command_and_control_wget_activity_llm_triage.toml	2fc14da3-03d1-4d8e-b42b-942566bf69b4	LLM-Based Wget Activity Triage	medium	not_eql	language esql, type esql
-cross-platform/credential_access_genai_process_sensitive_file_access.toml	c0136397-f82a-45e5-9b9f-a3651d77e21a	GenAI Process Accessing Sensitive Files	high	needs_fields	needs_fields event.outcome
 cross-platform/credential_access_grep_recursive_credential_discovery.toml	b8e4c2a1-7f3d-4e9b-8c5a-1d0e6f2a4b8c	Potential Credential Discovery via Recursive Grep	high	not_eql	language esql, type esql
 cross-platform/credential_access_multi_cloud_cli_token_harvesting.toml	2b9a3b7a-0891-4a89-abbe-dca753c403cd	Multi-Cloud CLI Token and Credential Access Commands	high	not_eql	language esql, type esql
 cross-platform/credential_access_multiple_files_by_vscode_or_cursor_descendant.toml	f27228e4-0792-4681-a965-9937ed6e4e00	Multiple Credential Access by VS Code or Cursor IDE Descendant	high	not_eql	language esql, type esql

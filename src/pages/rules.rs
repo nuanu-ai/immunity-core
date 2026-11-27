@@ -191,8 +191,8 @@ pub fn page(m: &v1::Rules, status: &v1::Status, now: i64) -> String {
                         names(&b.fields_text),
                     ),
                     (None, said) => format!(
-                        "<li>Checked without an alternative of the upstream rule, left out in translation, {}.</li>\n",
-                        Name::given(said.as_deref().unwrap_or("")).html()
+                        "<li>Checked without an alternative of the upstream rule, left out in translation: {}.</li>\n",
+                        Name::given(&crate::lists::translated(said.as_deref().unwrap_or(""))).html()
                     ),
                 })
                 .collect();
@@ -319,6 +319,15 @@ mod tests {
                         "\"needs_fields process.code_signature.trusted\"",
                     ),
                 ),
+                (
+                    "kinds.yml",
+                    rule(
+                        "00000000-0000-4000-8000-000000000003",
+                        "Invented also about files opened",
+                        signer,
+                        "\"needs_events open\"",
+                    ),
+                ),
             ],
         );
         let on = Arrival::Kept(Some(1));
@@ -402,6 +411,11 @@ mod tests {
         let now = page(&level(sig(on)));
         assert!(!now.contains(said), "{now}");
         assert_eq!(now.matches("No match in the last day.").count(), 1, "{now}");
+        // A kind of event the log does not hold, left out of a rule, is said in words.
+        assert!(
+            now.contains("left out in translation: <bdi class=\"src\">needs events this version does not collect: open</bdi>."),
+            "{now}"
+        );
         // One reason at a time: while file events are not collected, that is the one said.
         let no_files = page(&level_as(RUNNING, false, sig(Arrival::NotKept)));
         assert!(!no_files.contains(said), "{no_files}");

@@ -580,7 +580,7 @@ fn extension(name: &str) -> Option<&str> {
 /// show how Elastic Defend fills it; how Elastic fills `process.name` and `process.command_line`
 /// on macOS is not documented, and these are assumptions, said in `docs/event-level.md`. Every
 /// text is also given folded (`crate::sigma::ECS`). `process.args_count` is a number.
-pub const ECS_FIELDS: [(&str, Take); 11] = [
+pub const ECS_FIELDS: [(&str, Take); 12] = [
     // What Elastic Defend writes for every program start on macOS, as Elastic's rules ask for
     // it: `event.type == "start" and event.action == "exec"`.
     ("event.type", |_| Some("start".into())),
@@ -617,7 +617,18 @@ pub const ECS_FIELDS: [(&str, Take); 11] = [
     ("process.working_directory", |s| s.working_directory.clone()),
     // The effective user id, as text, as Elastic gives it.
     ("user.id", |s| s.user_id.map(|u| u.to_string())),
+    // The name of the same user, `user.id`'s, looked up when the line is read.
+    ("user.name", |s| s.user_id.and_then(user_name)),
 ];
+
+/// The short name of the account with user id `uid`, as Elastic's `user.name` gives it:
+/// `pw_name` in the system's user database, looked up when the log is read, so an account
+/// renamed since is given its new name. None for an id that is no account's, and for one that
+/// is no user id at all, which is never taken for another by wrapping.
+fn user_name(uid: i64) -> Option<String> {
+    let name = crate::service::user_database(u32::try_from(uid).ok()?, |e| e.pw_name)?;
+    String::from_utf8(name).ok()
+}
 
 /// One file created or renamed, as the published rules for file events read it and as a
 /// finding's evidence keeps it: the file, and the program that did it.
@@ -695,7 +706,7 @@ pub const FILE_SIGMA_FIELDS: [(&str, FileTake); 2] = [
 /// a program start. The path is given as Endpoint Security gives it, and only so: the translation
 /// was checked without a second name through macOS's links into `/private`, and Elastic's rules
 /// write `/private/...` where they mean it.
-pub const FILE_ECS_FIELDS: [(&str, FileTake); 8] = [
+pub const FILE_ECS_FIELDS: [(&str, FileTake); 9] = [
     // What Elastic Defend writes for a file created, and for one renamed.
     ("event.type", |f, _| {
         Some(
@@ -717,6 +728,9 @@ pub const FILE_ECS_FIELDS: [(&str, FileTake); 8] = [
             .into(),
         )
     }),
+    // Endpoint Security reports a file created or renamed after it happened, so each such
+    // event is one that succeeded.
+    ("event.outcome", |_, _| Some("success".into())),
     ("file.path", |_, name| Some(name.to_string())),
     ("file.name", |_, name| Some(basename(name).to_string())),
     ("file.extension", |_, name| {

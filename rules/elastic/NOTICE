@@ -1,7 +1,7 @@
 Detection rules for macOS from Elastic's rule set, https://github.com/elastic/detection-rules,
 at commit 032ac5ecb0b4035a12b03dd25164e2fbcfae9fad, translated into Sigma.
 
-Of the 185 rules there that apply to macOS, 66 are here as Sigma files, at the path their
+Of the 185 rules there that apply to macOS, 68 are here as Sigma files, at the path their
 upstream rule has under that repository's `rules/` folder (`macos/` or `cross-platform/`),
 with `.yml` for `.toml`. Each file is a mechanical translation of the upstream rule it names,
 and is not the upstream file. Its `references` link to the upstream file at that commit, and
@@ -15,7 +15,7 @@ this set only in the shape the translator writes, with the record's `severity` e
 rule's `level`.
 
 Each translation was checked against a reference that follows Elasticsearch's documented
-meaning of the upstream query, on 33,969 invented events evaluated by `sigma-rust` 0.7.0, the
+meaning of the upstream query, on 32,417 invented events evaluated by `sigma-rust` 0.7.0, the
 evaluator this program uses, over events built as this program builds them. They disagreed on
 none.
 
@@ -25,7 +25,7 @@ assumption about how Elasticsearch treats a missing field: that a comparison wit
 event does not have is neither true nor false, so its negation does not hold either. The
 translation asks for the field to be present wherever it is negated.
 
-`not-taken.tsv` lists the other 119 rules, each with its upstream path, rule id, name,
+`not-taken.tsv` lists the other 117 rules, each with its upstream path, rule id, name,
 severity, the reason it was not taken and the translation's detail: `sequence` (it correlates
 several events), `not_eql` (it is written in KQL or ES|QL), `needs_events` (it is about events
 this program does not record), `needs_fields` (a part it cannot do without reads a field the

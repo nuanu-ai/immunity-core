@@ -22,4 +22,4 @@ detection:
   s10: {"process.args|contains|cased": ["\u0000/:/hostfs\u0000", "\u0000/:/hostfs/\u0000"]}
   condition: "(s1 and s2 and s3 and s4 and s5 and (((s7 and not s6) or (s7 and not s8)) and ((s7 and not s9) or (s7 and not s10))))"
 level: "high"
-elastic: {"rule_id": "d1f310cb-5921-4d37-bbdf-cfdab7a6df9c", "severity": "high", "risk_score": 73, "query_sha256": "7ea7130c2e0468d3c0641549c8b49957660378eb62a13f097397787f3618b50d", "kinds": ["start"], "in_part_missing_fields": [], "also_asks_events": ["ProcessRollup2", "exec_event", "executed", "process_started"], "null_sensitive": ["process.args"], "folded_fields": []}
+elastic: {"rule_id": "d1f310cb-5921-4d37-bbdf-cfdab7a6df9c", "severity": "high", "risk_score": 73, "query_sha256": "7ea7130c2e0468d3c0641549c8b49957660378eb62a13f097397787f3618b50d", "kinds": ["start"], "in_part_missing_fields": [], "also_asks_events": ["ProcessRollup2", "exec_event", "executed", "process_started", "start"], "null_sensitive": ["process.args"], "folded_fields": []}

@@ -1,0 +1,16 @@
+title: "Suspicious Terminal Child Process Execution"
+id: "8e88d216-af7a-4f5c-8155-fa7d2be03987"
+status: "test"
+description: "Detects the execution of a process in a suspicious location by the Terminal application. Terminal will, often times, be\ngranted full disk access by users and administrators who use it. Threat actors are aware of this and will abuse it in\norder to get their payloads to execute with the same context as Terminal, providing their payload full disk access. They\ndo this by modifying shell profiles (e.g .zshrc, bashrc, etc.) that point to and execute their payload then when\nTerminal initiates those profiles the payload gets executed within the same context as Terminal."
+references: ["https://github.com/elastic/protections-artifacts/blob/a87715d87a2babd51b37ff6c55f104fe7e567911/behavior/rules/macos/execution_suspicious_terminal_child_process_execution.toml"]
+license: "Elastic License v2"
+tags: ["attack.t1059.004"]
+logsource: {"product": "macos", "category": "process_creation"}
+detection:
+  s1: {"user.name|cased": ["root"]}
+  s2: {"process.parent.name": ["terminal"]}
+  s3: {"process.name": ["terminal", "zsh", "bash", "sh", "tclsh*"]}
+  s4: {"process.args|contains|cased": ["\u0000-c\u0000"]}
+  s5: [{"process.args|contains": ["\u0000/private/tmp/", "\u0000/var/tmp/", "\u0000/tmp/", "\u0000/var/folders/", "\u0000/Users/Shared/", "\u0000/Library/Containers/", "\u0000/var/root/", "\u0000/Library/WebServer/", "\u0000/Library/Graphics/", "\u0000/Library/Fonts/", "\u0000/usr/local/bin/"]}, {"immunity.folded.process.args|re": ["(?s)\\x00/users/[^\\x00]*/library/[^\\x00]*\\x00", "(?s)\\x00/users/[^\\x00]*/applications/[^\\x00]*\\x00"]}]
+  condition: "(s1 and s2 and s3 and s4 and s5)"
+elastic: {"rule_id": "8e88d216-af7a-4f5c-8155-fa7d2be03987", "severity": null, "risk_score": null, "query_sha256": "8f0c3b3575f128f30032a4521c9198e2cea832b3c3c633528e3a8a208f0c8b3f", "kinds": ["start"], "in_part_missing_fields": [], "also_asks_events": [], "null_sensitive": [], "folded_fields": ["process.args"], "version": "1.0.21", "actions_ignored": ["kill_process process.entity_id"], "elastic_also_evaluates_on": []}

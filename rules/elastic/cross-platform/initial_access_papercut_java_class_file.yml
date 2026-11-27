@@ -15,4 +15,4 @@ detection:
   s3: {"file.path": ["/opt/papercut/server/lib/*", "/usr/local/papercut/server/lib/*", "/Applications/PaperCut*/server/lib/*"]}
   condition: "(s1 and s2 and s3)"
 level: "critical"
-elastic: {"rule_id": "a2d4508e-e9c2-41f6-9466-0c3aed8cc2c9", "severity": "critical", "risk_score": 99, "query_sha256": "4bb065bcbb27ee4a9eb88970a3bb82d0440b2244f4f5e91697fbd6618a8d58f6", "kinds": ["create"], "in_part_missing_fields": ["backslash_in_wildcard file.path: ?:\\Program Files (x86)\\PaperCut*\\server\\lib\\*", "backslash_in_wildcard file.path: ?:\\Program Files\\PaperCut*\\server\\lib\\*"], "also_asks_events": ["overwrite"], "null_sensitive": [], "folded_fields": []}
+elastic: {"rule_id": "a2d4508e-e9c2-41f6-9466-0c3aed8cc2c9", "severity": "critical", "risk_score": 99, "query_sha256": "4bb065bcbb27ee4a9eb88970a3bb82d0440b2244f4f5e91697fbd6618a8d58f6", "kinds": ["create"], "in_part_missing_fields": ["needs_events overwrite", "backslash_in_wildcard file.path: ?:\\Program Files (x86)\\PaperCut*\\server\\lib\\*", "backslash_in_wildcard file.path: ?:\\Program Files\\PaperCut*\\server\\lib\\*"], "also_asks_events": [], "null_sensitive": [], "folded_fields": []}
