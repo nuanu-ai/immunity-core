@@ -135,6 +135,9 @@ const READY: &str = "ready";
 const UNRECORDED: &str = "unrecorded";
 /// The lock file's third line, with the time after it, while places are left unwatched.
 const UNWATCHED: &str = "unwatched";
+/// The lock file's third line, with when the wait began after it, while the watcher has waited
+/// for the run lock past the time a check may take (`background::LIMIT`).
+const WAITING: &str = "waiting";
 /// The lock file's third line, with the time after it, of a watcher that left because the file it
 /// was started from was replaced.
 const CORE_REPLACED: &str = "core-replaced";
@@ -562,14 +565,16 @@ fn replaced(started: (u64, u64), now: std::io::Result<std::fs::Metadata>) -> boo
 
 /// What a watcher's lock file says of it: it has not completed its first reading; it has, its
 /// latest look left nothing unwatched and every failure since is in the store; its latest look
-/// left places unwatched, since when; or a failure is not in the store, with when the store
-/// refused it and what the store's error said.
+/// left places unwatched, since when; a failure is not in the store, with when the store
+/// refused it and what the store's error said; or it has waited for the run lock past the time a
+/// check may take, since when.
 #[derive(Debug, PartialEq)]
 enum LockState {
     Starting,
     Ready,
     Unwatched { at: i64 },
     Unrecorded { at: i64, said: String },
+    Waiting { at: i64 },
 }
 
 /// The lock file's whole content: the start time, `heartbeat`, and the state on a third line,
@@ -582,6 +587,7 @@ fn lock_text(since: i64, state: &LockState) -> String {
         LockState::Unrecorded { at, said } => {
             format!("{since}\n{HEARTBEAT}\n{UNRECORDED} {at}\n{said}")
         }
+        LockState::Waiting { at } => format!("{since}\n{HEARTBEAT}\n{WAITING} {at}"),
     }
 }
 
@@ -602,12 +608,14 @@ fn read_lock(text: &str) -> Option<(i64, LockState)> {
         [READY] => LockState::Ready,
         // An error that said nothing leaves no fourth line.
         [third, ref said @ ..] if said.len() <= 1 => {
-            match (stamped(third, UNWATCHED), stamped(third, UNRECORDED)) {
-                (Some(at), _) if said.is_empty() => LockState::Unwatched { at },
-                (_, Some(at)) => LockState::Unrecorded {
+            let stamp = |word| stamped(third, word);
+            match (stamp(UNWATCHED), stamp(UNRECORDED), stamp(WAITING)) {
+                (Some(at), ..) if said.is_empty() => LockState::Unwatched { at },
+                (_, Some(at), _) => LockState::Unrecorded {
                     at,
                     said: said.first().copied().unwrap_or_default().to_string(),
                 },
+                (.., Some(at)) => LockState::Waiting { at },
                 _ => LockState::Starting,
             }
         }
@@ -633,6 +641,8 @@ struct Heartbeat<'a> {
     skipped: BTreeSet<&'static str>,
     /// Since when the latest looks at what to watch have left places unwatched.
     unwatched: Option<i64>,
+    /// Since when it has waited for the run lock, once past the time a check may take.
+    waiting: Option<i64>,
     /// Why a rewrite failed; the watcher stops at its next turn.
     broken: Option<String>,
 }
@@ -660,18 +670,20 @@ impl<'a> Heartbeat<'a> {
             unrecorded: BTreeMap::new(),
             skipped: BTreeSet::new(),
             unwatched: None,
+            waiting: None,
             broken: None,
         })
     }
 
-    /// What the file should say now: a failure the store did not take, and places left
-    /// unwatched, each withdraw `ready`.
+    /// What the file should say now: a failure the store did not take, a wait for the run lock
+    /// past the time a check may take, and places left unwatched, each withdraw `ready`.
     fn state(&self) -> LockState {
         match self.unrecorded.values().max_by_key(|(at, _)| *at) {
             Some((at, said)) => LockState::Unrecorded {
                 at: *at,
                 said: said.clone(),
             },
+            None if let Some(at) = self.waiting => LockState::Waiting { at },
             None if !self.read => LockState::Starting,
             None => match self.unwatched {
                 Some(at) => LockState::Unwatched { at },
@@ -685,6 +697,15 @@ impl<'a> Heartbeat<'a> {
     fn left(&mut self, any: bool) {
         if any != self.unwatched.is_some() {
             self.unwatched = any.then(crate::now_secs);
+            let _ = self.write();
+        }
+    }
+
+    /// Whether it has waited for the run lock past the time a check may take, since when:
+    /// said at once when that changes.
+    fn waiting(&mut self, since: Option<i64>) {
+        if since != self.waiting {
+            self.waiting = since;
             let _ = self.write();
         }
     }
@@ -1162,8 +1183,15 @@ impl Watcher<'_> {
     /// The run lock, waited for; `None` when the watcher was stopped, or orphaned, meanwhile,
     /// or stdout is gone. A full run holds the lock for as long as it runs, minutes at times:
     /// meanwhile the watcher refreshes its heartbeat and says it is alive at its usual interval.
+    /// Past the time a check may take, its lock file says it waits, and it is not live.
     fn lock(&mut self) -> std::io::Result<Option<std::fs::File>> {
+        self.lock_from(Instant::now())
+    }
+
+    /// The run lock, for a wait that began at `waiting`, in awake time.
+    fn lock_from(&mut self, waiting: Instant) -> std::io::Result<Option<std::fs::File>> {
         let mut alive = Instant::now() + self.args.alive_every;
+        let since = crate::now_secs();
         loop {
             if STOP.load(Ordering::SeqCst) || self.orphaned() {
                 return Ok(None);
@@ -1172,8 +1200,14 @@ impl Watcher<'_> {
             if !self.progress() {
                 return Ok(None);
             }
+            // Held past the time a check may take, by a check that does not end: no reading
+            // takes place, and the watcher is not live while it waits.
+            if crate::background::expired(waiting, Instant::now()) {
+                self.heartbeat.waiting(Some(since));
+            }
             // Waits a little each time.
             if let Some(lock) = store::lock_run(&self.folder)? {
+                self.heartbeat.waiting(None);
                 self.mark_pending();
                 return Ok(Some(lock));
             }
@@ -1924,6 +1958,7 @@ pub fn basis(conn: &Connection, folder: &Path) -> rusqlite::Result<String> {
         LockState::Ready => "ready",
         LockState::Unwatched { .. } => "unwatched",
         LockState::Unrecorded { .. } => "unrecorded",
+        LockState::Waiting { .. } => "waiting",
     };
     let failed: Vec<String> = failures(conn, &lock)?.into_iter().map(|f| f.what).collect();
     Ok(format!("{since:?} {state} {}", failed.join(",")))
@@ -2186,12 +2221,12 @@ pub fn failures(conn: &Connection, lock: &Lock) -> rusqlite::Result<Vec<Failure>
         return Ok(Vec::new());
     };
     let mut failed = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT what, at, detail FROM watcher_failed AS f WHERE at >= ?1
-             AND NOT (what = ?2 AND EXISTS (SELECT 1 FROM journal
-                 WHERE entry = 'run_finished' AND journal.at > f.at))
+             AND NOT (what = ?2 AND EXISTS (SELECT 1 FROM ({}) c WHERE c.at > f.at))
              ORDER BY what",
-        )?
+            crate::status::FULL_CHECKS
+        ))?
         .query_map(params![since, FULL_CHECK], |r| {
             Ok(Failure {
                 what: r.get(0)?,
@@ -2207,6 +2242,16 @@ pub fn failures(conn: &Connection, lock: &Lock) -> rusqlite::Result<Vec<Failure>
         LockState::Unwatched { at } if !failed.iter().any(|f| f.what == PLACES) => {
             Some((PLACES, *at, UNWATCHED_SAID.to_string()))
         }
+        // The reading it waits to make has not taken place, whatever the store holds.
+        LockState::Waiting { at } => Some((
+            READ,
+            *at,
+            format!(
+                "the watcher has waited for the run lock since {}, longer than a full check may take ({} minutes), so no reading has taken place since",
+                crate::view::utc(*at),
+                crate::background::LIMIT.as_secs() / 60
+            ),
+        )),
         _ => None,
     };
     if let Some((what, at, detail)) = said {
@@ -2532,6 +2577,7 @@ mod tests {
                 at: 18,
                 said: String::new(),
             },
+            LockState::Waiting { at: 18 },
         ] {
             assert_eq!(read_lock(&lock_text(17, &state)), Some((17, state)));
         }
@@ -2674,6 +2720,56 @@ mod tests {
         });
         let failed = told.unwrap().failed.into_iter();
         failed.map(|f| (f.what, f.detail_text)).collect()
+    }
+
+    #[test]
+    fn a_watcher_waiting_for_the_run_lock_longer_than_a_check_may_take_is_not_live_until_it_has_it()
+    {
+        // A check that does not end holds the run lock, and no reading takes place. A wait as
+        // long as an ordinary check is no fault, and a wait past `background::LIMIT` is.
+        let (dir, lock) = held("watch-waits-for-the-run-lock");
+        let args = args_in(&dir);
+        let mut w = ready(&args, &lock);
+        let file = || std::fs::read_to_string(dir.join(store::WATCH_LOCK)).unwrap();
+        let limit = crate::background::LIMIT;
+        for waited in [limit - Duration::from_secs(60), limit] {
+            let check = store::lock_run(&dir).unwrap().unwrap();
+            let began = Instant::now().checked_sub(waited).unwrap();
+            let seen = std::thread::scope(|s| {
+                let seen = s.spawn(|| {
+                    // Long enough to see a wait past the limit said, short for one that is not.
+                    let end = Instant::now() + Duration::from_secs(2);
+                    let mut seen = None;
+                    while seen.is_none() && Instant::now() < end {
+                        if file().contains("\nwaiting ") {
+                            let conn = store::open_read_only(&args.store).unwrap();
+                            seen = Some((watching_live(&dir), told(&conn, &dir)));
+                        }
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    crate::common::release(check);
+                    seen
+                });
+                assert!(w.lock_from(began).unwrap().is_some());
+                seen.join().unwrap()
+            });
+            match waited < limit {
+                true => assert_eq!(seen, None),
+                false => {
+                    let (live, told) = seen.unwrap();
+                    assert!(!live);
+                    assert_eq!(told.len(), 1, "{told:?}");
+                    assert_eq!(told[0].0, READ);
+                    assert!(told[0].1.contains("waited for the run lock"), "{told:?}");
+                }
+            }
+            // Once it has the lock, the wait is over.
+            assert!(
+                file().ends_with("\nready") && watching_live(&dir),
+                "{}",
+                file()
+            );
+        }
     }
 
     #[test]
@@ -3452,9 +3548,14 @@ mod tests {
             let conn = store::open(&store_path).unwrap();
             store::journal_note(&conn, t, id, "run_finished", "").unwrap();
         };
-        // A check that finished before it, or in the same second, does not end it.
+        // A check that finished before it, or in the same second, does not end it, nor does a
+        // run after it told to read less than a full check reads.
         finished(at - 100, "before");
         finished(at, "same-second");
+        let conn = store::open(&store_path).unwrap();
+        store::journal_note(&conn, at + 1, "narrowed", "run_narrowed", "").unwrap();
+        drop(conn);
+        finished(at + 1, "narrowed");
         assert_eq!(standing(), [EVENTS, FULL_CHECK]);
         // A check by hand finished after it: the failure is over, and only that one.
         finished(at + 1, "by-hand");

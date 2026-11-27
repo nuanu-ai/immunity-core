@@ -128,13 +128,16 @@ CREATE TABLE raw_input (
 
 /// What the journal records: the words `journal_entry` is seeded with. A new kind of entry is a new
 /// word here, which a store of this format learns at its next open, as it learns any vocabulary.
-const JOURNAL_ENTRIES: [&str; 26] = [
+const JOURNAL_ENTRIES: [&str; 27] = [
     "run_started",
     "added",
     "changed",
     "removed",
     "report",
     "run_finished",
+    // A run told to read less than a full check reads, with what it did not read: it is not a
+    // full check (`status::FULL_CHECKS`).
+    "run_narrowed",
     "owner_said",
     "owner_withdrew",
     "threat_added",

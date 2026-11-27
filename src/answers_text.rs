@@ -1408,7 +1408,7 @@ pub fn vulnerability(m: &v1::Vulnerability, screen: &Screen) -> String {
         Some(true) => ("used in attacks", RED.bold()),
         Some(false) => ("not on the list of those used in attacks", PLAIN),
         None => (
-            "whether it is used in attacks is not known: the list was not read",
+            "whether it is used in attacks is not known: the list was not read or is not current",
             YELLOW,
         ),
     };
