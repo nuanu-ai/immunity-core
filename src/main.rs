@@ -1597,7 +1597,7 @@ fn write_view(store: &Path, if_stale: bool) -> Result<Vec<PathBuf>, Box<dyn Erro
         // Taken before the pages are read: a basis also names what is not in the store, the
         // watcher's lock, so the pages hold at least what it names and a watcher that stops
         // meanwhile moves the basis of the next look.
-        let (basis, events_basis) = (view::basis(tx, &folder)?, events::basis(tx)?);
+        let (basis, events_basis) = (view_basis(tx, &folder)?, events::basis(tx)?);
         // The pages are drawn from what the commands answer, built here from this one read:
         // `immunity status`, `immunity findings` with each finding a page opens as `immunity
         // finding` gives it, and `immunity rules` of the event level the status rests on.
@@ -1608,7 +1608,7 @@ fn write_view(store: &Path, if_stale: bool) -> Result<Vec<PathBuf>, Box<dyn Erro
         let all = !matches!(current, Current::Events(_));
         let answers = view::Answers {
             findings: finding_answer::list_of(tx, &found, now)?,
-            finding: Box::new(|id| finding_answer::of(tx, &found, id, now)),
+            finding: Box::new(|id| Ok(finding_answer::of(tx, &found, id, now)?)),
             rules: rules_answer(level, result.store_id.clone(), true, now),
             statements: owner::statements(tx, now)?,
             machine: Box::new(|id, files_anywhere| {
@@ -1620,7 +1620,7 @@ fn write_view(store: &Path, if_stale: bool) -> Result<Vec<PathBuf>, Box<dyn Erro
         };
         let pages = match current {
             Current::Events(_) => view::event_pages(&result, &answers, now)?,
-            _ => view::pages(tx, &result, &answers, &store.display().to_string(), now)?,
+            _ => view::pages(&result, &answers, now)?,
         };
         // The time until which the headline drawn can stand: the status is fresh until its
         // check is older than `FRESH_FOR`. One already stale stays so.
@@ -1651,6 +1651,10 @@ fn write_view(store: &Path, if_stale: bool) -> Result<Vec<PathBuf>, Box<dyn Erro
         Current::No => {}
     }
     std::fs::write(folder.join(happens::SCRIPT_FILE), happens::SCRIPT)?;
+    // Every page is written: what the previous full write listed and this one did not write
+    // goes, by the manifest it left; without one, nothing does.
+    let previous = open::read(&folder.join(view::MADE), open::Reach::Own, open::UNCAPPED);
+    view::remove_stale(&folder, &previous.unwrap_or_default(), &names);
     // Last, so that pages cut short by a failure are never named as current.
     let made = serde_json::json!({
         "basis": basis,
@@ -1713,13 +1717,55 @@ fn current_view(
         }
         paths.push(path);
     }
-    if view::basis(tx, &folder)? != basis {
+    if view_basis(tx, &folder)? != basis {
         return Ok(Current::No);
     }
     if made["events"].as_str() != Some(events::basis(tx)?.as_str()) {
         return Ok(Current::Events(paths));
     }
     Ok(Current::Yes(paths))
+}
+
+/// What the pages rest on that changes without the clock: the journal's latest entry (every
+/// change, finding raised or answered, owner's word, run and reading of threat data), what
+/// each latest reading covered, the watcher that holds the store and what failed in it, and
+/// the program that writes the pages. Equal bases make the same pages, but for the time
+/// they were made, the latest sample's counts, and what the event level records, which pages
+/// show with their time. What the event level records has a basis of its own,
+/// `events::basis`, kept beside this one in `view::MADE`: when only it moved, the pages that
+/// show it are written again (`view::event_pages`). Cheap: a lookup by key, the latest readings
+/// and a lock.
+fn view_basis(conn: &rusqlite::Connection, folder: &Path) -> Result<String, Box<dyn Error>> {
+    use rusqlite::OptionalExtension;
+    use std::hash::{Hash, Hasher};
+    // The latest journal entry but a `matched` one, which says a published rule matched in a
+    // reading: what it counts is the event level's and moves `events::basis`, and no page shows
+    // the entry itself. A match that raises or reopens a finding writes the finding's own entry
+    // in the same transaction, which moves this. Walked from the newest, so a run of `matched`
+    // entries is skipped, not the journal scanned.
+    let journal: i64 = conn
+        .query_row(
+            "SELECT seq FROM journal WHERE entry != 'matched' ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?
+        .unwrap_or(0);
+    // A reading's time and id are new at every reading; what it covered is not.
+    let mut covered = std::collections::hash_map::DefaultHasher::new();
+    for l in covered::latest_coverage(conn)? {
+        (l.reader, l.scope, l.kind, l.completeness, l.reason, l.cause).hash(&mut covered);
+    }
+    let watcher = watch::basis(conn, folder)?;
+    let program = std::env::current_exe()?;
+    let meta = std::fs::metadata(&program)?;
+    Ok(format!(
+        "journal {journal}; covered {:016x}; watcher {watcher}; program {} {} {:?}",
+        covered.finish(),
+        program.display(),
+        meta.len(),
+        meta.modified()?
+    ))
 }
 
 /// One server as `immunity servers` lists it.
@@ -2542,7 +2588,7 @@ fn run(args: &Args) -> Result<(String, Rows), Box<dyn Error>> {
     };
     let summary = status::summary(&tx, mark, &home)?;
     // What needs a look is counted by the code `immunity status` counts it with, at the run's time.
-    let latest = view::latest_coverage(&tx)?;
+    let latest = covered::latest_coverage(&tx)?;
     let problems = status::problems(&tx, &latest)?;
     let needs = findings::needs(&tx, at)?;
     // What is not covered is one clause, never a count of things to look at, with the event level
@@ -5776,14 +5822,7 @@ fn summary_sentences(s: &status::Summary) -> String {
         ));
     }
     if t.not_repeated > 0 {
-        gaps.push(format!(
-            "{} not repeated",
-            things(
-                t.not_repeated,
-                "earlier reading was",
-                "earlier readings were"
-            )
-        ));
+        gaps.push(overview::not_repeated(t.not_repeated as u64));
     }
     if !gaps.is_empty() {
         let gaps = gaps.join("; ");
@@ -6205,7 +6244,7 @@ mod tests {
         );
         // The answer about projects is not all, and why, in the class the status tells it by.
         let found =
-            covered::projects_found(&view::latest_coverage(&tx).unwrap(), Some("machine:mac"));
+            covered::projects_found(&covered::latest_coverage(&tx).unwrap(), Some("machine:mac"));
         assert!(!found.all);
         assert_eq!(found.cause, contract::v1::Cause::NotGiven as i32);
         assert_eq!(

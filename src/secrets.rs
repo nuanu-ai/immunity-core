@@ -291,7 +291,7 @@ impl Name {
 
     /// Inside an attribute's double quotes on a page: the entities of its shown form.
     pub fn attr(&self) -> String {
-        crate::view::esc_said(&self.shown())
+        crate::view::esc(&self.shown())
     }
 }
 
@@ -345,7 +345,14 @@ fn bare(mut shown: String) -> String {
 /// its own, `<bdi class="src">`, so a tag in it is shown as text and right-to-left letters in it
 /// never reorder the core's words around it. The core's own words are never inside one.
 fn html(shown: &str) -> String {
-    format!("<bdi class=\"src\">{}</bdi>", crate::view::esc_said(shown))
+    format!("<bdi class=\"src\">{}</bdi>", crate::view::esc(shown))
+}
+
+/// Names and what their sources said, already printed for a sentence (`quoted`), such as the
+/// part of a fault line the terminal sets after the core's words, on a page: in one element of
+/// its own, as `html` sets one name.
+pub fn quoted_html(quoted: &str) -> String {
+    html(quoted)
 }
 
 /// One text cut by `set`, or withheld whole without one.

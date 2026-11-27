@@ -8,11 +8,12 @@
 
 use crate::contract::v1;
 use crate::status::{self, Catalogue, Problems};
-use crate::view::Latest;
 use crate::{autorun, findings, guarded, integrity, resolver, servers, store, watched};
 use rusqlite::{Connection, OptionalExtension, params};
 use std::collections::{BTreeMap, BTreeSet};
 
+mod latest;
+pub use latest::{Latest, latest_coverage};
 mod watched_kinds;
 pub use watched_kinds::{kinds_read_by, watched_message};
 

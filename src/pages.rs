@@ -11,21 +11,21 @@
 //! Every link on the summary leads to a section that lists exactly what its label says,
 //! under a heading that says it, first thing on arrival.
 //!
-//! The band, the footer, the table of findings (`findings_table.rs`) and the page of rules
-//! (`rules.rs`) are drawn from the messages the commands answer (`view::Answers`), and print
-//! names and text from a source through `secrets::Name` and `secrets::Said`. Text the rest reads
-//! from the store goes through `esc`, as on every page of the view.
+//! Every page is drawn from the messages the commands answer (`view::Answers` and the status),
+//! and prints names and text from a source through `secrets::Name` and `secrets::Said` alone;
+//! `esc` is for the core's own words, as on every page of the view.
 
 pub(crate) mod beyond;
+pub(crate) mod coverage;
 pub(crate) mod findings_table;
 pub(crate) mod rules;
 pub(crate) mod this_mac;
 pub(crate) mod vulnerabilities;
 
 use crate::contract::v1;
-use crate::covered::{self, Count, YOU};
+use crate::covered::{self, Count, Latest, YOU};
 use crate::secrets::{Name, Said};
-use crate::view::{self, DETAILS, FOOT, Latest, Out, counted, esc, esc_said, utc};
+use crate::view::{self, DETAILS, FOOT, Out, counted, esc, utc};
 use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt::Write;
@@ -45,6 +45,10 @@ const RULES_TITLE: &str = "Published rules";
 pub(crate) const THREAT_DATA_TITLE: &str = "Threat data";
 pub const TECHNICAL: &str = "technical";
 pub const VULNERABILITIES: &str = "vulnerabilities";
+/// What was read and how completely, from the coverage summary of the status.
+pub const COVERAGE: &str = "coverage";
+/// The heading of that page, which the link to it is named by.
+const COVERAGE_TITLE: &str = "What was read and how completely";
 
 /// The link back to the summary, on every page of details.
 const BACK: &str = "<nav class=\"meta\"><a href=\"../view.html\">← What needs a look</a></nav>\n";
@@ -240,8 +244,13 @@ pub(crate) fn band(r: &v1::Status) -> (Option<String>, String) {
     let faults = (told.faults.iter())
         .map(|f| {
             let (words, said, tail, c, advice) = f.parts();
+            // What a source said, through the printer; the core's own words in its place as words.
             let said = said.map_or(String::new(), |s| {
-                format!(": <span class=\"said\">{}</span>", esc_said(s))
+                let s = match f.said_is_ours() {
+                    true => esc(s),
+                    false => crate::secrets::quoted_html(s),
+                };
+                format!(": <span class=\"said\">{s}</span>")
             });
             let advice = advice.map_or(String::new(), |a| {
                 format!("<span class=\"advice\">{}</span>", esc(a))
@@ -720,11 +729,12 @@ fn uncovered(out: &mut String, u: &v1::Uncovered) -> Out {
 /// At most this many readings are named under a list that is not whole.
 const GAPS_SHOWN: usize = 3;
 
-/// What a list cannot claim, from the latest readings that fill it: `None` when there is at
-/// least one and every one is full and fresh, that is taken by the latest check and dated no
-/// later than now (`store::age`); else a sentence naming each one that is not, with why and
-/// when it was last read in full, and `extra`, what else the list rests on that is not current.
-/// A list states that nothing is there only when this is `None` (`absent`).
+/// What a list cannot claim, as safe HTML, from the latest readings that fill it: `None` when
+/// there is at least one and every one is full and fresh, that is taken by the latest check and
+/// dated no later than now (`store::age`); else a sentence naming each one that is not, with why
+/// and when it was last read in full, and `extra`, what else the list rests on that is not
+/// current, each already safe HTML. A list states that nothing is there only when this is `None`
+/// (`absent`).
 fn unread(
     readings: &[&Latest],
     latest_run: Option<i64>,
@@ -739,14 +749,14 @@ fn unread(
         .map(|r| {
             let why = match (r.completeness.as_str(), r.reason.as_deref()) {
                 ("full", _) => "not read at the latest check".to_string(),
-                // What the reader's source said: cut, as every such text where it is printed.
-                (_, Some(reason)) => view::said(reason),
+                // What the reader's source said, given whole: cut where it is printed.
+                (_, Some(reason)) => Said::of(reason).html(),
                 (_, None) => "not read in full".to_string(),
             };
             let last = r.last_full.map_or("never read in full".to_string(), |at| {
                 format!("last read in full {}", utc(at))
             });
-            format!("{} ({why}; {last})", r.kind)
+            format!("{} ({why}; {last})", esc(&r.kind))
         })
         .filter(|s| seen.insert(s.clone()))
         .collect();
@@ -767,14 +777,14 @@ fn unread(
     })
 }
 
-/// Writes what a list rests on when it is not whole, and, for an empty list, that nothing is
-/// there only when it is (`unread`).
+/// Writes what a list rests on when it is not whole, as safe HTML, and, for an empty list, that
+/// nothing is there only when it is (`unread`).
 fn coverage_of_list(out: &mut String, unread: Option<&str>, empty: bool, absent: &str) {
     match unread {
-        // What `unread` says, which holds what sources said, cut.
+        // What `unread` says, whose sources' words went through the printer.
         Some(said) => {
             out.push_str("<p class=\"muted\">");
-            out.push_str(&esc_said(said));
+            out.push_str(said);
             out.push_str("</p>\n");
         }
         None if empty => {
@@ -814,12 +824,9 @@ pub fn technical() -> String {
     out.push_str(&format!(
         "<li><a href=\"{THREAT_DATA}.html\">{THREAT_DATA_TITLE}: every source of known vulnerabilities, and the list of those used in attacks</a></li>\n"
     ));
-    for (name, title) in view::DETAIL_PAGES {
-        out.push_str(&format!(
-            "<li><a href=\"{name}.html\">{}</a></li>\n",
-            esc(title)
-        ));
-    }
+    out.push_str(&format!(
+        "<li><a href=\"{COVERAGE}.html\">{COVERAGE_TITLE}: every kind of reading that was not full, with why</a></li>\n"
+    ));
     out.push_str("</ul>\n</section>\n");
     out.push_str(FOOT);
     out
@@ -1140,7 +1147,11 @@ mod tests {
                         if c.is_some() { "§c" } else { "" },
                         if advice.is_some() { "§a" } else { "" },
                     );
-                    (text, from.map(esc_said), c.map(esc), advice.map(esc))
+                    let from = from.map(|s| match f.said_is_ours() {
+                        true => esc(s),
+                        false => crate::secrets::quoted_html(s),
+                    });
+                    (text, from, c.map(esc), advice.map(esc))
                 })
                 .collect();
             assert_eq!(faults, wanted, "{page}");
@@ -1264,8 +1275,6 @@ mod tests {
     /// only, and stay text.
     #[test]
     fn every_thing_not_covered_is_on_the_pages_once_a_fault_in_its_section_a_limit_at_the_end() {
-        let dir = crate::common::Scratch::new("pages-once");
-        let conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
         let now = 1_800_000_000;
         let mut r = v1::Status {
             answered_at: now,
@@ -1284,7 +1293,7 @@ mod tests {
             for u in &mut r.not_covered {
                 u.fault = (u.class == v1::Cause::Failed as i32) != flip;
             }
-            let pages = view::pages(&conn, &r, &view::Answers::none(), "store.db", now).unwrap();
+            let pages = view::pages(&r, &view::Answers::none(), now).unwrap();
             let page = |name: &str| &pages.iter().find(|(n, _)| n == name).unwrap().1;
             let summary = page(view::SUMMARY);
             let limits = section_of(summary, crate::not_read_here::ANCHOR);

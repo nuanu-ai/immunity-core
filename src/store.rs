@@ -1409,29 +1409,16 @@ pub fn put_coverage(
 
 // --- Folding the history of readings. ---
 
-/// How many runs the changes page lists, each with every reading it made.
+/// How many of the latest runs the fold keeps whole, each with every reading it made.
 pub const RUNS_KEPT: i64 = 20;
 
-/// One run the changes page lists.
-pub struct Listed {
-    pub run_id: String,
-    /// When it began: its earliest journal entry.
-    pub at: i64,
-    pub finished: bool,
-    /// The report line of a full run that finished.
-    pub report: Option<String>,
-}
-
-/// The runs a page or an answer asks about by their id, newest first: the last `RUNS_KEPT`
-/// the journal holds, which the changes page lists. A run is what the journal says started as
-/// one, a watcher's reading or a sample; an answer, a statement or a verdict is not a run,
-/// whatever its id. The fold keeps every reading of each of them (`kept_from`).
-pub fn listed_runs(conn: &Connection) -> rusqlite::Result<Vec<Listed>> {
+/// The runs the fold keeps whole, by their id, newest first: the last `RUNS_KEPT` the journal
+/// holds. A run is what the journal says started as one, a watcher's reading or a sample; an
+/// answer, a statement or a verdict is not a run, whatever its id. The fold keeps every reading
+/// of each of them (`kept_from`).
+pub fn listed_runs(conn: &Connection) -> rusqlite::Result<Vec<String>> {
     conn.prepare(
-        "SELECT run_id, MIN(at),
-                MAX(entry = 'run_finished'),
-                MAX(CASE WHEN entry = 'report' THEN text END)
-         FROM journal WHERE entry NOT IN ('owner_said', 'owner_withdrew')
+        "SELECT run_id FROM journal WHERE entry NOT IN ('owner_said', 'owner_withdrew')
          GROUP BY run_id
          HAVING MAX(entry = 'run_started') OR run_id LIKE ?2 OR run_id LIKE ?3
          ORDER BY MAX(seq) DESC LIMIT ?1",
@@ -1442,14 +1429,7 @@ pub fn listed_runs(conn: &Connection) -> rusqlite::Result<Vec<Listed>> {
             format!("{}%", crate::watch::RUN_PREFIX),
             format!("{}%", crate::processes::RUN_PREFIX)
         ],
-        |r| {
-            Ok(Listed {
-                run_id: r.get(0)?,
-                at: r.get(1)?,
-                finished: r.get(2)?,
-                report: r.get(3)?,
-            })
-        },
+        |r| r.get(0),
     )?
     .collect()
 }
@@ -1471,11 +1451,7 @@ fn kept_from(conn: &Connection) -> rusqlite::Result<Option<i64>> {
         .optional()?;
     let mut first = conn.prepare("SELECT MIN(id) FROM coverage WHERE run_id = ?1")?;
     let mut from = None;
-    for run in listed_runs(conn)?
-        .into_iter()
-        .map(|l| l.run_id)
-        .chain(finished)
-    {
+    for run in listed_runs(conn)?.into_iter().chain(finished) {
         let id: Option<i64> = first.query_row([run], |r| r.get(0))?;
         from = from.into_iter().chain(id).min();
     }
@@ -2788,7 +2764,7 @@ mod tests {
         }
         let answers = |k: &Kept| {
             let c = &k.conn;
-            let latest: Vec<_> = crate::view::latest_coverage(c)
+            let latest: Vec<_> = crate::covered::latest_coverage(c)
                 .unwrap()
                 .into_iter()
                 .map(|l| {
@@ -2805,7 +2781,7 @@ mod tests {
                 })
                 .collect();
             let problems =
-                crate::status::problems(c, &crate::view::latest_coverage(c).unwrap()).unwrap();
+                crate::status::problems(c, &crate::covered::latest_coverage(c).unwrap()).unwrap();
             let unreached: Vec<_> = problems
                 .unreached
                 .iter()
@@ -2921,7 +2897,7 @@ mod tests {
         .unwrap();
         tx.commit().unwrap();
         let answers = |k: &Kept| {
-            let last_full = crate::view::latest_coverage(&k.conn)
+            let last_full = crate::covered::latest_coverage(&k.conn)
                 .unwrap()
                 .into_iter()
                 .find(|l| l.scope == server)
@@ -3037,9 +3013,9 @@ mod tests {
 
     #[test]
     fn the_runs_kept_whole_and_the_latest_finished_keep_every_reading_they_made() {
-        // The changes page and `immunity status` ask what each of these runs read: a run in the
-        // middle of unchanged readings still read them, and is never shown as having read
-        // nothing or everything.
+        // The fold keeps every reading of these runs, and `immunity status` asks what the latest
+        // finished one read: a run in the middle of unchanged readings still read them, and is
+        // never shown as having read nothing or everything.
         let mut k = Kept::new("window");
         let readings = [
             ("brew", MAC, BREW, failed("no output")),

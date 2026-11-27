@@ -86,8 +86,8 @@ impl Estate {
             "{}",
             String::from_utf8_lossy(&out.stderr)
         );
-        // The run's line, as the journal keeps it and the page of changes shows it for each run;
-        // what a person reads after a run is told from the status (`after_run.rs`).
+        // The run's line, as the journal keeps it; what a person reads after a run is told from
+        // the status (`after_run.rs`).
         self.db()
             .query_row(
                 "SELECT text FROM journal WHERE entry = 'report' ORDER BY seq DESC LIMIT 1",
