@@ -525,9 +525,9 @@ fn finding_body(
 
 /// What the findings of a row of several say. What every one of them says alike, once: its facts
 /// on the left, its voices on the right. Then each finding on a line of its own, every one, in the
-/// row's order: where it is, the command that reads it by its id, and what it says that the others
-/// do not, its answer through an agent or its time to expect among them. Under them, when the
-/// first was first seen and the last last seen.
+/// order of where they are, so a person finds a project or a file: where it is, the command that
+/// reads it by its id, and what it says that the others do not, its answer through an agent or its
+/// time to expect among them. Under them, when the first was first seen and the last last seen.
 fn group_body(
     out: &mut String,
     members: &[Listed],
@@ -557,19 +557,23 @@ fn group_body(
         "<div class=\"in\"><p class=\"wsh2\">In {}, one finding each</p>\n<ul>",
         counted(members.len() as i64, one, many)
     )?;
-    for (k, (m, (own_facts, own_voices))) in members.iter().zip(&all).enumerate() {
-        // The first is the row's own, by the row's id.
-        let id = match k {
-            0 => String::new(),
-            _ => format!(" id=\"{}\"", m.anchor()),
+    let place = |m: &Listed<'_>| -> String {
+        let place = Some(m.l.where_text.as_str()).filter(|w| !w.is_empty());
+        place.unwrap_or(&m.r.about_text).to_string()
+    };
+    let mut lines: Vec<_> = members.iter().zip(&all).collect();
+    lines.sort_by_key(|(m, _)| (place(m), m.r.id.as_str()));
+    for (m, (own_facts, own_voices)) in lines {
+        // The row's own finding is reached by the row's id.
+        let id = match m.r.id == members[0].r.id {
+            true => String::new(),
+            false => format!(" id=\"{}\"", m.anchor()),
         };
-        let place = Some(m.l.where_text.as_str())
-            .filter(|w| !w.is_empty())
-            .unwrap_or(&m.r.about_text);
+        let place = place(m);
         write!(
             out,
             "<li{id}><span class=\"p\">{}</span>{}",
-            Name::given(place).html(),
+            Name::given(&place).html(),
             command(&m.r.id)
         )?;
         let own_facts: Vec<&Fact> = (own_facts.iter()).filter(|f| !facts.contains(f)).collect();
@@ -1340,7 +1344,11 @@ mod tests {
         let rows = rows(&page);
         assert_eq!(rows.len(), 2, "{rows:?}");
         let ids: Vec<String> = (0..n).map(|k| format!("f{k}")).collect();
-        assert_eq!(rows[0], ids);
+        let mut drawn = rows[0].clone();
+        drawn.sort();
+        let mut all = ids.clone();
+        all.sort();
+        assert_eq!(drawn, all);
         assert!(
             page.contains("<span class=\"fc\">300 projects</span>"),
             "{page}"
@@ -1349,6 +1357,24 @@ mod tests {
             let command = format!("immunity finding {id} --json</span>");
             assert_eq!(page.matches(&command).count(), 1, "{id}");
         }
+    }
+
+    #[test]
+    fn the_lines_of_a_row_of_several_are_in_the_order_of_where_each_finding_is() {
+        // A person looks for a project by its name: the lines follow the text of where each
+        // finding is, whatever order the ids and the answer give them, and each keeps its id.
+        let all = vec![
+            package("f1", "dev/cart"),
+            package("f2", "dev/shop"),
+            package("f3", "dev/api"),
+        ];
+        let page = drawn_with(all, Vec::new());
+        let places: Vec<&str> = (page.split("<span class=\"p\"><bdi class=\"src\">~/dev/"))
+            .skip(1)
+            .map(|l| &l[..l.find('/').unwrap()])
+            .collect();
+        assert_eq!(places, ["api", "cart", "shop"], "{page}");
+        assert_eq!(rows(&page), [["f1", "f3", "f2"]], "{page}");
     }
 
     #[test]
