@@ -1,9 +1,10 @@
 //! The pages a person lands on: the summary, which answers what the app answers; what is
 //! watched on this Mac, kind by kind; and what is beyond it. Every sentence is in plain
 //! words: what something means for the owner, and whether he can do something about it.
-//! The summary says a state and its faults at the top, as the default status decides them
-//! (`overview::told`); what is read, in the table, a row drawn as a fault only by a fault of the
-//! status; and every limit of this version here once, collapsed, at its end (`not_read_here.rs`).
+//! The summary says a state at the top, and counts what could not be read, as the default status
+//! decides them (`overview::told`); what is read, in the table, a row drawn as a fault only by a
+//! fault of the status; each thing that could not be read in full, once, in its own section; and
+//! every limit of this version here once, collapsed, at its end (`not_read_here.rs`).
 //! Whether a thing not covered is a fault or a limit is the status's word (`Uncovered.fault`):
 //! the pages decide neither. The other pages are reached from the links at the bottom of the
 //! summary.
@@ -18,12 +19,14 @@
 pub(crate) mod beyond;
 pub(crate) mod coverage;
 pub(crate) mod findings_table;
+mod not_read;
 pub(crate) mod rules;
 pub(crate) mod this_mac;
 pub(crate) mod vulnerabilities;
 
 use crate::contract::v1;
-use crate::covered::{self, Count, Latest, YOU};
+use crate::covered::{self, Count, Latest};
+use crate::overview::Of;
 use crate::secrets::{Name, Said};
 use crate::view::{self, DETAILS, FOOT, Out, counted, esc};
 use std::collections::BTreeSet;
@@ -92,10 +95,11 @@ fn grouped(n: i64) -> String {
 
 /// The summary page, a report read from the top: the state in the panel's words, with one line
 /// on what it rests on; the findings as a table, open, answered and all, each row opening in
-/// place to its evidence as `immunity finding` gives it; what is watched, area by area, with its
+/// place to its evidence as `immunity finding` gives it; what is read, area by area, with its
 /// state and when it was last read; "As it happens", every program start checked against
-/// published rules (`happens.rs`); the faults the person can fix; once, collapsed, what this
-/// version does not read here (`not_read_here.rs`); and a line of links to the other pages.
+/// published rules (`happens.rs`); each thing that could not be read, in full (`not_read`); once,
+/// collapsed, what this version does not read here (`not_read_here.rs`); and a line of links to
+/// the other pages.
 /// Drawn from what the commands answer alone, the status first, so the two agree.
 pub fn summary(
     r: &v1::Status,
@@ -104,13 +108,12 @@ pub fn summary(
 ) -> Result<String, Box<dyn Error>> {
     let mut out = view::head("What needs a look").replacen("<body>", "<body class=\"summary\">", 1);
     // Whether a thing not covered is a fault or a limit is the status's word.
-    let (faults, limits): (Vec<&v1::Uncovered>, Vec<&v1::Uncovered>) =
-        r.not_covered.iter().partition(|u| u.fault);
+    let limits: Vec<&v1::Uncovered> = r.not_covered.iter().filter(|u| !u.fault).collect();
     state(&mut out, r, now)?;
     findings_table::table(&mut out, answers, now)?;
-    watched_table(&mut out, r, &faults, now)?;
+    watched_table(&mut out, r, now)?;
     crate::happens::draw(&mut out, r, &answers.rules, &answers.findings, now)?;
-    you_can_fix(&mut out, &fixable(&faults))?;
+    not_read::section(&mut out, r)?;
     crate::not_read_here::section(&mut out, &limits)?;
     links(&mut out, r, now)?;
     out.push_str(FOOT);
@@ -152,9 +155,10 @@ fn needs_you(urgent: u64, total: u64) -> String {
 
 /// The state band: the glyph and the headline in the panel's words, then one short line: this
 /// Mac's name as data, why the headline cannot say more when it cannot, the state the terminal
-/// says under its headline, the last full check and when the page was made; under it every
-/// fault the terminal lists (`band`). All of it is the status's: the findings counted as it
-/// counts them, each of a pair one. A state the page cannot work out is said as not known,
+/// says under its headline, the last full check and when the page was made; under it each fault
+/// of Immunity Core's own work, and, while something could not be read, one line that counts it
+/// and leads to where each is told (`band`). All of it is the status's: the findings counted as
+/// it counts them, each of a pair one. A state the page cannot work out is said as not known,
 /// never as calm.
 fn state(out: &mut String, r: &v1::Status, now: i64) -> Out {
     let m = r.this_mac.clone().unwrap_or_default();
@@ -201,8 +205,12 @@ fn state(out: &mut String, r: &v1::Status, now: i64) -> Out {
     // Its name now, which can differ from the one in its id.
     let mut parts: Vec<String> = m.name_text.iter().map(|n| Name::given(n).html()).collect();
     parts.extend(why);
-    let (said, faults) = band(r);
-    parts.extend(said);
+    let Band {
+        state,
+        faults,
+        unread,
+    } = band(r);
+    parts.extend(state);
     parts.push(match m.checked_at {
         Some(t) => format!("last check {}", view::when(t, now)),
         None => "no full check yet".to_string(),
@@ -211,9 +219,12 @@ fn state(out: &mut String, r: &v1::Status, now: i64) -> Out {
     if r.running {
         parts.push("a check was running".to_string());
     }
+    let lines: String = (faults.into_iter().chain(unread))
+        .map(|line| format!("{line}\n"))
+        .collect();
     writeln!(
         out,
-        "<section id=\"this-mac\">\n{glyph}\n<div>\n<h1>{headline}</h1>\n<p class=\"sub\">{}</p>\n{faults}</div>\n</section>",
+        "<section id=\"this-mac\">\n{glyph}\n<div>\n<h1>{headline}</h1>\n<p class=\"sub\">{}</p>\n{lines}</div>\n</section>",
         parts.join(" · ")
     )?;
     Ok(())
@@ -226,44 +237,77 @@ const TERMINAL: crate::screen::Screen = crate::screen::Screen {
     width: None,
 };
 
+/// What the band says under its headline: the state, for the line under it; each fault of
+/// Immunity Core's own work, a line of its own; and the line that counts what could not be read,
+/// while something could not.
+pub(crate) struct Band {
+    pub(crate) state: Option<String>,
+    pub(crate) faults: Vec<String>,
+    pub(crate) unread: Option<String>,
+}
+
 /// What the band says under its headline, as the default status decides it for the message
-/// (`overview::told`), and nothing of its own: the state, for the line under the headline; and
-/// each fault, a block of its own: `!` and the core's words, what the source said as data, the
-/// words after it, its command after a middle dot, and what the person can do on a line under.
-pub(crate) fn band(r: &v1::Status) -> (Option<String>, String) {
+/// (`overview::told`), and nothing of its own. The state is on the line under the headline. Each
+/// fault the text lists is placed by what it is about (`overview::Of`), one rule for every one:
+/// - a fault of Immunity Core's own work (a check that did not finish, a watcher that is off or
+///   a failure of it that stands, an answer that is not fresh) stays in the band as it was, a
+///   line of its own, `!` and the text's words, what its source said and its command;
+/// - a reading that failed (a cause the status calls a fault, the event level and what it lost,
+///   a download) is counted on one line, `!` and a link to "Could not be read", which tells each
+///   whole (`not_read::line`): as many as the things it is about, a cause of a hundred servers a
+///   hundred, with how many of them the person can fix.
+///
+/// So the band says less than the text of nothing and reads no calmer than a line for each: every
+/// state and fault of its own work in its words, every reading that failed in the count, each
+/// under the mark and in the ink a fault had.
+pub(crate) fn band(r: &v1::Status) -> Band {
     let told = crate::overview::told(r, &TERMINAL);
-    let run = |c: Option<&str>| {
-        c.map_or(String::new(), |c| {
-            format!(
-                " · <span class=\"cmd\"><span class=\"mono\">{}</span>{COPY}</span>",
-                esc(c)
-            )
-        })
-    };
-    let state = (told.state.as_ref()).map(|(words, c)| format!("{}{}", esc(words), run(*c)));
+    let state = (told.state.as_ref()).map(|(w, c)| fault_html(w, None, "", *c));
+    // Only a cause carries advice (`overview::cause_fault`), and a cause is never a state.
     let faults = (told.faults.iter())
+        .filter(|f| f.about() == Of::State)
         .map(|f| {
-            let (words, said, tail, c, advice) = f.parts();
-            // What a source said, through the printer; the core's own words in its place as words.
-            let said = said.map_or(String::new(), |s| {
-                let s = match f.said_is_ours() {
-                    true => esc(s),
-                    false => crate::secrets::quoted_html(s),
-                };
-                format!(": <span class=\"said\">{s}</span>")
-            });
-            let advice = advice.map_or(String::new(), |a| {
-                format!("<span class=\"advice\">{}</span>", esc(a))
-            });
+            let (words, said, tail, c, _) = f.parts();
+            let said = said.map(|s| (s, f.said_is_ours()));
             format!(
-                "<p class=\"sub fault\">! {}{said}{}{}{advice}</p>\n",
-                esc(words),
-                esc(tail),
-                run(c)
+                "<p class=\"sub fault\">! {}</p>",
+                fault_html(words, said, tail, c)
             )
         })
         .collect();
-    (state, faults)
+    let unread = not_read::line(r, &format!("#{NOT_READ}"))
+        .map(|line| format!("<p class=\"sub fault\">{line}</p>"));
+    Band {
+        state,
+        faults,
+        unread,
+    }
+}
+
+/// A line of the default status on a page, as safe HTML: the core's words, what the source said
+/// as data (or the core's own words in its place, `ours`), the words after it, and its command
+/// after a middle dot.
+fn fault_html(
+    words: &str,
+    said: Option<(&str, bool)>,
+    tail: &str,
+    command: Option<&str>,
+) -> String {
+    // What a source said, through the printer; the core's own words in its place as words.
+    let said = said.map_or(String::new(), |(s, ours)| {
+        let s = match ours {
+            true => esc(s),
+            false => crate::secrets::quoted_html(s),
+        };
+        format!(": <span class=\"said\">{s}</span>")
+    });
+    let command = command.map_or(String::new(), |c| {
+        format!(
+            " · <span class=\"cmd\"><span class=\"mono\">{}</span>{COPY}</span>",
+            esc(c)
+        )
+    });
+    format!("{}{said}{}{command}", esc(words), esc(tail))
 }
 
 /// The button beside the command an agent reads a finding with, fixed: the one script shows it
@@ -275,10 +319,14 @@ pub(crate) const COPY: &str = "<button class=\"copy\" type=\"button\" aria-label
 /// Read, in full or as far as this version reads here, is a filled dot of `--calm`; a fault a
 /// hollow one of `--look`; none here or a plain count a filled one of `--quiet`; never checked a
 /// hollow one of `--quiet`. Only coverage: findings are not repeated here.
+#[derive(Debug, PartialEq)]
 struct Standing {
     dot: &'static str,
     said: String,
 }
+
+/// What a row says when the status says its kind was read in full and fresh and nothing is there.
+const NONE_HERE: &str = "none here";
 
 impl Standing {
     /// Read, in full or as far as this version reads here.
@@ -311,54 +359,154 @@ impl Standing {
     }
 }
 
-/// One row of what is watched: the kind of place, how often it is looked at, how many things,
-/// its state and when it was last read. The count leads, where `href` is given, to the things.
-fn watched_row(
-    out: &mut String,
-    id: Option<&str>,
-    (kind, how): (&str, &str),
-    (things, href): (&str, Option<&str>),
-    states: &[Standing],
+/// The groups of what is read, in their order.
+const ON_THIS_MAC: &str = "On this Mac";
+const IN_PROJECTS: &str = "In your projects";
+const BEYOND_THIS_MAC: &str = "Beyond this Mac";
+
+/// Where the links of a table of what is read lead from the page it is on: the summary, with its
+/// section "Could not be read", and the folder of the pages of details.
+struct Links {
+    summary: String,
+    details: String,
+}
+
+impl Links {
+    /// From the summary.
+    fn summary() -> Links {
+        Links {
+            summary: String::new(),
+            details: format!("{DETAILS}/"),
+        }
+    }
+
+    /// From a page of details.
+    fn details() -> Links {
+        Links {
+            summary: format!("../{}", view::SUMMARY),
+            details: String::new(),
+        }
+    }
+}
+
+/// One row of what is read: its group, the kind of place in words, how often it is looked at, how
+/// many things and where the count leads, its states and when it was last read.
+struct Row {
+    group: &'static str,
+    id: Option<&'static str>,
+    kind: String,
+    how: &'static str,
+    things: String,
+    href: Option<String>,
+    states: Vec<Standing>,
     last: Option<i64>,
-    now: i64,
-) -> Out {
-    let id = id.map_or(String::new(), |id| format!(" id=\"{id}\""));
-    let said: Vec<String> = states
-        .iter()
+}
+
+impl Row {
+    /// That all the row says is that there is none here, read in full and fresh: a row that says
+    /// anything else, a fault, a reading short of full, no reading, is never folded.
+    fn none_here(&self) -> bool {
+        self.states == [Standing::none(NONE_HERE.to_string())]
+    }
+}
+
+/// One row of what is read: the kind of place, how often it is looked at, how many things, its
+/// state and when it was last read. The count leads, where the row has a link, to the things.
+fn watched_row(out: &mut String, row: &Row, now: i64) -> Out {
+    let id = row.id.map_or(String::new(), |id| format!(" id=\"{id}\""));
+    let said: Vec<String> = (row.states.iter())
         .map(|s| format!("<span class=\"dot{}\"></span>{}", s.dot, s.said))
         .collect();
     writeln!(
         out,
         "<div class=\"wr\"{id}><span>{}</span><span class=\"wh2 t2\">{}</span><span class=\"wn\">{}</span><span class=\"wc\">{}</span><span class=\"wl\">{}</span></div>",
-        esc(kind),
-        esc(how),
-        match href {
+        esc(&row.kind),
+        esc(row.how),
+        match &row.href {
             Some(href) => format!(
                 "<a href=\"{href}\" aria-label=\"{}: {}\">{}</a>",
-                esc(kind),
-                esc(things),
-                esc(things)
+                esc(&row.kind),
+                esc(&row.things),
+                esc(&row.things)
             ),
-            None => esc(things),
+            None => esc(&row.things),
         },
         said.join(" · "),
-        last.map_or("<span class=\"none\">—</span>".to_string(), |t| {
-            view::when(t, now)
-        })
+        row.last
+            .map_or("<span class=\"none\">—</span>".to_string(), |t| {
+                view::when(t, now)
+            })
     )?;
     Ok(())
 }
 
-/// What is watched, as a table by kind of place, grouped as on this Mac, in your projects and
-/// beyond this Mac: how often each is looked at, how many things, its state and when it was last
-/// read, from the status alone. A row's state is one of three: the faults of the status that name
-/// its kind (`Uncovered.watched_kinds`), linked to where they are told, and only they are drawn as
-/// faults; else how it was read, "read in full" and "none here" only where the status says its
-/// kind was read in full and fresh (`WatchedKind.coverage` and `fresh`, `IntegrityReading`), and
-/// "not checked yet" with no reading of it; else a plain count. A limit is never a row's fault:
-/// it is told once, at the end. Then one line: how many faults on this Mac nothing the person
-/// does changes, as a link to the page that names each.
-fn watched_table(out: &mut String, r: &v1::Status, faults: &[&v1::Uncovered], now: i64) -> Out {
+/// The table of what is read, group by group: under its group's name each row that says more than
+/// that there is none here, then the rows that say only that, folded into one line of their names
+/// (`Row::none_here`) with their rows' last read, as the column says it: one time, or the oldest
+/// to the latest, so a fold never hides that a reading is old.
+fn read_table(out: &mut String, rows: &[Row], now: i64) -> Out {
+    out.push_str("<div class=\"wt\">\n<div class=\"wr wh\" aria-hidden=\"true\"><span>Kind of place</span><span>How often</span><span class=\"wn\">Things</span><span>State</span><span class=\"wl\">Last read</span></div>\n");
+    for group in [ON_THIS_MAC, IN_PROJECTS, BEYOND_THIS_MAC] {
+        let of: Vec<&Row> = rows.iter().filter(|r| r.group == group).collect();
+        if of.is_empty() {
+            continue;
+        }
+        writeln!(out, "<p class=\"wg\">{group}</p>")?;
+        let (none, said): (Vec<&Row>, Vec<&Row>) = of.into_iter().partition(|r| r.none_here());
+        for row in said {
+            watched_row(out, row, now)?;
+        }
+        if !none.is_empty() {
+            let names: Vec<String> = (none.iter()).map(|r| esc(&r.kind)).collect();
+            let times: BTreeSet<i64> = none.iter().filter_map(|r| r.last).collect();
+            let at = match (times.first(), times.last()) {
+                (Some(a), Some(b)) if a == b => format!(", last read {}", view::when(*a, now)),
+                (Some(a), Some(b)) => {
+                    format!(
+                        ", last read {} to {}",
+                        view::when(*a, now),
+                        view::when(*b, now)
+                    )
+                }
+                _ => String::new(),
+            };
+            writeln!(
+                out,
+                "<p class=\"kn\"><span class=\"dot\"></span><strong>None here, read in full{at}:</strong> {}</p>",
+                names.join(" · ")
+            )?;
+        }
+    }
+    out.push_str("</div>\n");
+    Ok(())
+}
+
+/// What is read, on the summary: the table by kind of place, on this Mac, in your projects and
+/// beyond (`rows`).
+fn watched_table(out: &mut String, r: &v1::Status, now: i64) -> Out {
+    writeln!(
+        out,
+        "<section id=\"watched-here\">\n<div class=\"wsh\"><h2>{READ_TITLE}</h2><span class=\"n\">on this Mac, in your projects and beyond</span></div>"
+    )?;
+    read_table(out, &rows(r, &Links::summary(), now), now)?;
+    out.push_str("</section>\n");
+    Ok(())
+}
+
+/// The heading of what is read, on the summary.
+const READ_TITLE: &str = "What is read";
+
+/// What is read, as rows by kind of place, grouped as on this Mac, in your projects and beyond
+/// this Mac: how often each is looked at, how many things, its state and when it was last read,
+/// from the status alone, its links leading `from` the page it is drawn on. A row's state is one
+/// of three: the faults of the status that name its kind (`Uncovered.watched_kinds`), linked to
+/// "Could not be read", and only they are drawn as faults; else how it was read, "read in full"
+/// and "none here" only where the status says its kind was read in full and fresh
+/// (`WatchedKind.coverage` and `fresh`, `IntegrityReading`), and "not checked yet" with no
+/// reading of it; else a plain count. A limit is never a row's fault: it is told once, at the end.
+fn rows(r: &v1::Status, from: &Links, now: i64) -> Vec<Row> {
+    // Whether a thing not covered is a fault or a limit is the status's word.
+    let faults: Vec<&v1::Uncovered> = r.not_covered.iter().filter(|u| u.fault).collect();
     let m = r.this_mac.clone().unwrap_or_default();
     let kinds = r.watched.as_ref().map_or(&[][..], |w| &w.kinds[..]);
     let full = v1::Completeness::Full as i32;
@@ -374,35 +522,22 @@ fn watched_table(out: &mut String, r: &v1::Status, faults: &[&v1::Uncovered], no
     let check = (r.last_finished_run.as_ref())
         .and_then(|f| f.check.as_ref())
         .map(|c| c.started_at);
-    // Where a fault is told in full: "You can fix", or the page of what could not be read, its
-    // label naming that place before what the row says.
-    let told = |of: &[&&v1::Uncovered], said: String| {
-        let (href, at) = match of.iter().all(|u| u.who == YOU) {
-            true => ("#you-can-fix".to_string(), "You can fix"),
-            false => (
-                format!("{DETAILS}/{THIS_MAC}.html#{NOT_READ}"),
-                NOT_READ_TITLE,
-            ),
-        };
+    // A fault is told in full under "Could not be read", its label naming that place before
+    // what the row says.
+    let told = |said: String| {
         let said = esc(&said);
         Standing::not(format!(
-            "<a href=\"{href}\" aria-label=\"{at}: {said}\">{said}</a>"
+            "<a href=\"{}#{NOT_READ}\" aria-label=\"{NOT_READ_TITLE}: {said}\">{said}</a>",
+            from.summary
         ))
     };
     // The faults of some causes, as one state of a row.
     let by = |ids: &[&str], said: &str| {
-        let of: Vec<&&v1::Uncovered> = faults
-            .iter()
-            .filter(|u| ids.contains(&u.id.as_str()))
-            .collect();
-        (!of.is_empty()).then(|| told(&of, said.to_string()))
+        (faults.iter())
+            .any(|u| ids.contains(&u.id.as_str()))
+            .then(|| told(said.to_string()))
     };
-    writeln!(
-        out,
-        "<section id=\"watched-here\">\n<div class=\"wsh\"><h2>What is watched</h2><span class=\"n\">on this Mac, in your projects and beyond</span></div>\n<div class=\"wt\">\n<div class=\"wr wh\" aria-hidden=\"true\"><span>Kind of place</span><span>How often</span><span class=\"wn\">Things</span><span>State</span><span class=\"wl\">Last read</span></div>"
-    )?;
-    let mut on_mac = String::new();
-    let mut in_projects = String::new();
+    let mut out = Vec::new();
     for (count, what, _) in covered::watched() {
         let thing = m.watched.iter().find(|w| w.what == what);
         let how = match thing.is_some_and(|w| w.how == "live") {
@@ -415,14 +550,14 @@ fn watched_table(out: &mut String, r: &v1::Status, faults: &[&v1::Uncovered], no
             Count::Installed(kind) => kind,
             Count::Dependencies => covered::DEPENDENCIES,
         };
-        // The faults that name its kind; a fault that names none stays in its section alone.
-        let of: Vec<&&v1::Uncovered> = (faults.iter())
-            .filter(|u| u.watched_kinds.iter().any(|k| k == key))
-            .collect();
-        // A fault counts the places of its cause, of every kind, so the row gives no number.
+        // A fault that names its kind; a fault that names none stays in its section alone. A
+        // fault counts the places of its cause, of every kind, so the row gives no number.
         let mut faulted: Vec<Standing> = Vec::new();
-        if !of.is_empty() {
-            faulted.push(told(&of, "not all can be read now".to_string()));
+        if faults
+            .iter()
+            .any(|u| u.watched_kinds.iter().any(|k| k == key))
+        {
+            faulted.push(told("not all can be read now".to_string()));
         }
         let mut things = n.map_or("—".to_string(), grouped);
         // The packages' own state, and beside it what the comparison found.
@@ -455,7 +590,8 @@ fn watched_table(out: &mut String, r: &v1::Status, faults: &[&v1::Uncovered], no
                 .sum();
             if t.matched_this_store && known > 0 {
                 beside.push(Standing::none(format!(
-                    "<a href=\"{DETAILS}/{VULNERABILITIES}.html\">{}</a>",
+                    "<a href=\"{}{VULNERABILITIES}.html\">{}</a>",
+                    from.details,
                     esc(&counted(
                         known as i64,
                         "known vulnerability",
@@ -504,7 +640,7 @@ fn watched_table(out: &mut String, r: &v1::Status, faults: &[&v1::Uncovered], no
             let found = in_projects && in_found;
             match (n.unwrap_or(0) == 0, found, whole) {
                 (true, true, true) => Standing::none("none in the projects found".to_string()),
-                (true, false, true) => Standing::none("none here".to_string()),
+                (true, false, true) => Standing::none(NONE_HERE.to_string()),
                 (_, true, _) => Standing::read("read in the projects found"),
                 (false, false, true) => Standing::read("read in full"),
                 (_, false, false) => Standing::read("read"),
@@ -515,27 +651,21 @@ fn watched_table(out: &mut String, r: &v1::Status, faults: &[&v1::Uncovered], no
             false => faulted,
         };
         states.extend(beside);
-        let id = matches!(count, Count::Dependencies).then_some("vulnerabilities");
-        let href = format!("{DETAILS}/{THIS_MAC}.html#{}", anchor(what));
-        let group = if covered::in_projects(count) || matches!(count, Count::Dependencies) {
-            &mut in_projects
-        } else {
-            &mut on_mac
+        let at = format!("{}{THIS_MAC}.html#{}", from.details, anchor(what));
+        let group = match covered::in_projects(count) || matches!(count, Count::Dependencies) {
+            true => IN_PROJECTS,
+            false => ON_THIS_MAC,
         };
-        watched_row(
+        out.push(Row {
             group,
-            id,
-            (&capital(what), how),
-            (&things, n.is_some().then_some(href.as_str())),
-            &states,
+            id: matches!(count, Count::Dependencies).then_some("vulnerabilities"),
+            kind: capital(what),
+            how,
+            things,
+            href: n.is_some().then_some(at),
+            states,
             last,
-            now,
-        )?;
-    }
-    for (group, rows) in [("On this Mac", &on_mac), ("In your projects", &in_projects)] {
-        if !rows.is_empty() {
-            writeln!(out, "<p class=\"wg\">{group}</p>\n{rows}")?;
-        }
+        });
     }
     // Servers, checked only when the person runs the server check. A person with no servers is
     // not told about servers at all. Its faults are the status's: servers that could not be
@@ -552,8 +682,7 @@ fn watched_table(out: &mut String, r: &v1::Status, faults: &[&v1::Uncovered], no
             .map(|u| u.count)
             .sum();
         if n > 0 {
-            let of: Vec<&&v1::Uncovered> = faults.iter().filter(|u| u.id == cause.id).collect();
-            states.push(told(&of, format!("{} {words}", grouped(n as i64))));
+            states.push(told(format!("{} {words}", grouped(n as i64))));
         }
     }
     if e.servers > 0 || !states.is_empty() {
@@ -567,30 +696,29 @@ fn watched_table(out: &mut String, r: &v1::Status, faults: &[&v1::Uncovered], no
                 ))),
             });
         }
-        out.push_str("<p class=\"wg\">Beyond this Mac</p>\n");
-        let listed = format!("{DETAILS}/{BEYOND}.html#servers");
-        watched_row(
-            out,
-            None,
-            (
-                "Servers you log in to over SSH",
-                "when you run the server check",
-            ),
-            (&grouped(e.servers as i64), Some(listed.as_str())),
-            &states,
-            e.server_check_at,
-            now,
-        )?;
+        let listed = format!("{}{BEYOND}.html#servers", from.details);
+        out.push(Row {
+            group: BEYOND_THIS_MAC,
+            id: None,
+            kind: "Servers you log in to over SSH".to_string(),
+            how: "when you run the server check",
+            things: grouped(e.servers as i64),
+            href: Some(listed),
+            states,
+            last: e.server_check_at,
+        });
     }
-    out.push_str("</div>\n");
-    let failed = failed_here(faults).len();
-    if failed > 0 {
-        writeln!(
-            out,
-            "<p class=\"nj\" id=\"limits\"><a href=\"{DETAILS}/{THIS_MAC}.html#{NOT_READ}\">{} on this Mac could not be read</a></p>",
-            counted(failed as i64, "thing", "things")
-        )?;
-    }
+    out
+}
+
+/// What is read on this Mac and in its projects, as an index of the page of this Mac: the rows of
+/// the summary's table, every count and name leading to its kind's section here.
+pub(crate) fn read_index(out: &mut String, r: &v1::Status, now: i64) -> Out {
+    let rows: Vec<Row> = (rows(r, &Links::details(), now).into_iter())
+        .filter(|row| row.group != BEYOND_THIS_MAC)
+        .collect();
+    out.push_str("<section id=\"read-here\">\n<div class=\"wsh\"><h2>What is read here</h2><span class=\"n\">each kind of place, with its section below</span></div>\n");
+    read_table(out, &rows, now)?;
     out.push_str("</section>\n");
     Ok(())
 }
@@ -605,61 +733,10 @@ fn installed_whole(r: &v1::Status, kind: &str) -> Option<bool> {
     (!of.is_empty()).then(|| of.iter().all(|i| i.completeness == full))
 }
 
-/// The anchor of what could not be read on this Mac, on the page of what is watched.
+/// The anchor of what could not be read, on the summary.
 pub const NOT_READ: &str = "not-read";
 /// Its heading.
-const NOT_READ_TITLE: &str = "Could not be read on this Mac";
-
-/// The faults the person can do something about, told under "You can fix".
-fn fixable<'a>(faults: &[&'a v1::Uncovered]) -> Vec<&'a v1::Uncovered> {
-    faults.iter().copied().filter(|u| u.who == YOU).collect()
-}
-
-/// The faults nothing the person does changes, such as a reading or a download that failed, told
-/// under "Could not be read on this Mac". With `fixable`, every fault, each once.
-fn failed_here<'a>(faults: &[&'a v1::Uncovered]) -> Vec<&'a v1::Uncovered> {
-    faults.iter().copied().filter(|u| u.who != YOU).collect()
-}
-
-/// The faults the person can fix, one cause beside another: what it is, the examples the status
-/// gives as data, and Immunity Core's advice. A limit with advice is told among the limits.
-fn you_can_fix(out: &mut String, fixable: &[&v1::Uncovered]) -> Out {
-    writeln!(
-        out,
-        "<section id=\"you-can-fix\">\n<div class=\"wsh\"><h2>You can fix</h2><span class=\"n\">{}</span></div>",
-        esc(&counted(fixable.len() as i64, "thing", "things"))
-    )?;
-    if fixable.is_empty() {
-        out.push_str("<p class=\"empty\">Nothing for you to fix.</p>\n");
-    } else {
-        out.push_str("<div class=\"fixg\">\n");
-        for u in fixable {
-            writeln!(
-                out,
-                "<article class=\"fixc\" id=\"{}\">\n<p class=\"fct\">{}</p>",
-                esc(&u.id),
-                esc(&u.title)
-            )?;
-            let apart = apart(u);
-            if !apart.is_empty() {
-                out.push_str("<ul>\n");
-                for item in &apart {
-                    writeln!(out, "<li>{item}</li>")?;
-                }
-                out.push_str("</ul>\n");
-            }
-            writeln!(
-                out,
-                "<p class=\"fad\">{}</p>\n<p class=\"fad\">{}</p>\n</article>",
-                esc(&u.meaning),
-                esc(&u.advice)
-            )?;
-        }
-        out.push_str("</div>\n");
-    }
-    out.push_str("</section>\n");
-    Ok(())
-}
+const NOT_READ_TITLE: &str = "Could not be read";
 
 /// The links to the other pages, and when the page was made and on which Mac.
 fn links(out: &mut String, r: &v1::Status, now: i64) -> Out {
@@ -699,31 +776,6 @@ pub(crate) fn apart(u: &v1::Uncovered) -> Vec<String> {
         ));
     }
     out
-}
-
-/// One thing not covered, in full: its title, where, what it means and what to do.
-fn uncovered(out: &mut String, u: &v1::Uncovered) -> Out {
-    writeln!(
-        out,
-        "<article class=\"item\" id=\"{}\">\n<h3>{}</h3>",
-        esc(&u.id),
-        esc(&u.title)
-    )?;
-    let apart = apart(u);
-    if !apart.is_empty() {
-        out.push_str("<ul class=\"readings mono\">\n");
-        for item in &apart {
-            writeln!(out, "<li>{item}</li>")?;
-        }
-        out.push_str("</ul>\n");
-    }
-    writeln!(
-        out,
-        "<p>{}</p>\n<p class=\"advice\">{}</p>\n</article>",
-        esc(&u.meaning),
-        esc(&u.advice)
-    )?;
-    Ok(())
 }
 
 /// At most this many readings are named under a list that is not whole.
@@ -836,6 +888,7 @@ pub fn technical() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::covered::YOU;
 
     /// The band's glyph is the status's headline: the calm disc only for `calm`, the ring for
     /// `in_part`, the clock for `stale`, and the question mark for a headline not known. How this
@@ -910,8 +963,9 @@ mod tests {
             stopped.contains("No watcher runs") && !stopped.contains("live"),
             "{stopped}"
         );
-        // A watcher's failure is a fault: said once, under the line, as the terminal says it, and
-        // the line says nothing of how much is read or of the failure.
+        // A watcher's failure is a fault of Immunity Core's own work: said once, under the line,
+        // as the terminal says it; the line says nothing of how much is read or of the failure,
+        // and the failure is never counted as something that could not be read.
         for (what, words) in [
             (crate::watch::FULL_CHECK, "full check"),
             (crate::watch::EVENTS, "reading of program starts"),
@@ -938,59 +992,37 @@ mod tests {
             );
             let line = format!("<p class=\"sub fault\">! The watcher&#39;s latest {words} failed");
             assert_eq!(failed.matches(&line).count(), 1, "{failed}");
+            assert!(!failed.contains("could not be read"), "{failed}");
         }
     }
 
-    /// A fault as a page draws it: its text with a mark where what the source said (`§s`), its
-    /// command (`§c`) and its advice (`§a`) stand, and those three apart.
-    type Drawn = (String, Option<String>, Option<String>, Option<String>);
-
-    /// Takes the first `open`…`close` out of `text`, leaving `mark`, and gives what was inside.
-    fn take(text: &mut String, open: &str, close: &str, mark: &str) -> Option<String> {
-        let i = text.find(open)? + open.len();
-        let j = i + text[i..].find(close)?;
-        let inner = text[i..j].to_string();
-        text.replace_range(i - open.len()..j + close.len(), mark);
-        Some(inner)
-    }
-
-    /// The band of a page in parts: the line under the headline, its command taken out, and each
-    /// fault.
-    fn band_drawn(page: &str) -> ((String, Option<String>), Vec<Drawn>) {
-        let command = |t: &mut String| {
-            let close = format!("</span>{COPY}</span>");
-            take(
-                t,
-                " · <span class=\"cmd\"><span class=\"mono\">",
-                &close,
-                "§c",
-            )
-        };
+    /// The band of a page in parts: the line under the headline, each `!` line but the count, in
+    /// order, and the line that counts what could not be read, when there is one.
+    fn band_drawn(page: &str) -> (String, Vec<String>, Option<String>) {
         let mut sub = page.split("<p class=\"sub\">").nth(1).unwrap().to_string();
         sub.truncate(sub.find("</p>").unwrap());
-        let sub_command = command(&mut sub);
-        let faults = (page.split("<p class=\"sub fault\">").skip(1))
-            .map(|b| {
-                let mut b = b[..b.find("</p>").unwrap()].to_string();
-                let said = take(&mut b, "<span class=\"said\">", "</span>", "§s");
-                let c = command(&mut b);
-                let advice = take(&mut b, "<span class=\"advice\">", "</span>", "§a");
-                (b, said, c, advice)
-            })
-            .collect();
-        ((sub, sub_command), faults)
+        let lines = (page.split("<p class=\"sub fault\">").skip(1))
+            .map(|b| b[..b.find("</p>").unwrap()].to_string());
+        let (count, own): (Vec<String>, Vec<String>) =
+            lines.partition(|l| l.starts_with(&format!("! <a href=\"#{NOT_READ}\">")));
+        assert!(count.len() <= 1, "{page}");
+        (sub, own, count.into_iter().next())
     }
 
-    /// The pages and the text agree, as values: for every case of the watcher, a check not fresh
-    /// with and without findings, and a status of real size with faults and with only limits,
-    /// the band holds the state the default status decides (`overview::told`) on the line under
-    /// its headline, and every fault it lists, in order, each with its own words, what its source
-    /// said, its command and its advice, and nothing else; the state is never also a fault, the
-    /// ring is drawn only while a fault stands, and a watcher that is starting is never said to be
-    /// off. After `immunity on`, a job in place with no watcher and none restarting is off and not
-    /// by `immunity off`, and never calm.
+    /// The pages and the text agree, as values, and the band says less than the text of nothing:
+    /// for every case of the watcher, a check not fresh with and without findings, and a status of
+    /// real size with faults and with only limits, the line under the headline holds the state the
+    /// default status decides (`overview::told`), and every fault of Immunity Core's own work is a
+    /// `!` line of its own, as it was, in order, each with its own words, what its source said, its
+    /// command and its advice; every other fault is a reading that failed, out of the band's words
+    /// and counted on one `!` line, which leads to "Could not be read" and says how many the person
+    /// can fix. The state is said
+    /// once, the ring is drawn only while a fault stands, and a watcher that is starting is never
+    /// said to be off. After `immunity on`, a job in place with no watcher and none restarting is
+    /// off and not by `immunity off`, and never calm.
     #[test]
-    fn the_band_holds_the_state_faults_and_commands_the_status_decides_and_nothing_else() {
+    fn the_band_says_each_state_in_its_words_and_counts_each_reading_that_failed_as_the_text_lists_them()
+     {
         use crate::watch::{Case, EVENTS, READ};
         let now = 1_800_000_000;
         let on = now - 60;
@@ -1111,7 +1143,24 @@ mod tests {
             started_at: now - 600,
             ..Default::default()
         });
+        // Readings that failed of the event level: one that records nothing, and one that lost
+        // program starts since the latest check.
+        let level = |state: v1::CollectorState, lost: u64| {
+            let mut s = calm();
+            s.event_level = Some(v1::EventLevel {
+                state: state as i32,
+                said_text: Some("an invented <line>".to_string()),
+                lost: Some(v1::Span {
+                    since_check: lost,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+            s
+        };
         let others = [
+            (None, level(v1::CollectorState::Failing, 0)),
+            (None, level(v1::CollectorState::Running, 3)),
             (None, died),
             (None, left),
             (None, both),
@@ -1126,49 +1175,78 @@ mod tests {
             }
             let mut page = String::new();
             state(&mut page, &s, now).unwrap();
-            let ((sub, sub_command), faults) = band_drawn(&page);
+            let (sub, lines, count) = band_drawn(&page);
             let told = crate::overview::told(&s, &TERMINAL);
-            // The state, in the line under the headline, its command after it.
-            match &told.state {
-                Some((words, c)) => {
-                    let mark = if c.is_some() { "§c" } else { "" };
-                    assert!(sub.contains(&format!("{}{mark}", esc(words))), "{page}");
-                    assert_eq!(sub_command, c.map(esc), "{page}");
-                }
-                None => assert_eq!(sub_command, None, "{page}"),
-            }
-            let wanted: Vec<Drawn> = (told.faults.iter())
-                .map(|f| {
-                    let (words, from, tail, c, advice) = f.parts();
-                    let text = format!(
-                        "! {}{}{}{}{}",
-                        esc(words),
-                        if from.is_some() { ": §s" } else { "" },
-                        esc(tail),
-                        if c.is_some() { "§c" } else { "" },
-                        if advice.is_some() { "§a" } else { "" },
-                    );
-                    let from = from.map(|s| match f.said_is_ours() {
-                        true => esc(s),
-                        false => crate::secrets::quoted_html(s),
-                    });
-                    (text, from, c.map(esc), advice.map(esc))
-                })
+            // The state under the headline, then each fault of Immunity Core's own work on a `!`
+            // line of its own, in the text's order: its words, what its source said, its command
+            // and its advice, each where it follows.
+            let own: Vec<&crate::overview::Fault> = (told.faults.iter())
+                .filter(|f| f.about() == Of::State)
                 .collect();
-            assert_eq!(faults, wanted, "{page}");
-            // The state is said once: no fault is the state's words.
-            if let Some((words, _)) = &told.state {
-                assert!(faults.iter().all(|f| !f.0.contains(&esc(words))), "{page}");
+            assert_eq!(lines.len(), own.len(), "{page}");
+            let state = (told.state.iter()).map(|(w, c)| ((w.as_str(), None, "", *c, None), false));
+            let parts = own.iter().map(|f| (f.parts(), f.said_is_ours()));
+            let drawn = (told.state.iter().map(|_| sub.as_str()))
+                .chain(lines.iter().map(|l| l.strip_prefix("! ").unwrap()));
+            for (((words, said, tail, c, advice), ours), line) in state.chain(parts).zip(drawn) {
+                let said = said.map(|s| match ours {
+                    true => esc(s),
+                    false => crate::secrets::quoted_html(s),
+                });
+                let command = c.map(|c| format!("<span class=\"mono\">{}</span>", esc(c)));
+                let mut at = 0;
+                for piece in [
+                    Some(esc(words)),
+                    said,
+                    Some(esc(tail)),
+                    command,
+                    advice.map(esc),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    let found = line[at..].find(&piece);
+                    assert!(found.is_some(), "{piece} after {at}: {page}");
+                    at += found.unwrap() + piece.len();
+                }
             }
+            // The state is said once.
+            if let Some((words, _)) = &told.state {
+                assert_eq!(sub.matches(&esc(words)).count(), 1, "{page}");
+            }
+            // Every other fault is out of the band's words, and counted under them.
+            let failed: Vec<&crate::overview::Fault> = (told.faults.iter())
+                .filter(|f| f.about() != Of::State)
+                .collect();
+            for f in &failed {
+                let (words, ..) = f.parts();
+                assert!(!page.contains(&esc(words)), "{words}: {page}");
+            }
+            // Counted by the things: a cause as many as its title counts, at least one, and each
+            // other reading one.
+            let things = |u: &&v1::Uncovered| u.count.max(1);
+            let causes: Vec<&v1::Uncovered> = s.not_covered.iter().filter(|u| u.fault).collect();
+            let readings = (failed.iter().filter(|f| f.about() == Of::Reading)).count() as u64;
+            let n = causes.iter().map(things).sum::<u64>() + readings;
+            let yours: u64 = (causes.iter().filter(|u| u.who == YOU)).map(things).sum();
+            let wanted = (!failed.is_empty()).then(|| {
+                let n = counted(n as i64, "thing", "things");
+                let yours = match yours {
+                    0 => String::new(),
+                    y => format!(", {y} you can fix"),
+                };
+                format!("! <a href=\"#{NOT_READ}\">{n} could not be read{yours}</a>")
+            });
+            assert_eq!(count, wanted, "{page}");
             // Of the status of real size: the ring only while a fault stands, by the headline
             // that says so.
             if !s.not_covered.is_empty() {
                 let calm = s.headline == v1::Headline::Calm as i32;
                 assert_eq!(page.contains(GLYPH_PART), !calm, "{page}");
-                assert_eq!(faults.is_empty(), calm, "{page}");
+                assert_eq!(own.is_empty() && count.is_none(), calm, "{page}");
             }
             if let Some(case) = case {
-                let band = format!("{sub} {faults:?}");
+                let band = format!("{sub} {lines:?} {count:?}");
                 if case == Case::Starting {
                     assert!(!band.contains("off"), "{band}");
                 }
@@ -1263,7 +1341,7 @@ mod tests {
     const NONE_KNOWN: &str = "None known.";
 
     /// The part of a page from the section with `id` to its end, or nothing.
-    fn section_of<'a>(html: &'a str, id: &str) -> &'a str {
+    pub(super) fn section_of<'a>(html: &'a str, id: &str) -> &'a str {
         let rest = html
             .find(&format!("<section id=\"{id}\">"))
             .map_or("", |i| &html[i..]);
@@ -1271,9 +1349,9 @@ mod tests {
     }
 
     /// Nothing is hidden and nothing is told twice: every thing not covered, for every cause of
-    /// the catalogue, is on the pages once, a fault in its own section and a limit in the
-    /// collapsed section at the end, by the status's `fault` alone; a limit's names are there
-    /// only, and stay text.
+    /// the catalogue, is on the pages once, a fault under "Could not be read", marked where the
+    /// person can fix it, and a limit in the collapsed section at the end, by the status's `fault`
+    /// alone; a limit's names are there only, and stay text.
     #[test]
     fn every_thing_not_covered_is_on_the_pages_once_a_fault_in_its_section_a_limit_at_the_end() {
         let now = 1_800_000_000;
@@ -1311,18 +1389,22 @@ mod tests {
                 );
                 assert_eq!(all(&id), 1, "{} flip {flip}", u.id);
                 assert_eq!(all(&format!("<b>{}", u.id)), 0, "{}", u.id);
-                let home = match (u.fault, u.who == YOU) {
-                    (false, _) => limits,
-                    (true, true) => section_of(summary, "you-can-fix"),
-                    (true, false) => {
-                        section_of(page(&format!("{DETAILS}/{THIS_MAC}.html")), NOT_READ)
-                    }
+                let home = match u.fault {
+                    false => limits,
+                    true => section_of(summary, NOT_READ),
                 };
                 assert!(
                     home.contains(&id) && home.contains(&name),
                     "{} flip {flip}",
                     u.id
                 );
+                // A fault the person can fix says so beside it.
+                if u.fault {
+                    let article = &home[home.find(&id).unwrap()..];
+                    let article = &article[..article.find("</article>").unwrap()];
+                    let you = article.contains(">You can fix</p>");
+                    assert_eq!(you, u.who == YOU, "{article}");
+                }
                 if !u.fault {
                     assert_eq!(all(&name), 1, "{} flip {flip}", u.id);
                 }
@@ -1335,15 +1417,16 @@ mod tests {
         }
     }
 
-    /// The state and the last read of the row of what is watched whose kind is `what`.
+    /// The state and the last read of the row of what is read whose kind starts with `what`, as
+    /// a row is drawn, folded or not.
     fn row(r: &v1::Status, what: &str, now: i64) -> (String, String) {
-        let faults: Vec<&v1::Uncovered> = r.not_covered.iter().filter(|u| u.fault).collect();
+        let rows = rows(r, &Links::summary(), now);
+        let row = (rows.iter())
+            .find(|row| row.kind.starts_with(what))
+            .unwrap_or_else(|| panic!("{what}"));
         let mut out = String::new();
-        watched_table(&mut out, r, &faults, now).unwrap();
-        let row = out
-            .lines()
-            .find(|l| l.contains(what))
-            .unwrap_or_else(|| panic!("{what}: {out}"));
+        watched_row(&mut out, row, now).unwrap();
+        let row = out.trim_end();
         let cell = &row[row.find("<span class=\"wc\">").unwrap() + 17..];
         let (state, last) = cell.split_once("</span><span class=\"wl\">").unwrap();
         (
@@ -1381,7 +1464,7 @@ mod tests {
     /// never because it counts nothing, and a kind kept in projects only where projects were
     /// looked for. A row is drawn as a fault only by a fault of the status that names its kind
     /// (`Uncovered.watched_kinds`), and then never says it was read in full; the fault is linked
-    /// to where it is told, by who can fix it. A row with no reading is "not checked yet".
+    /// to where it is told, "Could not be read". A row with no reading is "not checked yet".
     #[test]
     fn a_row_says_read_in_full_or_none_here_only_by_its_kind_and_never_beside_a_fault_of_it() {
         let now = 1_800_000_000;
@@ -1438,7 +1521,7 @@ mod tests {
         assert_eq!(
             with(fault("nothing", &[crate::watched::PROFILE])),
             format!(
-                "<span class=\"dot off look\"></span><a href=\"{DETAILS}/{THIS_MAC}.html#{NOT_READ}\" aria-label=\"{NOT_READ_TITLE}: not all can be read now\">not all can be read now</a>"
+                "<span class=\"dot off look\"></span><a href=\"#{NOT_READ}\" aria-label=\"{NOT_READ_TITLE}: not all can be read now\">not all can be read now</a>"
             )
         );
         // A cause of ten places, one of them of this kind: the row says no number of them.
@@ -1447,10 +1530,9 @@ mod tests {
             ..fault("nothing", &[crate::watched::PROFILE, crate::watched::SSH])
         };
         assert!(!with(wide.clone()).contains("10"), "{}", with(wide));
-        assert!(
-            with(fault(YOU, &[crate::watched::PROFILE])).contains("href=\"#you-can-fix\""),
-            "{}",
-            with(fault(YOU, &[crate::watched::PROFILE]))
+        assert_eq!(
+            with(fault(YOU, &[crate::watched::PROFILE])),
+            with(fault("nothing", &[crate::watched::PROFILE]))
         );
         assert_eq!(
             with(fault("nothing", &[crate::watched::SSH])),
@@ -1619,5 +1701,155 @@ mod tests {
             "{}",
             packages(&r)
         );
+    }
+
+    /// No false calm in the fold: a kind is folded into "None here, read in full" only where all
+    /// its row says is that; a kind with a fault, a reading short of full or not fresh, no reading,
+    /// or things in it keeps a row of its own.
+    #[test]
+    fn a_kind_is_folded_into_none_here_only_where_its_row_says_nothing_else() {
+        let now = 1_800_000_000;
+        let kind = |as_: &str, fresh: bool| v1::WatchedKind {
+            kind: as_.to_string(),
+            coverage: Some(v1::Completeness::Full as i32),
+            fresh,
+            read_at: Some(now - 40),
+            ..Default::default()
+        };
+        let (profile, ssh) = ("Shell startup files", "SSH files");
+        // Where each kind is drawn: folded, or in a row of its own.
+        let drawn = |r: &v1::Status, what: &str| {
+            let mut out = String::new();
+            read_table(&mut out, &rows(r, &Links::summary(), now), now).unwrap();
+            let folded = (out.lines().filter(|l| l.starts_with("<p class=\"kn\">")))
+                .any(|l| l.contains(what));
+            let row = (out.lines().filter(|l| l.starts_with("<div class=\"wr\">")))
+                .any(|l| l.contains(&format!("<span>{what}</span>")));
+            assert_ne!(folded, row, "{what}: {out}");
+            folded
+        };
+        let things = [("shell startup files", 0), ("SSH files", 0)];
+        let mut r = watched_status(
+            &things,
+            vec![
+                kind(crate::watched::PROFILE, true),
+                kind(crate::watched::SSH, false),
+            ],
+        );
+        assert!(drawn(&r, profile));
+        assert!(!drawn(&r, ssh));
+        // No reading of it.
+        let none = watched_status(&things, vec![kind(crate::watched::SSH, true)]);
+        assert!(!drawn(&none, profile) && drawn(&none, ssh));
+        // Things in it.
+        let full = watched_status(
+            &[("shell startup files", 2)],
+            vec![kind(crate::watched::PROFILE, true)],
+        );
+        assert!(!drawn(&full, profile));
+        // A fault that names it.
+        r.not_covered = vec![v1::Uncovered {
+            id: "could-not-read".to_string(),
+            fault: true,
+            watched_kinds: vec![crate::watched::PROFILE.to_string()],
+            ..Default::default()
+        }];
+        assert!(!drawn(&r, profile));
+    }
+
+    /// A folded line carries its time: its kinds' last read, as their rows' column says it, once
+    /// when it is the same and from the oldest to the latest when not, so a day-old reading never
+    /// reads as one of now.
+    #[test]
+    fn a_folded_line_carries_when_its_kinds_were_read() {
+        let now = 1_800_000_000;
+        let kind = |as_: &str, at: i64| v1::WatchedKind {
+            kind: as_.to_string(),
+            coverage: Some(v1::Completeness::Full as i32),
+            fresh: true,
+            read_at: Some(at),
+            ..Default::default()
+        };
+        let fold = |old: i64| {
+            let r = watched_status(
+                &[("shell startup files", 0), ("SSH files", 0)],
+                vec![
+                    kind(crate::watched::PROFILE, old),
+                    kind(crate::watched::SSH, now - 40),
+                ],
+            );
+            let mut out = String::new();
+            read_table(&mut out, &rows(&r, &Links::summary(), now), now).unwrap();
+            let line = out.lines().find(|l| l.starts_with("<p class=\"kn\">"));
+            line.unwrap_or_else(|| panic!("{out}")).to_string()
+        };
+        let (old, new) = (view::when(now - 86_400, now), view::when(now - 40, now));
+        assert!(
+            fold(now - 40).contains(&format!(
+                "<strong>None here, read in full, last read {new}:</strong>"
+            )),
+            "{}",
+            fold(now - 40)
+        );
+        assert!(
+            fold(now - 86_400).contains(&format!(
+                "<strong>None here, read in full, last read {old} to {new}:</strong>"
+            )),
+            "{}",
+            fold(now - 86_400)
+        );
+    }
+
+    /// The page of this Mac opens with what is read on it and in its projects: the summary's own
+    /// rows, each leading within the page, so the two never say a kind apart; servers are on the
+    /// page of what is beyond this Mac.
+    #[test]
+    fn the_index_of_this_mac_is_the_summary_s_rows_of_this_mac_and_its_projects() {
+        let now = 1_800_000_000;
+        let mut r = watched_status(
+            &[("shell startup files", 3), ("git hooks in projects", 0)],
+            vec![v1::WatchedKind {
+                kind: crate::watched::PROFILE.to_string(),
+                read_at: Some(now - 40),
+                ..Default::default()
+            }],
+        );
+        r.estate = Some(v1::Estate {
+            servers: 2,
+            ..Default::default()
+        });
+        r.not_covered = vec![v1::Uncovered {
+            id: "could-not-read".to_string(),
+            fault: true,
+            watched_kinds: vec![crate::watched::PROFILE.to_string()],
+            ..Default::default()
+        }];
+        let pages = view::pages(&r, &view::Answers::none(), now).unwrap();
+        let page = |name: &str| &pages.iter().find(|(n, _)| n == name).unwrap().1;
+        let lines = |html: &str, id: &str| -> Vec<String> {
+            (section_of(html, id).lines())
+                .filter(|l| l.starts_with("<div class=\"wr\""))
+                .map(str::to_string)
+                .collect()
+        };
+        let summary = lines(page(view::SUMMARY), "watched-here");
+        let this_mac = page(&format!("{DETAILS}/{THIS_MAC}.html"));
+        let index = lines(this_mac, "read-here");
+        let from_details: Vec<String> = (summary.iter())
+            .filter(|l| !l.contains("Servers you log in to"))
+            .map(|l| {
+                l.replace(&format!("href=\"{DETAILS}/"), "href=\"").replace(
+                    &format!("href=\"#{NOT_READ}\""),
+                    &format!("href=\"../{}#{NOT_READ}\"", view::SUMMARY),
+                )
+            })
+            .collect();
+        assert!(
+            summary.len() > from_details.len() && !index.is_empty(),
+            "{summary:?}"
+        );
+        assert_eq!(index, from_details);
+        let at = |id: &str| this_mac.find(&format!("<section id=\"{id}\"")).unwrap();
+        assert!(at("read-here") < at("no-answer"), "{this_mac}");
     }
 }

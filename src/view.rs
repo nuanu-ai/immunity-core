@@ -183,13 +183,16 @@ fn of_a_page(name: &str) -> bool {
 /// title. Each has a page of its own that only sends the browser on to it, because macOS
 /// can lose the `#section` of a file URL when it hands one to the browser.
 pub const SECTIONS: [(&str, &str); 6] = [
-    ("watched-here", "What is watched"),
+    ("watched-here", "What is read"),
     (
         "vulnerabilities",
         "Known vulnerabilities in packages your projects use",
     ),
-    ("you-can-fix", "You can fix"),
-    ("limits", "Could not be read on this Mac"),
+    ("not-read", "Could not be read"),
+    (
+        crate::not_read_here::ANCHOR,
+        "What this version does not read here",
+    ),
     ("answered", "Answered"),
     ("as-it-happens", "As it happens"),
 ];
@@ -590,10 +593,10 @@ footer.licence { margin-top: 32px; }
 #this-mac:has(> .glyph.calm) { background: color-mix(in srgb, var(--calm) 10%, var(--fill)); }
 #this-mac h1 { margin: 0; }
 #this-mac .sub { font: var(--caption); color: var(--t2); margin: 4px 0 0; overflow-wrap: anywhere; }
-/* A fault, a block of its own: the core's words in the band's main colour, what the source said
-   as data, its command, and what the person can do on a line under them. */
+/* What could not be read, counted on a line of its own in the band's main colour, leading to
+   where each is told. */
 #this-mac .fault { color: var(--t1); margin-top: 8px; }
-#this-mac .fault .advice { display: block; }
+.meta.fault { color: var(--t1); margin: 0 0 16px; }
 #this-mac .cmd { white-space: nowrap; }
 
 /* Findings: the tabs, a group for each, one row per thing that opens in place. */
@@ -685,9 +688,6 @@ dl.facts dd .w { font: 12px/20px var(--font); }
 .copy.done::after { left: 4px; top: 2px; width: 5px; height: 9px; border-width: 0 1.5px 1.5px 0; border-radius: 0; background: none; transform: rotate(45deg); }
 .empty, .more { padding: 24px 12px; color: var(--t2); margin: 0; border-bottom: 1px solid var(--sep); }
 .more { padding: 12px; }
-#you-can-fix .empty { border-bottom: 0; }
-/* Its count in orange while there is something to fix. */
-#you-can-fix:has(.fixg) .wsh .n { color: var(--look-ink); }
 
 /* Known vulnerabilities, src/pages/vulnerabilities.rs: a row per record, the finding row's form. */
 .vr > summary { grid-template-columns: minmax(0, 0.9fr) minmax(0, 1.3fr) 172px 88px 16px; }
@@ -710,7 +710,9 @@ dl.facts dd .w { font: 12px/20px var(--font); }
 .dot.calm { background: var(--calm); }
 .dot.off { background: transparent; box-shadow: inset 0 0 0 1px var(--quiet); }
 .dot.off.look { box-shadow: inset 0 0 0 1.5px var(--look); }
-.nj { display: block; padding: 12px; margin: 0; }
+/* The kinds of place that hold nothing, read in full, folded into one line of their names. */
+.kn { padding: 8px 12px; margin: 0; font: var(--caption); color: var(--t2); border-bottom: 1px solid var(--sep); }
+.kn strong { font-weight: 600; }
 
 /* What this version does not read here, src/not_read_here.rs: collapsed, its heading the control. */
 #not-read-here details { margin: 0; }
@@ -776,13 +778,15 @@ ul.limits .advice { display: block; }
 .tip .td { margin-top: 4px; }
 .tip .ts { margin-top: 4px; color: var(--t2); }
 
-/* You can fix. */
-.fixg { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); column-gap: 32px; row-gap: 24px; padding: 16px 12px 0; }
-.fixc { min-width: 0; }
-.fixc .fct { font: 600 13px/20px var(--font); margin: 0; }
-.fixc ul { list-style: none; margin: 8px 0; padding: 0; font: var(--data); }
-.fixc li { overflow-wrap: anywhere; }
-.fixc .fad { color: var(--t2); margin: 0; }
+/* Could not be read: each thing a row, who can act on it beside what it is, what its source
+   said, what it means and what to do. */
+#not-read article.item { display: grid; grid-template-columns: 152px minmax(0, 1fr); column-gap: 16px; padding: 12px; border-top: 0; border-bottom: 1px solid var(--sep); }
+#not-read article.item > * { min-width: 0; }
+#not-read .who { font: var(--caption); color: var(--t2); margin: 2px 0 0; }
+#not-read .who.you { color: var(--look-ink); }
+#not-read h3 { margin: 0 0 4px; }
+#not-read p { margin: 4px 0 0; }
+#not-read ul.readings { list-style: none; padding: 0; }
 footer.links { display: flex; flex-wrap: wrap; gap: 8px 24px; margin-top: var(--section); padding: 16px 12px 0; border-top: 1px solid var(--sep); }
 .wfoot { font: var(--caption); color: var(--t2); padding: 8px 12px 0; margin: 0; }
 
@@ -820,7 +824,7 @@ footer.links { display: flex; flex-wrap: wrap; gap: 8px 24px; margin-top: var(--
   .wr .wh2, .wr .wc { grid-column: 1 / -1; }
   .wr .wn { grid-row: 1; grid-column: 2; }
   .wr .wl { display: none; }
-  .stats, .fixg { grid-template-columns: minmax(0, 1fr); }
+  .stats, #not-read article.item { grid-template-columns: minmax(0, 1fr); }
   .rr { grid-template-columns: minmax(0, 1fr) auto; }
   .rr .rl, .rr.rh { display: none; }
   .tactic { grid-template-columns: minmax(0, 1fr); }
@@ -1177,19 +1181,16 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name}"))
         };
         let summary = page(super::SUMMARY);
-        // The reading that failed is a fault: the band says what its source said as data, as
-        // the terminal does, each name and reason quoted, cut once.
+        // The reading that failed is told whole under "Could not be read": what its source said
+        // as data, the name and its reason each apart, cut once.
+        let not_read = &summary[summary.find("<section id=\"not-read\">").unwrap()..];
+        let reason = format!("a tool answered: fetch https://example.invalid/?t={mark} refused");
         let said = format!(
-            "\"~/.zshrc\": \"a tool answered: fetch https://example.invalid/?t={mark} refused\""
+            "{}: {}",
+            Name::given("~/.zshrc").html(),
+            Said::given(&reason).html()
         );
-        let fault = summary
-            .split("<p class=\"sub fault\">! Could not read: <span class=\"said\">")
-            .nth(1)
-            .map_or("", |f| &f[..f.find("</span>").unwrap()]);
-        assert!(
-            fault.starts_with("<bdi class=\"src\">") && fault.contains(&esc(&said)),
-            "{summary}"
-        );
+        assert!(not_read.contains(&said), "{summary}");
         // What not covered says a source said, as the status gives it: cut once, where it was
         // put together.
         let value = download.and_then(|u| u.value_text.clone()).unwrap();

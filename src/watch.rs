@@ -2519,8 +2519,13 @@ mod tests {
         assert_eq!(case(&m), Case::Starting);
         assert_ne!(m.headline, crate::contract::v1::Headline::Calm as i32);
         let terminal = crate::overview::watching(&m, &crate::screen::Screen::pipe()).0;
-        let (state, faults) = crate::pages::band(&m);
-        let page = format!("{} {faults}", state.unwrap_or_default());
+        let band = crate::pages::band(&m);
+        let page = format!(
+            "{} {} {}",
+            band.state.unwrap_or_default(),
+            band.faults.join(" "),
+            band.unread.unwrap_or_default()
+        );
         for said in [terminal, page] {
             // Its first letter aside, which a sentence makes a capital.
             assert!(

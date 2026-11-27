@@ -3753,17 +3753,18 @@ fn a_watched_file_its_permissions_keep_closed_leaves_this_mac_watched_in_part_an
             "reason_text": "Permission denied (os error 13)"
         }])
     );
-    // The page opens on it, not in green, and lists it under what he can fix.
+    // The page opens on it, not in green, counted, and tells it under what could not be read,
+    // as his to fix.
     let page = mac.view();
     let state = &page[page.find("<section id=\"this-mac\">").unwrap()..];
     let state = &state[..state.find("</section>").unwrap()];
     assert!(
-        state.contains(
-            "<p class=\"sub fault\">! Could not read: <span class=\"said\"><bdi class=\"src\">&quot;~/.zprofile&quot;"
-        ) && !state.contains("--green"),
+        state.contains("<p class=\"sub fault\">! <a href=\"#not-read\">")
+            && state.contains(" could not be read, 1 you can fix</a></p>")
+            && !state.contains("--green"),
         "{state}"
     );
-    let fix = &page[page.find("<section id=\"you-can-fix\"").unwrap()..];
+    let fix = &page[page.find("<section id=\"not-read\"").unwrap()..];
     let fix = &fix[..fix.find("</section>").unwrap()];
     assert!(
         fix.contains(
@@ -3776,7 +3777,7 @@ fn a_watched_file_its_permissions_keep_closed_leaves_this_mac_watched_in_part_an
     let watched = &watched[..watched.find("</section>").unwrap()];
     assert!(
         watched.contains(
-            "<a href=\"#you-can-fix\" aria-label=\"You can fix: not all can be read now\">not all can be read now</a>"
+            "<a href=\"#not-read\" aria-label=\"Could not be read: not all can be read now\">not all can be read now</a>"
         ),
         "{watched}"
     );
