@@ -2532,10 +2532,9 @@ fn put_awake(tx: &Transaction, kept: Option<&Before>) -> rusqlite::Result<()> {
 /// silent by at most the time awake between that reading and the line. An older write or none,
 /// as when the tidy job removed a file, is not a new line, and the count adds `d`.
 ///
-/// Three limits are taken. When more than `SILENT_AFTER` of awake time with sleep among it passes
+/// Two limits are taken. When more than `SILENT_AFTER` of awake time with sleep among it passes
 /// between two readings and a line was written early in it, a collector that runs can be told
-/// silent once. A full check judges by the time it started, so a count it keeps can be short by
-/// the time the check took. A clock set back shortens the count at that reading.
+/// silent once. A clock set back shortens the count at that reading.
 ///
 /// The record is data a program could write. One row written once can delay silent by up to
 /// `SILENT_AFTER` of awake time; holding it longer takes writing it again before the readings,

@@ -142,17 +142,33 @@ impl Dir {
 
     /// The same run, and what it says to a person, in a pipe.
     fn run_text(&self) -> String {
+        let out = self
+            .check()
+            .args(["--threats-input", "absent"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// A full run that reads nothing real but the event level under the temporary root, with
+    /// no threat catalogue given: the caller gives one or a curl that fetches it.
+    fn check(&self) -> Command {
         let absent = self.0.join("absent");
         std::fs::write(self.0.join("brew.json"), r#"{"formulae": [], "casks": []}"#).unwrap();
         std::fs::create_dir_all(self.0.join("home")).unwrap();
-        let out = Command::new(env!("CARGO_BIN_EXE_immunity"))
-            .env("HOME", self.0.join("home"))
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_immunity"));
+        cmd.env("HOME", self.0.join("home"))
             .current_dir(&self.0)
             .args(["run", "--machine-name", "mac", "--store"])
             .arg(self.store())
             .arg("--brew-input")
             .arg(self.0.join("brew.json"))
-            .args(["--tailscale", "absent", "--threats-input", "absent"])
+            .args(["--tailscale", "absent"])
             .args(["--osv-crates-input", "absent", "--osv-npm-input", "absent"])
             .args(["--osv-pypi-input", "absent"])
             .arg("--system-root")
@@ -162,15 +178,8 @@ impl Dir {
             .arg("--checkouts-root")
             .arg(self.0.join("home"))
             .arg("--sessions-root")
-            .arg(&absent)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        String::from_utf8_lossy(&out.stdout).into_owned()
+            .arg(&absent);
+        cmd
     }
 
     /// A full run that starts in a later second than every reading before it, so that "since
@@ -2198,6 +2207,112 @@ fn a_log_file_written_while_the_reading_goes_on_is_the_level_recording() {
         .unwrap();
     dir.run();
     assert_eq!(dir.status()["event_level"]["state"], "running");
+}
+
+/// Runs a full check held in its download of the threat catalogue: its curl waits for a file
+/// `go`, at most a minute, then answers as a network that is down. Once the check has written
+/// its start, `meanwhile` is given that time; the check is let go two seconds after it, and
+/// must finish within two minutes.
+fn held_check(dir: &Dir, meanwhile: impl FnOnce(i64)) {
+    use std::os::unix::fs::PermissionsExt;
+    let (curl, go) = (dir.0.join("curl"), dir.0.join("go"));
+    let _ = std::fs::remove_file(&go);
+    let script = format!(
+        r#"#!/bin/sh
+i=0
+while [ ! -e '{}' ] && [ $i -lt 600 ]; do sleep 0.1; i=$((i + 1)); done
+echo 'curl: (6) Could not resolve host: catalogue.invalid' >&2
+printf '\n000 \n' >&2
+exit 6
+"#,
+        go.display()
+    );
+    std::fs::write(&curl, script).unwrap();
+    std::fs::set_permissions(&curl, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let starts = || {
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY;
+        let conn = rusqlite::Connection::open_with_flags(dir.store(), flags).ok()?;
+        conn.query_row(
+            "SELECT COUNT(*), (SELECT at FROM journal WHERE entry = 'run_started'
+                                ORDER BY seq DESC LIMIT 1)
+             FROM journal WHERE entry = 'run_started'",
+            [],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
+        )
+        .ok()
+    };
+    let before = starts().map_or(0, |(n, _)| n);
+    let mut check = dir
+        .check()
+        .arg("--curl")
+        .arg(&curl)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let end = std::time::Instant::now() + Duration::from_secs(120);
+    let started = loop {
+        if let Some((n, Some(at))) = starts()
+            && n > before
+        {
+            break at;
+        }
+        assert!(std::time::Instant::now() < end, "the check never started");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    meanwhile(started);
+    while now_secs() < started as u64 + 2 {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    std::fs::write(&go, "").unwrap();
+    let status = loop {
+        if let Some(status) = check.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() > end {
+            check.kill().unwrap();
+            panic!("the check did not finish");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut said = String::new();
+    std::io::Read::read_to_string(&mut check.stderr.take().unwrap(), &mut said).unwrap();
+    assert!(status.success(), "{said}");
+}
+
+#[test]
+fn a_check_judges_the_collector_at_the_time_it_reads_the_log_not_the_time_it_began() {
+    // A check reads the log after downloads that can take minutes, and the collector writes
+    // meanwhile. A test cannot wait minutes, so the line is dated as written 301 seconds into
+    // the check, and the check is held two seconds. Judged at the check's start, that time
+    // would be ahead of the clock by more than the five minutes allowed, no sign of life, and a
+    // level installed an hour ago would be told silent. Judged when the log is read, it is the
+    // collector writing.
+    let dir = Dir::new("held-check");
+    dir.install();
+    let hour_ago = SystemTime::now() - Duration::from_secs(3600);
+    let dated = |path: PathBuf, when: SystemTime| {
+        std::fs::File::options()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .set_modified(when)
+            .unwrap();
+    };
+    dated(dir.root().join(PLIST), hour_ago);
+    dir.append("exec-20261004T00.jsonl", &exec(1));
+    let file = dir.log().join("exec-20261004T00.jsonl");
+    held_check(&dir, |started| {
+        let written = UNIX_EPOCH + Duration::from_secs(started as u64 + 301);
+        dated(file.clone(), written);
+    });
+    assert_eq!(dir.status()["event_level"]["state"], "running");
+
+    // A collector that wrote nothing for an hour is still silent after the same wait.
+    dated(file, hour_ago);
+    dir.forget_awake();
+    held_check(&dir, |_| {});
+    assert_eq!(dir.status()["event_level"]["state"], "silent");
 }
 
 #[test]
