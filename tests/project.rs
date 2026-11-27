@@ -138,11 +138,12 @@ impl Drop for Home {
     }
 }
 
-/// A lockfile of npm declaring one package.
+/// A lockfile of npm declaring one package from the public registry.
 fn package_lock(package: &str) -> String {
     format!(
         "{{\"name\": \"shop\", \"lockfileVersion\": 3, \"packages\": {{\"\": {{\"name\": \"shop\"}}, \
-         \"node_modules/{package}\": {{\"version\": \"1.3.0\"}}}}}}\n"
+         \"node_modules/{package}\": {{\"version\": \"1.3.0\", \"resolved\": \
+         \"https://registry.npmjs.org/{package}/-/{package}-1.3.0.tgz\"}}}}}}\n"
     )
 }
 

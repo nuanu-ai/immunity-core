@@ -219,7 +219,10 @@ fn iso_utc(secs: i64) -> String {
 fn lock_deps(w: &Watch, deps: &[(&str, &str)]) {
     let entries: Vec<String> = deps
         .iter()
-        .map(|(name, version)| format!("\"node_modules/{name}\": {{\"version\": \"{version}\"}}"))
+        .map(|(name, version)| {
+            let resolved = format!("https://registry.npmjs.org/{name}/-/{name}-{version}.tgz");
+            format!("\"node_modules/{name}\": {{\"version\": \"{version}\", \"resolved\": \"{resolved}\"}}")
+        })
         .collect();
     put(
         w.home(),
@@ -885,8 +888,14 @@ const PACKAGE_LOCK: &str = r#"{
   "requires": true,
   "packages": {
     "": { "name": "shop", "version": "1.0.0" },
-    "node_modules/left-pad": { "version": "1.3.0" },
-    "node_modules/@types/node": { "version": "22.7.4" }
+    "node_modules/left-pad": {
+      "version": "1.3.0",
+      "resolved": "https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz"
+    },
+    "node_modules/@types/node": {
+      "version": "22.7.4",
+      "resolved": "https://registry.npmjs.org/@types/node/-/node-22.7.4.tgz"
+    }
   }
 }
 "#;
@@ -941,10 +950,8 @@ fn under_partial_coverage_new_assertions_become_live_and_nothing_is_retracted() 
     immunity_home(&store, &brew, &absent);
 
     let next = PACKAGE_LOCK
-        .replace(
-            "left-pad\": { \"version\": \"1.3.0",
-            "is-odd\": { \"version\": \"3.0.1",
-        )
+        .replace("left-pad", "is-odd")
+        .replace("1.3.0", "3.0.1")
         .replace("22.7.4", "22.7.5");
     put(&shop, "package-lock.json", &next);
     let report = immunity_home(&store, &brew, &absent);

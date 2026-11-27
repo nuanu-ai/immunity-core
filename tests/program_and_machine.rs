@@ -1519,7 +1519,8 @@ fn a_machines_parts_are_one_level_and_a_project_on_it_is_a_part_without_its_own_
     e.put(
         "home/dev/shop/package-lock.json",
         "{\"name\": \"shop\", \"lockfileVersion\": 3, \"packages\": {\"\": {\"name\": \"shop\"}, \
-         \"node_modules/left-pad\": {\"version\": \"1.3.0\"}}}\n",
+         \"node_modules/left-pad\": {\"version\": \"1.3.0\", \"resolved\": \
+         \"https://registry.npmjs.org/left-pad/-/left-pad-1.3.0.tgz\"}}}\n",
     );
     e.formula("tool", "1.0");
     e.run();
