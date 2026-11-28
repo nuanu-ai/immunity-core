@@ -569,9 +569,11 @@ struct Layout {
     numbers: Vec<bool>,
     /// Where a file event's fields begin.
     file_at: usize,
-    /// Which texts the rules of this schema need in each field, searched for once per event;
-    /// `None` asks every rule.
-    texts: Option<Texts>,
+    /// Which texts the rules of this schema need in each field, numbered.
+    wanted: Wanted,
+    /// Those texts searched for once per event; `None` asks every rule. Built at the first
+    /// event, so that an answer that evaluates nothing never builds them.
+    texts: std::sync::OnceLock<Option<Texts>>,
 }
 
 impl Layout {
@@ -605,8 +607,15 @@ impl Layout {
             names,
             numbers,
             file_at,
-            texts: None,
+            wanted: Wanted::new(),
+            texts: std::sync::OnceLock::new(),
         }
+    }
+
+    fn texts(&self) -> Option<&Texts> {
+        self.texts
+            .get_or_init(|| Texts::new(&self.wanted, self.names.len()))
+            .as_ref()
     }
 
     /// Where the fields of `kind` stand among the values.
@@ -1171,7 +1180,7 @@ impl Rules {
         kept: crate::events::Keeps,
         values: &[Option<String>],
     ) -> Vec<usize> {
-        let held = self.layouts[n].texts.as_ref().map(|t| t.held(values));
+        let held = self.layouts[n].texts().map(|t| t.held(values));
         self.rules
             .iter()
             .enumerate()
@@ -1419,13 +1428,11 @@ pub fn times(n: i64) -> String {
     crate::view::counted(n, "time", "times")
 }
 
-/// The rules as they are read, before the texts they need are gathered into automata.
+/// The rules as they are read, with the texts each layout's rules need.
 #[derive(Default)]
 struct Loading {
     rules: Vec<Loaded>,
     layouts: Vec<Layout>,
-    /// The texts the rules of each layout need, numbered.
-    wanted: Vec<Wanted>,
 }
 
 impl Loading {
@@ -1439,7 +1446,6 @@ impl Loading {
             Some(n) => n,
             None => {
                 self.layouts.push(Layout::new(schema));
-                self.wanted.push(Wanted::new());
                 self.layouts.len() - 1
             }
         }
@@ -1447,7 +1453,9 @@ impl Loading {
 
     fn add(&mut self, source: &'static Source, file: &'static str, text: &str) {
         let n = self.layout(source.schema);
-        let loaded = load(source, file, text, n, &self.layouts[n], &mut self.wanted[n]);
+        let mut wanted = std::mem::take(&mut self.layouts[n].wanted);
+        let loaded = load(source, file, text, n, &self.layouts[n], &mut wanted);
+        self.layouts[n].wanted = wanted;
         self.rules.push(loaded);
     }
 
@@ -1518,13 +1526,9 @@ impl Loading {
     }
 
     fn done(self) -> Rules {
-        let mut layouts = self.layouts;
-        for (layout, wanted) in layouts.iter_mut().zip(self.wanted) {
-            layout.texts = Texts::new(wanted, layout.names.len());
-        }
         Rules {
             rules: self.rules,
-            layouts,
+            layouts: self.layouts,
         }
     }
 }
@@ -1583,7 +1587,7 @@ fn load(
     if let Err(said) = shape(&yaml, source) {
         return not_parsed(said);
     }
-    let rule: sigma_rust::Rule = match serde_norway::from_value(yaml.clone()) {
+    let rule = match <sigma_rust::Rule as serde::Deserialize>::deserialize(&yaml) {
         Ok(rule) => rule,
         Err(e) => return not_parsed(e.to_string()),
     };
@@ -2044,7 +2048,7 @@ struct FieldTexts {
 impl Texts {
     /// For `count` fields; `None` when an automaton cannot be built, and then every rule is
     /// asked.
-    fn new(texts: Wanted, count: usize) -> Option<Texts> {
+    fn new(texts: &Wanted, count: usize) -> Option<Texts> {
         let mut fields = Vec::new();
         for field in 0..count {
             let mine = || texts.iter().filter(move |((f, _, _), _)| *f == field);
@@ -4741,7 +4745,7 @@ mod tests {
     fn asking_only_the_rules_a_start_can_match_gives_the_same_matches() {
         let rules = Rules::shipped();
         assert!(
-            rules.layouts.iter().all(|l| l.texts.is_some()),
+            rules.layouts.iter().all(|l| l.texts().is_some()),
             "the texts' automata were built"
         );
         let (mut base, mut files) = starts_from_rules();
@@ -5163,10 +5167,7 @@ mod tests {
             assert!(ask(anything, "/bin/x", "z"), "{anything}");
         }
         let wildcards = load("        CommandLine|contains: '*?'\n");
-        assert_eq!(
-            wildcards.layouts[0].texts.as_ref().map(|t| t.count),
-            Some(0)
-        );
+        assert_eq!(wildcards.layouts[0].texts().map(|t| t.count), Some(0));
     }
 
     /// What keeps the rules of Immunity Core's own among `files`, a folder's files by their names,
