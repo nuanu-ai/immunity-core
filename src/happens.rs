@@ -476,14 +476,20 @@ fn lost(out: &mut String, l: &v1::EventLevel) -> Out {
     Ok(())
 }
 
-/// What a running watcher writes to `LIVE_FILE` after a reading of program starts, at `now`:
-/// the level's numbers, its state as a fixed word, the caveats in their few words, and how
-/// many program starts matched each shipped rule this week, by id. Nothing else: a title or
-/// anything read from an event stays in the page as it was made.
-pub fn live(l: Option<&Level>, now: i64) -> Value {
+/// What `LIVE_FILE` says while the watcher's evaluator has lines of the log left unread: the
+/// counts of matches are not yet of the whole log, and the page says no rule matched only once
+/// they are.
+pub const CATCHING_UP: &str = "catching up on the log";
+
+/// What a running watcher writes to `LIVE_FILE` at each conclusion of its evaluator, at `now`:
+/// the level's numbers, its state as a fixed word, the caveats in their few words, how many
+/// program starts matched each shipped rule this week, by id, and why it is behind the log,
+/// when it is. Nothing else: a title or anything read from an event stays in the page as it was
+/// made.
+pub fn live(l: Option<&Level>, now: i64, behind: Option<&str>) -> Value {
     let series = |s: &events::Series| serde_json::json!({ "ends_at_seconds": s.ends_at, "step": s.step, "counts": s.counts });
     let Some(level) = l else {
-        return serde_json::json!({ "written_at_seconds": now, "state": known(None) });
+        return serde_json::json!({ "written_at_seconds": now, "state": known(None), "behind": behind });
     };
     let said = events::words(level);
     let rules = Rules::shipped();
@@ -494,6 +500,7 @@ pub fn live(l: Option<&Level>, now: i64) -> Value {
         .collect();
     serde_json::json!({
         "written_at_seconds": now,
+        "behind": behind,
         "state": known(l),
         "state_words": said.state,
         "last_day": level.last_day.starts,
@@ -510,11 +517,19 @@ pub fn live(l: Option<&Level>, now: i64) -> Value {
 
 /// `live` as the script file the page loads: one assignment. Written whole and then moved into
 /// place, so that the page never loads half of one.
-pub fn write_live(folder: &std::path::Path, l: Option<&Level>, now: i64) -> std::io::Result<()> {
+pub fn write_live(
+    folder: &std::path::Path,
+    l: Option<&Level>,
+    now: i64,
+    behind: Option<&str>,
+) -> std::io::Result<()> {
     let path = folder.join(LIVE_FILE);
     std::fs::create_dir_all(path.parent().unwrap_or(folder))?;
     let part = path.with_extension("js.part");
-    std::fs::write(&part, format!("window.immunityLive = {};\n", live(l, now)))?;
+    std::fs::write(
+        &part,
+        format!("window.immunityLive = {};\n", live(l, now, behind)),
+    )?;
     std::fs::rename(&part, &path)
 }
 
@@ -1520,7 +1535,7 @@ print(JSON.stringify(out));
             step: 3600,
             counts: vec![0; events::HOURS],
         };
-        live(Some(&l), 0)
+        live(Some(&l), 0, None)
     }
 
     #[test]
@@ -1567,10 +1582,10 @@ print(JSON.stringify(out));
         l.files.collected = true;
         l.files.last_day.files = 9;
         assert_eq!(
-            live(Some(&l), 0)["file_events_last_day"],
+            live(Some(&l), 0, None)["file_events_last_day"],
             serde_json::Value::Null
         );
-        let page = page_after(events::RUNNING, Some(live(Some(&l), 0)), 5);
+        let page = page_after(events::RUNNING, Some(live(Some(&l), 0, None)), 5);
         assert_eq!(
             page["moved"],
             serde_json::json!({ "text": "Program starts are refused by macOS now. The rest of this section is as the page was made; open it again from the app.", "hidden": false }),
@@ -1593,12 +1608,12 @@ print(JSON.stringify(out));
             (PADDING.to_string(), 2),
             ("</script><script>alert(1)//".to_string(), 1),
         ]);
-        let v = live(Some(&l), 1_791_000_000);
+        let v = live(Some(&l), 1_791_000_000, None);
         assert_eq!(v["state"], events::FAILED);
         assert_eq!(v["matches_last_week"], serde_json::json!({ PADDING: 2 }));
         assert_eq!(v["written_at_seconds"], 1_791_000_000);
         l.state = events::RUNNING.to_string();
-        let v = live(Some(&l), 0);
+        let v = live(Some(&l), 0, None);
         assert_eq!(
             (&v["state"], &v["state_words"]),
             (&serde_json::json!("running"), &serde_json::json!("on"))
@@ -1608,9 +1623,10 @@ print(JSON.stringify(out));
             (&serde_json::json!(7), &serde_json::json!("3"))
         );
         assert_eq!(
-            live(None, 5),
-            serde_json::json!({ "written_at_seconds": 5, "state": "none" })
+            live(None, 5, None),
+            serde_json::json!({ "written_at_seconds": 5, "state": "none", "behind": null })
         );
+        assert_eq!(live(Some(&l), 0, Some(CATCHING_UP))["behind"], CATCHING_UP);
     }
 
     #[test]

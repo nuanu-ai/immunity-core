@@ -180,21 +180,10 @@ impl Text {
         show(&self.0, &store_escape)
     }
 
-    /// The text shown: each piece of text through `esc`, each mark as it is.
-    pub fn shown(&self, esc: impl Fn(&str) -> String) -> String {
-        show(&self.0, &esc)
-    }
-
-    /// The core's own words or a name, such as a path, to be put beside a source's text
-    /// (`then`): never cut, and shown as `said` shows any text, a backslash as `\u{5c}`.
+    /// The core's own words or a name, such as a path, to be put beside a source's text: never
+    /// cut, and shown as `said` shows any text, a backslash as `\u{5c}`.
     pub fn ours(s: &str) -> Text {
         Text(text_pieces(s))
-    }
-
-    /// This text, then `next`, each piece as it was cut.
-    pub fn then(mut self, next: Text) -> Text {
-        self.0.extend(next.0);
-        self
     }
 
     /// The text as every output shows it, the contract, the text for a person, the pages and
@@ -1557,6 +1546,13 @@ mod tests {
     /// One text from a source, cut and shown: each piece of text through `esc`.
     fn text(s: &str, esc: impl Fn(&str) -> String) -> String {
         Text::source(s).shown(esc)
+    }
+
+    impl Text {
+        /// The text shown: each piece of text through `esc`, each mark as it is.
+        fn shown(&self, esc: impl Fn(&str) -> String) -> String {
+            show(&self.0, &esc)
+        }
     }
 
     // Every secret here is invented. Token-shaped ones are made when the test runs, a prefix and
@@ -3361,10 +3357,12 @@ mod tests {
         // text alone, and what the core put around it is kept.
         let long = "x".repeat(LINE_CAP + 1);
         let line = |source: &str| {
-            Text::ours("db-1: ")
-                .then(Text::source(source))
-                .then(Text::ours(". 2 need a look."))
-                .said()
+            let pieces = [
+                Text::ours("db-1: "),
+                Text::source(source),
+                Text::ours(". 2 need a look."),
+            ];
+            Text(pieces.into_iter().flat_map(|t| t.0).collect()).said()
         };
         assert_eq!(
             line(&long),

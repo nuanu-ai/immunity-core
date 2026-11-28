@@ -10,32 +10,38 @@
 // of a rule marked high or critical also raised a finding; the others, and those of a rule whose
 // set states no level, are only counted in the store. Events that matched no rule are not given.
 //
-// The queue is the log itself, read again. The store keeps no event, and the caller keeps its
-// own place: it passes `continue_after` back as `--after` to read on. The place is the core's own
-// words and is opaque: a reader stores it and passes it back whole, and never parses or compares
-// it. It holds what the core's own reading keeps for itself: for each log file, the file's
-// identity and how far it was read. So a file that is replaced, a clock that was wrong, or a file
-// deleted before it was read is noticed, and nothing is skipped without the answer saying so. An
-// event may be given twice, after a file was replaced; it is never missed silently.
+// The queue is the record the core keeps of what its evaluator concluded: a row for every match
+// of every rule, in the order the evaluator wrote them, each with a number never given to another
+// row. The store keeps no copy of the event: the answer reads the line again from the log at its
+// place, and gives it only when it is the line the evaluator judged, by a hash the row keeps. A
+// row goes with its log file when the file leaves the log. Nothing is evaluated for the answer. The caller keeps its own place: it passes `continue_after` back as `--after` to read
+// on. The place is the core's own words and is opaque: a reader stores it and passes it back
+// whole, and never parses or compares it. A place from another store, or one an earlier version
+// printed, is refused with what to do. Rows a caller had not been given that went before it asked
+// are told (`evaluated.gone`), never left out silently. Since 1.41.0; before, the answer read the
+// log again from a place of its own and evaluated it.
 //
 // When an answer is quiet. An answer with no matches says that nothing matched only when all of
 // these hold:
+// - `evaluated.state` is `current`: the evaluator has read the log up to about now;
 // - `collector.state` is `running`;
-// - the stretch shows nothing lost, unread or gone: every count in `stretch` other than
+// - `evaluated` shows nothing lost, unreadable or gone: every count in it other than
 //   `program_starts`, `file_events` and `other` is 0, and `gone` is false;
 // - `collector.file_events_collected` is true;
 // - no rule the reader cares about is in `unevaluated`. A rule there `in_part` is evaluated, and
 //   a match of it is a match; that it did not match says nothing of the alternatives that need
 //   the fields in its `fields_text`.
 // Otherwise the answer says what the core did not see, and the reader does not take it for calm.
-// Quiet rests on `unevaluated`, which covers the lines this answer read, and not on the lists of
-// what arrives in `collector`, which are the core's latest reading and may be older than them.
-// A group that only some lines fill by nature, as `script` is, is judged by the core's latest
-// reading alone: one start without a script cannot tell a program that runs none from a field the
-// collector stopped filling. After the collector stops filling such a group, an answer over lines
-// the core has not read yet can stay quiet until the core's reading has counted the group's bound,
-// 1,000 program starts for `script`, and for as long as the core does not read at all. No shipped
-// rule reads such a group.
+// A reader built before 1.41.0, which looks for the counts in the field `stretch`, finds none:
+// for it, `collector.state` is `running` only when the answer is quiet by the conditions above
+// that `evaluated` holds, and `behind` or `failed` otherwise.
+// Quiet rests on `unevaluated`, which covers the lines the counts cover, and not on the lists of
+// what arrives in `collector`, which are the evaluator's latest conclusion. A group that only some
+// lines fill by nature, as `script` is, is judged by that conclusion alone: one start without a
+// script cannot tell a program that runs none from a field the collector stopped filling. After
+// the collector stops filling such a group, an answer can stay quiet until the evaluator has
+// counted the group's bound, 1,000 program starts for `script`. No shipped rule reads such a
+// group.
 //
 // Values that will be added. A reader meets values of `Raised`, `CollectorState`,
 // `UnevaluatedReason` and a rule's `Level`, and those `event.proto` names, that it does not know:
@@ -59,36 +65,128 @@ message Matches {
   uint32 format = 1;
   // When the answer was made.
   int64 answered_at = 2;
-  // The place given with `--after`, as given. Absent when the answer starts at the oldest line
+  // The place given with `--after`, as given. Absent when the answer starts at the oldest row
   // kept.
   optional string after = 3;
-  // The matches after `after`, in the order of the log; the matches of one event in the order
-  // the rules are shipped.
+  // The matches after `after`, in the order the evaluator recorded them: the order of the log
+  // within a file, and the matches of one event in the order the rules are shipped.
   repeated RuleMatch matches = 4;
   // The place to pass as `--after` next time, the core's own words: opaque, stored and passed
-  // back whole. Absent when the collector is not installed: the next answer starts at the oldest
-  // line kept.
+  // back whole.
   optional string continue_after = 5;
-  // Whether whole lines are left after `continue_after` that this answer did not read because
-  // it stopped at its limit.
+  // Whether matches are left after `continue_after` that this answer did not give because it
+  // stopped at its limit, of matches or of bytes.
   bool more = 6;
-  // What was read after `after` up to `continue_after`, and what was not.
-  Stretch stretch = 7;
+  // 7 was `stretch`, what an answer read of the log after `after`, until 1.41.0: the answer
+  // reads the log no more. `evaluated` says what the counts after `after` are now.
+  reserved 7;
+  reserved "stretch";
   Collector collector = 8;
   // The shipped rules that are not evaluated over these events, or only in part, each with why.
   repeated Unevaluated unevaluated = 9;
   // The store this answer was read from, as in every answer (`common.proto`): random, made once
   // when the store was made.
   optional string store_id = 10;
+  // How far the evaluator has read the log, and what the lines it counted after `after` held.
+  // Since 1.41.0.
+  Evaluated evaluated = 11;
+}
+
+// How far the evaluator has read the log, whether it is reading it now, and what the lines it
+// counted after the caller's place held. Since 1.41.0.
+//
+// The store keeps running totals of the counts, which only grow, and the caller's place holds the
+// totals its answer reached: an answer gives the totals now less those, so the counts of answers
+// read on one from another add up to the lines read, none twice and none left out, whatever the
+// clock does.
+//
+// `state` rests on the evaluator's own writes, never on the times of the log's files: each start
+// of the watcher's evaluator is a new one, and each of its writes records which one wrote,
+// whether that pass reached the end of the log with nothing left to read, and when. It is
+// `current` only when the last write is the evaluator the live watcher runs and reached the end,
+// and either no whole line waits past where it read or it wrote within a few seconds of the
+// answer. A pass that left lines to read is `behind`, however fresh its write.
+message Evaluated {
+  EvaluatorState state = 1;
+  // Why it is behind, when `state` is `behind`.
+  BehindReason behind = 2;
+  // What failed, when `state` is `failed`, in the words the failure gave.
+  optional string reason_text = 3;
+  // When a reader of the log, the evaluator or a full check, last wrote how far it read, in seconds
+  // since the epoch. Absent before any reading of the log.
+  optional int64 read_until_at = 4;
+  // Lines read and evaluated by the rules of their kind.
+  uint64 program_starts = 5;
+  uint64 file_events = 6;
+  // Lines read that hold a kind of message the rules are not asked about.
+  uint64 other = 7;
+  // Lines that are not a message, such as a line split at the turn of an hour, or a line longer
+  // than the evaluator reads: not evaluated.
+  uint64 unreadable_lines = 8;
+  // File events the collector or the core could not make out, such as one whose path eslogger
+  // marked as cut short: not evaluated.
+  uint64 unreadable_file_events = 9;
+  // Program starts missing from eslogger's numbering: dropped before they reached the log, or in
+  // lines deleted before they were read.
+  uint64 program_starts_lost = 10;
+  // Times the numbering of program starts started again, as it does when eslogger restarts: each
+  // a loss of unknown size.
+  uint64 program_starts_unknown_losses = 11;
+  // The same for files created and renamed.
+  uint64 file_events_lost = 12;
+  uint64 file_events_unknown_losses = 13;
+  // Log files deleted, replaced or cut short before the evaluator read them to their end, or
+  // that left with that unknown: nothing in what was left of them was evaluated, and the core
+  // cannot say how many lines that was.
+  uint64 files_removed_unread = 14;
+  // Matches after `after` went before this answer could give them: their log files left the log,
+  // or became other files before the evaluator wrote them; or a log file left, also with an
+  // uninstall, before it was known read to its end, so lines no reading read may have gone with
+  // it; or the line of a match given here is no longer the line judged, and that match is given
+  // with no event.
+  bool gone = 15;
+}
+
+// Whether the evaluator has read the log up to about now.
+enum EvaluatorState {
+  EVALUATOR_STATE_UNSPECIFIED = 0;
+  // It reads the log as it grows: whole lines written more than a few seconds ago are read.
+  EVALUATOR_STATE_CURRENT = 1;
+  // Lines of the log may be left that it has not read, as `behind` says why. Matches in them are
+  // not in this answer yet.
+  EVALUATOR_STATE_BEHIND = 2;
+  // Its latest reading failed, as `reason_text` says.
+  EVALUATOR_STATE_FAILED = 3;
+}
+
+// Why the evaluator is behind the log. Values are added within version 1; one the reader does not
+// know is read as behind for a reason it cannot judge.
+enum BehindReason {
+  BEHIND_REASON_UNSPECIFIED = 0;
+  // No watcher runs: the log is read only by a full check, and lines written since the latest
+  // one are not read.
+  BEHIND_REASON_NO_WATCHER = 1;
+  // A whole line waits in the log, the evaluator has not written for more than a few seconds,
+  // and a full check holds the store, which the evaluator waits for to write what it read.
+  BEHIND_REASON_STORE_HELD = 2;
+  // The watcher's evaluator has lines left to read: its last write did not reach the end of the
+  // log, as when it reads the lines written while none read, or a backlog, or it started a moment
+  // ago and has not written yet.
+  BEHIND_REASON_CATCHING_UP = 3;
+  // A whole line waits in the log past where the evaluator read, and it has not written for more
+  // than a few seconds: it stalled.
+  BEHIND_REASON_NOT_ADVANCING = 4;
 }
 
 // A published rule matched an event. A match is named by its `position` and its rule's `name`.
 message RuleMatch {
-  // Where the event's line is: the core's own reference, opaque, that includes the log file's
-  // identity, so it is never given to another line. Positions are not ordered as text: matches
-  // come in the order of the log.
+  // Where the event's line is: the core's own reference, opaque, that names the generation of the
+  // log file the line was read in, so it is never given to another line. Positions are not ordered
+  // as text: matches come in the order of the log.
   string position = 1;
   Rule rule = 2;
+  // The event on the line, read again from the log. Absent when the line could not be read
+  // again, as when its file left the log a moment before; `Evaluated.gone` then says so.
   Event event = 3;
   // What became of the match among the core's findings.
   Raised raised = 4;
@@ -114,11 +212,10 @@ enum Raised {
   RAISED_BELOW_HIGH = 1;
   // The core's own reading raised a finding of the match or added it to one, as `findings` says.
   RAISED_FINDING = 2;
-  // The core's own reading has not read the line yet. This is not a promise of a finding. When
-  // the reading reaches the line, the match raises the rule's finding or adds to it, and a later
-  // answer says which. A line deleted before then is never read, and no finding holds it. The
-  // reader judges the match itself.
-  RAISED_NOT_READ_YET = 3;
+  // 3 was `RAISED_NOT_READ_YET`, a match the core's own reading had not read yet, until 1.41.0:
+  // a match is given only once the evaluator recorded it, with its finding where it raised one.
+  reserved 3;
+  reserved "RAISED_NOT_READ_YET";
   // The core's own reading read the line and no finding holds the match, as a build that lacked
   // the rule leaves it. The reader judges the match itself.
   RAISED_NO_FINDING = 4;
@@ -131,51 +228,20 @@ enum Raised {
   RAISED_LEVEL_NOT_STATED = 6;
 }
 
-// What was read after `after` up to `continue_after`, and what was not. Adding the stretches of
-// answers that follow one another gives what one reading of the whole log gives.
-message Stretch {
-  // Lines read and evaluated by the rules of their kind.
-  uint64 program_starts = 1;
-  uint64 file_events = 2;
-  // Lines read that hold a kind of message the rules are not asked about.
-  uint64 other = 3;
-  // Lines that are not a message, such as a line split at the turn of an hour: not evaluated.
-  uint64 unreadable_lines = 4;
-  // File events the collector or the core could not make out, such as one whose path eslogger
-  // marked as cut short: not evaluated.
-  uint64 unreadable_file_events = 5;
-  // Program starts missing from eslogger's numbering: dropped before they reached the log, or
-  // in lines deleted before they were read. The number before this stretch's first program start
-  // is the one `after` holds, so a gap at the seam between two answers is counted in the later
-  // one; without `after`, the first has nothing before it.
-  uint64 program_starts_lost = 6;
-  // Times the numbering of program starts started again, as it does when eslogger restarts:
-  // each a loss of unknown size.
-  uint64 program_starts_unknown_losses = 7;
-  // The same for files created and renamed.
-  uint64 file_events_lost = 8;
-  uint64 file_events_unknown_losses = 9;
-  // Lines that `after` had not read were deleted, or their file replaced, before this answer
-  // could read them: they are gone, and nothing in them was evaluated here. The core cannot say
-  // how many.
-  bool gone = 10;
-  // When `gone`, where the log kept goes on: the first line of the first file kept at or after
-  // the place of the lines that are gone, as a `position`. Absent when no such file is kept.
-  optional string kept_from = 11;
-}
-
 // The collector and what it records.
 message Collector {
-  // Its state, judged from its log when this answer was made, the way the core's own reading
-  // judges it. This is the state that speaks for the stretch just read. Only while it is
-  // `running` does a quiet stretch mean that little happened.
+  // Its state as its own files say at the answer, judged as a reading judges it: not installed,
+  // refused, failing or silent; failed when its launch daemon is there and its log folder is not,
+  // or cannot be read. Where they say it runs, `behind` or `failed` where the evaluator is
+  // (`Evaluated.state`), or where what it counted after `after` is not whole; see "When an answer
+  // is quiet". Only while it is `running` does a quiet answer mean that little happened.
   CollectorState state = 1;
   // What made it `refused` or `failing`: who printed it, `eslogger` or `scripts`, and the last
   // line printed.
   optional string said_by = 2;
   optional string said_text = 3;
-  // When its log was last written to, as the files' times say. A time later than `answered_at`
-  // is not taken as a sign that it records.
+  // When its log was last written to, as the files' times say at the answer. A time later than
+  // `answered_at` is not taken as a sign that it records.
   optional int64 written_at = 4;
   // Whether the collector installed here is established to record files created and renamed.
   // When it is not, or it is not installed, the rules for file events are listed in
@@ -183,22 +249,21 @@ message Collector {
   bool file_events_collected = 5;
   // Its state as `immunity status` serves it now, from the core's own latest reading, and when
   // that reading was made; failed, with when, while the store says it runs and the watcher's
-  // latest reading of it failed. It speaks for the core's findings and for `raised`, not for the
-  // stretch. Absent when the store holds no reading of it.
+  // latest reading of it failed. Absent when the store holds no reading of it.
   optional CollectorState status_state = 6;
   optional int64 status_read_at = 7;
   // Files in the log folder that are not the collector's own, by their names: not read.
   uint64 foreign_files = 8;
   // What a collector may keep beyond what the first one kept, `identity`, `script` and
   // `signature`, each in one of five lists by what the core's latest reading stored, at
-  // `status_read_at`, and not by the stretch: only that reading reads every log file to its end
-  // and so knows which one the collector is writing now, and only that file's lines say it. Kept
-  // is decided by what arrives, never by a record. A rule that reads one that does not arrive is
-  // listed in `unevaluated` with `not_collected`, and `detail_text` says which of the other four
-  // it is. So is a rule that reads one some line of this answer did not give, whatever these
-  // lists say: a line without its key, which the rule was not asked about, or, for `identity`
-  // and `signature`, a line with the key and no value; `detail_text` then says that the lines of
-  // this answer did not carry it.
+  // `status_read_at`: only a reading of every log file to its end knows which one the collector
+  // is writing now, and only that file's lines say it. Kept is decided by what arrives, never by
+  // a record. A rule that reads one that does not arrive is listed in `unevaluated` with
+  // `not_collected`, and `detail_text` says which of the other four it is. So is a rule that reads
+  // one some line counted for this answer did not give, whatever these lists say: a line without
+  // its key, which the rule was not asked about, or, for `identity` and `signature`, a line with
+  // the key and no value; `detail_text` then says that the lines counted for this answer did not
+  // carry it.
   //
   // `not_kept`: the latest line lacks it, so the collector that wrote it is an earlier one, which
   // keeps none of them.
@@ -249,9 +314,11 @@ enum CollectorState {
   // Nothing was written while the Mac was awake for 15 minutes. Time the Mac was asleep or off
   // is not counted.
   COLLECTOR_STATE_SILENT = 5;
-  // The core's reading failed. Only `status_state` holds this: an answer whose reading fails
-  // is not given.
+  // The core's reading failed.
   COLLECTOR_STATE_FAILED = 6;
+  // Only in `Matches.collector.state`: the evaluator has not read the log up to now, or what it
+  // counted after `after` is not whole, as `Matches.evaluated` says. Since 1.41.0.
+  COLLECTOR_STATE_BEHIND = 7;
 }
 
 // A shipped rule that is not evaluated over the events here, or only in part, or a rule of a
@@ -274,9 +341,9 @@ message Unevaluated {
   repeated string fields_text = 7;
   // For `needs_events` the kind of event it is about; for `not_parsed` what the parser said; for
   // `not_collected` why the collector here is not taken to record file events, or to keep what
-  // the rule reads, or that lines this answer read did not give it. For a rule a translated set
-  // did not take, what the translation said of it, and for `in_part` what a translation left out
-  // that is not a missing field, such as a pattern it could not carry.
+  // the rule reads, or that lines counted for this answer did not give it. For a rule a
+  // translated set did not take, what the translation said of it, and for `in_part` what a
+  // translation left out that is not a missing field, such as a pattern it could not carry.
   optional string detail_text = 8;
   // Its set, as `Rule.source` and `Rule.set` give it; present for a rule that could not be read
   // too.

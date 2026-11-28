@@ -1144,26 +1144,22 @@ pub struct Matches {
     /// When the answer was made.
     #[prost(int64, tag = "2")]
     pub answered_at: i64,
-    /// The place given with `--after`, as given. Absent when the answer starts at the oldest line
+    /// The place given with `--after`, as given. Absent when the answer starts at the oldest row
     /// kept.
     #[prost(string, optional, tag = "3")]
     pub after: ::core::option::Option<::prost::alloc::string::String>,
-    /// The matches after `after`, in the order of the log; the matches of one event in the order
-    /// the rules are shipped.
+    /// The matches after `after`, in the order the evaluator recorded them: the order of the log
+    /// within a file, and the matches of one event in the order the rules are shipped.
     #[prost(message, repeated, tag = "4")]
     pub matches: ::prost::alloc::vec::Vec<RuleMatch>,
     /// The place to pass as `--after` next time, the core's own words: opaque, stored and passed
-    /// back whole. Absent when the collector is not installed: the next answer starts at the oldest
-    /// line kept.
+    /// back whole.
     #[prost(string, optional, tag = "5")]
     pub continue_after: ::core::option::Option<::prost::alloc::string::String>,
-    /// Whether whole lines are left after `continue_after` that this answer did not read because
-    /// it stopped at its limit.
+    /// Whether matches are left after `continue_after` that this answer did not give because it
+    /// stopped at its limit, of matches or of bytes.
     #[prost(bool, tag = "6")]
     pub more: bool,
-    /// What was read after `after` up to `continue_after`, and what was not.
-    #[prost(message, optional, tag = "7")]
-    pub stretch: ::core::option::Option<Stretch>,
     #[prost(message, optional, tag = "8")]
     pub collector: ::core::option::Option<Collector>,
     /// The shipped rules that are not evaluated over these events, or only in part, each with why.
@@ -1173,19 +1169,105 @@ pub struct Matches {
     /// when the store was made.
     #[prost(string, optional, tag = "10")]
     pub store_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// How far the evaluator has read the log, and what the lines it counted after `after` held.
+    /// Since 1.41.0.
+    #[prost(message, optional, tag = "11")]
+    pub evaluated: ::core::option::Option<Evaluated>,
+}
+/// How far the evaluator has read the log, whether it is reading it now, and what the lines it
+/// counted after the caller's place held. Since 1.41.0.
+///
+/// The store keeps running totals of the counts, which only grow, and the caller's place holds the
+/// totals its answer reached: an answer gives the totals now less those, so the counts of answers
+/// read on one from another add up to the lines read, none twice and none left out, whatever the
+/// clock does.
+///
+/// `state` rests on the evaluator's own writes, never on the times of the log's files: each start
+/// of the watcher's evaluator is a new one, and each of its writes records which one wrote,
+/// whether that pass reached the end of the log with nothing left to read, and when. It is
+/// `current` only when the last write is the evaluator the live watcher runs and reached the end,
+/// and either no whole line waits past where it read or it wrote within a few seconds of the
+/// answer. A pass that left lines to read is `behind`, however fresh its write.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(default)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Evaluated {
+    #[prost(enumeration = "EvaluatorState", tag = "1")]
+    #[serde(
+        serialize_with = "crate::enum_name::<EvaluatorState, _>",
+        deserialize_with = "crate::enum_from_name::<EvaluatorState, _>"
+    )]
+    pub state: i32,
+    /// Why it is behind, when `state` is `behind`.
+    #[prost(enumeration = "BehindReason", tag = "2")]
+    #[serde(
+        serialize_with = "crate::enum_name::<BehindReason, _>",
+        deserialize_with = "crate::enum_from_name::<BehindReason, _>"
+    )]
+    pub behind: i32,
+    /// What failed, when `state` is `failed`, in the words the failure gave.
+    #[prost(string, optional, tag = "3")]
+    pub reason_text: ::core::option::Option<::prost::alloc::string::String>,
+    /// When a reader of the log, the evaluator or a full check, last wrote how far it read, in seconds
+    /// since the epoch. Absent before any reading of the log.
+    #[prost(int64, optional, tag = "4")]
+    pub read_until_at: ::core::option::Option<i64>,
+    /// Lines read and evaluated by the rules of their kind.
+    #[prost(uint64, tag = "5")]
+    pub program_starts: u64,
+    #[prost(uint64, tag = "6")]
+    pub file_events: u64,
+    /// Lines read that hold a kind of message the rules are not asked about.
+    #[prost(uint64, tag = "7")]
+    pub other: u64,
+    /// Lines that are not a message, such as a line split at the turn of an hour, or a line longer
+    /// than the evaluator reads: not evaluated.
+    #[prost(uint64, tag = "8")]
+    pub unreadable_lines: u64,
+    /// File events the collector or the core could not make out, such as one whose path eslogger
+    /// marked as cut short: not evaluated.
+    #[prost(uint64, tag = "9")]
+    pub unreadable_file_events: u64,
+    /// Program starts missing from eslogger's numbering: dropped before they reached the log, or in
+    /// lines deleted before they were read.
+    #[prost(uint64, tag = "10")]
+    pub program_starts_lost: u64,
+    /// Times the numbering of program starts started again, as it does when eslogger restarts: each
+    /// a loss of unknown size.
+    #[prost(uint64, tag = "11")]
+    pub program_starts_unknown_losses: u64,
+    /// The same for files created and renamed.
+    #[prost(uint64, tag = "12")]
+    pub file_events_lost: u64,
+    #[prost(uint64, tag = "13")]
+    pub file_events_unknown_losses: u64,
+    /// Log files deleted, replaced or cut short before the evaluator read them to their end, or
+    /// that left with that unknown: nothing in what was left of them was evaluated, and the core
+    /// cannot say how many lines that was.
+    #[prost(uint64, tag = "14")]
+    pub files_removed_unread: u64,
+    /// Matches after `after` went before this answer could give them: their log files left the log,
+    /// or became other files before the evaluator wrote them; or a log file left, also with an
+    /// uninstall, before it was known read to its end, so lines no reading read may have gone with
+    /// it; or the line of a match given here is no longer the line judged, and that match is given
+    /// with no event.
+    #[prost(bool, tag = "15")]
+    pub gone: bool,
 }
 /// A published rule matched an event. A match is named by its `position` and its rule's `name`.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct RuleMatch {
-    /// Where the event's line is: the core's own reference, opaque, that includes the log file's
-    /// identity, so it is never given to another line. Positions are not ordered as text: matches
-    /// come in the order of the log.
+    /// Where the event's line is: the core's own reference, opaque, that names the generation of the
+    /// log file the line was read in, so it is never given to another line. Positions are not ordered
+    /// as text: matches come in the order of the log.
     #[prost(string, tag = "1")]
     pub position: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "2")]
     pub rule: ::core::option::Option<Rule>,
+    /// The event on the line, read again from the log. Absent when the line could not be read
+    /// again, as when its file left the log a moment before; `Evaluated.gone` then says so.
     #[prost(message, optional, tag = "3")]
     pub event: ::core::option::Option<Event>,
     /// What became of the match among the core's findings.
@@ -1208,60 +1290,16 @@ pub struct RuleMatch {
     #[prost(message, optional, tag = "6")]
     pub verdicts: ::core::option::Option<Verdicts>,
 }
-/// What was read after `after` up to `continue_after`, and what was not. Adding the stretches of
-/// answers that follow one another gives what one reading of the whole log gives.
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(default)]
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
-pub struct Stretch {
-    /// Lines read and evaluated by the rules of their kind.
-    #[prost(uint64, tag = "1")]
-    pub program_starts: u64,
-    #[prost(uint64, tag = "2")]
-    pub file_events: u64,
-    /// Lines read that hold a kind of message the rules are not asked about.
-    #[prost(uint64, tag = "3")]
-    pub other: u64,
-    /// Lines that are not a message, such as a line split at the turn of an hour: not evaluated.
-    #[prost(uint64, tag = "4")]
-    pub unreadable_lines: u64,
-    /// File events the collector or the core could not make out, such as one whose path eslogger
-    /// marked as cut short: not evaluated.
-    #[prost(uint64, tag = "5")]
-    pub unreadable_file_events: u64,
-    /// Program starts missing from eslogger's numbering: dropped before they reached the log, or
-    /// in lines deleted before they were read. The number before this stretch's first program start
-    /// is the one `after` holds, so a gap at the seam between two answers is counted in the later
-    /// one; without `after`, the first has nothing before it.
-    #[prost(uint64, tag = "6")]
-    pub program_starts_lost: u64,
-    /// Times the numbering of program starts started again, as it does when eslogger restarts:
-    /// each a loss of unknown size.
-    #[prost(uint64, tag = "7")]
-    pub program_starts_unknown_losses: u64,
-    /// The same for files created and renamed.
-    #[prost(uint64, tag = "8")]
-    pub file_events_lost: u64,
-    #[prost(uint64, tag = "9")]
-    pub file_events_unknown_losses: u64,
-    /// Lines that `after` had not read were deleted, or their file replaced, before this answer
-    /// could read them: they are gone, and nothing in them was evaluated here. The core cannot say
-    /// how many.
-    #[prost(bool, tag = "10")]
-    pub gone: bool,
-    /// When `gone`, where the log kept goes on: the first line of the first file kept at or after
-    /// the place of the lines that are gone, as a `position`. Absent when no such file is kept.
-    #[prost(string, optional, tag = "11")]
-    pub kept_from: ::core::option::Option<::prost::alloc::string::String>,
-}
 /// The collector and what it records.
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Collector {
-    /// Its state, judged from its log when this answer was made, the way the core's own reading
-    /// judges it. This is the state that speaks for the stretch just read. Only while it is
-    /// `running` does a quiet stretch mean that little happened.
+    /// Its state as its own files say at the answer, judged as a reading judges it: not installed,
+    /// refused, failing or silent; failed when its launch daemon is there and its log folder is not,
+    /// or cannot be read. Where they say it runs, `behind` or `failed` where the evaluator is
+    /// (`Evaluated.state`), or where what it counted after `after` is not whole; see "When an answer
+    /// is quiet". Only while it is `running` does a quiet answer mean that little happened.
     #[prost(enumeration = "CollectorState", tag = "1")]
     #[serde(
         serialize_with = "crate::enum_name::<CollectorState, _>",
@@ -1274,8 +1312,8 @@ pub struct Collector {
     pub said_by: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag = "3")]
     pub said_text: ::core::option::Option<::prost::alloc::string::String>,
-    /// When its log was last written to, as the files' times say. A time later than `answered_at`
-    /// is not taken as a sign that it records.
+    /// When its log was last written to, as the files' times say at the answer. A time later than
+    /// `answered_at` is not taken as a sign that it records.
     #[prost(int64, optional, tag = "4")]
     pub written_at: ::core::option::Option<i64>,
     /// Whether the collector installed here is established to record files created and renamed.
@@ -1285,8 +1323,7 @@ pub struct Collector {
     pub file_events_collected: bool,
     /// Its state as `immunity status` serves it now, from the core's own latest reading, and when
     /// that reading was made; failed, with when, while the store says it runs and the watcher's
-    /// latest reading of it failed. It speaks for the core's findings and for `raised`, not for the
-    /// stretch. Absent when the store holds no reading of it.
+    /// latest reading of it failed. Absent when the store holds no reading of it.
     #[prost(enumeration = "CollectorState", optional, tag = "6")]
     #[serde(
         serialize_with = "crate::optional_enum_name::<CollectorState, _>",
@@ -1300,14 +1337,14 @@ pub struct Collector {
     pub foreign_files: u64,
     /// What a collector may keep beyond what the first one kept, `identity`, `script` and
     /// `signature`, each in one of five lists by what the core's latest reading stored, at
-    /// `status_read_at`, and not by the stretch: only that reading reads every log file to its end
-    /// and so knows which one the collector is writing now, and only that file's lines say it. Kept
-    /// is decided by what arrives, never by a record. A rule that reads one that does not arrive is
-    /// listed in `unevaluated` with `not_collected`, and `detail_text` says which of the other four
-    /// it is. So is a rule that reads one some line of this answer did not give, whatever these
-    /// lists say: a line without its key, which the rule was not asked about, or, for `identity`
-    /// and `signature`, a line with the key and no value; `detail_text` then says that the lines of
-    /// this answer did not carry it.
+    /// `status_read_at`: only a reading of every log file to its end knows which one the collector
+    /// is writing now, and only that file's lines say it. Kept is decided by what arrives, never by
+    /// a record. A rule that reads one that does not arrive is listed in `unevaluated` with
+    /// `not_collected`, and `detail_text` says which of the other four it is. So is a rule that reads
+    /// one some line counted for this answer did not give, whatever these lists say: a line without
+    /// its key, which the rule was not asked about, or, for `identity` and `signature`, a line with
+    /// the key and no value; `detail_text` then says that the lines counted for this answer did not
+    /// carry it.
     ///
     /// `not_kept`: the latest line lacks it, so the collector that wrote it is an earlier one, which
     /// keeps none of them.
@@ -1395,9 +1432,9 @@ pub struct Unevaluated {
     pub fields_text: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     /// For `needs_events` the kind of event it is about; for `not_parsed` what the parser said; for
     /// `not_collected` why the collector here is not taken to record file events, or to keep what
-    /// the rule reads, or that lines this answer read did not give it. For a rule a translated set
-    /// did not take, what the translation said of it, and for `in_part` what a translation left out
-    /// that is not a missing field, such as a pattern it could not carry.
+    /// the rule reads, or that lines counted for this answer did not give it. For a rule a
+    /// translated set did not take, what the translation said of it, and for `in_part` what a
+    /// translation left out that is not a missing field, such as a pattern it could not carry.
     #[prost(string, optional, tag = "8")]
     pub detail_text: ::core::option::Option<::prost::alloc::string::String>,
     /// Its set, as `Rule.source` and `Rule.set` give it; present for a rule that could not be read
@@ -1406,6 +1443,100 @@ pub struct Unevaluated {
     pub source: ::prost::alloc::string::String,
     #[prost(string, tag = "10")]
     pub set: ::prost::alloc::string::String,
+}
+/// Whether the evaluator has read the log up to about now.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum EvaluatorState {
+    #[serde(rename = "unspecified")]
+    Unspecified = 0,
+    /// It reads the log as it grows: whole lines written more than a few seconds ago are read.
+    #[serde(rename = "current")]
+    Current = 1,
+    /// Lines of the log may be left that it has not read, as `behind` says why. Matches in them are
+    /// not in this answer yet.
+    #[serde(rename = "behind")]
+    Behind = 2,
+    /// Its latest reading failed, as `reason_text` says.
+    #[serde(rename = "failed")]
+    Failed = 3,
+}
+impl EvaluatorState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "EVALUATOR_STATE_UNSPECIFIED",
+            Self::Current => "EVALUATOR_STATE_CURRENT",
+            Self::Behind => "EVALUATOR_STATE_BEHIND",
+            Self::Failed => "EVALUATOR_STATE_FAILED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "EVALUATOR_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "EVALUATOR_STATE_CURRENT" => Some(Self::Current),
+            "EVALUATOR_STATE_BEHIND" => Some(Self::Behind),
+            "EVALUATOR_STATE_FAILED" => Some(Self::Failed),
+            _ => None,
+        }
+    }
+}
+/// Why the evaluator is behind the log. Values are added within version 1; one the reader does not
+/// know is read as behind for a reason it cannot judge.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum BehindReason {
+    #[serde(rename = "unspecified")]
+    Unspecified = 0,
+    /// No watcher runs: the log is read only by a full check, and lines written since the latest
+    /// one are not read.
+    #[serde(rename = "no_watcher")]
+    NoWatcher = 1,
+    /// A whole line waits in the log, the evaluator has not written for more than a few seconds,
+    /// and a full check holds the store, which the evaluator waits for to write what it read.
+    #[serde(rename = "store_held")]
+    StoreHeld = 2,
+    /// The watcher's evaluator has lines left to read: its last write did not reach the end of the
+    /// log, as when it reads the lines written while none read, or a backlog, or it started a moment
+    /// ago and has not written yet.
+    #[serde(rename = "catching_up")]
+    CatchingUp = 3,
+    /// A whole line waits in the log past where the evaluator read, and it has not written for more
+    /// than a few seconds: it stalled.
+    #[serde(rename = "not_advancing")]
+    NotAdvancing = 4,
+}
+impl BehindReason {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "BEHIND_REASON_UNSPECIFIED",
+            Self::NoWatcher => "BEHIND_REASON_NO_WATCHER",
+            Self::StoreHeld => "BEHIND_REASON_STORE_HELD",
+            Self::CatchingUp => "BEHIND_REASON_CATCHING_UP",
+            Self::NotAdvancing => "BEHIND_REASON_NOT_ADVANCING",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "BEHIND_REASON_UNSPECIFIED" => Some(Self::Unspecified),
+            "BEHIND_REASON_NO_WATCHER" => Some(Self::NoWatcher),
+            "BEHIND_REASON_STORE_HELD" => Some(Self::StoreHeld),
+            "BEHIND_REASON_CATCHING_UP" => Some(Self::CatchingUp),
+            "BEHIND_REASON_NOT_ADVANCING" => Some(Self::NotAdvancing),
+            _ => None,
+        }
+    }
 }
 /// What became of a match among the core's findings. Values are added within version 1.
 /// `UNSPECIFIED`, or a value the reader does not know, is read as something it cannot judge: the
@@ -1423,12 +1554,6 @@ pub enum Raised {
     /// The core's own reading raised a finding of the match or added it to one, as `findings` says.
     #[serde(rename = "finding")]
     Finding = 2,
-    /// The core's own reading has not read the line yet. This is not a promise of a finding. When
-    /// the reading reaches the line, the match raises the rule's finding or adds to it, and a later
-    /// answer says which. A line deleted before then is never read, and no finding holds it. The
-    /// reader judges the match itself.
-    #[serde(rename = "not_read_yet")]
-    NotReadYet = 3,
     /// The core's own reading read the line and no finding holds the match, as a build that lacked
     /// the rule leaves it. The reader judges the match itself.
     #[serde(rename = "no_finding")]
@@ -1448,7 +1573,6 @@ impl Raised {
             Self::Unspecified => "RAISED_UNSPECIFIED",
             Self::BelowHigh => "RAISED_BELOW_HIGH",
             Self::Finding => "RAISED_FINDING",
-            Self::NotReadYet => "RAISED_NOT_READ_YET",
             Self::NoFinding => "RAISED_NO_FINDING",
             Self::LevelNotStated => "RAISED_LEVEL_NOT_STATED",
         }
@@ -1459,7 +1583,6 @@ impl Raised {
             "RAISED_UNSPECIFIED" => Some(Self::Unspecified),
             "RAISED_BELOW_HIGH" => Some(Self::BelowHigh),
             "RAISED_FINDING" => Some(Self::Finding),
-            "RAISED_NOT_READ_YET" => Some(Self::NotReadYet),
             "RAISED_NO_FINDING" => Some(Self::NoFinding),
             "RAISED_LEVEL_NOT_STATED" => Some(Self::LevelNotStated),
             _ => None,
@@ -1488,10 +1611,13 @@ pub enum CollectorState {
     /// is not counted.
     #[serde(rename = "silent")]
     Silent = 5,
-    /// The core's reading failed. Only `status_state` holds this: an answer whose reading fails
-    /// is not given.
+    /// The core's reading failed.
     #[serde(rename = "failed")]
     Failed = 6,
+    /// Only in `Matches.collector.state`: the evaluator has not read the log up to now, or what it
+    /// counted after `after` is not whole, as `Matches.evaluated` says. Since 1.41.0.
+    #[serde(rename = "behind")]
+    Behind = 7,
 }
 impl CollectorState {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1507,6 +1633,7 @@ impl CollectorState {
             Self::Failing => "COLLECTOR_STATE_FAILING",
             Self::Silent => "COLLECTOR_STATE_SILENT",
             Self::Failed => "COLLECTOR_STATE_FAILED",
+            Self::Behind => "COLLECTOR_STATE_BEHIND",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1519,6 +1646,7 @@ impl CollectorState {
             "COLLECTOR_STATE_FAILING" => Some(Self::Failing),
             "COLLECTOR_STATE_SILENT" => Some(Self::Silent),
             "COLLECTOR_STATE_FAILED" => Some(Self::Failed),
+            "COLLECTOR_STATE_BEHIND" => Some(Self::Behind),
             _ => None,
         }
     }

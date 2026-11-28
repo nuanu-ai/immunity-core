@@ -927,21 +927,26 @@ fn check(
             Ok(None)
         }
         About::Match { position, rule } => {
-            checked_match(args, position, rule, sent.kind, now).map(Some)
+            checked_match(conn, args, position, rule, sent.kind, now).map(Some)
         }
     }
 }
 
-/// A match a verdict names, checked against the log: the rule is one this build ships, the
-/// position is one `immunity matches` prints, and the event on the line there, read again and
-/// evaluated at the one place the core evaluates an event, matched the rule.
+/// A match a verdict names, checked against the record of matches: the rule is one this build
+/// ships, the position is one `immunity matches` prints, and the record holds a row of that rule
+/// at that position, in the generation of its file the position names (`events::recorded`). The
+/// event is read again from its line, and taken only when it is the line judged; nothing is
+/// evaluated: the row is what the evaluator concluded when it read the line.
 ///
-/// The log keeps about a day, and a decision can take longer. When the line is no longer in it,
-/// a `suspicious` verdict is not lost: it is taken with no event (`Line::Gone`), as long as the
-/// time its position's file was started is a real one and not later than now, since
-/// `immunity matches` never printed any other (`LineAt::start`). A `harmless` one is refused: it
-/// is a record beside a match, and there is no match to keep it beside.
+/// The log keeps about a day, and a decision can take longer. When the line judged is no longer
+/// in the log, or the row went with its file's generation, a `suspicious` verdict is not lost: it
+/// is taken with no event (`Line::Gone`), as long as the time its position's file was started is a
+/// real one and not later than now, since `immunity matches` never printed any other
+/// (`LineAt::start`). A `harmless` one is refused: it is a record beside a match, and there is no
+/// match to keep it beside. A position in a generation the store holds with no row of the rule
+/// there, or in one never given, is no match, whatever the log holds there.
 fn checked_match(
+    conn: &Connection,
     args: &VerdictArgs,
     position: &str,
     rule: &str,
@@ -963,41 +968,40 @@ fn checked_match(
             "{position} is not a position immunity matches printed"
         )));
     };
-    let hit = match events::at_line(&args.system_root, &at, now) {
-        Ok(AtLine::Event(hit)) => hit,
-        Ok(AtLine::NoLine) => {
-            return Err(no_match(format!("no event's line begins at {position}")));
-        }
-        Ok(AtLine::Gone) if kind == Kind::Harmless => {
-            return Err(refused(
-                "match_gone",
-                "the log holds no line at that position: the file it names is not in the log, or another file has its name now; nothing was recorded",
-                position,
-            ));
-        }
-        Ok(AtLine::Gone) => {
-            return match at.start() {
-                Some(start) if start <= now => Ok(Line::Gone),
-                _ => Err(no_match(format!(
-                    "{position} names a log file started later than now, or at no real time"
-                ))),
-            };
-        }
-        Err(why) => {
-            return Err(Refusal::of(
-                "log_unreadable",
-                "the event log could not be read, so the match cannot be read again; nothing was recorded",
-                why,
-                1,
-            ));
-        }
+    let gone = || match kind {
+        Kind::Harmless => Err(refused(
+            "match_gone",
+            "the log holds no line at that position: the file it names is not in the log, or another file has its name now; nothing was recorded",
+            position,
+        )),
+        _ => match at.start() {
+            Some(start) if start <= now => Ok(Line::Gone),
+            _ => Err(no_match(format!(
+                "{position} names a log file started later than now, or at no real time"
+            ))),
+        },
     };
-    if !hit.matched.iter().any(|(_, m)| m.name == rule) {
-        return Err(no_match(format!(
-            "the event at {position} did not match {rule}"
-        )));
+    // Every match the core made is a row of the record, so without one there is no match to
+    // judge, unless the generation of the file the position names went, and the row with it. A
+    // line the core has not read yet cannot be in any of this store's answers.
+    let Some(row) = events::recorded(conn, &at, rule)? else {
+        return match events::generation(conn, &at)? {
+            events::Generation::Went => gone(),
+            _ => Err(no_match(format!(
+                "the record holds no match of {rule} at {position}"
+            ))),
+        };
+    };
+    match events::at_line(&args.system_root, &at, row.inode, &row.line) {
+        Ok(AtLine::Event(event, _)) => Ok(Line::Read(event)),
+        Ok(AtLine::Gone | AtLine::NoLine) => gone(),
+        Err(why) => Err(Refusal::of(
+            "log_unreadable",
+            "the event log could not be read, so the match cannot be read again; nothing was recorded",
+            why,
+            1,
+        )),
     }
-    Ok(Line::Read(Box::new(hit.event)))
 }
 
 /// The verdict recorded before under the same id, when this one carries an id: the same verdict

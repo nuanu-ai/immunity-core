@@ -13,8 +13,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// The store's format. A store of any other format is refused and left as it is: this build
-/// reads only what a build of format 11 wrote, with every table and column this build reads and
-/// text from a source kept cut, in the store's form (see `secrets`).
+/// reads only what a build of format 11 wrote, with every table and column this build reads,
+/// text from a source kept cut, in the store's form (see `secrets`), and every match of every
+/// rule kept by the place of its line (`events::SCHEMA`, `rule_line`).
 pub const FORMAT_VERSION: &str = "11";
 
 const SCHEMA: &str = "

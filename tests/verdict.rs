@@ -157,10 +157,36 @@ impl Mac {
         offset
     }
 
-    /// A line's position as `immunity matches` prints it.
+    /// A line's position as `immunity matches` prints it, in the generation of the log file the
+    /// store holds now; before the core read the file, in none, as no answer could print it.
     fn position(&self, offset: usize) -> String {
-        let inode = std::fs::metadata(self.log().join(H00)).unwrap().ino();
-        format!("20261004T00-{inode}-{offset}")
+        format!("20261004T00-{}-{offset}", self.generation(H00).unwrap_or(0))
+    }
+
+    /// The generation of the log file `name` the store holds, its row.
+    fn generation(&self, name: &str) -> Option<i64> {
+        use rusqlite::OptionalExtension;
+        rusqlite::Connection::open(self.store())
+            .unwrap()
+            .query_row("SELECT id FROM event_file WHERE name = ?1", [name], |r| {
+                r.get(0)
+            })
+            .optional()
+            .unwrap()
+    }
+
+    /// A generation of a log file that went: a file the core read, then deleted with no note,
+    /// which the readings after take out of the store with its rows. Its number.
+    fn went(&self) -> i64 {
+        let name = "exec-20261004T01.jsonl";
+        self.put(&self.log().join(name), &sw_vers(90));
+        self.run();
+        let went = self.generation(name).unwrap();
+        std::fs::remove_file(self.log().join(name)).unwrap();
+        self.run();
+        self.run();
+        assert_eq!(self.generation(name), None);
+        went
     }
 
     fn command(&self, args: &[&str]) -> Command {
@@ -1937,7 +1963,9 @@ fn a_late_suspicious_verdict_about_a_line_the_log_no_longer_holds_raises_its_fin
         }
         if replaced {
             // A finding of another rule raised by a verdict whose event was read: a count of the
-            // two by rule says only what holds for both, and each row keeps its own name.
+            // two by rule says only what holds for both, and each row keeps its own name. The
+            // file that has the name now is read first, so its match is on the record.
+            mac.run();
             let answer = mac.send(&about_match(
                 &store,
                 &mac.position(0),
@@ -2006,43 +2034,80 @@ fn a_late_verdict_is_never_taken_for_a_line_that_is_there_an_hour_to_come_a_rule
     let at = mac.append(&sw_vers(1));
     mac.run();
     let store = mac.store_id();
-    let next_hour = format!("{}-1-0", utc_name(now() + 3600, "%Y%m%dT%H"));
+    // A generation that went: a position in it is taken as gone only by a time it can be of.
+    let went = mac.went();
+    let next_hour = format!("{}-{went}-0", utc_name(now() + 3600, "%Y%m%dT%H"));
     // A file whose name a later collector gives, started two minutes from now: within this hour
     // or the next, later than now either way.
     let soon = utc_name(now() + 120, "%Y%m%dT%H%M%S");
-    let soon = format!("{soon}-{soon}-1-0");
+    let soon = format!("{soon}-{soon}-{went}-0");
     // A file the log no longer holds, of an hour gone by.
-    let gone = "20261003T00-1-0";
+    let gone = &format!("20261003T00-{went}-0");
     let suspicious = |position: &str, rule: &str| about_match(&store, position, rule, "suspicious");
     let refusals = [
         // A line that is there and did not match the rule.
         (suspicious(&mac.position(at), PADDING), "no_such_match"),
         // A position inside a file that is there, where no line begins.
         (suspicious(&mac.position(at + 1), SW_VERS), "no_such_match"),
+        // An offset past what the store can hold, in a generation that went.
+        (
+            suspicious(&format!("20261003T00-{went}-9223372036854775808"), SW_VERS),
+            "no_such_match",
+        ),
         // A file of an hour still to come, by either kind of name, run or start.
         (suspicious(&next_hour, SW_VERS), "no_such_match"),
         (suspicious(&soon, SW_VERS), "no_such_match"),
-        (suspicious("20991004T00-1-0", SW_VERS), "no_such_match"),
+        (
+            suspicious(&format!("20991004T00-{went}-0"), SW_VERS),
+            "no_such_match",
+        ),
         // A date that is no real one, or no time a Mac's clock gives.
-        (suspicious("20260231T00-1-0", SW_VERS), "no_such_match"),
         (
-            suspicious("20260231T000013-20260231T000013-1-0", SW_VERS),
-            "no_such_match",
-        ),
-        (suspicious("00011004T00-1-0", SW_VERS), "no_such_match"),
-        (suspicious("19691231T23-1-0", SW_VERS), "no_such_match"),
-        (
-            suspicious("20261004T000013-20991004T000000-1-0", SW_VERS),
+            suspicious(&format!("20260231T00-{went}-0"), SW_VERS),
             "no_such_match",
         ),
         (
-            suspicious("20991004T000013-20261004T000000-1-0", SW_VERS),
+            suspicious(
+                &format!("20260231T000013-20260231T000013-{went}-0"),
+                SW_VERS,
+            ),
+            "no_such_match",
+        ),
+        (
+            suspicious(&format!("00011004T00-{went}-0"), SW_VERS),
+            "no_such_match",
+        ),
+        (
+            suspicious(&format!("19691231T23-{went}-0"), SW_VERS),
+            "no_such_match",
+        ),
+        (
+            suspicious(
+                &format!("20261004T000013-20991004T000000-{went}-0"),
+                SW_VERS,
+            ),
+            "no_such_match",
+        ),
+        (
+            suspicious(
+                &format!("20991004T000013-20261004T000000-{went}-0"),
+                SW_VERS,
+            ),
             "no_such_match",
         ),
         // A rule this build does not ship.
         (suspicious(gone, GONE), "no_such_match"),
         // Not a position `immunity matches` prints.
-        (suspicious("20261003T00-01-0", SW_VERS), "no_such_match"),
+        (
+            suspicious(&format!("20261003T00-0{went}-0"), SW_VERS),
+            "no_such_match",
+        ),
+        // A generation never given, or one the store holds under another name.
+        (
+            suspicious(&format!("20261003T00-{}-0", went + 9), SW_VERS),
+            "no_such_match",
+        ),
+        (suspicious("20261003T00-1-0", SW_VERS), "no_such_match"),
         // A harmless verdict about a line that is gone has no match to stand beside.
         (about_match(&store, gone, SW_VERS, "harmless"), "match_gone"),
     ];
@@ -2051,14 +2116,26 @@ fn a_late_verdict_is_never_taken_for_a_line_that_is_there_an_hour_to_come_a_rule
         // With an id, refused the same, and the id is not kept for a later message.
         mac.refused(with_id(v.clone(), "rl-x").to_string().as_bytes(), code, 2);
     }
+    // A line the core has not read, in a file it has not read yet, matches the rule, and yet the
+    // record holds no such match: no answer of this store gave it, so no verdict is taken on it,
+    // whichever number a caller puts to its file.
+    let unread = mac.log().join("exec-20261004T01.jsonl");
+    std::fs::write(&unread, sw_vers(2)).unwrap();
+    for kind in ["suspicious", "harmless"] {
+        for row in [0, went + 9] {
+            let v = about_match(&store, &format!("20261004T01-{row}-0"), SW_VERS, kind);
+            mac.refused(v.to_string().as_bytes(), "no_such_match", 2);
+        }
+    }
+    std::fs::remove_file(&unread).unwrap();
     // The start of this hour, and a second ago, are not later than now; nor is 29 February of a
     // leap year.
-    let this_hour = format!("{}-1-0", utc_name(now(), "%Y%m%dT%H"));
+    let this_hour = format!("{}-{went}-0", utc_name(now(), "%Y%m%dT%H"));
     let ago = utc_name(now() - 1, "%Y%m%dT%H%M%S");
     for (n, position) in [
         this_hour,
-        format!("{ago}-{ago}-1-0"),
-        "20240229T00-1-0".to_string(),
+        format!("{ago}-{ago}-{went}-0"),
+        format!("20240229T00-{went}-0"),
     ]
     .iter()
     .enumerate()
@@ -2190,8 +2267,9 @@ fn what_this_build_does_not_read_is_refused_in_either_form_and_records_nothing()
         "unknown_finding",
         2,
     );
+    // A generation of a log file never given holds no match.
     let mut no_match = about_match(&store, "20261004T00-1-0", PADDING, "harmless");
-    mac.refused(no_match.to_string().as_bytes(), "match_gone", 2);
+    mac.refused(no_match.to_string().as_bytes(), "no_such_match", 2);
     no_match["match"]["rule"] = json!("sigma:nope");
     mac.refused(no_match.to_string().as_bytes(), "no_such_match", 2);
     // In binary: a field this build does not know, a field given twice, both subjects.
@@ -5537,4 +5615,99 @@ fn a_row_holding_the_response_layer_s_finding_is_never_folded_so_that_finding_st
     let rows = drawn_rows(&page);
     assert!(rows.contains(&vec![again.to_string(), partner]), "{rows:?}");
     assert!(rows.contains(&ids[1..].to_vec()), "{rows:?}");
+}
+
+#[test]
+fn a_line_written_again_in_place_is_not_the_one_judged_and_its_match_is_given_and_judged_as_gone() {
+    // A row of the record keeps the hash of the line judged. The line is written again in
+    // place, another event at the same offset of the same file: the match is given with no
+    // event and `gone`, a harmless verdict has no match to stand beside, and a suspicious one is
+    // taken with no event, never against the event now there.
+    let mac = Mac::new("rewritten");
+    let at = mac.append(&sw_vers(1));
+    mac.run();
+    let store = mac.store_id();
+    let position = mac.position(at);
+    let path = mac.log().join(H00);
+    let (inode, len) = std::fs::metadata(&path)
+        .map(|m| (m.ino(), m.len()))
+        .unwrap();
+    let other = sw_vers(1).replace("-productVersion", "-buildVersion--");
+    assert_eq!(other.len(), sw_vers(1).len());
+    let f = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+    std::os::unix::fs::FileExt::write_all_at(&f, other.as_bytes(), at as u64).unwrap();
+    let now = std::fs::metadata(&path).unwrap();
+    assert_eq!((now.ino(), now.len()), (inode, len));
+    let m = mac.matches();
+    assert_eq!(m["matches"][0]["position"], position.as_str());
+    assert!(
+        m["matches"][0].get("event").is_none_or(Value::is_null),
+        "{m:#}"
+    );
+    assert_eq!(m["evaluated"]["gone"], true);
+    mac.refused(
+        about_match(&store, &position, SW_VERS, "harmless")
+            .to_string()
+            .as_bytes(),
+        "match_gone",
+        2,
+    );
+    let answer = mac.send(&about_match(&store, &position, SW_VERS, "suspicious"));
+    assert_eq!(answer["recorded"]["event_gone"], true);
+}
+
+#[test]
+fn a_verdict_about_a_match_of_a_generation_that_went_is_gone_whatever_the_file_of_its_name_holds_now()
+ {
+    // The file of a match is written again from its start on the same inode, which is another
+    // generation of its name, and the row of the match went with the first. A position names its
+    // generation: a suspicious verdict about the match is taken with no event, while the new file
+    // is there and after it left too, and a harmless one is refused as gone, even while the new
+    // file holds a match of the same rule at the same offset. A position in the new generation
+    // with no row is no match.
+    let mac = Mac::new("generation-went");
+    let at = mac.append(&sw_vers(1));
+    mac.run();
+    let store = mac.store_id();
+    let first = mac.position(at);
+    let path = mac.log().join(H00);
+    let inode = std::fs::metadata(&path).unwrap().ino();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    let next = mac.append(&sw_vers(2)) + sw_vers(2).len();
+    mac.append(&(dd(5).replace("dd", "de") + &dd(6).replace("dd", "de")));
+    assert_eq!(std::fs::metadata(&path).unwrap().ino(), inode);
+    mac.run();
+    assert_ne!(mac.position(at), first);
+    mac.refused(
+        about_match(&store, &first, SW_VERS, "harmless")
+            .to_string()
+            .as_bytes(),
+        "match_gone",
+        2,
+    );
+    mac.refused(
+        about_match(&store, &mac.position(next), SW_VERS, "suspicious")
+            .to_string()
+            .as_bytes(),
+        "no_such_match",
+        2,
+    );
+    let answer = mac.send(&about_match(&store, &first, SW_VERS, "suspicious"));
+    assert_eq!(answer["recorded"]["event_gone"], true);
+    std::fs::remove_file(&path).unwrap();
+    let mut again = about_match(&store, &first, SW_VERS, "suspicious");
+    again["case_text"] = json!("after the file left");
+    assert_eq!(mac.send(&again)["recorded"]["event_gone"], true);
+    mac.refused(
+        about_match(&store, &first, SW_VERS, "harmless")
+            .to_string()
+            .as_bytes(),
+        "match_gone",
+        2,
+    );
 }

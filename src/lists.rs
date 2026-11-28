@@ -265,8 +265,9 @@ fn program(m: &v1::RuleMatch) -> String {
     )
 }
 
-/// What was lost of what the stretch should hold, in a person's words; empty when nothing was.
-fn lost_said(s: &v1::Stretch) -> Vec<String> {
+/// What was lost of what the counts after the place should hold, in a person's words; empty when
+/// nothing was.
+fn lost_said(s: &v1::Evaluated) -> Vec<String> {
     let mut said = Vec::new();
     if s.program_starts_lost > 0 {
         said.push(format!(
@@ -310,13 +311,55 @@ fn lost_said(s: &v1::Stretch) -> Vec<String> {
             )
         ));
     }
+    if s.files_removed_unread > 0 {
+        said.push(format!(
+            "{} deleted before they were read to their end, and the rest of them was not evaluated",
+            count(s.files_removed_unread, "log file was", "log files were")
+        ));
+    }
     if s.gone {
         said.push(
-            "lines were deleted before they were read, and nothing in them was evaluated"
+            "matches or counts after the place given went before this answer could give them"
                 .to_string(),
         );
     }
     said
+}
+
+/// How far the evaluator has read the log, in a person's words, and its style.
+fn evaluator_said(screen: &Screen, e: &v1::Evaluated, now: i64) -> (String, Style) {
+    use v1::{BehindReason as Why, EvaluatorState as State};
+    let until = e
+        .read_until_at
+        .map(|at| format!(", wrote how far it read {}", screen.time(at, now)))
+        .unwrap_or_default();
+    match State::try_from(e.state) {
+        Ok(State::Current) => (format!("current{until}"), PLAIN),
+        Ok(State::Behind) => {
+            let why = match Why::try_from(e.behind) {
+                Ok(Why::NoWatcher) => {
+                    "no watcher runs, so lines written since the latest full check are not read"
+                }
+                Ok(Why::StoreHeld) => {
+                    "a full check holds the store, and the evaluator waits for it"
+                }
+                Ok(Why::CatchingUp) => {
+                    "the watcher started a moment ago and is reading what was written while none read"
+                }
+                Ok(Why::NotAdvancing) => {
+                    "lines have waited in the log and the evaluator has not read them"
+                }
+                _ => "for a reason this version cannot judge",
+            };
+            (format!("behind: {why}{until}"), YELLOW)
+        }
+        Ok(State::Failed) => {
+            let why = e.reason_text.as_deref().map(Said::given);
+            let why = why.map_or(String::new(), |w| format!(": {}", w.quoted()));
+            (format!("failed{why}{until}"), RED)
+        }
+        _ => (collector_word(0), RED),
+    }
 }
 
 /// A collector's state in words; one this version does not know said as such.
@@ -346,6 +389,10 @@ fn collector_said(screen: &Screen, c: &v1::Collector, now: i64) -> Vec<(String, 
             RED,
         ),
         Ok(S::Failing) => ("failing: its scripts print errors".to_string(), RED),
+        Ok(S::Behind) => (
+            "not judged running here: the evaluator line says why".to_string(),
+            YELLOW,
+        ),
         Ok(S::Silent) => (
             format!(
                 "silent: nothing was written for 15 minutes{}",
@@ -420,10 +467,11 @@ pub fn matches(m: &v1::Matches, single: bool, screen: &Screen) -> String {
     } else {
         "in the last day"
     };
-    let s = m.stretch.clone().unwrap_or_default();
+    let s = m.evaluated.clone().unwrap_or_default();
     let c = m.collector.clone().unwrap_or_default();
     let lost = lost_said(&s);
-    let quiet = c.state == v1::CollectorState::Running as i32
+    let quiet = s.state == v1::EvaluatorState::Current as i32
+        && c.state == v1::CollectorState::Running as i32
         && lost.is_empty()
         && c.file_events_collected
         && m.unevaluated.is_empty();
@@ -462,9 +510,12 @@ pub fn matches(m: &v1::Matches, single: bool, screen: &Screen) -> String {
             PLAIN,
         ));
     }
-    // Context: what was read and lost, the collector, and what the rules cannot judge.
+    // Context: how far the evaluator read, what was read and lost, the collector, and what the
+    // rules cannot judge.
     out.push(String::new());
     let label = 10;
+    let (said, style) = evaluator_said(screen, &s, now);
+    out.extend(screen.labelled(2, label, "Evaluator", &said, style, None, 0));
     let read = format!(
         "{} and {}",
         count(s.program_starts, "program start", "program starts"),
@@ -1048,7 +1099,7 @@ pub fn replay(m: &v1::Replay, screen: &Screen) -> String {
         )
     );
     out.extend(screen.labelled(2, 4, "Read", &read, PLAIN, None, 0));
-    let stretch = v1::Stretch {
+    let stretch = v1::Evaluated {
         program_starts_lost: m.lost.unwrap_or_default(),
         program_starts_unknown_losses: m.unknown_losses.unwrap_or_default(),
         file_events_lost: m.file_events_lost.unwrap_or_default(),
@@ -1601,7 +1652,8 @@ mod tests {
             matches: list,
             continue_after: Some("0343abcdef".to_string()),
             more: true,
-            stretch: Some(v1::Stretch {
+            evaluated: Some(v1::Evaluated {
+                state: v1::EvaluatorState::Current as i32,
                 program_starts: 1_204_331,
                 file_events: 37,
                 program_starts_lost: 34,
@@ -2031,7 +2083,7 @@ mod tests {
             "it restarted once",
             "3 lines could not be read",
             "4 file events could not be made out",
-            "lines were deleted before they were read",
+            "matches or counts after the place given went",
         ] {
             assert!(text.contains(said), "{said}: {text}");
         }
@@ -2057,7 +2109,7 @@ mod tests {
         assert!(!text.contains("0343abcdef"), "{text}");
         // Nothing lost is said too, and the rules not evaluated in words.
         let mut quiet = m.clone();
-        quiet.stretch = Some(v1::Stretch::default());
+        quiet.evaluated = Some(v1::Evaluated::default());
         let text = matches(&quiet, false, &Screen::pipe());
         assert!(text.contains("  Lost         nothing"), "{text}");
         assert!(
@@ -2081,7 +2133,12 @@ mod tests {
     }
 
     #[test]
-    fn no_match_is_calm_only_when_the_collector_ran_lost_nothing_and_every_rule_was_evaluated() {
+    fn no_match_is_calm_only_when_the_evaluator_is_current_the_collector_ran_lost_nothing_and_every_rule_was_evaluated()
+     {
+        let current = || v1::Evaluated {
+            state: v1::EvaluatorState::Current as i32,
+            ..Default::default()
+        };
         let mut m = v1::Matches {
             answered_at: NOW,
             collector: Some(v1::Collector {
@@ -2089,16 +2146,27 @@ mod tests {
                 file_events_collected: true,
                 ..Default::default()
             }),
-            stretch: Some(v1::Stretch::default()),
+            evaluated: Some(current()),
             ..Default::default()
         };
         assert!(matches(&m, false, &Screen::pipe()).starts_with("✓ No rule matched"));
         m.unevaluated.push(v1::Unevaluated::default());
         assert!(matches(&m, false, &Screen::pipe()).starts_with("No rule matched"));
         m.unevaluated.clear();
-        m.stretch.as_mut().unwrap().gone = true;
+        m.evaluated.as_mut().unwrap().gone = true;
         assert!(matches(&m, false, &Screen::pipe()).starts_with("No rule matched"));
-        m.stretch = Some(v1::Stretch::default());
+        m.evaluated.as_mut().unwrap().gone = false;
+        m.evaluated.as_mut().unwrap().files_removed_unread = 1;
+        assert!(matches(&m, false, &Screen::pipe()).starts_with("No rule matched"));
+        // An evaluator behind, failed, or in a state this version does not know is never calm.
+        for state in [2, 3, 0, 9] {
+            m.evaluated = Some(v1::Evaluated { state, ..current() });
+            assert!(
+                matches(&m, false, &Screen::pipe()).starts_with("No rule matched"),
+                "{state}"
+            );
+        }
+        m.evaluated = Some(current());
         m.collector.as_mut().unwrap().file_events_collected = false;
         assert!(matches(&m, false, &Screen::pipe()).starts_with("No rule matched"));
         m.collector.as_mut().unwrap().file_events_collected = true;
@@ -2110,13 +2178,21 @@ mod tests {
     fn no_raw_enum_word_and_no_store_id_reaches_the_text() {
         let mut m = matches_of("odd");
         let mut texts = Vec::new();
-        for state in 0..=7 {
+        for state in 0..=8 {
             m.collector.as_mut().unwrap().state = state;
-            m.collector.as_mut().unwrap().status_state = Some(7 - state);
+            m.collector.as_mut().unwrap().status_state = Some(8 - state);
             for raised in 0..=7 {
                 m.matches[0].raised = raised;
                 texts.push(matches(&m, false, &Screen::pipe()));
             }
+        }
+        for (state, behind) in (0..=4).flat_map(|s| (0..=5).map(move |b| (s, b))) {
+            m.evaluated = Some(v1::Evaluated {
+                state,
+                behind,
+                ..Default::default()
+            });
+            texts.push(matches(&m, false, &Screen::pipe()));
         }
         let mut r = rules_of("odd");
         for level in 0..=7 {

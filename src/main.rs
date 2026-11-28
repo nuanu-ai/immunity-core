@@ -23,6 +23,7 @@ mod closed;
 mod codesign;
 mod contract;
 mod covered;
+mod evaluator;
 mod events;
 mod fault;
 mod finding_answer;
@@ -747,7 +748,7 @@ fn via_once(
 }
 
 /// Misuse of the command line.
-const EXIT_USAGE: u8 = 2;
+pub const EXIT_USAGE: u8 = 2;
 /// The store is there and cannot be read.
 const EXIT_STORE: u8 = 3;
 /// Another run holds the store.
@@ -1028,55 +1029,11 @@ fn sample_cmd(args: &SampleArgs) -> ExitCode {
 /// collector writes meanwhile. What is since the check goes by the journal (`Since::Check`).
 fn read_events(run: &mut Run, args: &Args) -> Result<usize, Box<dyn Error>> {
     let root = &args.system_root;
-    let outcome = events::read(run.tx, run.run_id, run.machine, root, now_secs(), None)?;
+    let outcome = events::read(run.tx, run.run_id, run.machine, root, now_secs())?;
     if outcome.state != events::NOT_INSTALLED {
         run.readers += 1;
     }
     Ok(outcome.opened)
-}
-
-/// What one reading of the event level by the watcher came to: the program starts it took,
-/// whether it changed the level's state, the level as it left it, and why it failed.
-pub struct EventsRead {
-    pub starts: i64,
-    pub changed: bool,
-    pub level: Option<events::Level>,
-    pub failed: Option<String>,
-    pub at: i64,
-}
-
-/// One step of the watcher's reading of the event level (`events::Pass`), with the run lock
-/// held by the caller. It commits what it read, the state and the coverage, and returns the
-/// reason when the reading failed, so that the watcher records the failure. The pass moves on
-/// only once the step committed.
-pub fn read_events_held(
-    path: &Path,
-    system_root: &Path,
-    pass: &mut events::Pass,
-) -> Result<EventsRead, Box<dyn Error>> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-    let at = now.as_secs() as i64;
-    let run_id = format!(
-        "{}{}-{:09}",
-        events::RUN_PREFIX,
-        now.as_secs(),
-        now.subsec_nanos()
-    );
-    let mut conn = store::open(path)?;
-    let tx = conn.transaction()?;
-    let machine = this_machine_or_named(&tx)?;
-    store::put_entity(&tx, &machine)?;
-    let before = events::state(&tx)?;
-    let outcome = events::read(&tx, &run_id, &machine, system_root, at, Some(pass))?;
-    tx.commit()?;
-    *pass = outcome.pass;
-    Ok(EventsRead {
-        starts: outcome.starts,
-        changed: before != events::state(&conn)?,
-        level: events::level(&conn, at)?,
-        failed: outcome.failed,
-        at,
-    })
 }
 
 // ---- `immunity rules`: the published rules, what they did, and a replay over the log. ----
@@ -1230,6 +1187,21 @@ fn status_answer(store: &Path, now: i64) -> Result<contract::v1::Status, Outcome
         return Ok(status::message(None, None, false, &path, now)?);
     }
     store::read(store, |tx| status_read(tx, store, now)).map(|(_, m)| m)
+}
+
+/// Whether a full check of the store in `home` is under way: the latest start the store's
+/// journal holds, by that check's own lock (`osv::check_in_progress`). A lock that cannot be
+/// looked at is no check.
+pub fn check_running(conn: &rusqlite::Connection, home: &Path) -> rusqlite::Result<bool> {
+    use rusqlite::OptionalExtension;
+    let latest: Option<String> = conn
+        .query_row(
+            "SELECT run_id FROM journal WHERE entry = 'run_started' ORDER BY seq DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(latest.is_some_and(|id: String| osv::check_in_progress(home, &id).unwrap_or(false)))
 }
 
 /// What the store holds and the contract's `Status` built from it, read in `tx`, a read of

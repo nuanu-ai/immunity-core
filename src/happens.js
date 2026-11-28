@@ -93,7 +93,8 @@
     if (age < -AHEAD) return "updated at a time ahead of this Mac's clock";
     if (!(age <= STALE)) return "not updating: no watcher is running";
     var s = Math.max(0, Math.round(age));
-    return "updated " + s + (s === 1 ? " second ago" : " seconds ago");
+    var behind = live.behind ? ", " + live.behind : "";
+    return "updated " + s + (s === 1 ? " second ago" : " seconds ago") + behind;
   }
 
   function bars(svg, h) {
@@ -121,7 +122,7 @@
     );
   }
 
-  function rules(week) {
+  function rules(week, behind) {
     var id;
     var sum = 0;
     for (id in week) sum += week[id];
@@ -146,8 +147,9 @@
         : ""
     );
     if (line) line.hidden = !more;
+    // No rule matched is said only of a log read to its end.
     var none = one("none");
-    if (none) none.hidden = more > 0;
+    if (none) none.hidden = more > 0 || !!behind;
   }
 
   function draw(live) {
@@ -185,7 +187,7 @@
         "files",
         num(files) + (files === 1 ? " file event" : " file events") + " checked in the last day"
       );
-    rules(live.matches_last_week || {});
+    rules(live.matches_last_week || {}, live.behind);
   }
 
   function tell() {
