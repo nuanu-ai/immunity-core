@@ -340,6 +340,22 @@ pub(crate) struct Fault {
     /// That no watcher watches live, without a failure of one: what a status that is not fresh
     /// gives as its reason.
     not_live: bool,
+    /// What it is about (`Of`), which the pages place by.
+    of: Of,
+}
+
+/// What a fault is about. The text lists every fault alike; the band of a page says a state and
+/// counts what could not be read, which a section of its own tells whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Of {
+    /// Immunity Core's own work: whether a check finished, whether a watcher runs and what its
+    /// latest step said, whether the answer is fresh.
+    State,
+    /// Something Immunity Core reads that it could not: the event level and what it lost, a
+    /// download of vulnerability data.
+    Reading,
+    /// A cause of `not_covered` that is a fault, whose own message the pages tell it from.
+    Cause,
 }
 
 impl Fault {
@@ -352,7 +368,18 @@ impl Fault {
             command: None,
             advice: None,
             not_live: false,
+            of: Of::State,
         }
+    }
+
+    /// The same fault, about `of`.
+    fn of(self, of: Of) -> Fault {
+        Fault { of, ..self }
+    }
+
+    /// What it is about.
+    pub(crate) fn about(&self) -> Of {
+        self.of
     }
 
     fn said(mut self, text: Option<&str>, cut: Cut) -> Fault {
@@ -435,12 +462,12 @@ fn faults(s: &v1::Status, screen: &Screen, with_causes: bool) -> Vec<Fault> {
         out.extend(event_faults(l, any(&EVENT_CAUSES)));
     }
     if with_causes {
-        out.extend(failed.iter().map(|u| cause_fault(u)));
+        out.extend(failed.iter().map(|u| cause_fault(u).of(Of::Cause)));
     }
     out.extend(
         downloads_failed(s, any(&DATA_CAUSES))
             .into_iter()
-            .map(Fault::new),
+            .map(|said| Fault::new(said).of(Of::Reading)),
     );
     out
 }
@@ -529,7 +556,8 @@ fn event_faults(l: &v1::EventLevel, said_by_cause: bool) -> Vec<Fault> {
                 .map(|t| Said::given(t).quoted());
             return vec![
                 Fault::new(format!("Program starts are not seen; event level: {state}"))
-                    .said(said.as_deref(), Cut::End),
+                    .said(said.as_deref(), Cut::End)
+                    .of(Of::Reading),
             ];
         }
     }
@@ -595,7 +623,7 @@ fn event_faults(l: &v1::EventLevel, said_by_cause: bool) -> Vec<Fault> {
     losses
         .into_iter()
         .filter(|(n, _)| *n > 0)
-        .map(|(_, said)| Fault::new(said).run("immunity run"))
+        .map(|(_, said)| Fault::new(said).run("immunity run").of(Of::Reading))
         .collect()
 }
 
@@ -3712,7 +3740,7 @@ mod tests {
             "! This answer is not fresh: the latest full check finished more than 2 hours ago   immunity run"
         );
         // On a page they are the core's words, never set apart as what a source said.
-        let (_, faults) = crate::pages::band(&s);
+        let faults = crate::pages::band(&s).faults.join("\n");
         assert!(
             faults.contains("not fresh: <span class=\"said\">the latest full check finished more than 2 hours ago</span>"),
             "{faults}"

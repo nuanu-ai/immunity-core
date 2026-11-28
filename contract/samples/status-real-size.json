@@ -1121,12 +1121,12 @@
         "section": "vulnerabilities"
       },
       {
-        "path_text": "/Users/example/view/section-you-can-fix.html",
-        "section": "you-can-fix"
+        "path_text": "/Users/example/view/section-not-read.html",
+        "section": "not-read"
       },
       {
-        "path_text": "/Users/example/view/section-limits.html",
-        "section": "limits"
+        "path_text": "/Users/example/view/section-not-read-here.html",
+        "section": "not-read-here"
       },
       {
         "path_text": "/Users/example/view/section-answered.html",
