@@ -195,7 +195,7 @@ fn a_failure_has_the_documented_json_and_protobuf_fields() {
         (
             &["status"],
             &older,
-            r#"{"operation":"status","ok":false,"errors":[{"code":"store_unreadable","message":"the store cannot be read; nothing was changed","example":"immunity status --json --store <file>","detail_text":"the store at <dir>/older.db is from an older format (5); this version uses format 10 and does not convert old stores. Nothing was changed. Move the old store aside with its -wal and -shm files or pass another --store; the next run starts a store from the beginning.","ids_text":[],"outcome":"older_format"}]}"#,
+            r#"{"operation":"status","ok":false,"errors":[{"code":"store_unreadable","message":"the store cannot be read; nothing was changed","example":"immunity status --json --store <file>","detail_text":"the store at <dir>/older.db is from an older format (5); this version uses format 11 and does not convert old stores. Nothing was changed. Move the old store aside with its -wal and -shm files or pass another --store; the next run starts a store from the beginning.","ids_text":[],"outcome":"older_format"}]}"#,
         ),
         (
             &["findings", "--frob"],

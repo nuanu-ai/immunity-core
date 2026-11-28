@@ -244,8 +244,6 @@ pub struct Outcome {
     /// Why the reading is incomplete, and the lockfile kinds this build has no reader for.
     pub gap: Gap,
     pub statements: Vec<Statement>,
-    /// Every lockfile found: path relative to the home folder, and size in bytes.
-    pub lockfiles: Vec<(String, u64)>,
 }
 
 /// The kind of lockfile a file's name says, as this build names the kind; `None` for a name of
@@ -476,13 +474,67 @@ pub fn read_as_text(checkout: &Checkout) -> Texts {
 
 /// Reads one checkout. `None` when it holds no lockfile at all: then there is nothing
 /// to cover. Where the checkout is, is said by the `checkouts` reader.
+#[cfg(test)]
 pub fn read(checkout: &Checkout, id: &str) -> Option<Outcome> {
     read_within(checkout, id, LOOK_LIMIT, CAP)
 }
 
 /// `read`, with the look for names below the folders opened stopping after `limit` folders,
 /// and lockfiles read up to `cap`.
+#[cfg(test)]
 fn read_within(checkout: &Checkout, id: &str, limit: usize, cap: u64) -> Option<Outcome> {
+    open_within(checkout, limit, cap).map(|found| found.read(id))
+}
+
+/// What the walk of a checkout found and the bytes of every lockfile it opens, before any is
+/// parsed: a reading whose files are all as they were at its last full reading is not parsed
+/// again (`unchanged.rs`).
+pub struct Opened {
+    prefix: String,
+    walked: Walk,
+    /// Each lockfile the walk found, in the walk's order: `None` for one not opened where it
+    /// is.
+    taken: Vec<Option<Taken>>,
+}
+
+/// A lockfile where lockfiles are opened: its own size, and for a kind with a reader the text
+/// it was read as with the SHA-256 of its bytes, or the error number and why it could not be
+/// read.
+struct Taken {
+    size: u64,
+    text: Option<Result<(String, String), Unreadable>>,
+}
+
+/// Why a file could not be read: the system's error number, when it gave one, and its words.
+type Unreadable = (Option<i32>, String);
+
+/// Walks one checkout and takes every lockfile it opens. `None` when it holds no lockfile at
+/// all: then there is nothing to cover. Where the checkout is, is said by the `checkouts`
+/// reader.
+pub fn open(checkout: &Checkout) -> Option<Opened> {
+    open_within(checkout, LOOK_LIMIT, CAP)
+}
+
+/// Takes one lockfile where lockfiles are opened. Its size is the file's own, never what was
+/// read of it, 0 when that cannot be had. One of a kind with a reader is opened as the walk
+/// found it, a regular file, a link in its place not followed, without waiting, up to the cap;
+/// one refused could not be read. This is the one place a reader's bytes come from, so the
+/// files a reading says it opened (`Opened::files`) are the bytes its readers read.
+fn take(path: &Path, readable: bool, cap: u64) -> Taken {
+    let size = std::fs::symlink_metadata(path).map_or(0, |m| m.len());
+    let text = readable.then(|| {
+        let bytes = crate::open::read(path, crate::open::Reach::Place, cap)
+            .map_err(|e| (e.errno(), e.to_string()))?;
+        let sha256 = crate::sha256::hex(&bytes);
+        let text = String::from_utf8(bytes).map_err(|_| (None, "not UTF-8 text".to_string()))?;
+        Ok((text, sha256))
+    });
+    Taken { size, text }
+}
+
+/// `open`, with the look for names below the folders opened stopping after `limit` folders,
+/// and lockfiles read up to `cap`.
+fn open_within(checkout: &Checkout, limit: usize, cap: u64) -> Option<Opened> {
     let prefix = if checkout.rel == "." {
         String::new()
     } else {
@@ -500,6 +552,55 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize, cap: u64) -> Option<
     if walked.lockfiles.is_empty() && walked.look.cause().is_none() {
         return None;
     }
+    let taken = (walked.lockfiles.iter())
+        .map(|(rel, kind, at)| {
+            let readable = reader_of(kind).is_some();
+            (*at == Where::Opened).then(|| take(&checkout.path.join(rel), readable, cap))
+        })
+        .collect();
+    Some(Opened {
+        prefix,
+        walked,
+        taken,
+    })
+}
+
+impl Opened {
+    /// Every lockfile found where lockfiles are opened, of any kind, with its size: the raw
+    /// input of the reading, which is the manifest of where they are.
+    pub fn lockfiles(&self) -> Vec<(String, u64)> {
+        (self.walked.lockfiles.iter().zip(&self.taken))
+            .filter_map(|((rel, ..), t)| Some((format!("{}{rel}", self.prefix), t.as_ref()?.size)))
+            .collect()
+    }
+
+    /// The files a full reading of the checkout opens, each by its path as the reading names
+    /// it, with the SHA-256 of the bytes its reader got. `None` when the reading cannot
+    /// be full whatever those files hold: the walk did not read all it looked at, or a lockfile
+    /// it found is not opened where it is, has no reader, or could not be read as text.
+    pub fn files(&self) -> Option<Vec<crate::unchanged::File>> {
+        if self.walked.look.cause().is_some() {
+            return None;
+        }
+        (self.walked.lockfiles.iter().zip(&self.taken))
+            .map(|((rel, ..), taken)| match taken.as_ref()?.text.as_ref()? {
+                Ok((_, sha256)) => Some(crate::unchanged::File {
+                    path: format!("{}{rel}", self.prefix),
+                    sha256: sha256.clone(),
+                }),
+                Err(_) => None,
+            })
+            .collect()
+    }
+
+    /// Parses what was taken and says what the checkout declares, as the reading `id`.
+    pub fn read(self, id: &str) -> Outcome {
+        read_taken(&self.prefix, self.walked, self.taken, id)
+    }
+}
+
+/// The reading of what a walk found and took (`Opened::read`).
+fn read_taken(prefix: &str, walked: Walk, taken: Vec<Option<Taken>>, id: &str) -> Outcome {
     let mut look = Look::default();
     // Kinds and versions with no reader, with the lockfiles of each.
     let mut not_supported: BTreeMap<String, Vec<Unit>> = BTreeMap::new();
@@ -507,13 +608,12 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize, cap: u64) -> Option<
     // Lockfiles of a kind read here that were not opened, by where, and their kinds.
     let mut not_opened: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
     let mut lacks: BTreeSet<(&'static str, &str)> = BTreeSet::new();
-    let mut lockfiles = Vec::new();
     // (ecosystem, name with its source) -> where it was first read, and version -> where
     // that version was first read.
     let mut deps: BTreeMap<(&str, String), Found> = BTreeMap::new();
     let mut no_reader = |kind: String, unit| not_supported.entry(kind).or_default().push(unit);
 
-    for (rel, kind, at) in &walked.lockfiles {
+    for ((rel, kind, at), taken) in walked.lockfiles.iter().zip(taken) {
         let source = format!("{prefix}{rel}");
         let (name, unit): (&str, _) = (kind, Unit::whole(&source));
         // A kind with no reader is that wherever it is; one read here is not opened where the
@@ -533,26 +633,17 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize, cap: u64) -> Option<
             }
             continue;
         }
-        let path = checkout.path.join(rel);
-        // Its size is the file's own, never what was read of it, 0 when that cannot be had. A
-        // kind with no reader is never opened.
-        let size = std::fs::symlink_metadata(&path).map_or(0, |m| m.len());
-        lockfiles.push((source.clone(), size));
-        let Some(reader) = reader_of(name) else {
+        // A kind with no reader is never opened.
+        let (Some(reader), Some(text)) = (reader_of(name), taken.and_then(|t| t.text)) else {
             no_reader(name.to_string(), unit);
             continue;
         };
-        // Opened as the walk found it: a regular file, a link in its place not followed,
-        // without waiting, up to the cap. One refused could not be read.
-        let text = crate::open::read(&path, crate::open::Reach::Place, cap)
-            .map_err(|e| (e.errno(), e.to_string()))
-            .and_then(|t| String::from_utf8(t).map_err(|_| (None, "not UTF-8 text".to_string())));
         let parsed = match text {
             Err((errno, why)) => {
                 look.unread_as(unit, Said::Lockfile(name), errno, why);
                 continue;
             }
-            Ok(t) => reader(&t, name),
+            Ok((t, _)) => reader(&t, name),
         };
         let (ecosystem, found) = match parsed {
             Parsed::Deps(ecosystem, found, unknown) => {
@@ -650,13 +741,12 @@ fn read_within(checkout: &Checkout, id: &str, limit: usize, cap: u64) -> Option<
     }
     look.add(walked.look);
     let (completeness, reason) = look.completeness_noted(None);
-    Some(Outcome {
+    Outcome {
         completeness,
         reason,
         gap: look.gap(),
         statements,
-        lockfiles,
-    })
+    }
 }
 
 /// The clause of the units of one kind a reading of lockfiles did not read (`look::Said`):
