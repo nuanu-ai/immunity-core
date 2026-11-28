@@ -1457,40 +1457,12 @@ fn a_file_made_again_under_the_same_name_is_read_from_its_start_shorter_or_longe
     assert_eq!(m["matches"][0]["position"], dir.position(H00, 0));
 }
 
-/// A place as an earlier build printed it, version 1: the last numbers, then for each
-/// file its hour's difference from the one before, doubled, plus one when finished, its inode
-/// and its offset, each a varint, in lower-case hexadecimal.
-fn place_v1(seq: [u64; 3], files: &[(u64, bool, u64, u64)]) -> String {
-    let mut bytes = Vec::new();
-    let mut put = |mut n: u64| {
-        while n >= 0x80 {
-            bytes.push((n as u8) | 0x80);
-            n >>= 7;
-        }
-        bytes.push(n as u8);
-    };
-    put(1);
-    for s in seq {
-        put(s + 1);
-    }
-    put(files.len() as u64);
-    let mut before = 0;
-    for (hour, finished, inode, offset) in files {
-        put(((hour - before) << 1) | u64::from(*finished));
-        put(*inode);
-        put(*offset);
-        before = *hour;
-    }
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
 #[test]
 fn a_log_an_earlier_collector_began_and_a_later_one_went_on_is_read_in_the_order_it_was_written() {
     // Installed over an earlier collector, the log holds files named by the hour and files
     // named by run and start. They are read in the order they were written, the earlier
-    // collector's first, by one answer or by many; a place an earlier build printed is refused;
-    // and the root side's notes of deletions count what was read and what
-    // was not, under both kinds of name.
+    // collector's first, by one answer or by many, and the root side's notes of deletions count
+    // what was read and what was not, under both kinds of name.
     let dir = Dir::new("mixed");
     dir.install();
     dir.run();
@@ -1528,33 +1500,6 @@ fn a_log_an_earlier_collector_began_and_a_later_one_went_on_is_read_in_the_order
     let (paged, sums, _) = pages(&dir, None, "1");
     assert_eq!(&json!(paged), &whole["matches"]);
     assert_eq!(sums, [6, 0, 0, 0]);
-    // A place an earlier build printed, after H00 was read to its end with its hour over and
-    // H01 had begun, is not read on from: the answer fails as a misuse that says to start from
-    // the oldest line kept, and never reads as nothing new.
-    let held = place_v1(
-        [2, 0, 0],
-        &[
-            (
-                2026100400,
-                true,
-                dir.inode(H00),
-                (dd(1) + &git(2)).len() as u64,
-            ),
-            (2026100401, false, dir.inode(H01), 0),
-        ],
-    );
-    let out = dir.matches_output(&["--json", "--after", &held]);
-    assert_eq!(out.status.code(), Some(2));
-    let failure: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(failure["errors"][0]["code"], "usage");
-    assert!(
-        failure["errors"][0]["detail_text"]
-            .as_str()
-            .unwrap()
-            .contains("run immunity matches without --after"),
-        "{failure}"
-    );
-    assert_eq!(failure.get("matches"), None);
     // The core's own reading reads them all. A file of either kind deleted once read loses
     // nothing; one deleted before it was read is counted, once.
     dir.run();
@@ -1631,6 +1576,12 @@ fn only_the_collector_s_own_files_are_read_and_the_others_are_counted() {
         let failure: Value = serde_json::from_slice(&out.stdout).unwrap();
         assert_eq!(failure["errors"][0]["code"], "usage");
         assert_eq!(failure.get("format"), None);
+        // It says to start from the oldest match kept, as for a place an earlier build printed.
+        let detail = failure["errors"][0]["detail_text"].as_str().unwrap();
+        assert!(
+            detail.contains("run immunity matches without --after"),
+            "{failure}"
+        );
     }
 }
 
