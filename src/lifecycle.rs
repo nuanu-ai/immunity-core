@@ -222,8 +222,10 @@ pub fn set_aside(
 }
 
 /// Retracts everything read inside an entity once nothing says where it is any more, and
-/// so on down: a file located in a checkout that is gone takes its own readings along.
-/// Returns whether nothing says where it is.
+/// so on down: a file located in a checkout that is gone takes its own readings along. The
+/// record of the files a reading inside it opened goes too (`unchanged::forget`): this is the
+/// one way the facts of a reading leave with no reading of their own. Returns whether nothing
+/// says where it is.
 pub(crate) fn retract_inside(
     tx: &Transaction,
     r: &Reading,
@@ -244,6 +246,7 @@ pub(crate) fn retract_inside(
          WHERE layer = 'live' AND scope = ?3",
         params![r.at, r.run_id, entity],
     )?;
+    crate::unchanged::forget(tx, entity)?;
     for thing in inside {
         retract_inside(tx, r, &thing)?;
     }

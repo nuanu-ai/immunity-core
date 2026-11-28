@@ -76,6 +76,7 @@ mod text;
 mod threats;
 mod tools;
 mod traces;
+mod unchanged;
 mod usage;
 mod verdict;
 mod view;
@@ -3840,7 +3841,7 @@ fn read_lockfiles(
         };
         // A checkout opened with no lockfile in it is read in full with a note, so that it is
         // told from one never opened, and what an earlier reading found in it goes.
-        let Some(o) = lockfiles::read(checkout, &id) else {
+        let Some(found) = lockfiles::open(checkout) else {
             run.apply(
                 &reading,
                 lockfiles::BASIS,
@@ -3855,9 +3856,20 @@ fn read_lockfiles(
             guarded.insert(g);
             "unknown".to_string()
         });
-        for (path, size) in &o.lockfiles {
+        for (path, size) in found.lockfiles() {
             manifest.push_str(&format!("{path}\t{size}\t{commit}\n"));
         }
+        // Files with the bytes and the build of the last full reading are not parsed again: the
+        // reading would write its coverage, full with no note, and nothing else (`unchanged.rs`).
+        let files = found.files();
+        if let Some(files) = &files
+            && unchanged::same(run.tx, &reading, files)?
+        {
+            store::put_coverage(run.tx, &reading, "full", None, &Gap::default())?;
+            unchanged::record(run.tx, &reading, files)?;
+            continue;
+        }
+        let o = found.read(&id);
         run.apply(
             &reading,
             lockfiles::BASIS,
@@ -3866,6 +3878,9 @@ fn read_lockfiles(
             &o.gap,
             &o.statements,
         )?;
+        if let (Some(files), "full") = (&files, o.completeness) {
+            unchanged::record(run.tx, &reading, files)?;
+        }
     }
     let guarded: Vec<PathBuf> = guarded.into_iter().collect();
     not_looked_into_when_met(run, lockfiles::READER, &guarded, &args.home)?;
