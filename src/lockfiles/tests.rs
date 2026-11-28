@@ -439,7 +439,7 @@ fn a_lockfile_of_a_kind_with_no_reader_is_never_opened_and_is_listed_with_its_si
     let reason = format!("not supported yet: {file}");
     assert_eq!(o.reason.as_deref(), Some(reason.as_str()));
     let size = text.len() as u64;
-    assert!(o.lockfiles.contains(&(format!("dev/shop/{file}"), size)));
+    assert!(listed(&dir.checkout()).contains(&(format!("dev/shop/{file}"), size)));
     assert_eq!(unknown_for(&o), [true, false]);
     assert!(!partial_for(&rows(&o), &names(&o), "PyPI"));
     assert_eq!(texts.opened, ["Cargo.lock"]);
@@ -815,7 +815,7 @@ fn a_project_with_both_an_npm_and_a_pnpm_lockfile_is_read_from_both() {
         said.contains(&"npm/ms|has_version|2.1.3|dev/shop/web/pnpm-lock.yaml#ms@2.1.3".to_string())
     );
     assert_eq!(
-        o.lockfiles
+        listed(&dir.checkout())
             .iter()
             .map(|(p, _)| p.as_str())
             .collect::<Vec<_>>(),
@@ -891,7 +891,7 @@ fn a_lockfile_the_walk_does_not_open_makes_the_reading_partial_for_its_ecosystem
         );
         assert_eq!(unknown_for(&o), eco, "{tag}");
         // Not opened, so neither in the copy of what was read nor read as text.
-        assert_eq!(o.lockfiles.len(), 1, "{tag}");
+        assert_eq!(listed(&dir.checkout()).len(), 1, "{tag}");
         assert_eq!(
             read_as_text(&dir.checkout()).opened,
             ["Cargo.lock"],
@@ -967,7 +967,8 @@ fn a_folder_of_installed_copies_build_output_an_environment_or_a_cache_holds_no_
     let (o, _) = dir.read();
     assert_eq!((o.completeness, o.reason.as_deref()), ("full", None));
     assert!(o.gap.lacks.is_empty());
-    let read: Vec<&str> = o.lockfiles.iter().map(|(p, _)| p.as_str()).collect();
+    let listed = listed(&dir.checkout());
+    let read: Vec<&str> = listed.iter().map(|(p, _)| p.as_str()).collect();
     assert_eq!(read, ["dev/shop/Cargo.lock"]);
     // Each is told to the indicators reader as a folder left aside, so that what was known
     // in it is kept, and the reading stays full.
@@ -1260,7 +1261,10 @@ fn a_lockfile_over_the_cap_is_not_read_and_leaves_the_reading_partial_with_its_o
     assert_eq!(o.reason.as_deref(), Some("could not be read: Cargo.lock"));
     assert_eq!(o.gap.cause, Some(Cause::Failed));
     assert_eq!(unknown_for(&o), [false, true]);
-    assert_eq!(o.lockfiles, [("dev/shop/Cargo.lock".to_string(), size)]);
+    assert_eq!(
+        listed(&checkout),
+        [("dev/shop/Cargo.lock".to_string(), size)]
+    );
 }
 
 #[test]
@@ -1284,11 +1288,16 @@ fn a_lockfile_that_is_not_a_regular_file_is_never_opened_and_never_leaves_its_ec
     assert_eq!(o.reason.as_deref(), Some("could not be read: Cargo.lock"));
     assert_eq!(unknown_for(&o), [false, true]);
     // Not a lockfile found: which files the walk finds and names is as it was.
-    assert_eq!(o.lockfiles.len(), 2);
+    assert_eq!(listed(&dir.checkout()).len(), 2);
     assert_eq!(
         texts.look.completeness_noted(None).1.as_deref(),
         Some("could not be read: dev/shop/tools/Cargo.lock (not a regular file: fifo)")
     );
+}
+
+/// The lockfiles a reading of the checkout lists in its raw input, each with its size.
+fn listed(checkout: &Checkout) -> Vec<(String, u64)> {
+    super::open(checkout).unwrap().lockfiles()
 }
 
 /// Both readings of `dir` with a named pipe made at `rel`, or a failed test when either has

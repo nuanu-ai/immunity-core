@@ -645,6 +645,7 @@ fn schema() -> String {
         crate::processes::SCHEMA,
         crate::baseline::SCHEMA,
         crate::watch::SCHEMA,
+        crate::unchanged::SCHEMA,
         INDEXES,
         JOURNAL_INDEXES,
     ]
@@ -2351,9 +2352,9 @@ mod tests {
         // (`text::error`); a format that is no number is shown as the check words it.
         for (version, code, said, what_to_do) in [
             (
-                "9",
+                "10",
                 Code::OlderFormat,
-                "is from an older format (9)",
+                "is from an older format (10)",
                 START_OVER,
             ),
             (
