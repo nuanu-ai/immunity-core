@@ -45,10 +45,11 @@
 //! the kinds of kept text that may hold a secret and are read back as text, and every reader of
 //! such text goes by it.
 //!
-//! If the set does not load whole (its sum differs, a key this build does not read, a pattern
-//! that does not compile, a self-test on planted fakes that is not cut), nothing is printed or
-//! kept raw: every argument is withheld whole. A line longer than `LINE_CAP` is withheld whole
-//! too, with a mark of its own.
+//! If the set does not load whole (its sum differs, a key this build does not read, a self-test
+//! on planted fakes that is not cut), nothing is printed or kept raw: every argument is withheld
+//! whole. A pattern is compiled the first time a line holds one of its keywords; one that does
+//! not compile withholds whole every line it would read, and the tests compile every pattern
+//! shipped. A line longer than `LINE_CAP` is withheld whole too, with a mark of its own.
 //!
 //! Text from a source reaches output one way, `said` (or `Text::said`), on every surface: the
 //! contract, the text for a person, the pages and `immunity watch`. It cuts the text and writes a
@@ -524,7 +525,7 @@ fn cut_exempting(set: Option<&Set>, args: Vec<Vec<Piece>>, exempt: bool) -> Vec<
                 pieces
                     .iter()
                     .map(|p| match p {
-                        Piece::Text(t) => Piece::Cut {
+                        Piece::Text(t) | Piece::Quoted(t) => Piece::Cut {
                             kind: kind.to_string(),
                             length: t.chars().count(),
                         },
@@ -616,9 +617,16 @@ fn cut_exempting(set: Option<&Set>, args: Vec<Vec<Piece>>, exempt: bool) -> Vec<
     gone.push_str(&line[from..]);
     at.extend(from..=line.len());
     let spaced = String::from_utf8(spaced).expect("only ASCII bytes were replaced");
-    spans.extend(set.spans(&spaced, &words, |i| i, Some(&marks)));
+    // A pattern that does not compile cuts nothing, so a line it would read is withheld whole.
+    let Some(found) = set.spans(&spaced, &words, |i| i, Some(&marks)) else {
+        return whole(&args, NO_PATTERNS);
+    };
+    spans.extend(found);
     if !marks.is_empty() {
-        spans.extend(set.spans(&gone, &words, |i| at[i], None));
+        let Some(found) = set.spans(&gone, &words, |i| at[i], None) else {
+            return whole(&args, NO_PATTERNS);
+        };
+        spans.extend(found);
     }
     spans.extend(set.flag_values(&words));
     // A value that is a mark, with only quotes and punctuation around it, is already cut; one
@@ -703,7 +711,11 @@ enum Target {
 
 struct Rule {
     kind: String,
-    re: Regex,
+    /// The regular expression as the set writes it, compiled the first time a line holds one of
+    /// the rule's keywords (`regex`): most lines hold the keywords of few rules, and compiling
+    /// all of them was most of the time an answer took to load the set.
+    pattern: String,
+    re: OnceLock<Option<Regex>>,
     /// Indexes into the gate's keywords; none means the rule always runs.
     keywords: Vec<usize>,
     entropy: f64,
@@ -714,6 +726,13 @@ struct Rule {
     /// A rule of the core's own that finds what stands before a value: the value begins where
     /// the match ends, and `value_end` says where it ends.
     value_follows: bool,
+}
+
+impl Rule {
+    /// The rule's regular expression, compiled once; `None` when it does not compile.
+    fn regex(&self) -> Option<&Regex> {
+        self.re.get_or_init(|| compile(&self.pattern).ok()).as_ref()
+    }
 }
 
 /// A word for a flag's name, Datadog's form: `*` stands for any run of characters. Words and
@@ -929,7 +948,6 @@ impl Set {
                 continue;
             }
             let rx = r["regex"].as_str().ok_or(format!("{id} has no regex"))?;
-            let re = compile(rx).map_err(|e| format!("{id} does not compile: {e}"))?;
             let allows = match &r["allowlists"] {
                 Value::Null => Vec::new(),
                 Value::Array(a) => a.iter().map(|v| allow(v, id)).collect::<Result<_, _>>()?,
@@ -950,7 +968,8 @@ impl Set {
             };
             rules.push(Rule {
                 kind: format!("gitleaks:{id}"),
-                re,
+                pattern: rx.to_string(),
+                re: OnceLock::new(),
                 keywords: strings(&r["keywords"], id)?
                     .into_iter()
                     .map(&mut keyword)
@@ -991,7 +1010,8 @@ impl Set {
             };
             rules.push(Rule {
                 kind: kind.to_string(),
-                re: compile(rx).map_err(|e| format!("{kind} does not compile: {e}"))?,
+                pattern: rx.to_string(),
+                re: OnceLock::new(),
                 keywords: strings(&r["keywords"], kind)?
                     .into_iter()
                     .map(&mut keyword)
@@ -1090,7 +1110,7 @@ impl Set {
         words: &Words,
         at: impl Fn(usize) -> usize,
         inert: Option<&[(usize, usize)]>,
-    ) -> Vec<(usize, usize, String)> {
+    ) -> Option<Vec<(usize, usize, String)>> {
         let place = |s: usize, e: usize| (at(s), at(e));
         let bytes = line.as_bytes();
         let found: BTreeSet<usize> = self
@@ -1109,13 +1129,14 @@ impl Set {
             if !r.keywords.is_empty() && !r.keywords.iter().any(|k| found.contains(k)) {
                 continue;
             }
+            let re = r.regex()?;
             if r.value_follows {
                 let Some(inert) = inert else {
                     continue;
                 };
                 // The value begins where the match ends, in the argument it begins in; its key
                 // is the group `key`, or the whole match.
-                for c in r.re.captures_iter(bytes) {
+                for c in re.captures_iter(bytes) {
                     let m = c.get(0).expect("a match has its whole");
                     let vs = inert
                         .iter()
@@ -1133,7 +1154,7 @@ impl Set {
                 }
                 continue;
             }
-            for m in r.re.find_iter(bytes) {
+            for m in re.find_iter(bytes) {
                 // gitleaks trims newlines off a match.
                 let raw = &bytes[m.start()..m.end()];
                 let lead = raw.iter().take_while(|b| **b == b'\n').count();
@@ -1149,7 +1170,7 @@ impl Set {
                 let matched = &line[ms..me];
                 // The secret: the rule's secret group, or else its first non-empty group, as
                 // the regular expression gives them over the match alone; else the match.
-                let (ss, se) = match r.re.captures(matched.as_bytes()) {
+                let (ss, se) = match re.captures(matched.as_bytes()) {
                     Some(c) if c.len() >= 2 => {
                         let g = if r.group > 0 {
                             c.get(r.group)
@@ -1178,7 +1199,7 @@ impl Set {
                 out.push((ss, se, r.kind.clone()));
             }
         }
-        out
+        Some(out)
     }
 
     /// Values of names a word names: a name at each `=` or `:` of a word, taken from the word's
@@ -1704,6 +1725,8 @@ mod tests {
             (s.evaluated, s.file_bound, s.allowlists_dropped),
             (217, 5, 4)
         );
+        // Each is compiled at its first use, so here each is compiled.
+        assert!(s.rules.iter().all(|r| r.regex().is_some()));
     }
 
     #[test]
@@ -2103,7 +2126,7 @@ mod tests {
         assert!(load(&validating, COMMAND_LINE).is_err());
         let filtered = GITLEAKS.replacen("\"regexes\": ", "\"filter\": \"x\", \"regexes\": ", 1);
         assert!(load(&filtered, COMMAND_LINE).is_err());
-        // A pattern that does not compile.
+        // A pattern that does not compile, met by a planted secret: it is withheld, not cut.
         let broken = GITLEAKS.replacen("ghp_[0-9a-zA-Z]{36}", "ghp_[0-9a-zA-Z{36}", 1);
         assert_ne!(broken, GITLEAKS);
         assert!(load(&broken, COMMAND_LINE).is_err());
@@ -2113,6 +2136,29 @@ mod tests {
         assert!(load(GITLEAKS, &fewer).is_err());
         let unknown = COMMAND_LINE.replacen("\"about\"", "\"verify\": 1, \"about\"", 1);
         assert!(load(GITLEAKS, &unknown).is_err());
+    }
+
+    #[test]
+    fn a_line_a_pattern_that_does_not_compile_would_read_is_withheld_whole() {
+        // A pattern is compiled at the first line that holds one of its keywords, so a set with
+        // one that does not compile loads. A line it would read, in either reading of an
+        // exemption, shows nothing, the exemption included; a line it would not read is cut as
+        // a whole set cuts it.
+        let gitleaks = r#"{"global": {}, "rules": [
+            {"id": "broken", "regex": "brk[", "keywords": ["brk"]},
+            {"id": "fine", "regex": "q[0-9]+", "keywords": ["zzz"]}]}"#;
+        let own = r#"{"about": "", "flag_words": [], "rules": []}"#;
+        let set = Set::of(gitleaks, own).unwrap();
+        let withheld = |args: &[&str]| {
+            cut_with(Some(&set), args.iter().map(|a| text_pieces(a)).collect())
+                .iter()
+                .flatten()
+                .all(|p| matches!(p, Piece::Cut { kind, .. } if kind == NO_PATTERNS))
+        };
+        assert!(withheld(&["t", "brk zzz q1"]));
+        let mark = mark(FLAG_VALUE, 5);
+        assert!(withheld(&["t", &format!("br{mark}k"), &mark]));
+        assert_eq!(cut_by(&set, &["t", "zzz q1"]), [(1, "q1".to_string())]);
     }
 
     /// What a set of these rules, read as gitleaks reads them, cuts out of `args`: each cut's
@@ -2195,6 +2241,7 @@ mod tests {
                 |i| i,
                 Some(&[])
             )
+            .unwrap()
             .into_iter()
             .map(|s| s.2)
             .collect::<Vec<_>>(),
