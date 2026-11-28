@@ -46,24 +46,6 @@ fn fresh(tag: &str) -> (crate::common::Scratch, Connection) {
     (dir, conn)
 }
 
-/// One reading of every whole line of the log under `root` at `now`, committed, as a full check
-/// reads it.
-fn reading(conn: &mut Connection, root: &Path, now: i64) -> Outcome {
-    read_in(conn, root, now, true)
-}
-
-/// The same reading, in a transaction left to roll back unless `commit`: one that met a busy
-/// store at its commit, or failed after it read.
-fn read_in(conn: &mut Connection, root: &Path, now: i64, commit: bool) -> Outcome {
-    let tx = conn.transaction().unwrap();
-    crate::store::put_entity(&tx, "machine:mac").unwrap();
-    let out = read(&tx, "events-1", "machine:mac", root, now).unwrap();
-    if commit {
-        tx.commit().unwrap();
-    }
-    out
-}
-
 fn rolled_back(conn: &mut Connection, root: &Path, now: i64) -> Outcome {
     read_in(conn, root, now, false)
 }

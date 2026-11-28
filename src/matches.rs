@@ -135,9 +135,7 @@ impl std::fmt::Display for Place {
 impl Place {
     /// The place in the store whose id is `store`, as `store::id` gives it.
     fn of(store: &str, seq: i64, totals: &[i64; events::TOTALS]) -> Option<Place> {
-        let bytes: Vec<u8> = (store.as_bytes().chunks(2))
-            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
-            .collect::<Option<_>>()?;
+        let bytes = unhex(store)?;
         let mut kept = [0; events::TOTALS];
         for (k, t) in kept.iter_mut().zip(totals) {
             *k = u64::try_from(*t).ok()?;
@@ -163,14 +161,12 @@ impl Place {
     /// version of the encoding among them. The text must be exactly what this build prints for
     /// the place it reads: lower case, nothing left over, and no two texts one place.
     pub fn parse(text: &str) -> Option<Place> {
-        let bytes: Vec<u8> = (text.as_bytes().chunks(2))
-            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
-            .collect::<Option<_>>()?;
+        let bytes = unhex(text)?;
         let mut buf = bytes.as_slice();
         let mut next = || prost::encoding::decode_varint(&mut buf).ok();
-        if next()? != PLACE_VERSION {
-            return None;
-        }
+        // The encoding's version: a place of another one fails the round trip below, which
+        // writes `PLACE_VERSION`.
+        next()?;
         let mut store = [0u8; 16];
         for b in &mut store {
             *b = u8::try_from(next()?).ok()?;
@@ -183,6 +179,14 @@ impl Place {
         let place = Place { store, seq, totals };
         (place.to_string() == text).then_some(place)
     }
+}
+
+/// The bytes two hexadecimal digits each write; `None` for any other text. What it takes in
+/// either case or with a sign, a place's round trip refuses (`Place::parse`).
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    (text.as_bytes().chunks(2))
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+        .collect()
 }
 
 /// Why an answer could not be given.
@@ -688,35 +692,12 @@ fn collector(
         status_state: level.map(|l| value_of::<C>(&l.state)),
         status_read_at: level.map(|l| l.read_at),
         foreign_files: looked.map_or(0, |s| s.foreign),
-        not_kept: named(arrivals, Arrival::NotKept),
-        kept_never_filled: named(arrivals, Arrival::Kept(None)),
-        not_yet_known: named(arrivals, Arrival::Unknown),
-        arriving: arrivals
-            .arriving()
-            .into_iter()
-            .map(|(name, since)| v1::Arriving {
-                name: name.to_string(),
-                since,
-            })
-            .collect(),
-        no_longer_arriving: arrivals
-            .no_longer()
-            .into_iter()
-            .map(|(name, since)| v1::NoLongerArriving {
-                name: name.to_string(),
-                since,
-            })
-            .collect(),
+        not_kept: arrivals.named(Arrival::NotKept),
+        kept_never_filled: arrivals.named(Arrival::Kept(None)),
+        not_yet_known: arrivals.named(Arrival::Unknown),
+        arriving: arrivals.arriving(),
+        no_longer_arriving: arrivals.no_longer(),
     }
-}
-
-/// The names of what a collector may keep that the lines say this of.
-fn named(arrivals: &Arrivals, state: Arrival) -> Vec<String> {
-    arrivals
-        .named(|a| a == state)
-        .into_iter()
-        .map(str::to_string)
-        .collect()
 }
 
 /// The rules that judge nothing here, or only in part, each with why, in the order they are
@@ -924,14 +905,7 @@ mod tests {
             let mut after = None;
             let mut pages = 0;
             loop {
-                let args = MatchesArgs {
-                    store: store.clone(),
-                    form: answer::Form::Json,
-                    after: after.take(),
-                    limit: 1,
-                    single: true,
-                    system_root: root.clone(),
-                };
+                let args = args(&store, &root, after.as_deref(), 1);
                 let answer = read_with(&rules, &args, NOW).ok().unwrap();
                 pages += 1;
                 let c = answer.collector.as_ref().unwrap();
@@ -954,8 +928,7 @@ mod tests {
                 if !answer.more {
                     break;
                 }
-                let place = answer.continue_after.unwrap();
-                after = Some((place.clone(), Place::parse(&place).unwrap()));
+                after = answer.continue_after;
             }
             assert_eq!(pages, 6, "{tag}");
             let _ = std::fs::remove_dir_all(&dir);
@@ -977,21 +950,33 @@ mod tests {
         (dir, root)
     }
 
+    /// What `immunity matches --json` is asked of `store` under `root`, after the place `after`
+    /// printed, at most `limit`.
+    fn args(
+        store: &std::path::Path,
+        root: &std::path::Path,
+        after: Option<&str>,
+        limit: usize,
+    ) -> MatchesArgs {
+        MatchesArgs {
+            store: store.to_path_buf(),
+            form: answer::Form::Json,
+            after: after.map(|p| (p.to_string(), Place::parse(p).unwrap())),
+            limit,
+            single: false,
+            system_root: root.to_path_buf(),
+        }
+    }
+
     fn ask(
         rules: &Rules,
         store: &std::path::Path,
         root: &std::path::Path,
         after: Option<&str>,
     ) -> v1::Matches {
-        let args = MatchesArgs {
-            store: store.to_path_buf(),
-            form: answer::Form::Json,
-            after: after.map(|p| (p.to_string(), Place::parse(p).unwrap())),
-            limit: LIMIT,
-            single: false,
-            system_root: root.to_path_buf(),
-        };
-        read_with(rules, &args, NOW).ok().unwrap()
+        read_with(rules, &args(store, root, after, LIMIT), NOW)
+            .ok()
+            .unwrap()
     }
 
     /// `git status`, which no shipped rule matches, in the forms `dd` writes.
@@ -1256,14 +1241,9 @@ mod tests {
         // nothing is known; a log an earlier collector wrote lacks the field, a later
         // collector's carries it empty, and only a line that gives it a value lets the rule
         // judge; each is said in the collector's lists.
-        let dir = crate::common::Scratch::at(
-            std::env::temp_dir().join(format!("immunity-matches-arrival-{}", std::process::id())),
-        );
-        let root = dir.join("root");
-        std::fs::create_dir_all(root.join(events::LOG)).unwrap();
+        let (dir, root) = installed_root("arrival");
+        std::fs::remove_file(root.join(events::COLLECTS)).unwrap();
         let plist = root.join(events::PLIST);
-        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        std::fs::write(&plist, "<plist/>").unwrap();
         let start = |seq: u64, extra: &str| {
             format!(
                 r#"{{"schema_version":1,"version":10,"seq_num":{seq},"global_seq_num":{seq},"time":"2026-10-04T00:00:02.000002Z","process":{{"executable":{{"path":"/bin/zsh"}}}},"event":{{"exec":{{"args":["git","status"],"cwd":{{"path":"/Users/example/dev/site"}},{extra}"target":{{"executable":{{"path":"/usr/bin/git"}},"audit_token":{{"pid":402,"euid":501}},"ppid":401,"signing_id":"com.apple.git","team_id":null,"is_platform_binary":true}}}}}}}}
@@ -1275,14 +1255,7 @@ mod tests {
         std::fs::write(&log, start(1, "")).unwrap();
         drop(crate::store::open_or_make(&dir.join("store.db")).unwrap());
         let core = || core_reads(&dir.join("store.db"), &root);
-        let args = MatchesArgs {
-            store: dir.join("store.db"),
-            form: answer::Form::Json,
-            after: None,
-            limit: LIMIT,
-            single: false,
-            system_root: root.clone(),
-        };
+        let args = args(&dir.join("store.db"), &root, None, LIMIT);
         let rules = crate::sigma::testing::process_kept();
         let unevaluated_why = |answer: &v1::Matches| {
             assert_eq!(answer.unevaluated.len(), 1, "{:?}", answer.unevaluated);
@@ -1364,15 +1337,7 @@ mod tests {
         );
         let store = dir.join("store.db");
         core_reads(&store, &root);
-        let args = MatchesArgs {
-            store,
-            form: answer::Form::Json,
-            after: None,
-            limit: LIMIT,
-            single: false,
-            system_root: root,
-        };
-        (dir, args)
+        (dir, args(&store, &root, None, LIMIT))
     }
 
     /// A reading of program starts the watcher failed is named among the readings that failed in
@@ -1383,9 +1348,7 @@ mod tests {
      {
         let (dir, args) = one_line("watcher-failed");
         let now = 1_791_090_010;
-        let lock = store::lock_watch(&dir).unwrap().unwrap();
-        let text = format!("1791000000\nheartbeat {EVALUATOR}\nready");
-        std::fs::write(dir.join(store::WATCH_LOCK), text).unwrap();
+        let lock = watching(&dir);
         let said = || {
             let state = read_with(Rules::shipped(), &args, now);
             let state = state.ok().unwrap().collector.unwrap().status_state;
@@ -1530,15 +1493,9 @@ mod tests {
         limit: usize,
         now: i64,
     ) -> v1::Matches {
-        let args = MatchesArgs {
-            store: dir.join("store.db"),
-            form: answer::Form::Json,
-            after: after.map(|p| (p.to_string(), Place::parse(p).unwrap())),
-            limit,
-            single: false,
-            system_root: root.to_path_buf(),
-        };
-        read(&args, now).ok().unwrap()
+        read(&args(&dir.join("store.db"), root, after, limit), now)
+            .ok()
+            .unwrap()
     }
 
     fn evaluator_of(a: &v1::Matches) -> (v1::EvaluatorState, v1::BehindReason) {
@@ -1604,14 +1561,7 @@ mod tests {
         let mut wrapped_total = Place::of(&id, 2, &totals).unwrap();
         wrapped_total.totals[0] = u64::MAX;
         let other = "f".repeat(32);
-        let args = |p: Place| MatchesArgs {
-            store: dir.join("store.db"),
-            form: answer::Form::Json,
-            after: Some((p.to_string(), p)),
-            limit: LIMIT,
-            single: false,
-            system_root: root.clone(),
-        };
+        let args = |p: Place| args(&dir.join("store.db"), &root, Some(&p.to_string()), LIMIT);
         for p in [
             Place::of(&other, 0, &totals).unwrap(),
             Place::of(&id, 99, &totals).unwrap(),
@@ -1693,16 +1643,7 @@ mod tests {
         log_file(&root, NAME, &(text + &git(5, "kept")), 100);
         core_reads_at(&dir.join("store.db"), &root, NOW + 20);
         // Over rules that all judge here, so that `unevaluated` is empty.
-        let args = MatchesArgs {
-            store: dir.join("store.db"),
-            form: answer::Form::Json,
-            after: place
-                .as_deref()
-                .map(|p| (p.to_string(), Place::parse(p).unwrap())),
-            limit: LIMIT,
-            single: false,
-            system_root: root.clone(),
-        };
+        let args = args(&dir.join("store.db"), &root, place.as_deref(), LIMIT);
         let rules = crate::sigma::testing::process_kept();
         let a = read_with(&rules, &args, NOW + 20).ok().unwrap();
         assert_eq!(evaluator_of(&a).0, v1::EvaluatorState::Current);

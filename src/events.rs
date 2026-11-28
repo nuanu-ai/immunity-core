@@ -1479,8 +1479,8 @@ impl Reader {
         !self.more && matches!(self.found, Found::Read | Found::NotInstalled)
     }
 
-    /// Whether what was read since the last write is owed to the store, or a look failed or
-    /// found no collector and that is to be said.
+    /// Whether what was read since the last write is owed to the store, or a look failed and that
+    /// is to be said. A look that found no collector is owed only for the files it let go.
     pub fn owed(&self) -> bool {
         self.batch.owed() || matches!(self.found, Found::Failed(..))
     }
@@ -1763,13 +1763,7 @@ impl Reader {
             Found::Failed(why, _) => {
                 out.state = FAILED;
                 out.failed = Some(why.clone());
-                tx.execute(
-                    "INSERT INTO event_level (id, read_at, state, reason) VALUES (1, ?1, ?2, ?3)
-                     ON CONFLICT (id) DO UPDATE SET read_at = excluded.read_at,
-                         state = excluded.state, said_by = NULL, said = NULL,
-                         reason = excluded.reason",
-                    params![now, FAILED, why],
-                )?;
+                put_failed(tx, now, why)?;
                 put_cap(tx, &log_cap(&self.root))?;
             }
             Found::Read => {
@@ -1791,11 +1785,7 @@ impl Reader {
                     put_level(tx, now, state, written, said.unzip(), seqs)?;
                     if let Found::Failed(why, _) = found {
                         out.state = FAILED;
-                        tx.execute(
-                            "UPDATE event_level SET state = ?1, reason = ?2, said_by = NULL,
-                                 said = NULL",
-                            params![FAILED, why],
-                        )?;
+                        put_failed(tx, now, why)?;
                     }
                 } else {
                     tx.execute(
@@ -1952,7 +1942,7 @@ fn remove_file(tx: &Transaction, name: &str) -> rusqlite::Result<()> {
 }
 
 /// Matches read in a file that left, or became another file, before they were written
-/// (`Matched::dropped`): they are given a number of the record that no row holds, and it is kept
+/// (`Matched::drop_file`): they are given a number of the record that no row holds, and it is kept
 /// as the largest that went, so a caller of `immunity matches` whose place is before it is told
 /// matches are gone. `sqlite_sequence` is SQLite's own count of `rule_line`'s numbers, which it
 /// lets a program raise; a number raised there is never given to a row.
@@ -1980,9 +1970,11 @@ fn give_gone(tx: &Transaction) -> rusqlite::Result<()> {
 /// read the rows by time (`Since`), and an answer of `immunity matches` reads `event_total`.
 const COUNT_EVERY: i64 = 10;
 
-/// The counts `event_total` keeps, in its order: each of `Tally`, of `FileTally`, and for each
-/// of `MARKS` the writes in which some judged line did not give it.
+/// The counts `event_total` keeps, in its order: each of `Tally`, of `FileTally` (the first
+/// `COUNTS`, which `event_count` keeps under the same names), and for each of `MARKS` the writes
+/// in which some judged line did not give it.
 pub const TOTALS: usize = 16;
+const COUNTS: usize = 11;
 const TOTAL_COLUMNS: [&str; TOTALS] = [
     "starts",
     "lost",
@@ -2028,52 +2020,46 @@ fn put_counts(
         f.lost,
         f.unknown_gaps,
         f.unreadable,
-        i64::from(lacked.bits()),
     ];
+    // A mark of `lacked` comes only with a judged line, which is a start or a file event counted.
     if n.iter().all(|c| *c == 0) {
         return Ok(());
     }
+    // Each count is the parameter after `now`, in the order of `TOTAL_COLUMNS`.
+    let columns = &TOTAL_COLUMNS[..COUNTS];
+    let add: Vec<String> = (columns.iter().enumerate())
+        .map(|(i, c)| format!("{c} = {c} + ?{}", i + 2))
+        .collect();
+    let (lacked_at, every_at) = (COUNTS + 2, COUNTS + 3);
     let added = tx.execute(
-        "UPDATE event_count SET starts = starts + ?2, lost = lost + ?3,
-             unknown_gaps = unknown_gaps + ?4, unreadable = unreadable + ?5, other = other + ?6,
-             removed_cap = removed_cap + ?7, removed_unread = removed_unread + ?8,
-             files = files + ?9, files_lost = files_lost + ?10,
-             files_unknown_gaps = files_unknown_gaps + ?11,
-             files_unreadable = files_unreadable + ?12, lacked = lacked | ?13,
-             at = MAX(at, ?1)
-         WHERE id = (SELECT MAX(id) FROM event_count) AND at / ?14 = ?1 / ?14
-           AND NOT EXISTS (SELECT 1 FROM journal j
-                           WHERE j.entry = 'run_started' AND j.seq > event_count.journal_seq)",
-        params![
-            now,
-            n[0],
-            n[1],
-            n[2],
-            n[3],
-            n[4],
-            n[5],
-            n[6],
-            n[7],
-            n[8],
-            n[9],
-            n[10],
-            n[11],
-            COUNT_EVERY
-        ],
+        &format!(
+            "UPDATE event_count SET {}, lacked = lacked | ?{lacked_at}, at = MAX(at, ?1)
+             WHERE id = (SELECT MAX(id) FROM event_count) AND at / ?{every_at} = ?1 / ?{every_at}
+               AND NOT EXISTS (SELECT 1 FROM journal j
+                               WHERE j.entry = 'run_started' AND j.seq > event_count.journal_seq)",
+            add.join(", ")
+        ),
+        rusqlite::params_from_iter(
+            [now]
+                .into_iter()
+                .chain(n)
+                .chain([i64::from(lacked.bits()), COUNT_EVERY]),
+        ),
     )?;
     if added == 0 {
+        let values: Vec<String> = (2..=COUNTS + 2).map(|i| format!("?{i}")).collect();
         tx.execute(
-            "INSERT INTO event_count (journal_seq, at, starts, lost, unknown_gaps, unreadable,
-                                      other, removed_cap, removed_unread, files, files_lost,
-                                      files_unknown_gaps, files_unreadable, lacked)
-             VALUES ((SELECT COALESCE(MAX(seq), 0) FROM journal),
-                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-            params![
-                now, n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7], n[8], n[9], n[10], n[11]
-            ],
+            &format!(
+                "INSERT INTO event_count (journal_seq, at, {}, lacked)
+                 VALUES ((SELECT COALESCE(MAX(seq), 0) FROM journal), ?1, {})",
+                columns.join(", "),
+                values.join(", ")
+            ),
+            rusqlite::params_from_iter(
+                [now].into_iter().chain(n).chain([i64::from(lacked.bits())]),
+            ),
         )?;
     }
-    let lacked = lacked.0.map(i64::from);
     let raise: Vec<String> = TOTAL_COLUMNS
         .iter()
         .enumerate()
@@ -2086,12 +2072,33 @@ fn put_counts(
         ),
         [],
     )?;
-    let by: Vec<i64> = n[..11].iter().copied().chain(lacked).collect();
+    let by = n.into_iter().chain(lacked.0.map(i64::from));
     tx.execute(
         &format!("UPDATE event_total SET {}", raise.join(", ")),
         rusqlite::params_from_iter(by),
     )?;
     Ok(())
+}
+
+/// The first `COUNTS` of `TOTAL_COLUMNS`, in that order, as what they count.
+fn tallies(n: &[i64]) -> (Tally, FileTally) {
+    (
+        Tally {
+            starts: n[0],
+            lost: n[1],
+            unknown_gaps: n[2],
+            unreadable: n[3],
+            other: n[4],
+            removed_cap: n[5],
+            removed_unread: n[6],
+        },
+        FileTally {
+            files: n[7],
+            lost: n[8],
+            unknown_gaps: n[9],
+            unreadable: n[10],
+        },
+    )
 }
 
 /// The running totals of every count since the store was made (`event_total`), in the order of
@@ -2123,23 +2130,11 @@ pub fn counted_between(
     later: &[i64; TOTALS],
 ) -> (Tally, FileTally, Lacked) {
     let d: Vec<i64> = later.iter().zip(earlier).map(|(l, e)| l - e).collect();
+    let (tally, file_tally) = tallies(&d);
     (
-        Tally {
-            starts: d[0],
-            lost: d[1],
-            unknown_gaps: d[2],
-            unreadable: d[3],
-            other: d[4],
-            removed_cap: d[5],
-            removed_unread: d[6],
-        },
-        FileTally {
-            files: d[7],
-            lost: d[8],
-            unknown_gaps: d[9],
-            unreadable: d[10],
-        },
-        Lacked(std::array::from_fn(|i| d[11 + i] > 0)),
+        tally,
+        file_tally,
+        Lacked(std::array::from_fn(|i| d[COUNTS + i] > 0)),
     )
 }
 
@@ -2475,53 +2470,58 @@ impl Arrivals {
     /// Of a set of `KEEPS`, the one furthest from arriving, as a rule that reads them all is
     /// named with.
     pub fn worst(&self, keeps: Keeps) -> Arrival {
-        of(keeps)
-            .map(|(name, _)| self.of(keeps_named(&[name])))
+        (0..KEEPS.len())
+            .map(|i| 1 << i)
+            .filter(|keep| keeps & keep != 0)
+            .map(|keep| self.of(keep))
             .max_by_key(|a| a.distance())
             .unwrap_or(Arrival::Kept(Some(0)))
     }
 
-    /// What of `KEEPS` does not arrive: a rule that reads it does not watch.
-    pub fn not_arriving(&self) -> Keeps {
+    /// The set of `KEEPS` the lines say this of.
+    fn keeps(&self, state: impl Fn(Arrival) -> bool) -> Keeps {
         (0..KEEPS.len())
             .map(|i| 1 << i)
-            .filter(|keep| !matches!(self.of(*keep), Arrival::Kept(Some(_))))
+            .filter(|keep| state(self.of(*keep)))
             .fold(0, |set, keep| set | keep)
     }
 
-    /// The names of `KEEPS` the lines say this of, in their order.
-    pub fn named(&self, state: impl Fn(Arrival) -> bool) -> Vec<&'static str> {
-        KEEPS
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| state(self.of(1 << i)))
-            .map(|(_, (name, _))| *name)
-            .collect()
+    /// What of `KEEPS` does not arrive: a rule that reads it does not watch.
+    pub fn not_arriving(&self) -> Keeps {
+        self.keeps(|a| !matches!(a, Arrival::Kept(Some(_))))
+    }
+
+    /// The names of `KEEPS` the lines say `state` of, in their order, as the status and the
+    /// contract list them.
+    pub fn named(&self, state: Arrival) -> Vec<String> {
+        let keeps = self.keeps(|a| a == state);
+        names(keeps).into_iter().map(str::to_string).collect()
     }
 
     /// The names of `KEEPS` that arrive, each with the time since when.
-    pub fn arriving(&self) -> Vec<(&'static str, i64)> {
+    pub fn arriving(&self) -> Vec<crate::contract::v1::Arriving> {
         self.timed(|a| match a {
             Arrival::Kept(Some(since)) => Some(since),
             _ => None,
         })
+        .map(|(name, since)| crate::contract::v1::Arriving { name, since })
+        .collect()
     }
 
     /// The names of `KEEPS` that no longer arrive, each with the time since when.
-    pub fn no_longer(&self) -> Vec<(&'static str, i64)> {
+    pub fn no_longer(&self) -> Vec<crate::contract::v1::NoLongerArriving> {
         self.timed(|a| match a {
             Arrival::NoLonger(since) => Some(since),
             _ => None,
         })
+        .map(|(name, since)| crate::contract::v1::NoLongerArriving { name, since })
+        .collect()
     }
 
     /// The names of `KEEPS` whose state gives a time, with it.
-    fn timed(&self, time: impl Fn(Arrival) -> Option<i64>) -> Vec<(&'static str, i64)> {
-        KEEPS
-            .iter()
-            .enumerate()
-            .filter_map(|(i, (name, _))| Some((*name, time(self.of(1 << i))?)))
-            .collect()
+    fn timed(&self, time: impl Fn(Arrival) -> Option<i64>) -> impl Iterator<Item = (String, i64)> {
+        (KEEPS.iter().enumerate())
+            .filter_map(move |(i, (name, _))| Some((name.to_string(), time(self.of(1 << i))?)))
     }
 }
 
@@ -2553,10 +2553,6 @@ impl Lacked {
             .fold(0, |bits, (i, lacked)| bits | (u8::from(*lacked) << i))
     }
 
-    fn from_bits(bits: u8) -> Lacked {
-        Lacked(std::array::from_fn(|i| bits & (1 << i) != 0))
-    }
-
     /// What of `KEEPS` some judged line of `kind` did not give.
     pub fn of(&self, kind: crate::sigma::Kind) -> Keeps {
         self.0
@@ -2565,15 +2561,6 @@ impl Lacked {
             .filter(|(lacked, (k, _, _))| **lacked && *k == kind)
             .fold(0, |set, (_, (_, keep, _))| set | keep)
     }
-}
-
-/// The set of `KEEPS` these names name; a name it does not know names nothing.
-fn keeps_named(names: &[impl AsRef<str>]) -> Keeps {
-    KEEPS
-        .iter()
-        .enumerate()
-        .filter(|(_, (name, _))| names.iter().any(|n| n.as_ref() == *name))
-        .fold(0, |keeps, (i, _)| keeps | 1 << i)
 }
 
 /// The names of a set of `KEEPS`, in their order.
@@ -2680,6 +2667,16 @@ struct Into<'a> {
 }
 
 impl Into<'_> {
+    /// Takes in which of `KEEPS` one event of `kind`, at `timestamp`, holds the key of (`kept`)
+    /// and a value under (`filled`): into what arrives, when this file speaks of it, and into what
+    /// the judged lines lacked.
+    fn keeps(&mut self, kind: crate::sigma::Kind, kept: Keeps, filled: Keeps, timestamp: &str) {
+        if let Some(arrivals) = self.arrivals.as_deref_mut() {
+            arrivals.line(kind, kept, filled, second_of(timestamp, self.now));
+        }
+        self.batch.lacked.line(kind, kept, filled);
+    }
+
     /// Evaluates one event against the rules of its kind. This is the one place an event is
     /// evaluated: what the store records, counts and raises comes from this call. `begins` is
     /// where the event's line begins, and `line` the line, its newline left out.
@@ -2798,18 +2795,8 @@ fn read_from(mut file: std::fs::File, from: u64, into: &mut Into) -> Result<Upto
                 count_seq(seq, into.last_seq, counts, into.pending);
                 t.starts += 1;
                 into.batch.version = v.or(into.batch.version);
-                if let Some(arrivals) = into.arrivals.as_deref_mut() {
-                    arrivals.line(
-                        crate::sigma::Kind::Process,
-                        start.kept,
-                        filled_start(&start),
-                        second_of(&start.timestamp, into.now),
-                    );
-                }
                 let kind = crate::sigma::Kind::Process;
-                into.batch
-                    .lacked
-                    .line(kind, start.kept, filled_start(&start));
+                into.keeps(kind, start.kept, filled_start(&start), &start.timestamp);
                 into.judge(Subject::Start(&start), begins, &buf[..n - 1])
             }
             Line::File { kind, seq, event } => {
@@ -2821,17 +2808,8 @@ fn read_from(mut file: std::fs::File, from: u64, into: &mut Into) -> Result<Upto
                 match event {
                     Some(e) => {
                         t.files += 1;
-                        if let Some(arrivals) = into.arrivals.as_deref_mut() {
-                            arrivals.line(
-                                crate::sigma::Kind::File,
-                                e.kept,
-                                filled_file(&e),
-                                second_of(&e.timestamp, into.now),
-                            );
-                        }
-                        into.batch
-                            .lacked
-                            .line(crate::sigma::Kind::File, e.kept, filled_file(&e));
+                        let kind = crate::sigma::Kind::File;
+                        into.keeps(kind, e.kept, filled_file(&e), &e.timestamp);
                         into.judge(Subject::File(&e), begins, &buf[..n - 1])
                     }
                     None => t.unreadable += 1,
@@ -3030,9 +3008,9 @@ fn real_second(second: u64) -> bool {
 /// back. A file nobody writes any more holds nothing new, so from the second reading on only the
 /// file being written is a candidate, whatever its name and whatever the clock said. When a
 /// reading finds several, at the first reading or across a new file, the time each was last
-/// written decides, as `tidy.sh` keeps the one written last. Within a pass (`Pass`) the file an
-/// earlier step told stays a candidate when it holds nothing new, so a file it read is not
-/// passed over for an older one, and a newer file, as after a rotation, takes over.
+/// written decides, as `tidy.sh` keeps the one written last. The file the look before told
+/// (`told`) stays a candidate when it holds nothing new, so a file it read is not passed over for
+/// an older one, and a newer file, as after a rotation, takes over.
 fn writing(
     files: &[LogFile],
     read: impl Fn(&LogFile) -> Option<(u64, u64)>,
@@ -4164,12 +4142,17 @@ fn files_covered(
             .gaps(),
         );
     }
-    if said.is_empty() {
+    over_the_day(said)
+}
+
+/// Full when nothing was lost over the last day, else partial with what was, `not_given`.
+fn over_the_day(gaps: Vec<String>) -> (&'static str, Option<String>, Option<Cause>) {
+    if gaps.is_empty() {
         return ("full", None, None);
     }
     (
         "partial",
-        Some(format!("over the last day, {}", said.join("; "))),
+        Some(format!("over the last day, {}", gaps.join("; "))),
         Some(Cause::NotGiven),
     )
 }
@@ -4185,18 +4168,7 @@ fn files_covered(
 /// until a full check that began after it finishes (`Level::lost_since_check`).
 fn covered(state: &str, t: &Tally) -> (&'static str, Option<String>, Option<Cause>) {
     match state {
-        RUNNING => {
-            let said = t.gaps();
-            if said.is_empty() {
-                ("full", None, None)
-            } else {
-                (
-                    "partial",
-                    Some(format!("over the last day, {}", said.join("; "))),
-                    Some(Cause::NotGiven),
-                )
-            }
-        }
+        RUNNING => over_the_day(t.gaps()),
         REFUSED => (
             "none",
             Some("macOS refuses eslogger Full Disk Access, so no program start is recorded".into()),
@@ -4241,6 +4213,18 @@ fn put_level(
         params![
             now, state, written, said_by, said, last_seq, version, counted
         ],
+    )?;
+    Ok(())
+}
+
+/// The level's row of a reading that failed at `now`, with why: nothing the collector said
+/// stands beside it.
+fn put_failed(tx: &Transaction, now: i64, why: &str) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO event_level (id, read_at, state, reason) VALUES (1, ?1, ?2, ?3)
+         ON CONFLICT (id) DO UPDATE SET read_at = excluded.read_at, state = excluded.state,
+             said_by = NULL, said = NULL, reason = excluded.reason",
+        params![now, FAILED, why],
     )?;
     Ok(())
 }
@@ -4758,49 +4742,18 @@ fn spared_from(conn: &Connection) -> rusqlite::Result<Option<i64>> {
 /// The counts of every row of `event_count` `since` counts.
 fn tally_since(conn: &Connection, since: Since) -> rusqlite::Result<(Tally, FileTally)> {
     let (rows, at) = since.rows();
-    let (t, f, _) = tally_where(conn, rows, at)?;
-    Ok((t, f))
-}
-
-/// The counts of the rows of `event_count` that `rows` holds of, with its one parameter, and
-/// what some judged line in them did not give.
-fn tally_where(
-    conn: &Connection,
-    rows: &str,
-    at: i64,
-) -> rusqlite::Result<(Tally, FileTally, Lacked)> {
+    let sums: Vec<String> = (TOTAL_COLUMNS[..COUNTS].iter())
+        .map(|c| format!("COALESCE(SUM({c}), 0)"))
+        .collect();
     conn.query_row(
-        &format!(
-            "SELECT COALESCE(SUM(starts), 0), COALESCE(SUM(lost), 0),
-                    COALESCE(SUM(unknown_gaps), 0), COALESCE(SUM(unreadable), 0),
-                    COALESCE(SUM(other), 0), COALESCE(SUM(removed_cap), 0),
-                    COALESCE(SUM(removed_unread), 0), COALESCE(SUM(files), 0),
-                    COALESCE(SUM(files_lost), 0), COALESCE(SUM(files_unknown_gaps), 0),
-                    COALESCE(SUM(files_unreadable), 0),
-                    COALESCE(MAX(lacked & 1) | MAX(lacked & 2) | MAX(lacked & 4)
-                             | MAX(lacked & 8) | MAX(lacked & 16), 0)
-             FROM event_count WHERE {rows}"
-        ),
+        &format!("SELECT {} FROM event_count WHERE {rows}", sums.join(", ")),
         [at],
         |r| {
-            Ok((
-                Tally {
-                    starts: r.get(0)?,
-                    lost: r.get(1)?,
-                    unknown_gaps: r.get(2)?,
-                    unreadable: r.get(3)?,
-                    other: r.get(4)?,
-                    removed_cap: r.get(5)?,
-                    removed_unread: r.get(6)?,
-                },
-                FileTally {
-                    files: r.get(7)?,
-                    lost: r.get(8)?,
-                    unknown_gaps: r.get(9)?,
-                    unreadable: r.get(10)?,
-                },
-                Lacked::from_bits(r.get(11)?),
-            ))
+            let mut n = [0; COUNTS];
+            for (i, v) in n.iter_mut().enumerate() {
+                *v = r.get(i)?;
+            }
+            Ok(tallies(&n))
         },
     )
 }
@@ -4834,13 +4787,6 @@ pub fn message(l: &Level) -> crate::contract::v1::EventLevel {
         counts: s.counts.iter().map(|c| n(*c)).collect(),
     };
     let said = words(l);
-    let names = |state: Arrival| -> Vec<String> {
-        l.arrivals
-            .named(|a| a == state)
-            .into_iter()
-            .map(str::to_string)
-            .collect()
-    };
     v1::EventLevel {
         state: value_of::<v1::CollectorState>(&l.state),
         level: LEVEL.to_string(),
@@ -4861,18 +4807,10 @@ pub fn message(l: &Level) -> crate::contract::v1::EventLevel {
         reason_text: l.reason.as_deref().map(crate::secrets::said),
         silent_after_seconds: n(SILENT_AFTER),
         cannot_see: cannot_see(l).into_iter().map(str::to_string).collect(),
-        not_kept: names(Arrival::NotKept),
-        kept_never_filled: names(Arrival::Kept(None)),
-        not_yet_known: names(Arrival::Unknown),
-        arriving: l
-            .arrivals
-            .arriving()
-            .into_iter()
-            .map(|(name, since)| v1::Arriving {
-                name: name.to_string(),
-                since,
-            })
-            .collect(),
+        not_kept: l.arrivals.named(Arrival::NotKept),
+        kept_never_filled: l.arrivals.named(Arrival::Kept(None)),
+        not_yet_known: l.arrivals.named(Arrival::Unknown),
+        arriving: l.arrivals.arriving(),
         file_events: Some(v1::FileEvents {
             collected: l.files.collected,
             not_collected_reason: l.files.why.clone().filter(|_| !l.files.collected),
@@ -4901,15 +4839,7 @@ pub fn message(l: &Level) -> crate::contract::v1::EventLevel {
             .cap
             .as_ref()
             .and_then(|c| c.as_ref().err().map(|why| crate::secrets::said(why))),
-        no_longer_arriving: l
-            .arrivals
-            .no_longer()
-            .into_iter()
-            .map(|(name, since)| v1::NoLongerArriving {
-                name: name.to_string(),
-                since,
-            })
-            .collect(),
+        no_longer_arriving: l.arrivals.no_longer(),
     }
 }
 
@@ -4969,7 +4899,7 @@ pub fn words(l: &Level) -> Said {
     let mut said = state_words(l);
     // An earlier collector keeps less than this version reads, as its latest lines show: said
     // in every state it is installed in, and as a caveat while it records.
-    let missing = keeps_named(&l.arrivals.named(|a| a == Arrival::NotKept));
+    let missing = l.arrivals.keeps(|a| a == Arrival::NotKept);
     if missing != 0 {
         let what: Vec<&str> = of(missing).map(|(_, words)| *words).collect();
         let list = match what.split_last() {
@@ -5869,27 +5799,14 @@ mod tests {
     fn counts_older_than_two_days_are_deleted_so_the_store_does_not_grow_with_the_readings() {
         // The watcher reads for as long as the Mac runs. A reading that read nothing writes no
         // row of counts; each of these reads a program start.
-        let dir = crate::common::Scratch::at(
-            std::env::temp_dir().join(format!("immunity-events-keep-{}", std::process::id())),
-        );
-        std::fs::create_dir_all(dir.join("root").join(LOG)).unwrap();
-        let plist = dir.join("root").join(PLIST);
-        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        std::fs::write(&plist, "<plist/>").unwrap();
+        let dir = installed("keep");
         let mut conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
         let now = 1_791_000_000;
         let mut text = String::new();
         let mut read = |conn: &mut rusqlite::Connection, at: i64, seq: u64| {
             text.push_str(&(exec(seq, OBJECT) + "\n"));
-            std::fs::write(
-                dir.join("root").join(LOG).join("exec-20261004T00.jsonl"),
-                &text,
-            )
-            .unwrap();
-            let tx = conn.transaction().unwrap();
-            crate::store::put_entity(&tx, "machine:mac").unwrap();
-            read(&tx, "events-1", "machine:mac", &dir.join("root"), at).unwrap();
-            tx.commit().unwrap();
+            std::fs::write(dir.join(LOG).join("exec-20261004T00.jsonl"), &text).unwrap();
+            reading(conn, &dir, at);
         };
         read(&mut conn, now - KEEP - 1, 1);
         read(&mut conn, now - KEEP + 1, 2);
@@ -5909,20 +5826,11 @@ mod tests {
     fn the_pages_basis_moves_with_a_start_read_or_a_new_state_and_not_with_a_reading_alone() {
         // A click after new program starts writes the pages that count them again; a reading
         // every ten seconds that took nothing writes nothing, or every click would.
-        let dir = crate::common::Scratch::at(
-            std::env::temp_dir().join(format!("immunity-events-basis-{}", std::process::id())),
-        );
-        let log = dir.join("root").join(LOG);
-        std::fs::create_dir_all(&log).unwrap();
-        let plist = dir.join("root").join(PLIST);
-        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        std::fs::write(&plist, "<plist/>").unwrap();
+        let dir = installed("basis");
+        let (log, plist) = (dir.join(LOG), dir.join(PLIST));
         let mut conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
         let read = |conn: &mut rusqlite::Connection, at: i64| {
-            let tx = conn.transaction().unwrap();
-            crate::store::put_entity(&tx, "machine:mac").unwrap();
-            read(&tx, "events-1", "machine:mac", &dir.join("root"), at).unwrap();
-            tx.commit().unwrap();
+            reading(conn, &dir, at);
             basis(conn).unwrap()
         };
         let now = crate::now_secs();
@@ -5934,7 +5842,7 @@ mod tests {
         // The collector is established to record file events: the pages that said the rules
         // for files do not watch are written again.
         std::fs::write(
-            dir.join("root").join(COLLECTS),
+            dir.join(COLLECTS),
             r#"["/usr/bin/eslogger","exec","create","rename"]"#,
         )
         .unwrap();
@@ -5951,18 +5859,12 @@ mod tests {
         // The owner tunes the rules on a week of counts; the status serves the last day. Both
         // are kept by the hour of the reading, so the hour that holds the start of the span
         // counts whole, and an hour older than the week is deleted.
-        let dir = crate::common::Scratch::at(
-            std::env::temp_dir().join(format!("immunity-events-hours-{}", std::process::id())),
-        );
-        std::fs::create_dir_all(dir.join("root").join(LOG)).unwrap();
-        let plist = dir.join("root").join(PLIST);
-        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        std::fs::write(&plist, "<plist/>").unwrap();
+        let dir = installed("hours");
         let mut conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
         // On the hour, so that each reading below is in an hour of its own.
         let now = 1_791_000_000;
         assert_eq!(now % HOUR, 0);
-        let log = dir.join("root").join(LOG).join("exec-20261004T00.jsonl");
+        let log = dir.join(LOG).join("exec-20261004T00.jsonl");
         let mut text = String::new();
         for (seq, at) in [
             (1, now - KEEP_MATCHES - HOUR),
@@ -5981,10 +5883,7 @@ mod tests {
             );
             text.push('\n');
             std::fs::write(&log, &text).unwrap();
-            let tx = conn.transaction().unwrap();
-            crate::store::put_entity(&tx, "machine:mac").unwrap();
-            read(&tx, "events-1", "machine:mac", &dir.join("root"), at).unwrap();
-            tx.commit().unwrap();
+            reading(&mut conn, &dir, at);
         }
         let l = level(&conn, now).unwrap().unwrap();
         let hours: i64 = conn
@@ -6089,11 +5988,8 @@ mod tests {
         // a clock stepped forward. A loss received before the check is behind it, though a clock
         // ahead stamped it after the check's start. These checks' own readings of the log failed,
         // so no reading carries a check's stamp but the one a clock set back gave.
-        let dir = crate::common::Scratch::new("events-since-seq");
-        let root = dir.join("root");
-        std::fs::create_dir_all(root.join(LOG)).unwrap();
-        std::fs::create_dir_all(root.join(PLIST).parent().unwrap()).unwrap();
-        std::fs::write(root.join(PLIST), "<plist/>").unwrap();
+        let dir = installed("since-seq");
+        let root = dir.to_path_buf();
         let collects = r#"["/usr/bin/eslogger","exec","create","rename"]"#;
         std::fs::write(root.join(COLLECTS), collects).unwrap();
         let log = root.join(LOG).join("exec-20261004T00.jsonl");
@@ -6110,10 +6006,7 @@ mod tests {
                 lines.push_str(&(line + "\n"));
             }
             std::fs::write(&log, &lines).unwrap();
-            let tx = conn.transaction().unwrap();
-            crate::store::put_entity(&tx, "machine:mac").unwrap();
-            read(&tx, "events-1", "machine:mac", &root, at).unwrap();
-            tx.commit().unwrap();
+            reading(conn, &root, at);
         };
         let lost = |conn: &Connection| level(conn, start).unwrap().unwrap().lost_since_check();
         let check = |conn: &Connection, run: &str, at: i64| {
@@ -6145,11 +6038,8 @@ mod tests {
         // before the check finishes must not delete it, though no check has finished yet: once
         // the check finishes, the loss holds this Mac in part, as its own reading does not meet
         // it again.
-        let dir = crate::common::Scratch::new("events-spared-open");
-        let root = dir.join("root");
-        std::fs::create_dir_all(root.join(LOG)).unwrap();
-        std::fs::create_dir_all(root.join(PLIST).parent().unwrap()).unwrap();
-        std::fs::write(root.join(PLIST), "<plist/>").unwrap();
+        let dir = installed("spared-open");
+        let root = dir.to_path_buf();
         let log = root.join(LOG).join("exec-20261004T00.jsonl");
         let mut conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
         let start = crate::now_secs();
@@ -6159,10 +6049,7 @@ mod tests {
                 lines.push_str(&(exec(seq, OBJECT) + "\n"));
             }
             std::fs::write(&log, &lines).unwrap();
-            let tx = conn.transaction().unwrap();
-            crate::store::put_entity(&tx, "machine:mac").unwrap();
-            read(&tx, "events-1", "machine:mac", &root, at).unwrap();
-            tx.commit().unwrap();
+            reading(conn, &root, at);
         };
         crate::store::journal_note(&conn, start, "first", "run_started", "").unwrap();
         read(&mut conn, start + 100, &[1, 3]);
@@ -6181,13 +6068,7 @@ mod tests {
         // a loaded machine measures the machine: it is measured and printed with
         // `--nocapture`, with the share of the time the rules take, measured over the same
         // starts apart from the reading.
-        let dir = crate::common::Scratch::at(
-            std::env::temp_dir().join(format!("immunity-events-speed-{}", std::process::id())),
-        );
-        std::fs::create_dir_all(dir.join(LOG)).unwrap();
-        let plist = dir.join(PLIST);
-        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        std::fs::write(&plist, "<plist/>").unwrap();
+        let dir = installed("speed");
         let git = r#"["git","status","--short"]"#;
         let n: u64 = 5_000;
         let mut text = String::new();
@@ -6259,14 +6140,8 @@ mod tests {
         // A rule matches once from an unknown program, then again and again from the person's
         // own: the start and the file event that raised each finding stay beside the latest
         // five, whether they were pushed out within the reading that raised it or by a later one.
-        let dir = crate::common::Scratch::at(
-            std::env::temp_dir().join(format!("immunity-events-first-{}", std::process::id())),
-        );
-        let log = dir.join("root").join(LOG);
-        std::fs::create_dir_all(&log).unwrap();
-        let plist = dir.join("root").join(PLIST);
-        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        std::fs::write(&plist, "<plist/>").unwrap();
+        let dir = installed("first");
+        let log = dir.join(LOG);
         let grep = |seq: u64, pid: u64| {
             exec(seq, &format!(r#"{{"pid":{pid},"euid":501}}"#))
                 .replace(
@@ -6288,17 +6163,7 @@ mod tests {
             ));
             if seq == 7 || seq == 14 {
                 std::fs::write(log.join("exec-20261004T00.jsonl"), &text).unwrap();
-                let tx = conn.transaction().unwrap();
-                crate::store::put_entity(&tx, "machine:mac").unwrap();
-                read(
-                    &tx,
-                    "events-1",
-                    "machine:mac",
-                    &dir.join("root"),
-                    1_791_000_000,
-                )
-                .unwrap();
-                tx.commit().unwrap();
+                reading(&mut conn, &dir, 1_791_000_000);
             }
         }
         let column = |sql: &str| -> Vec<String> {
@@ -6327,13 +6192,7 @@ mod tests {
         // One file event in ten matches a high rule for file events, so its
         // finding's evidence is taken, and only the latest few are kept. Each file event is
         // asked only of the rules for file events.
-        let dir = crate::common::Scratch::at(
-            std::env::temp_dir().join(format!("immunity-events-files-{}", std::process::id())),
-        );
-        std::fs::create_dir_all(dir.join(LOG)).unwrap();
-        let plist = dir.join(PLIST);
-        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        std::fs::write(&plist, "<plist/>").unwrap();
+        let dir = installed("files");
         let n: u64 = 20_000;
         let mut text = String::new();
         for seq in 1..=n {
@@ -6706,7 +6565,13 @@ mod tests {
         a.line(Process, ALL_KEPT, SIGNATURE, 20);
         assert_eq!(told(&a), ["!20", "+10", "+11"]);
         assert_eq!(a.not_arriving(), IDENTITY);
-        assert_eq!(a.no_longer(), [("identity", 20)]);
+        assert_eq!(
+            a.no_longer(),
+            [crate::contract::v1::NoLongerArriving {
+                name: "identity".into(),
+                since: 20
+            }]
+        );
         a.line(Process, ALL_KEPT, SIGNATURE, 21);
         assert_eq!(told(&a), ["!20", "+10", "+11"]);
         // It arrives again from the next start that gives it.
@@ -6830,6 +6695,24 @@ mod tests {
         dir
     }
 
+    /// One reading of every whole line of the log under `root` at `now`, committed, as a full
+    /// check reads it.
+    fn reading(conn: &mut Connection, root: &Path, now: i64) -> Outcome {
+        read_in(conn, root, now, true)
+    }
+
+    /// The same reading, in a transaction left to roll back unless `commit`: one that met a busy
+    /// store at its commit, or failed after it read.
+    fn read_in(conn: &mut Connection, root: &Path, now: i64, commit: bool) -> Outcome {
+        let tx = conn.transaction().unwrap();
+        crate::store::put_entity(&tx, "machine:mac").unwrap();
+        let out = read(&tx, "events-1", "machine:mac", root, now).unwrap();
+        if commit {
+            tx.commit().unwrap();
+        }
+        out
+    }
+
     /// Appends `text` to the log file `name` under `root`, then gives it `at` as the time it was
     /// last written.
     fn write_at(root: &Path, name: &str, text: &str, at: i64) {
@@ -6947,16 +6830,9 @@ mod tests {
         };
         let run = most(SCRIPT);
         write_at(&root, name, &starts(1, run / 2), now - 2);
-        let dir = crate::common::Scratch::at(
-            std::env::temp_dir().join(format!("immunity-events-run-{}", std::process::id())),
-        );
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
+        let mut conn = crate::store::open_or_make(&root.join("store.db")).unwrap();
         let read = |conn: &mut rusqlite::Connection| {
-            let tx = conn.transaction().unwrap();
-            crate::store::put_entity(&tx, "machine:mac").unwrap();
-            read(&tx, "events-1", "machine:mac", &root, now).unwrap();
-            tx.commit().unwrap();
+            reading(conn, &root, now);
             told(&arrivals(conn).unwrap())
         };
         assert_eq!(read(&mut conn)[1], format!("+{}", now - 4999));
@@ -6967,7 +6843,6 @@ mod tests {
             now - 1,
         );
         assert_eq!(read(&mut conn)[1], format!("!{}", now - 4998));
-        let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&root);
     }
 

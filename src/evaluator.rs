@@ -452,17 +452,22 @@ impl Kqueue {
         Ok(Kqueue(unsafe { OwnedFd::from_raw_fd(fd) }))
     }
 
-    /// Asks to be woken when `fd` changes as `fflags` says, until it is closed.
-    fn add(&self, fd: &OwnedFd, fflags: u32) -> std::io::Result<()> {
+    /// Asks to be woken when `fd` changes as `fflags` says, until it is closed. A file's
+    /// registration is `marked`, so a wake tells it from the folder's (`wait`).
+    fn add(&self, fd: &OwnedFd, fflags: u32, marked: bool) -> std::io::Result<()> {
         let change = libc::kevent {
             ident: fd.as_raw_fd() as usize,
             filter: libc::EVFILT_VNODE,
             flags: libc::EV_ADD | libc::EV_CLEAR,
             fflags,
             data: 0,
-            udata: std::ptr::null_mut(),
+            udata: match marked {
+                true => std::ptr::NonNull::<libc::c_void>::dangling().as_ptr(),
+                false => std::ptr::null_mut(),
+            },
         };
-        // SAFETY: one change from a live structure, no events asked back.
+        // SAFETY: one change from a live structure, no events asked back; the mark is never read
+        // through.
         let r = unsafe {
             libc::kevent(
                 self.0.as_raw_fd(),
@@ -529,7 +534,7 @@ impl Watched {
     fn register(&mut self, kq: &Kqueue, dir: &Path, file: Option<&str>) {
         if self.folder.is_none()
             && let Some(fd) = evtonly(dir)
-            && kq.add(&fd, libc::NOTE_WRITE).is_ok()
+            && kq.add(&fd, libc::NOTE_WRITE, false).is_ok()
         {
             self.folder = Some(fd);
         }
@@ -541,28 +546,8 @@ impl Watched {
             let fd = evtonly(&dir.join(name))?;
             let wanted =
                 libc::NOTE_WRITE | libc::NOTE_EXTEND | libc::NOTE_DELETE | libc::NOTE_RENAME;
-            // The file's registration carries a mark, so a wake tells it from the folder's.
-            let change = libc::kevent {
-                ident: fd.as_raw_fd() as usize,
-                filter: libc::EVFILT_VNODE,
-                flags: libc::EV_ADD | libc::EV_CLEAR,
-                fflags: wanted,
-                data: 0,
-                udata: std::ptr::NonNull::<libc::c_void>::dangling().as_ptr(),
-            };
-            // SAFETY: one change from a live structure, no events asked back; the mark is never
-            // read through.
-            let r = unsafe {
-                libc::kevent(
-                    kq.0.as_raw_fd(),
-                    &change,
-                    1,
-                    std::ptr::null_mut(),
-                    0,
-                    std::ptr::null(),
-                )
-            };
-            (r == 0).then(|| (name.to_string(), fd))
+            kq.add(&fd, wanted, true).ok()?;
+            Some((name.to_string(), fd))
         });
     }
 }
