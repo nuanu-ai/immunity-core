@@ -49,21 +49,18 @@
 //! after one that failed; another quiet sample prints nothing. A sample that failed is a
 //! `problem` line, `sample_failed`, and the next is taken at its time.
 //!
-//! Program starts. Every `EVENTS_EVERY` (`--events-every`) the watcher reads the event level's
-//! log (`events.rs`) one log file a step, each step under the run lock in its own transaction.
-//! Between steps, every `LOOK`, it evaluates the lines written since it last looked, without
-//! opening the store (`events::Pass::raising`), and reads at once when one matches a rule that
-//! raises a finding, so that the finding comes within about a second of its line. Each rule
-//! does that once between two steps at the period: a rule that keeps matching waits for the
-//! period after its first early step, and another rule is still read at once. An early step
-//! leaves the time of the step at the period where it was, so a line read at the period is
-//! read no later than with no early step.
-//! While log is left after a step, the next is read at the next turn of the loop, at once. A
-//! step that took program starts or changed the level's state prints a `program_starts` line,
-//! so that the app shows it without asking for the status; a reading that failed is a
-//! `problem` line, `events_failed`; one that took nothing prints nothing. After every step it
-//! writes the numbers of "As it happens" to `view/live.js` for a summary page that is open
-//! (`happens::live`).
+//! Program starts. The watcher's evaluator (`evaluator.rs`), a thread of its own with its own
+//! connection to the store, reads the event level's log as it grows and evaluates every rule on
+//! each line once; a match is in the store within milliseconds of its line. It writes under
+//! the run lock, as every writer does, for milliseconds at a time. Every `EVENTS_EVERY` (`--events-every`) it concludes:
+//! the level's state, the coverage. A conclusion that took program starts or changed the level's
+//! state prints a `program_starts` line, so that the app shows it without asking for the status,
+//! and writes the numbers of "As it happens" to `view/live.js` for a summary page that is open
+//! (`happens::live`). A reading that failed is a `problem` line, `events_failed`, and the failure
+//! of the kind `events`, recorded under the run lock by the watcher's loop. An evaluator that
+//! stops advancing (`Evaluator::stalled`) is a `problem` line, `events_stalled`, and the same
+//! failure until it advances; one whose thread ended is started again. The watcher is not ready
+//! until the evaluator has read the log to its end once, or failed to.
 //!
 //! Failures. A reading, a sample or a look at what to watch that failed is a `problem` line,
 //! and is recorded in the `watcher_failed` table with what it said, under the run lock, where
@@ -154,17 +151,10 @@ const PARENT: Duration = Duration::from_secs(1);
 /// How often the watcher takes a sample of running programs. The rule over them wants two
 /// samples a minute apart, so three samples at this cadence; a sample costs 10 to 20 ms.
 pub const SAMPLE: Duration = Duration::from_secs(30);
-/// How often the watcher reads the event level's log, see `--events-every`. A reading that took
-/// nothing still writes the level's rows and one row of `event_count`, and what reads those
-/// (the level's state, whether the collector fell silent, the freshness of the reading) goes by
-/// this period.
+/// How often the watcher's evaluator concludes on the event level, see `--events-every`: the
+/// level's state, whether the collector fell silent, the coverage. What reads those, the
+/// freshness of the reading among them, goes by this period.
 pub const EVENTS_EVERY: Duration = Duration::from_secs(10);
-/// How often the watcher's early look evaluates the lines written since it last looked
-/// (`events::Pass::raising`), and so about the longest a line that raises a finding waits to be
-/// read. A look at a log that did not grow is a listing of its folder, tens of microseconds;
-/// each new line costs its evaluation, as in a reading. It opens no store and writes nothing;
-/// the loop turns this often anyway (`PARENT`).
-const LOOK: Duration = Duration::from_secs(1);
 /// Another watcher holds the store.
 pub const EXIT_WATCHING: u8 = 5;
 /// How the run id of a watcher's reading begins; it writes no `run_started` or `run_finished`.
@@ -235,7 +225,7 @@ pub struct WatchArgs {
     /// system's: for tests, which set the clock in it.
     pub sample_input: Option<PathBuf>,
     pub sample_every: Duration,
-    /// How often it reads the event level's log: `EVENTS_EVERY`.
+    /// How often its evaluator concludes on the event level: `EVENTS_EVERY`.
     pub events_every: Duration,
     /// How often it says it is alive and looks again at what to watch: `ALIVE`, shorter in
     /// tests.
@@ -292,6 +282,7 @@ pub fn parse(mut it: impl Iterator<Item = String>) -> Result<WatchArgs, String> 
 
 enum Msg {
     Events(fsevents::Batch),
+    Evaluated(crate::evaluator::Said),
     Stop,
 }
 
@@ -404,6 +395,10 @@ pub fn watch(args: &WatchArgs) -> ExitCode {
         core,
         left: false,
         parsed: Default::default(),
+        evaluator: None,
+        evaluated: None,
+        stall_said: false,
+        held_said: false,
     };
     // The stream is started here, and the reading of every place only in `run`, after it: a
     // change made in between is seen by that reading or brings an event.
@@ -455,7 +450,7 @@ fn line(event: &str, mut fields: Value) -> Value {
 /// surface shows, the program starts this reading took, those of the last hour by the minute
 /// and of the last day, and each caveat in a few words. Numbers and fixed words only: nothing
 /// read from an event, and not what the collector said.
-fn starts_line(read: &crate::EventsRead) -> Value {
+fn starts_line(read: &crate::evaluator::Read) -> Value {
     let Some(l) = &read.level else {
         return json!({ "state": crate::happens::known(None), "starts": read.starts });
     };
@@ -529,6 +524,14 @@ struct Watcher<'a> {
     left: bool,
     /// What Git parsed of the configuration files in the last pass that read them.
     parsed: crate::git_hooks::Parsed,
+    /// The evaluator of the event level's log, from the start of `run` until it ends.
+    evaluator: Option<crate::evaluator::Evaluator>,
+    /// What the evaluator said of its latest reading, `None` when it succeeded, and whether the
+    /// loop said it stalled.
+    evaluated: Option<String>,
+    stall_said: bool,
+    /// The evaluator finds the store held by another writer, as said in the lock file.
+    held_said: bool,
 }
 
 /// The file a watcher was started from: its path, its device and inode then, and when it is
@@ -577,28 +580,41 @@ enum LockState {
     Waiting { at: i64 },
 }
 
-/// The lock file's whole content: the start time, `heartbeat`, and the state on a third line,
-/// absent while starting, with what the store said on a fourth for `unrecorded`.
-fn lock_text(since: i64, state: &LockState) -> String {
+/// The lock file's whole content: the start time, `heartbeat` with the evaluator the watcher
+/// runs now after it once one is started (`evaluator.rs`), and the state on a third line, absent
+/// while starting, with what the store said on a fourth for `unrecorded`.
+fn lock_text(since: i64, evaluator: Option<i64>, state: &LockState) -> String {
+    let beat = match evaluator {
+        Some(e) => format!("{since}\n{HEARTBEAT} {e}"),
+        None => format!("{since}\n{HEARTBEAT}"),
+    };
     match state {
-        LockState::Starting => format!("{since}\n{HEARTBEAT}"),
-        LockState::Ready => format!("{since}\n{HEARTBEAT}\n{READY}"),
-        LockState::Unwatched { at } => format!("{since}\n{HEARTBEAT}\n{UNWATCHED} {at}"),
-        LockState::Unrecorded { at, said } => {
-            format!("{since}\n{HEARTBEAT}\n{UNRECORDED} {at}\n{said}")
-        }
-        LockState::Waiting { at } => format!("{since}\n{HEARTBEAT}\n{WAITING} {at}"),
+        LockState::Starting => beat,
+        LockState::Ready => format!("{beat}\n{READY}"),
+        LockState::Unwatched { at } => format!("{beat}\n{UNWATCHED} {at}"),
+        LockState::Unrecorded { at, said } => format!("{beat}\n{UNRECORDED} {at}\n{said}"),
+        LockState::Waiting { at } => format!("{beat}\n{WAITING} {at}"),
     }
 }
 
+/// The evaluator a lock file's content says its watcher runs now, from its second line.
+fn lock_evaluator(text: &str) -> Option<i64> {
+    let beat = text.lines().nth(1)?;
+    beat.strip_prefix(HEARTBEAT)?
+        .strip_prefix(' ')?
+        .parse()
+        .ok()
+}
+
 /// Reads a lock file's content back. `None` unless it is a heartbeat lock: the start time on
-/// the first line and `heartbeat` on the second. A file met while the watcher rewrites it can
-/// hold the start of the new content over the rest of the old: only a whole `ready` line with
-/// nothing after it is ready, and anything else on the third line is read as starting.
+/// the first line and `heartbeat`, with or without an evaluator, on the second. A file met while
+/// the watcher rewrites it can hold the start of the new content over the rest of the old: only a
+/// whole `ready` line with nothing after it is ready, and anything else on the third line is read
+/// as starting.
 fn read_lock(text: &str) -> Option<(i64, LockState)> {
     let lines: Vec<&str> = text.lines().collect();
     let since = lines.first()?.parse().ok()?;
-    if lines.get(1) != Some(&HEARTBEAT) {
+    if lines.get(1) != Some(&HEARTBEAT) && lock_evaluator(text).is_none() {
         return None;
     }
     let stamped = |line: &str, word: &str| -> Option<i64> {
@@ -629,11 +645,15 @@ fn read_lock(text: &str) -> Option<(i64, LockState)> {
 struct Heartbeat<'a> {
     lock: &'a std::fs::File,
     since: i64,
+    /// The evaluator the watcher runs now, once one is started.
+    evaluator: Option<i64>,
     tx: Sender<()>,
     /// When the file was last touched, on the calendar the status judges it by.
     touched: SystemTime,
-    /// Whether a first reading has completed.
+    /// Whether a first reading has completed, and whether the evaluator has read the event
+    /// level's log to its end once, or failed to.
     read: bool,
+    caught_up: bool,
     /// The kinds whose latest failure the store did not take, each with when and what the
     /// store's error said.
     unrecorded: BTreeMap<&'static str, (i64, String)>,
@@ -664,9 +684,11 @@ impl<'a> Heartbeat<'a> {
         Ok(Self {
             lock,
             since,
+            evaluator: None,
             tx,
             touched: SystemTime::UNIX_EPOCH,
             read: false,
+            caught_up: false,
             unrecorded: BTreeMap::new(),
             skipped: BTreeSet::new(),
             unwatched: None,
@@ -684,7 +706,7 @@ impl<'a> Heartbeat<'a> {
                 said: said.clone(),
             },
             None if let Some(at) = self.waiting => LockState::Waiting { at },
-            None if !self.read => LockState::Starting,
+            None if !self.read || !self.caught_up => LockState::Starting,
             None => match self.unwatched {
                 Some(at) => LockState::Unwatched { at },
                 None => LockState::Ready,
@@ -713,7 +735,7 @@ impl<'a> Heartbeat<'a> {
     /// Rewrites the file: one write at its start, then its length. A reader meeting it between
     /// the two sees the new start over the old rest, which `read_lock` never reads as ready.
     fn write(&mut self) -> std::io::Result<()> {
-        let text = lock_text(self.since, &self.state());
+        let text = lock_text(self.since, self.evaluator, &self.state());
         let wrote = self
             .lock
             .write_all_at(text.as_bytes(), 0)
@@ -747,9 +769,25 @@ impl<'a> Heartbeat<'a> {
             .and_then(|()| self.lock.set_len(text.len() as u64))
     }
 
+    /// The evaluator `id` was started: the file says it from now on, so an answer tells its
+    /// writes from an earlier evaluator's.
+    fn evaluator(&mut self, id: i64) {
+        self.evaluator = Some(id);
+        let _ = self.write();
+    }
+
     /// A first reading has completed.
     fn read(&mut self) -> std::io::Result<()> {
         self.read = true;
+        self.write()
+    }
+
+    /// The evaluator has read the event level's log to its end once, or failed to.
+    fn caught_up(&mut self) -> std::io::Result<()> {
+        if self.caught_up {
+            return Ok(());
+        }
+        self.caught_up = true;
         self.write()
     }
 
@@ -903,34 +941,36 @@ impl Watcher<'_> {
         Ok((wanted.into_iter().collect(), targets, left))
     }
 
-    /// Runs until stopped, starting with a reading of every place, due at once. The stream is
-    /// running already (`subscribe`).
+    /// Runs until stopped, starting with a reading of every place, due at once, and the
+    /// evaluator of the event level's log. The stream is running already (`subscribe`). The
+    /// evaluator is stopped, between two of its transactions, before the watcher leaves, for
+    /// good or for a new core.
     fn run(&mut self, rx: mpsc::Receiver<Msg>) {
+        self.evaluate();
+        self.turns(rx);
+        if let Some(mut evaluator) = self.evaluator.take() {
+            evaluator.stop();
+        }
+    }
+
+    fn turns(&mut self, rx: mpsc::Receiver<Msg>) {
         let mut due = Some(every_place(Instant::now()));
         let mut alive = Instant::now() + self.args.alive_every;
-        // The first sample is taken at start, after the reading due then, and the first
-        // reading of program starts after it.
+        // The first sample is taken at start, after the reading due then.
         let mut sample = Instant::now();
-        let mut starts = Instant::now();
-        let mut look = Instant::now();
-        let mut pass = crate::events::Pass::default();
-        // The rules that brought a step forward since the last step at the period
-        // (`events::Pass::raising`), and whether the step due now goes on with a pass.
-        let mut held = BTreeSet::new();
-        let mut reading_on = false;
         loop {
-            if !self.progress() {
+            if !self.progress() || !self.evaluator_alive() {
                 return;
             }
             let next = due.as_ref().map_or(alive, |d| d.at.min(alive)).min(sample);
-            // Log left unread after a step is read at the next turn, at once.
-            let next = match reading_on {
-                true => Instant::now(),
-                false => next.min(starts).min(look),
-            };
             let next = next.min(Instant::now() + PARENT);
             match rx.recv_timeout(next.saturating_duration_since(Instant::now())) {
                 Ok(Msg::Stop) | Err(RecvTimeoutError::Disconnected) => return,
+                Ok(Msg::Evaluated(said)) => {
+                    if !self.evaluated(said) {
+                        return;
+                    }
+                }
                 Ok(Msg::Events(b)) if b.events > 0 => {
                     let now = Instant::now();
                     due = Some(match due {
@@ -995,52 +1035,6 @@ impl Watcher<'_> {
                     Ok(_) => {}
                     Err(e) => {
                         if !is_skip(&*e) && !emit(&problem("sample_failed", &e.to_string())) {
-                            return;
-                        }
-                    }
-                }
-            }
-            // A line of a rule that raises a finding, and has not brought a step forward since
-            // the last step at the period, is read at once; any other waits for `events_every`.
-            // `starts` is the time of the step at the period, and only that step moves it: an
-            // early step, and the steps that go on with a pass, leave it where it was, so no line
-            // waits longer for the period than it would with no early step. A period that comes
-            // while a pass goes on is taken by the first step after the pass.
-            let period = starts <= Instant::now() && !reading_on;
-            let mut news = false;
-            if !period && !reading_on && look <= Instant::now() {
-                look = Instant::now() + LOOK;
-                news = pass.raising(&self.args.system_root, crate::now_secs(), &mut held);
-            }
-            if news || period || reading_on {
-                if period {
-                    held.clear();
-                    starts = Instant::now() + self.args.events_every;
-                }
-                let read = self.events(&mut pass);
-                // Log left unread is read on at the next turn, at once: a full check waiting for
-                // the run lock takes it between steps, and the turn says the watcher is alive. A
-                // step that did not commit ends the pass here and is read again by the next step.
-                reading_on = matches!(read, Ok(Some(_))) && pass.more();
-                match read {
-                    // A reading that took program starts or changed the level's state is said,
-                    // so that the app shows it without asking for the status.
-                    Ok(Some(read)) => {
-                        if (read.starts > 0 || read.changed)
-                            && !emit(&line("program_starts", starts_line(&read)))
-                        {
-                            return;
-                        }
-                        if let Some(why) = read.failed
-                            && !emit(&problem("events_failed", &why))
-                        {
-                            return;
-                        }
-                    }
-                    // Stopped while it waited: the loop ends at its next turn.
-                    Ok(None) => {}
-                    Err(e) => {
-                        if !is_skip(&*e) && !emit(&problem("events_failed", &e.to_string())) {
                             return;
                         }
                     }
@@ -1300,23 +1294,107 @@ impl Watcher<'_> {
         Ok(Some((report.findings_opened, needs)))
     }
 
-    /// One step of the reading of the event level under the run lock (`events::Pass`), and then
-    /// the numbers of "As it happens" written beside the pages for a page that is open
-    /// (`happens::live`). `None` when the watcher was stopped while it waited for the lock.
-    fn events(
-        &mut self,
-        pass: &mut crate::events::Pass,
-    ) -> Result<Option<crate::EventsRead>, Box<dyn Error>> {
-        let Some(_lock) = self.lock_for(EVENTS)? else {
-            return Ok(None);
-        };
-        let read = crate::read_events_held(&self.args.store, &self.args.system_root, pass);
-        self.mark_reading(EVENTS, to_mark(&read, |r| r.failed.clone()));
-        let read = read?;
-        // A page that is open shows these numbers; one that could not be written is a page
-        // that says it is not updating, not a failed reading.
-        let _ = crate::happens::write_live(&self.folder, read.level.as_ref(), read.at);
-        Ok(Some(read))
+    /// Starts the evaluator of the event level's log (`evaluator.rs`), which tells this loop
+    /// what it read through the loop's channel. One that cannot be started is a failure of the
+    /// kind `events`, tried again at the next turn.
+    fn evaluate(&mut self) {
+        let tx = self.tx.clone();
+        let started = crate::evaluator::Evaluator::start(
+            self.args.store.clone(),
+            self.args.system_root.clone(),
+            self.args.events_every,
+            move |said| tx.send(Msg::Evaluated(said)).is_ok(),
+        );
+        match started {
+            Ok(evaluator) => {
+                self.heartbeat.evaluator(evaluator.id());
+                self.evaluator = Some(evaluator);
+            }
+            Err(e) => {
+                let why = format!("the evaluator of program starts could not be started: {e}");
+                self.evaluated(crate::evaluator::Said::Marked(Some(why)));
+            }
+        }
+    }
+
+    /// Whether the evaluator advances, said when that changes: one that stalled
+    /// (`Evaluator::stalled`) is a `problem` line, `events_stalled`, and a failure of the kind
+    /// `events` until it advances again; one whose thread ended is started again. `false` when
+    /// stdout is gone.
+    fn evaluator_alive(&mut self) -> bool {
+        if self.evaluator.as_ref().is_none_or(|e| e.finished()) {
+            self.evaluator = None;
+            self.evaluate();
+        }
+        // A store held by a writer outside Immunity Core for two conclusions is a failure the
+        // store did not take, in the lock file, until the evaluator writes again.
+        let held = (self.evaluator.as_ref()).is_some_and(|e| e.held(self.args.events_every));
+        if held != self.held_said {
+            self.held_said = held;
+            match held {
+                true => self.heartbeat.say(EVENTS, "database is locked"),
+                false => self.heartbeat.recorded(EVENTS),
+            }
+        }
+        let stalled = (self.evaluator.as_ref()).is_none_or(|e| e.stalled(self.args.events_every));
+        if stalled == self.stall_said {
+            return true;
+        }
+        self.stall_said = stalled;
+        if !stalled {
+            let failed = self.evaluated.clone();
+            self.mark_events(failed);
+            return true;
+        }
+        let why = "the evaluator of program starts has not advanced: lines of the event level's log may be left unread";
+        self.mark_events(Some(why.to_string()));
+        emit(&problem("events_stalled", why))
+    }
+
+    /// What the evaluator said: a reading that failed, or the first to succeed after one,
+    /// recorded as the kind `events` and a failure printed; that it read the log to its end once;
+    /// a conclusion, whose numbers are written to `view/live.js` for a page that is open
+    /// (`happens::live`) and printed as a `program_starts` line when it took program starts or
+    /// changed the level's state. `false` when stdout is gone.
+    fn evaluated(&mut self, said: crate::evaluator::Said) -> bool {
+        use crate::evaluator::Said;
+        match said {
+            Said::Marked(failed) => {
+                // A reading that fails stands in for reading the log to its end: the failure is
+                // recorded, and the watcher is not held back from saying it is ready.
+                if failed.is_some() && self.heartbeat.caught_up().is_err() {
+                    return false;
+                }
+                self.evaluated = failed.clone();
+                // While it stalls, the stall is what stands.
+                if !self.stall_said {
+                    self.mark_events(failed.clone());
+                }
+                failed.is_none_or(|why| emit(&problem("events_failed", &why)))
+            }
+            Said::CaughtUp => self.heartbeat.caught_up().is_ok(),
+            Said::Concluded(read) => {
+                // What was learned outside the run lock, as places a look left unwatched, is
+                // recorded at least once a conclusion, as the lock is taken (`lock_from`).
+                if self.unwatched.is_some() || self.check_result.is_some() {
+                    let _ = self.lock();
+                }
+                // A page that is open shows these numbers; one that could not be written is a
+                // page that says it is not updating, not a failed reading.
+                let behind = read.behind.then_some(crate::happens::CATCHING_UP);
+                let _ =
+                    crate::happens::write_live(&self.folder, read.level.as_ref(), read.at, behind);
+                !(read.starts > 0 || read.changed)
+                    || emit(&line("program_starts", starts_line(&read)))
+            }
+        }
+    }
+
+    /// Records the evaluator's latest reading under the run lock (`mark_held`).
+    fn mark_events(&mut self, failed: Option<String>) {
+        if let Ok(Some(_lock)) = self.lock_for(EVENTS) {
+            self.mark_held(EVENTS, failed);
+        }
     }
 
     /// Under the run lock the caller holds: records a reading of `what` (`to_mark`). A skip is
@@ -1975,8 +2053,9 @@ enum Held {
     /// None holds it; when the latest left for a new core, as its file says (`left_at`).
     No(Option<i64>),
     /// One holds it: when it took the lock, where the file says, and what its file says
-    /// (`heard`); `None` when it has not touched the file within `STALLED`.
-    Yes(Option<(Option<i64>, LockState)>),
+    /// (`heard`), `None` when it has not touched the file within `STALLED`; and the evaluator
+    /// the file says it runs now.
+    Yes(Option<(Option<i64>, LockState)>, Option<i64>),
 }
 
 impl Lock {
@@ -1992,7 +2071,10 @@ impl Lock {
         Lock(match store::watch_in_progress(folder) {
             Err(_) => Held::Unknown,
             Ok(false) => Held::No(text().as_deref().and_then(left_at)),
-            Ok(true) => Held::Yes(heard(&path)),
+            Ok(true) => {
+                let (heard, evaluator) = heard(&path);
+                Held::Yes(heard, evaluator)
+            }
         })
     }
 
@@ -2000,7 +2082,20 @@ impl Lock {
     /// of it (`Held::Yes`).
     fn responsive(&self) -> Option<(Option<i64>, &LockState)> {
         match &self.0 {
-            Held::Yes(Some((since, state))) => Some((*since, state)),
+            Held::Yes(Some((since, state)), _) => Some((*since, state)),
+            _ => None,
+        }
+    }
+
+    /// Whether a watcher holds the store and is alive: it has touched its file within `STALLED`.
+    pub fn watcher_alive(&self) -> bool {
+        self.responsive().is_some()
+    }
+
+    /// The evaluator the live watcher that holds the store runs now, as its file says it.
+    pub fn evaluator(&self) -> Option<i64> {
+        match self.0 {
+            Held::Yes(Some(_), evaluator) => evaluator,
             _ => None,
         }
     }
@@ -2031,8 +2126,8 @@ impl Lock {
 /// watcher that runs, so a file that cannot be read, or that holds no heartbeat lock (empty, as a
 /// new watcher leaves it before its first write, or half written), is a watcher starting, with no
 /// start time.
-fn heard(path: &Path) -> Option<(Option<i64>, LockState)> {
-    let starting = Some((None, LockState::Starting));
+fn heard(path: &Path) -> (Option<(Option<i64>, LockState)>, Option<i64>) {
+    let starting = (Some((None, LockState::Starting)), None);
     let Ok((mut file, meta)) =
         crate::open::open(path, crate::open::Reach::Own, crate::open::UNCAPPED)
     else {
@@ -2041,15 +2136,16 @@ fn heard(path: &Path) -> Option<(Option<i64>, LockState)> {
     let Ok(modified) = meta.modified() else {
         return starting;
     };
-    if modified.elapsed().ok()? >= STALLED {
-        return None;
+    if modified.elapsed().map_or(true, |e| e >= STALLED) {
+        return (None, None);
     }
     let mut bytes = Vec::new();
     if file.read_to_end(&mut bytes).is_err() {
         return starting;
     }
-    match read_lock(&String::from_utf8_lossy(&bytes)) {
-        Some((since, state)) => Some((Some(since), state)),
+    let text = String::from_utf8_lossy(&bytes);
+    match read_lock(&text) {
+        Some((since, state)) => (Some((Some(since), state)), lock_evaluator(&text)),
         None => starting,
     }
 }
@@ -2172,11 +2268,11 @@ pub fn seen(store: &Path) -> Option<Seen> {
             None => Seen::Absent,
         },
         // A watcher that stalled, or whose lock file is not a heartbeat lock, is no watcher.
-        Held::Yes(None) => Seen::Absent,
-        Held::Yes(Some((_, LockState::Starting))) => Seen::Starting,
+        Held::Yes(None, _) => Seen::Absent,
+        Held::Yes(Some((_, LockState::Starting)), _) => Seen::Starting,
         // Ready, places left unwatched or a failure the store did not take, which `failures`
         // gives as one of `PLACES` or `STORE`.
-        Held::Yes(Some(_)) => {
+        Held::Yes(Some(_), _) => {
             let conn = store::open_read_only(store).ok()?;
             let failed = failures(&conn, &lock).ok()?;
             match lock.live(&failed) {
@@ -2579,7 +2675,7 @@ mod tests {
             },
             LockState::Waiting { at: 18 },
         ] {
-            assert_eq!(read_lock(&lock_text(17, &state)), Some((17, state)));
+            assert_eq!(read_lock(&lock_text(17, None, &state)), Some((17, state)));
         }
     }
 
@@ -2590,7 +2686,11 @@ mod tests {
         let said = || read_lock(&std::fs::read_to_string(dir.join(store::WATCH_LOCK)).unwrap());
         heartbeat.write().unwrap();
         assert_eq!(said(), Some((17, LockState::Starting)));
+        // Ready only once the watched places were read and the evaluator has read the event
+        // level's log to its end once, in either order.
         heartbeat.read().unwrap();
+        assert_eq!(said(), Some((17, LockState::Starting)));
+        heartbeat.caught_up().unwrap();
         assert_eq!(said(), Some((17, LockState::Ready)));
         // What the store said is one line, and at most `UNRECORDED_CAP` characters.
         let long = format!("disk\nfull\r{}", "é".repeat(400));
@@ -2656,6 +2756,7 @@ mod tests {
     fn ready<'a>(args: &'a WatchArgs, lock: &'a std::fs::File) -> Watcher<'a> {
         let mut heartbeat = Heartbeat::start(lock, crate::now_secs(), STALLED).unwrap();
         heartbeat.read().unwrap();
+        heartbeat.caught_up().unwrap();
         let mut w = Watcher {
             args,
             folder: crate::home(&args.store),
@@ -2678,6 +2779,10 @@ mod tests {
             core: None,
             left: false,
             parsed: Default::default(),
+            evaluator: None,
+            evaluated: None,
+            stall_said: false,
+            held_said: false,
         };
         (w.wanted, w.targets, _) = w.derive().unwrap();
         w
@@ -2881,6 +2986,7 @@ mod tests {
         let (dir, lock, conn) = watcher_of("watch-skips");
         let mut heartbeat = Heartbeat::start(&lock, 17, Duration::from_secs(3600)).unwrap();
         heartbeat.read().unwrap();
+        heartbeat.caught_up().unwrap();
         let busy = Code::StoreBusy.words();
         for what in [EVENTS, SAMPLED, READ] {
             heartbeat.skipped(what, busy);
@@ -2898,6 +3004,7 @@ mod tests {
         let (dir, lock, conn) = watcher_of("watch-skips-end");
         let mut heartbeat = Heartbeat::start(&lock, 17, Duration::from_secs(3600)).unwrap();
         heartbeat.read().unwrap();
+        heartbeat.caught_up().unwrap();
         let busy = Code::StoreBusy.words();
         heartbeat.skipped(EVENTS, busy);
         heartbeat.skipped(EVENTS, busy);
@@ -2924,6 +3031,7 @@ mod tests {
         let read_only = std::fs::File::open(dir.join(store::WATCH_LOCK)).unwrap();
         let mut heartbeat = Heartbeat::start(&lock, 17, Duration::from_secs(3600)).unwrap();
         heartbeat.read().unwrap();
+        heartbeat.caught_up().unwrap();
         assert!(watching_live(&dir));
         heartbeat.lock = &read_only;
         heartbeat.progress().unwrap();

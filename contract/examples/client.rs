@@ -173,11 +173,13 @@ fn run(a: &Args) -> Result<(), Error> {
                 program.unwrap_or("not given"),
             );
         }
-        // An empty page is calm only when the collector runs and nothing was lost or left
-        // unevaluated: `matches.proto` lists the conditions.
+        // An empty page is calm only when the evaluator is current, the collector runs and
+        // nothing was lost or left unevaluated: `matches.proto` lists the conditions.
         let state = m.collector.as_ref().map_or(0, |c| c.state);
+        let evaluator = m.evaluated.as_ref().map_or(0, |e| e.state);
         println!(
-            "collector {}, {} rules unevaluated or in part",
+            "evaluator {}, collector {}, {} rules unevaluated or in part",
+            name(evaluator, v1::EvaluatorState::as_str_name),
             name(state, v1::CollectorState::as_str_name),
             m.unevaluated.len()
         );

@@ -246,6 +246,24 @@ impl Mac {
             .unwrap();
     }
 
+    /// `immunity matches --json` over this store and system root.
+    fn matches(&self) -> Value {
+        let out = self
+            .immunity()
+            .args(["matches", "--json", "--store"])
+            .arg(self.store())
+            .arg("--system-root")
+            .arg(self.sys())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    }
+
     fn status(&self) -> Value {
         let out = self
             .immunity()
@@ -375,6 +393,22 @@ impl Watcher {
         self.next("watching");
         self.next("read");
         self
+    }
+
+    /// `started`, and then its evaluator has read the log to its end once: its lock file says it
+    /// is ready, which a watcher is only from then on.
+    fn ready(self, mac: &Mac) -> Watcher {
+        let w = self.started();
+        let lock = mac.root.join("store/watch.lock");
+        let end = Instant::now() + WAIT;
+        while !std::fs::read_to_string(&lock)
+            .unwrap_or_default()
+            .contains("\nready")
+        {
+            assert!(Instant::now() < end, "the watcher never said it was ready");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        w
     }
 
     /// Every line of this event printed so far, those not yet waited for included.
@@ -904,12 +938,11 @@ fn a_sample_or_a_reading_of_program_starts_that_met_a_busy_store_is_no_failure_a
 }
 
 #[test]
-fn a_backlog_of_log_files_is_read_one_file_a_step_and_on_at_once_while_log_is_left() {
-    // A watcher that fell behind reads the log one file a step, each step committed, and the
-    // next at once while log is left, not at the next reading an hour later.
+fn a_backlog_of_log_files_left_while_no_watcher_ran_is_read_as_the_watcher_starts() {
+    // A watcher started after files were written reads them all at once, file by file in the
+    // order they were written, and not at its next conclusion an hour later.
     let mac = Mac::new("events-steps");
     mac.event_level();
-    // A full check concludes a first reading; a store with none reads its first pass whole.
     mac.run();
     for (seq, hour) in [(1, "00"), (2, "01"), (3, "02")] {
         mac.exec_in(
@@ -920,15 +953,10 @@ fn a_backlog_of_log_files_is_read_one_file_a_step_and_on_at_once_while_log_is_le
     let quiet = ["--events-every", "3600", "--sample-every", "3600"];
     let mut w = mac.watch_with(&[&quiet[..], &["--alive-every", "1"]].concat());
     w = w.started();
-    for _ in 0..3 {
-        w.until("program_starts", |v| v["starts"] == 1);
-    }
-    // Once nothing is left, it reads no more until the next reading is due: a second of
-    // alive is about a thousand turns of its loop.
+    w.until("program_starts", |v| v["starts"] == 3);
     w.next("alive");
-    // The check's row, and one a step.
-    let rows = "SELECT CAST(COUNT(*) AS TEXT) || ' ' || SUM(starts) FROM event_count";
-    assert_eq!(mac.rows(rows), ["4 3"]);
+    let rows = "SELECT CAST(SUM(starts) AS TEXT) FROM event_count";
+    assert_eq!(mac.rows(rows), ["3"]);
     assert_eq!(mac.rows("SELECT name FROM event_file").len(), 3);
     assert!(w.stop().success());
 }
@@ -961,12 +989,12 @@ fn a_step_with_log_left_and_no_program_starts_says_nothing_of_a_state_it_did_not
 }
 
 /// How long a line written to the event level's log may wait to be read, and its finding raised,
-/// by a watcher whose reading at its own period is an hour away: a look every second, a step,
-/// and a loaded test machine.
+/// by a watcher whose conclusion at its own period is an hour away: a wake, a write, and a
+/// loaded test machine.
 const LINE_READ_WITHIN: Duration = Duration::from_secs(5);
 
-/// A watcher on `mac` whose readings of program starts at their own period, and samples, are an
-/// hour apart, so that only its looks at the log read it; past its first sample and reading.
+/// A watcher on `mac` whose conclusions about the event level, and samples, are an hour apart,
+/// so that only its evaluator's wakes read the log; past its first sample and conclusion.
 fn reading_by_looks(mac: &Mac) -> Watcher {
     let hourly = ["--events-every", "3600", "--sample-every", "3600"];
     let mut w = mac
@@ -976,12 +1004,16 @@ fn reading_by_looks(mac: &Mac) -> Watcher {
     w
 }
 
-/// Writes to the log with `write` and waits for the step that reads the one start written: how
-/// long that took.
-fn read_after(w: &mut Watcher, write: impl FnOnce()) -> Duration {
+/// Writes to the log with `write` and waits for a row of the record past those there before:
+/// how long that took.
+fn recorded_after(mac: &Mac, write: impl FnOnce()) -> Duration {
+    let before = &mac.rows("SELECT CAST(COUNT(*) AS TEXT) FROM rule_line")[0];
     let t = Instant::now();
     write();
-    w.until("program_starts", |v| v["starts"] == 1);
+    until_row(
+        mac,
+        &format!("SELECT 'recorded' WHERE (SELECT COUNT(*) FROM rule_line) > {before}"),
+    );
     t.elapsed()
 }
 
@@ -991,134 +1023,70 @@ fn a_line_that_matches_a_rule_that_raises_is_read_and_its_finding_raised_within_
     let mac = Mac::new("events-look");
     mac.event_level();
     mac.run();
-    let mut w = reading_by_looks(&mac);
-    let took = read_after(&mut w, || mac.exec(1));
+    let w = reading_by_looks(&mac);
+    let took = recorded_after(&mac, || mac.exec(1));
     assert!(took < LINE_READ_WITHIN, "read after {took:?}");
     let found = "SELECT id FROM finding WHERE rule LIKE 'sigma:%'";
     assert_eq!(mac.rows(found).len(), 1);
     assert!(w.stop().success());
 }
 
+/// What `immunity matches` says of the evaluator, once it says `want` or after five seconds.
+fn evaluator_said(mac: &Mac, want: &str) -> Value {
+    let t = Instant::now();
+    loop {
+        let e = mac.matches()["evaluated"].clone();
+        if e["state"] == want || t.elapsed() > Duration::from_secs(5) {
+            return e;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
-fn a_line_that_matches_no_rule_that_raises_is_left_for_the_reading_period() {
-    // A rule below high matches it: it is counted with the reading that takes it, and no
-    // reading is made for it alone.
+fn the_evaluator_of_the_live_watcher_is_current_by_its_own_writes_and_an_earlier_one_never_is() {
+    // `immunity matches` says the evaluator is current only from the evaluator's own writes and
+    // the lock file of the watcher that runs it. A watcher that reads the log is current; once it
+    // stops, behind for want of one; a new watcher is current once its own evaluator wrote, never
+    // on the writes of the one before it.
+    let mac = Mac::new("evaluator-current");
+    mac.event_level();
+    mac.run();
+    let first = reading_by_looks(&mac);
+    assert_eq!(evaluator_said(&mac, "current")["state"], "current");
+    let evaluator = "SELECT CAST(evaluator AS TEXT) FROM event_level";
+    let before = mac.rows(evaluator);
+    assert!(first.stop().success());
+    let e = evaluator_said(&mac, "behind");
+    assert_eq!(
+        (&e["state"], &e["behind"]),
+        (
+            &serde_json::json!("behind"),
+            &serde_json::json!("no_watcher")
+        )
+    );
+    let second = reading_by_looks(&mac);
+    assert_eq!(evaluator_said(&mac, "current")["state"], "current");
+    assert_ne!(mac.rows(evaluator), before);
+    assert!(second.stop().success());
+}
+
+#[test]
+fn a_line_that_matches_only_a_rule_below_high_is_on_the_record_within_seconds_and_raises_nothing() {
+    // Every match is a row of the record as soon as its line is read, whatever its level: the
+    // response layer takes it from `immunity matches` without waiting for the conclusion.
     let mac = Mac::new("events-look-low");
     mac.event_level();
     mac.run();
-    let mut w = reading_by_looks(&mac);
-    let readings = "SELECT CAST(COUNT(*) AS TEXT) FROM event_count";
-    let before = mac.rows(readings);
+    let w = reading_by_looks(&mac);
     let name = "exec-20261004T000013-20261004T000000.jsonl";
-    mac.split_in(name, 1);
-    // Several looks, one a second.
-    for _ in 0..4 {
-        w.next("alive");
-    }
-    assert_eq!(mac.rows(readings), before);
-    assert!(w.lines("program_starts").is_empty(), "{:?}", w.seen);
-    // A line that raises is read at once, and the reading takes both.
-    mac.exec_in(name, 2);
-    w.until("program_starts", |v| v["starts"] == 2);
-    assert!(w.stop().success());
-}
-
-#[test]
-fn a_rule_that_brought_a_reading_forward_brings_no_other_before_the_reading_at_the_period() {
-    // A rule that keeps matching, as on a build tool it takes for something else, does not
-    // make the watcher read every second.
-    let mac = Mac::new("events-look-held");
-    mac.event_level();
-    mac.run();
-    let mut w = reading_by_looks(&mac);
-    let took = read_after(&mut w, || mac.exec(1));
+    let took = recorded_after(&mac, || mac.split_in(name, 1));
     assert!(took < LINE_READ_WITHIN, "read after {took:?}");
-    let readings = "SELECT CAST(COUNT(*) AS TEXT) FROM event_count";
-    let before = mac.rows(readings);
-    mac.exec(2);
-    // Several looks, one a second.
-    for _ in 0..4 {
-        w.next("alive");
-    }
-    assert_eq!(mac.rows(readings), before);
-    assert_eq!(w.lines("program_starts").len(), 1, "{:?}", w.seen);
-    assert!(w.stop().success());
-}
-
-#[test]
-fn after_the_reading_at_the_period_a_rule_brings_a_reading_forward_again() {
-    let mac = Mac::new("events-look-again");
-    mac.event_level();
-    mac.run();
-    let period: u64 = 10;
-    let every = period.to_string();
-    let args = [
-        "--events-every",
-        &every,
-        "--sample-every",
-        "3600",
-        "--alive-every",
-        "1",
-    ];
-    let mut w = mac.watch_with(&args).started();
-    w.next("alive");
-    let took = read_after(&mut w, || mac.exec(1));
-    assert!(took < LINE_READ_WITHIN, "read after {took:?}");
-    let readings = || mac.rows("SELECT CAST(COUNT(*) AS TEXT) FROM event_count")[0].clone();
-    let early: u64 = readings().parse().unwrap();
-    // The reading at the period, which takes nothing.
-    until_row(
-        &mac,
-        &format!("SELECT 'read' WHERE (SELECT COUNT(*) FROM event_count) > {early}"),
-    );
-    // The next reading at the period is a whole period away.
-    let took = read_after(&mut w, || mac.exec(2));
-    assert!(took < LINE_READ_WITHIN, "read after {took:?}");
-    assert!(w.stop().success());
-}
-
-#[test]
-fn an_early_reading_does_not_put_off_the_reading_at_the_period() {
-    // A line no rule raises on, written after an early reading, is read at the period counted
-    // from the watcher's reading before, as it would be with no early reading. Times are the
-    // readings' own, in the store.
-    let mac = Mac::new("events-look-period");
-    mac.event_level();
-    mac.run();
-    let period: i64 = 8;
-    let every = period.to_string();
-    let args = [
-        "--events-every",
-        &every,
-        "--sample-every",
-        "3600",
-        "--alive-every",
-        "1",
-    ];
-    let mut w = mac.watch_with(&args).started();
-    let last = || {
-        mac.rows("SELECT CAST(MAX(at) AS TEXT) FROM event_count")[0]
-            .parse::<i64>()
-            .unwrap()
-    };
-    // The watcher's first reading is behind this line, and is the last at the period.
-    w.next("alive");
-    let at_period = last();
-    // Late in the period, so that an early reading that moved the period would move it far.
-    for _ in 0..3 {
-        w.next("alive");
-    }
-    let name = "exec-20261004T000013-20261004T000000.jsonl";
-    read_after(&mut w, || mac.exec_in(name, 1));
-    mac.split_in(name, 2);
-    w.until("program_starts", |v| v["starts"] == 1);
-    // The readings' times are whole seconds; two more allow for a loaded machine. An early
-    // reading that moved the period would read the line about five seconds later still.
-    let read = last();
+    let row = "SELECT CAST(finding IS NULL AS TEXT) FROM rule_line";
+    assert_eq!(mac.rows(row), ["1"]);
     assert!(
-        read <= at_period + period + 2,
-        "read at {read}, the period came at {}",
-        at_period + period
+        mac.rows("SELECT id FROM finding WHERE rule LIKE 'sigma:%'")
+            .is_empty()
     );
     assert!(w.stop().success());
 }
@@ -1126,37 +1094,39 @@ fn an_early_reading_does_not_put_off_the_reading_at_the_period() {
 #[test]
 fn a_log_file_that_cannot_be_read_does_not_hide_a_match_the_look_found_before_it() {
     // A line of a format this version does not know, in a later file, fails the reading. The
-    // look reads the earlier file first, and its line that raises is read at once.
+    // earlier file is read first, and its line that raises is written before the failure.
     let mac = Mac::new("events-look-error");
     mac.event_level();
     mac.run();
-    let mut w = reading_by_looks(&mac);
+    let w = reading_by_looks(&mac);
     let later = mac
         .sys()
         .join(EVENT_LOG)
         .join("exec-20261004T000013-20261004T010000.jsonl");
     std::fs::write(&later, "{\"schema_version\":2,\"seq_num\":9}\n").unwrap();
-    let took = read_after(&mut w, || {
+    let took = recorded_after(&mac, || {
         mac.exec_in("exec-20261004T000013-20261004T000000.jsonl", 1)
     });
     assert!(took < LINE_READ_WITHIN, "read after {took:?}");
+    let found = "SELECT id FROM finding WHERE rule LIKE 'sigma:%'";
+    assert_eq!(mac.rows(found).len(), 1);
+    until_row(&mac, "SELECT state FROM event_level WHERE state = 'failed'");
     assert!(w.stop().success());
 }
 
 #[test]
 fn a_log_file_that_appears_is_read_as_soon_as_a_log_file_that_grew() {
-    // The collector starts a new file at the hour and at its size. The line in the new file is
-    // of another rule that raises, so it is read at once while the first rule waits for the
-    // reading at the period.
+    // The collector starts a new file at the hour and at its size: a line in it wakes the
+    // evaluator through the folder as a line in the file it writes does through the file.
     let mac = Mac::new("events-look-turn");
     mac.event_level();
     mac.run();
     let first = "exec-20261004T000013-20261004T000000.jsonl";
     mac.exec_in(first, 1);
-    let mut w = reading_by_looks(&mac);
-    let grew = read_after(&mut w, || mac.exec_in(first, 2));
+    let w = reading_by_looks(&mac);
+    let grew = recorded_after(&mac, || mac.exec_in(first, 2));
     let next = "exec-20261004T000013-20261004T010000.jsonl";
-    let appeared = read_after(&mut w, || mac.password_search_in(next, 3));
+    let appeared = recorded_after(&mac, || mac.password_search_in(next, 3));
     assert!(
         grew < LINE_READ_WITHIN && appeared < LINE_READ_WITHIN,
         "grew {grew:?}, appeared {appeared:?}"
@@ -1165,10 +1135,10 @@ fn a_log_file_that_appears_is_read_as_soon_as_a_log_file_that_grew() {
 }
 
 #[test]
-fn while_the_log_is_quiet_the_watcher_reads_it_once_a_reading_period_and_no_more() {
-    // What reads the reading's rows, as whether the collector fell silent, sees them come as
-    // before there were looks. A line left unfinished, as by a collector stopped while it
-    // wrote, stays as it is and is no news.
+fn while_the_log_is_quiet_the_watcher_concludes_once_a_period_and_writes_nothing_else() {
+    // What reads the level's conclusions, as whether the collector fell silent, sees one a
+    // period, and a quiet log adds no rows of counts. A line left unfinished, as by a collector
+    // stopped while it wrote, stays as it is and is no news.
     let mac = Mac::new("events-quiet");
     mac.event_level();
     mac.run();
@@ -1177,6 +1147,7 @@ fn while_the_log_is_quiet_the_watcher_reads_it_once_a_reading_period_and_no_more
     let name = "exec-20261004T000013-20261004T010000.jsonl";
     mac.exec_in(name, 2);
     let log = mac.sys().join(EVENT_LOG).join(name);
+    let whole = std::fs::metadata(&log).unwrap().len();
     let mut held = std::fs::OpenOptions::new().append(true).open(log).unwrap();
     std::io::Write::write_all(&mut held, br#"{"schema_version":1,"seq_num":3"#).unwrap();
     let period: u64 = 3;
@@ -1190,25 +1161,28 @@ fn while_the_log_is_quiet_the_watcher_reads_it_once_a_reading_period_and_no_more
         "1",
     ];
     let mut w = mac.watch_with(&args).started();
-    // A step for each file, the second at once.
-    for _ in 0..2 {
-        w.until("program_starts", |v| v["starts"] == 1);
-    }
-    let readings = || mac.rows("SELECT CAST(COUNT(*) AS TEXT) FROM event_count")[0].clone();
-    let before: u64 = readings().parse().unwrap();
+    w.until("program_starts", |v| v["starts"] == 2);
+    let counts = || mac.rows("SELECT CAST(COUNT(*) AS TEXT) FROM event_count")[0].clone();
+    let before = counts();
+    let mut concluded = std::collections::BTreeSet::new();
     let t = Instant::now();
     // Nine alive lines, one a second.
     for _ in 0..9 {
         w.next("alive");
+        concluded.extend(mac.rows("SELECT CAST(read_at AS TEXT) FROM event_level"));
     }
-    let after: u64 = readings().parse().unwrap();
     let periods = t.elapsed().as_secs() / period;
+    let n = concluded.len() as u64;
     assert!(
-        (periods - 1..=periods + 1).contains(&(after - before)),
-        "{} readings in {:?}, {periods} periods",
-        after - before,
+        (periods - 1..=periods + 1).contains(&n),
+        "{n} conclusions in {:?}, {periods} periods",
         t.elapsed()
     );
+    assert_eq!(counts(), before);
+    // A conclusion that took nothing and changed nothing prints nothing.
+    assert_eq!(w.lines("program_starts").len(), 1, "{:?}", w.seen);
+    let offset = format!("SELECT CAST(offset AS TEXT) FROM event_file WHERE name = '{name}'");
+    assert_eq!(mac.rows(&offset), [whole.to_string()]);
     assert!(w.stop().success());
 }
 
@@ -1552,7 +1526,7 @@ fn hooks_named_under_a_regular_file_leave_nothing_unwatched_and_are_read_when_th
         ),
     );
     mac.run();
-    let mut w = mac.watch_with(&["--alive-every", "1"]).started();
+    let mut w = mac.watch_with(&["--alive-every", "1"]).ready(&mac);
     assert!(w.lines("problem").is_empty());
     assert_eq!(failing(&mac), (true.into(), vec![]));
     std::fs::remove_file(mac.home().join("dev/file")).unwrap();
@@ -1586,7 +1560,7 @@ fn hooks_named_where_nothing_can_be_now_leave_nothing_unwatched() {
         );
     }
     mac.run();
-    let mut w = mac.watch().started();
+    let mut w = mac.watch().ready(&mac);
     assert!(w.lines("problem").is_empty(), "{:?}", w.lines("problem"));
     assert_eq!(failing(&mac), (true.into(), vec![]));
 }
@@ -3102,7 +3076,12 @@ fn a_background_watcher_reports_live_only_after_its_first_read_and_while_its_hea
     assert_eq!(mac.status()["this_mac"]["live"], false);
     common::release(reading);
     watcher.next("read");
-    assert_eq!(mac.status()["this_mac"]["live"], true);
+    // Live once its evaluator has also read the log to its end, milliseconds later.
+    let end = Instant::now() + WAIT;
+    while mac.status()["this_mac"]["live"] != true {
+        assert!(Instant::now() < end, "never live");
+        std::thread::sleep(Duration::from_millis(50));
+    }
     let duplicate = mac.watch_cmd().arg("--background").output().unwrap();
     assert_eq!(duplicate.status.code(), Some(5));
 
@@ -3839,7 +3818,7 @@ fn the_watcher_writes_no_page_and_the_page_asked_for_after_a_change_shows_it() {
     mac.put(".zprofile", "one\n");
     mac.run();
     let summary = mac.root.join("store/view.html");
-    let mut w = mac.watch().started();
+    let mut w = mac.watch().ready(&mac);
     let page = mac.view_if_stale();
     assert!(page.contains("<h1>Nothing needs you</h1>"), "{page}");
     std::fs::write(&summary, "as it was").unwrap();

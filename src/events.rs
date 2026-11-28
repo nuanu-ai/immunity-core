@@ -282,26 +282,69 @@ CREATE TABLE event_level (
     reason    TEXT,              -- why the reading failed
     last_seq  INTEGER,           -- seq_num of the latest exec read, NULL before any
     version   INTEGER,           -- the message version of the latest exec read
-    counted   INTEGER            -- notes of deletions up to this time are counted
+    counted   TEXT,              -- the SHA-256 of the last note of a deletion counted
+    evaluated_at INTEGER,        -- when how far the log was read was last committed
+    evaluator INTEGER,           -- the evaluator that wrote last, new at each start of its thread
+    evaluator_at_end INTEGER,    -- whether its last write reached the end of the log, nothing left
+    evaluator_at INTEGER,        -- when it wrote last, UTC seconds
+    removed_seq INTEGER NOT NULL DEFAULT 0  -- the largest seq of rule_line ever removed
 );
--- Where each log file was read up to: every byte before `offset` is whole lines already read.
+-- Where each log file was read up to: every byte before `offset` is whole lines already read. A
+-- file is its name, its inode and the hash of its first bytes, so a file made again under the name is
+-- another row, a generation of the name; ids are never given twice, so a row of the record never
+-- names a later file.
 CREATE TABLE event_file (
-    name   TEXT PRIMARY KEY,
+    id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    name   TEXT NOT NULL UNIQUE,
     inode  INTEGER NOT NULL,
-    offset INTEGER NOT NULL
+    head_len INTEGER NOT NULL, -- how many of its first bytes were hashed, at most `HEAD`
+    head   TEXT NOT NULL,     -- their SHA-256: nothing of a line is kept
+    offset INTEGER NOT NULL,
+    ended  INTEGER NOT NULL,  -- it was read to its end once its hour was over (`FileAt::ended`)
+    gone   INTEGER NOT NULL   -- it left the folder and was charged then; a note for it is not counted
 );
--- What one reading of a log read, kept for two days, and from the latest finished full check
--- on whatever its time.
+-- What the log's readers read, a row for each ten seconds (`COUNT_EVERY`) in which they read
+-- anything, begun anew at the start of a full check, kept for two days, and from the latest
+-- finished full check on whatever its time.
 CREATE TABLE event_count (
-    journal_seq  INTEGER NOT NULL,  -- the journal's largest seq when the reading was written
-    at           INTEGER NOT NULL,
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    journal_seq  INTEGER NOT NULL,  -- the journal's largest seq when the row was begun
+    at           INTEGER NOT NULL,  -- when it was begun
     starts       INTEGER NOT NULL,  -- program starts read
     lost         INTEGER NOT NULL,  -- program starts missing from the numbering
     unknown_gaps INTEGER NOT NULL,  -- times the numbering started again: losses of unknown size
-    unreadable   INTEGER NOT NULL,  -- lines that could not be read
+    unreadable   INTEGER NOT NULL,  -- lines that could not be read or were longer than `LINE`
     other        INTEGER NOT NULL,  -- messages of a kind this reader does not read
     removed_cap  INTEGER NOT NULL,  -- log files deleted to stay under the size cap
-    removed_unread INTEGER NOT NULL -- log files deleted before they were read to their end
+    removed_unread INTEGER NOT NULL, -- log files deleted before they were read to their end
+    files        INTEGER NOT NULL,  -- file events read
+    files_lost   INTEGER NOT NULL,  -- file events missing from the numbering
+    files_unknown_gaps INTEGER NOT NULL, -- times their numbering started again
+    files_unreadable INTEGER NOT NULL, -- file events that could not be made out
+    lacked       INTEGER NOT NULL   -- the marks some judged line did not give (`Lacked`), as bits
+);
+-- Every count of `event_count` since the store was made, as running totals that only grow, raised
+-- in the transaction that reads: a caller's place holds the totals its answer reached
+-- (`immunity matches`). For each of `MARKS`, `lacked_<n>` counts the writes in which some judged
+-- line did not give it.
+CREATE TABLE event_total (
+    id           INTEGER PRIMARY KEY CHECK (id = 1),
+    starts       INTEGER NOT NULL,
+    lost         INTEGER NOT NULL,
+    unknown_gaps INTEGER NOT NULL,
+    unreadable   INTEGER NOT NULL,
+    other        INTEGER NOT NULL,
+    removed_cap  INTEGER NOT NULL,
+    removed_unread INTEGER NOT NULL,
+    files        INTEGER NOT NULL,
+    files_lost   INTEGER NOT NULL,
+    files_unknown_gaps INTEGER NOT NULL,
+    files_unreadable INTEGER NOT NULL,
+    lacked_0     INTEGER NOT NULL,
+    lacked_1     INTEGER NOT NULL,
+    lacked_2     INTEGER NOT NULL,
+    lacked_3     INTEGER NOT NULL,
+    lacked_4     INTEGER NOT NULL
 );
 -- How many program starts matched each published rule, by the hour of the reading that read
 -- them, kept a week. A rule's id and a number: nothing of the start.
@@ -345,27 +388,20 @@ CREATE TABLE event_files (
     last_create INTEGER,
     last_rename INTEGER
 );
--- Which finding each match of a rule that raises one went to, so `immunity matches` says it
--- exactly: the line, by its log file's name and inode and the offset where it begins; the rule
--- by its name, its set and its id; and the finding. Only rules marked high or critical raise
--- one. A row of a log file the reading no longer finds is removed, so a row lives as long as its
--- line.
+-- The record: every match of every rule, of every level, in the order it was judged, by a
+-- number never given twice, the place of its line (the generation of its log file it was read in
+-- and the offset where the line begins), the hash of the line judged, the rule by its name, its
+-- set and its id, and the finding it went to, for a rule that raises one. No copy of the event:
+-- the line is read again at its place, and taken only when its hash is the one judged. A row goes
+-- with its file, and the largest number of a row that went is `event_level.removed_seq`.
 CREATE TABLE rule_line (
-    file    TEXT NOT NULL,
-    inode   INTEGER NOT NULL,
+    seq     INTEGER PRIMARY KEY AUTOINCREMENT,
+    file    INTEGER NOT NULL REFERENCES event_file (id),
     offset  INTEGER NOT NULL,
+    line    TEXT NOT NULL,   -- the first `LINE_HASH` characters of the line's SHA-256
     rule    TEXT NOT NULL,
-    finding TEXT NOT NULL REFERENCES finding (id),
-    PRIMARY KEY (file, inode, offset, rule)
-) WITHOUT ROWID;
--- What one reading read of file events, kept as event_count is, beside it.
-CREATE TABLE event_file_count (
-    journal_seq  INTEGER NOT NULL,  -- the journal's largest seq when the reading was written
-    at           INTEGER NOT NULL,
-    files        INTEGER NOT NULL,  -- file events read
-    lost         INTEGER NOT NULL,  -- file events missing from the numbering
-    unknown_gaps INTEGER NOT NULL,  -- times their numbering started again
-    unreadable   INTEGER NOT NULL   -- file events that could not be made out
+    finding TEXT REFERENCES finding (id),
+    UNIQUE (file, offset, rule)
 );
 -- The file events a finding from a published rule rests on, the first, which raised it, and
 -- the latest five: the file, the program, who it is and who signed it, as the line gave them.
@@ -1041,7 +1077,7 @@ fn token(v: &Value) -> Option<(i64, Option<i64>, Option<i64>)> {
 }
 
 /// What a reading read.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Tally {
     pub starts: i64,
     pub lost: i64,
@@ -1098,7 +1134,7 @@ impl Tally {
 
 /// What a reading read of file events. Lines that could not be read at all, and hours deleted,
 /// are counted once in `Tally` and judge both kinds.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct FileTally {
     pub files: i64,
     pub lost: i64,
@@ -1134,24 +1170,24 @@ impl FileTally {
 }
 
 /// What the published rules matched in a reading: per rule, how many events, and for a rule
-/// that raises a finding the first of them and the latest `EVIDENCE`. Nothing else of an event is kept, so a
-/// lower rule's match leaves only its count.
-#[derive(Debug, Default)]
+/// that raises a finding the first of them and the latest `EVIDENCE`; and every match, in the
+/// order it was judged, by the place of its line and the hash of the line (`line_hash`), for the
+/// record (`rule_line`). Nothing else of an event is kept.
+#[derive(Clone, Debug, Default)]
 pub struct Matched {
     pub rules: BTreeMap<&'static str, Hits>,
+    /// Every match, line by line, and on one line in the order the rules are shipped.
+    pub order: Vec<(LineAt, String, &'static Meta)>,
 }
 
 /// One rule's matches in a reading.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Hits {
     pub meta: &'static Meta,
     pub count: i64,
     /// The first event it matched in the reading, which raises its finding when none stands.
     pub first: Option<Evidence>,
     pub latest: VecDeque<Evidence>,
-    /// For a rule that raises a finding, where every line it matched is, so that the store keeps
-    /// which finding each went to (`rule_line`).
-    pub lines: Vec<LineAt>,
 }
 
 /// An event a finding rests on: a rule is about one kind, so its finding keeps one kind.
@@ -1162,19 +1198,19 @@ pub enum Evidence {
 }
 
 impl Matched {
-    /// Counts what one event, the line at `at`, matched, as `Into::judge` evaluated it.
-    fn add(&mut self, matches: &[Match<'static>], subject: Subject, at: &LineAt) {
+    /// Counts what one event, the line at `at` whose hash is `line`, matched, as `Into::judge`
+    /// evaluated it.
+    fn add(&mut self, matches: &[Match<'static>], subject: Subject, at: &LineAt, line: &str) {
         for m in matches {
+            self.order.push((at.clone(), line.to_string(), m.meta));
             let hits = self.rules.entry(m.meta.id.as_str()).or_insert(Hits {
                 meta: m.meta,
                 count: 0,
                 first: None,
                 latest: VecDeque::new(),
-                lines: Vec::new(),
             });
             hits.count += 1;
             if m.meta.raises() {
-                hits.lines.push(at.clone());
                 if hits.latest.len() == EVIDENCE {
                     hits.latest.pop_front();
                 }
@@ -1187,304 +1223,1024 @@ impl Matched {
             }
         }
     }
+
+    /// The file `name` left, or is another file now: the matches read in it and not yet written
+    /// are not written against any file. What they raise stays. Whether any was taken out.
+    fn drop_file(&mut self, name: &str) -> bool {
+        let before = self.order.len();
+        self.order.retain(|(at, _, _)| at.file != name);
+        self.order.len() < before
+    }
 }
 
-/// What a look at the source found.
-#[derive(Debug)]
+/// How many hexadecimal characters of a line's SHA-256 a row of the record keeps: 128 bits. The
+/// hash tells the line judged from another line found later at the same place, as after a file
+/// was written again in place; 128 bits put a second line with the same prefix beyond any search
+/// and beyond chance, at half the bytes of the whole hash. Nothing else of the line is kept.
+const LINE_HASH: usize = 32;
+
+/// The hash a row of the record keeps of a line, its newline left out.
+fn line_hash(line: &[u8]) -> String {
+    let mut h = crate::sha256::hex(line);
+    h.truncate(LINE_HASH);
+    h
+}
+
+/// What the latest look at the source found.
+#[derive(Debug, Default)]
 enum Found {
+    /// No look has been made yet.
+    #[default]
+    NotLooked,
     NotInstalled,
     /// The source is there and could not be read, with why and the system's error number when it
     /// gave one; nothing is taken as read.
     Failed(String, Option<i32>),
-    Read(Box<Log>),
+    Read,
 }
 
-/// A log that was read: what it held, where each file was read up to, the last sequence
-/// number, when it was last written, and the state the evidence gives.
-#[derive(Debug)]
-struct Log {
+/// How many of a log file's first bytes tell it from another file under its name. A name and an
+/// inode do not: macOS gives a freed inode to the next file made, and rotatelogs empties a file
+/// and writes it again from its start after a failed write. The first line does, since it holds
+/// eslogger's numbers and the time of its message, which the filter writes in its first 64 bytes,
+/// before the program and any argument. Only their SHA-256 is kept, never the bytes: nothing of a
+/// line reaches the store. A file whose first bytes are not those is another file, read from its
+/// start, and the rows of the record on the one it replaced go with it.
+const HEAD: usize = 64;
+
+/// A log file as a reading left it: its generation, its inode, how many of its first bytes were
+/// hashed and their SHA-256 (`HEAD`), the offset before which every byte is whole lines read,
+/// whether it was read to its end once its hour was over (`ended`), and whether it left the folder
+/// and was charged for it (`gone`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileAt {
+    /// Its row in `event_file`, which a file of the name taken for another one never shares: 0
+    /// from a read until the write that takes it in gives it one. Part of the frontier a writer compares, so a batch read from one
+    /// generation is never written against a later one of the same name, inode and length.
+    id: i64,
+    inode: u64,
+    head_len: u64,
+    head: String,
+    offset: u64,
+    /// Read to its length while it was over (`LogFile::over`): rotatelogs writes to it no more,
+    /// so whatever becomes of it later, no line of it is left unread. A file not known to be
+    /// ended that leaves, or becomes another file, counts as deleted unread (`relist`).
+    ended: bool,
+    /// It left the folder at a look, which charged it as deleted unread unless it was ended: a
+    /// note of the root side's that names it at the next look is not counted again (`removed`).
+    gone: bool,
+}
+
+impl FileAt {
+    /// The file of `inode` whose first bytes are `first` (at most `HEAD`), read to `offset`; the
+    /// write that takes it in gives its generation (`Reader::write`).
+    fn of(inode: u64, first: &[u8], offset: u64, ended: bool) -> FileAt {
+        let n = first.len().min(HEAD).min(offset as usize);
+        FileAt {
+            id: 0,
+            inode,
+            head_len: n as u64,
+            head: crate::sha256::hex(&first[..n]),
+            offset,
+            ended,
+            gone: false,
+        }
+    }
+
+    /// Whether the file of `inode`, whose first bytes are `first` (at most `HEAD`) and whose
+    /// length is `len`, is this file read on: the same inode, the same first bytes, and at least
+    /// as long as it was read. Reading only goes forward.
+    fn goes_on(&self, inode: u64, first: &[u8], len: u64) -> bool {
+        let n = self.head_len as usize;
+        self.inode == inode
+            && self.offset <= len
+            && first.len() >= n
+            && crate::sha256::hex(&first[..n]) == self.head
+    }
+}
+
+/// Where the log's readers left off, as the store keeps it: each file's place, the last sequence
+/// number of program starts and of each kind of file event, up to when the root side's notes of
+/// deletions were counted, what arrives, and the filter's markers no gap has taken in yet. It is
+/// the frontier: a reader that finds it in the store other than it left it does not write.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Left {
+    files: BTreeMap<String, FileAt>,
+    last_seq: Option<u64>,
+    file_seq: [Option<u64>; 2],
+    /// The SHA-256 of the last note of a deletion counted (`removed`).
+    counted: Option<String>,
+    arrivals: Arrivals,
+    pending: u64,
+}
+
+/// What a reader read since it last wrote to the store.
+#[derive(Clone, Debug, Default)]
+struct Batch {
     tally: Tally,
     file_tally: FileTally,
     matched: Matched,
-    files: Vec<(String, u64, u64)>,
-    last_seq: Option<u64>,
-    file_seq: [Option<u64>; 2],
+    lacked: Lacked,
     version: Option<u64>,
-    written: Option<i64>,
-    state: &'static str,
-    said: Option<(&'static str, String)>,
-    /// Whether the collector installed here is established to record file events, or why not:
-    /// not given, or a record that is there and could not be read.
-    collects: Result<(), NotCollected>,
-    /// What the lines say of each of `KEEPS`, after the last line read.
-    arrivals: Arrivals,
-    /// The filter's markers no gap has taken in yet.
-    pending: u64,
-    /// What the next reading counts the time awake from, when it is known (`quiet_awake`).
-    kept: Option<Before>,
-    /// Where the pass goes on after this step, when it was one (`Pass`).
-    pass: Pass,
+    /// The log files whose rows leave the store with the record on their lines: gone from the
+    /// folder, or another file under their name now.
+    gone: BTreeSet<String>,
+    /// A file let go held lines no row of the record holds: matches read and not written, or
+    /// lines it may have held past where it was read (`lets_go`).
+    went: bool,
+    /// Bytes of whole lines read.
+    bytes: u64,
 }
 
-/// Where the last reading left off: each file's inode and offset, the last sequence number of
-/// program starts and of each kind of file event, and up to when the root side's notes of
-/// deletions were counted.
-#[derive(Default)]
-struct Left {
-    files: BTreeMap<String, (u64, u64)>,
-    last_seq: Option<u64>,
-    file_seq: [Option<u64>; 2],
-    counted: Option<i64>,
-    arrivals: Arrivals,
-    pending: u64,
-}
-
-/// The watcher's reading of the log in steps, each committed on its own: one log file a step,
-/// the collector bounding a file's size and age. A pass goes through the files once, in the
-/// order one reading reads them: a step reads the first file after the one the step before
-/// read that holds bytes past its place, so the file being written, or one that ends in a line
-/// not yet finished, never keeps the files after it waiting. The file whose lines say what
-/// arrives (`writing`) is told at each step, the one an earlier step told among the candidates.
-/// A step that leaves log after its file commits what it counted and where it is, and leaves
-/// the conclusion of the last whole reading standing: the state and the coverage are written by
-/// the step that ends the pass, as by a reading (`read`). A step gives
-/// the pass that follows it in its outcome, which the caller takes once the step committed: a
-/// step that did not commit leaves the pass where the last one that did left it, so the next
-/// step reads its file again. The pass goes on only from a step that read with log left after
-/// its file; any other end starts the next pass from the places kept.
-#[derive(Debug, Default)]
-pub struct Pass {
-    after: Option<Key>,
-    writing: Option<Key>,
-    /// How far the watcher's early look (`raising`) has looked in each file since the latest
-    /// step that read the log.
-    seen: Option<Seen>,
-}
-
-/// How far the early look has looked in each log file: its inode, the offset after the last
-/// whole line looked at, and the file's length then. It starts at each step that reads the log
-/// from where that step left each file, the rows it wrote into `event_file`, with the length the
-/// step listed for the files it read. It lives in memory only and is never written: the store's
-/// places stay the one record of what was read.
-#[derive(Debug, Default)]
-struct Seen {
-    looked: BTreeMap<String, (u64, u64, u64)>,
-}
-
-impl Pass {
-    /// Log is left after the latest step: the next step reads on.
-    pub fn more(&self) -> bool {
-        self.after.is_some()
+impl Batch {
+    /// Whether it holds anything the store does not: a line read, a file gone, a deletion noted.
+    fn owed(&self) -> bool {
+        self.bytes > 0
+            || !self.gone.is_empty()
+            || self.tally.removed_cap + self.tally.removed_unread > 0
     }
 
-    /// The watcher's early look: whether lines written since it last looked match a rule that
-    /// raises a finding (`Meta::raises`, a level stated and high or critical) and is not in
-    /// `held`, or more is waiting than one look takes (`BYTES`), so that the step should run now
-    /// rather than at its period. Every rule that raised in those lines then goes into `held`,
-    /// by the id the evaluator keys its matches by (`Matched::rules`). The caller empties `held`
-    /// at each step at its period, so a rule brings a step forward once in each period, and a
-    /// rule that matches all the time costs one early step and the step at the period. It
-    /// opens no store and writes nothing. First a listing of the log's folder and each file's
-    /// size: a file as it was at the last look, or holding nothing past where the look got to,
-    /// is passed over, so a quiet log costs that listing alone, and a line left unfinished is
-    /// looked at again only once the file grows. Then the new whole lines are read and
-    /// evaluated by the reading's own parser and the one evaluator (`read_file`,
-    /// `Into::judge`), counted into nothing that is kept, and where the look got to moves past
-    /// them, so a line is looked at once. False until a step read the log, after a step that
-    /// failed or found no collector, and when the folder cannot be listed; a file that cannot
-    /// be read ends the look, which answers by what matched before it. The step at its period
-    /// reads and tells such a failure. Whatever this says, what the step
-    /// reads is decided by the store's places alone, so a wrong answer here, or a wrong `held`,
-    /// costs an early step or a wait of at most one period, and never a line.
-    pub fn raising(&mut self, root: &Path, now: i64, held: &mut BTreeSet<&'static str>) -> bool {
-        let Some(seen) = &mut self.seen else {
-            return false;
+    /// The one way the reader lets go of a log file it held: the file leaves the store with the
+    /// rows of the record on its lines, and the matches read in it and not yet written are not
+    /// written (`Matched::drop_file`). When those matches, or lines past where it was read
+    /// (`unread`), are lost to the record, the write raises its gone mark (`give_gone`), so a
+    /// caller whose place is older is told `gone`; and when the cause is one that loses lines
+    /// (`charge`), they count as a file deleted unread. Not installed is a cause that does not:
+    /// the uninstall took the log with it, and the level says it was not installed.
+    fn lets_go(&mut self, name: &str, unread: bool, charge: bool) {
+        self.gone.insert(name.to_string());
+        let dropped = self.matched.drop_file(name);
+        self.went |= dropped || unread;
+        self.tally.removed_unread += i64::from(unread && charge);
+    }
+}
+
+/// The one reader of the event log. It reads whole lines from where the store says the last
+/// reading stopped, parses each once, evaluates every rule of its kind on it (`Into::judge`), and
+/// writes what it read in one transaction (`write`): a row of the record for every match, the
+/// counts, how far each file was read, and for a rule that raises a finding, the finding with
+/// its evidence. A full check makes one and reads everything in its own transaction (`read`);
+/// the watcher keeps one in its evaluator (`evaluator.rs`), reads as the log grows and writes as
+/// matches come. Whoever reads, what it writes rests on the frontier it began from: a reader that
+/// finds the store's frontier moved since writes nothing, takes the store's and reads again, so a
+/// line is judged once whether a check and a watcher are both alive or not.
+pub struct Reader {
+    root: std::path::PathBuf,
+    rules: &'static Rules,
+    /// The frontier as the store held it when this reader last loaded or wrote it.
+    base: Left,
+    /// The frontier with what is read and not yet written.
+    left: Left,
+    batch: Batch,
+    found: Found,
+    /// When the collector was installed, whether it records file events, and when each log file
+    /// was last written to, as the latest look found them.
+    installed_at: i64,
+    collects: Result<(), NotCollected>,
+    times: BTreeMap<String, i64>,
+    /// The file the collector writes now, as the latest look told it (`writing`).
+    writing: Option<(Key, String)>,
+    /// Whole lines were left that the budget of the latest read did not take.
+    more: bool,
+    /// The store holds a conclusion on the level, which a write that reads in part leaves
+    /// standing; without one, a reader writes only once it has read every whole line
+    /// (`holds_back`), so no conclusion rests on part of the log.
+    concluded: bool,
+    /// A log file that could not be read after lines of other files were read, with why and the
+    /// system's error number (`read_keeping`): those lines are written, and a conclusion of this
+    /// pass is that the reading failed, never that the log was read whole.
+    left_out: Option<(String, Option<i32>)>,
+    /// The evaluator this reader is, new at each start of its thread (`by_evaluator`): each of its
+    /// writes records which one wrote, whether that pass reached the end of the log, and when, so
+    /// `immunity matches` tells it from an earlier one and from one with lines left.
+    evaluator: Option<i64>,
+}
+
+/// What a reader wrote, for the caller: the state, the reason when it failed, how many program
+/// starts and matches it took, how many findings the rules opened, and whether it had read every
+/// whole line it listed.
+#[derive(Debug, Default)]
+pub struct Outcome {
+    pub state: &'static str,
+    pub failed: Option<String>,
+    pub starts: i64,
+    pub matches: usize,
+    pub opened: usize,
+    pub caught_up: bool,
+}
+
+impl Reader {
+    /// A reader of the log under `root` from the frontier the store holds.
+    pub fn load(conn: &Connection, root: &Path) -> rusqlite::Result<Reader> {
+        let left = left(conn)?;
+        Ok(Reader {
+            concluded: state(conn)?.is_some(),
+            ..Reader::at(root, left)
+        })
+    }
+
+    fn at(root: &Path, left: Left) -> Reader {
+        Reader {
+            root: root.to_path_buf(),
+            rules: Rules::shipped(),
+            base: left.clone(),
+            left,
+            batch: Batch::default(),
+            found: Found::NotLooked,
+            installed_at: 0,
+            collects: Ok(()),
+            times: BTreeMap::new(),
+            writing: None,
+            more: false,
+            concluded: false,
+            left_out: None,
+            evaluator: None,
+        }
+    }
+
+    /// This reader is the evaluator `id` (`evaluator.rs`).
+    pub fn by_evaluator(&mut self, id: i64) {
+        self.evaluator = Some(id);
+    }
+
+    /// Forgets what was read since the last write and takes the frontier the store holds.
+    pub fn reload(&mut self, conn: &Connection) -> rusqlite::Result<()> {
+        let root = std::mem::take(&mut self.root);
+        let writing = self.writing.take();
+        let evaluator = self.evaluator;
+        *self = Reader::load(conn, &root)?;
+        (self.writing, self.evaluator) = (writing, evaluator);
+        Ok(())
+    }
+
+    /// Whether what was read since the last write reaches every whole line a look listed and no
+    /// reading failed. A file left out leaves lines to read (`read_keeping`).
+    fn caught_up(&self) -> bool {
+        !self.more && matches!(self.found, Found::Read | Found::NotInstalled)
+    }
+
+    /// Whether what was read since the last write is owed to the store, or a look failed or
+    /// found no collector and that is to be said.
+    pub fn owed(&self) -> bool {
+        self.batch.owed() || matches!(self.found, Found::Failed(..))
+    }
+
+    /// The matches read since the last write.
+    pub fn matched(&self) -> usize {
+        self.batch.matched.order.len()
+    }
+
+    /// Whole lines were left that the budget of the latest read did not take.
+    pub fn more(&self) -> bool {
+        self.more
+    }
+
+    /// Whether what was read is held back from the store: lines are left and the store holds no
+    /// conclusion yet, which a write of part of the log would make.
+    pub fn holds_back(&self) -> bool {
+        self.more && !self.concluded
+    }
+
+    /// A look at the source, at `now`: whether the collector is installed and records file
+    /// events, the root side's notes of deletions since the last look, the files gone, and then
+    /// every file that holds bytes past its place, in the order they are written, until `budget`
+    /// more bytes of whole lines are read. A file the root side deleted or replaced leaves with its
+    /// rows. A look that fails takes nothing as read until it is written (`write`). Before it
+    /// reads, `watch` is told the log's folder and the file the collector writes now, so a line
+    /// written after the read is a wake for whoever waits on them (`evaluator.rs`).
+    pub fn relist(&mut self, now: i64, budget: u64, watch: impl FnOnce(&Path, Option<&str>)) {
+        if matches!(self.found, Found::Failed(..)) {
+            return;
+        }
+        let budget = self.batch.bytes.saturating_add(budget);
+        let opened = match open(&self.root) {
+            Ok(opened) => opened,
+            // Every file held leaves with the uninstall, never charged as deleted unread.
+            Err(None) => {
+                self.settle(&[], false);
+                self.found = Found::NotInstalled;
+                self.writing = None;
+                self.more = false;
+                return;
+            }
+            Err(Some((why, errno))) => return self.fail(why, errno),
         };
-        let dir = root.join(LOG);
-        let Ok((files, _)) = list(&dir) else {
-            return false;
-        };
-        let from = |f: &LogFile| match seen.looked.get(&f.name) {
-            Some(&(inode, to, len)) if inode == f.inode && to <= f.len => (to, len == f.len),
-            _ => (0, f.len == 0),
-        };
-        let grown: Vec<(&LogFile, u64)> = files
-            .iter()
-            .filter_map(|f| match from(f) {
-                (_, true) => None,
-                (to, false) => Some((f, to)),
-            })
+        if let Err(e) = removed(&opened.dir, &mut self.left, &mut self.batch) {
+            let why = format!("{REMOVED} in the event level's log: {e}");
+            return self.fail(why, e.raw_os_error());
+        }
+        self.settle(&opened.files, true);
+        let Opened {
+            installed_at,
+            collects,
+            dir,
+            files,
+            ..
+        } = opened;
+        self.installed_at = installed_at;
+        self.collects = collects;
+        self.times = files.iter().map(|f| (f.name.clone(), f.mtime.0)).collect();
+        let left = &self.left;
+        let place = |f: &LogFile| left.files.get(&f.name).map(|p| (p.inode, p.offset));
+        let told = self.writing.as_ref().map(|(k, _)| *k);
+        let now_written = writing(&files, place, told);
+        let todo: Vec<(String, bool, bool)> = (files.iter().enumerate())
+            .filter(|(_, f)| unread(f, place(f)))
+            .map(|(i, f)| (f.name.clone(), f.over, now_written == Some(i)))
             .collect();
-        let waiting: u64 = grown.iter().map(|(f, to)| f.len - to).sum();
-        if waiting > BYTES as u64 {
+        self.writing = now_written.map(|i| (files[i].key, files[i].name.clone()));
+        // Before the collector's file holds a line, the file written last is the one to wake on.
+        let newest = (files.iter().enumerate()).max_by_key(|(i, f)| (f.mtime, *i));
+        let watched = (self.writing.as_ref().map(|(_, n)| n.as_str()))
+            .or(newest.map(|(_, f)| f.name.as_str()));
+        watch(&dir, watched);
+        self.found = Found::Read;
+        self.more = false;
+        for (name, over, arrivals) in todo {
+            if self.batch.bytes >= budget {
+                self.more = true;
+                return;
+            }
+            if let Err((why, errno)) = self.read_keeping(&dir, &name, over, arrivals, now, budget) {
+                return self.fail(why, errno);
+            }
+            if self.more {
+                return;
+            }
+        }
+    }
+
+    /// Reads on in the file the collector writes now, as the latest look told it, until
+    /// `budget` bytes of whole lines are read. Returns whether a look is owed: before the first,
+    /// or when that file is gone.
+    pub fn read_on(&mut self, now: i64, budget: u64) -> bool {
+        let Some((_, name)) = self.writing.clone() else {
+            return true;
+        };
+        if !matches!(self.found, Found::Read) {
             return true;
         }
-        let (mut tally, mut file_tally) = (Tally::default(), FileTally::default());
-        let (mut last_seq, mut file_seq, mut version, mut pending) = (None, [None; 2], None, 0);
-        let mut matched = Matched::default();
-        for (f, to) in grown {
-            let mut into = Into {
-                tally: &mut tally,
-                file_tally: &mut file_tally,
-                last_seq: &mut last_seq,
-                file_seq: &mut file_seq,
-                version: &mut version,
-                arrivals: None,
-                lacked: None,
-                pending: &mut pending,
-                now,
-                rules: Rules::shipped(),
-                matched: &mut matched,
-                file: String::new(),
-                inode: 0,
-                queue: None,
-            };
-            let at = |m: &std::fs::Metadata| if m.ino() == f.inode { to } else { 0 };
-            match read_file(&dir, &f.name, at, false, &mut into) {
-                Ok(Some(read)) => {
-                    let place = (read.inode, read.to, read.len);
-                    seen.looked.insert(f.name.clone(), place);
-                }
-                Ok(None) => {}
-                // The look ends here; what matched before the file that failed still counts,
-                // since where the look got to has moved past it.
-                Err(_) => break,
+        let budget = self.batch.bytes.saturating_add(budget);
+        let dir = self.root.join(LOG);
+        match self.read_keeping(&dir, &name, false, true, now, budget) {
+            Ok(true) => false,
+            Ok(false) => true,
+            Err((why, errno)) => {
+                self.fail(why, errno);
+                false
             }
         }
-        let raised = matched.rules.into_iter().filter(|(_, h)| h.meta.raises());
-        let before = held.len();
-        held.extend(raised.map(|(id, _)| id));
-        held.len() > before
+    }
+
+    /// What became of each log file the store holds a place for, as a look lists the folder
+    /// (`files`, none when the collector is not installed), once the root side's notes are counted
+    /// (`removed`). A file that left, or is another file under its name (another inode, or shorter
+    /// than where it was read to), is let go in this pass (`Batch::lets_go`): unless it was read to
+    /// its end once its hour was over (`FileAt::ended`), its lines past its place are lost to the
+    /// record, and with `charge` it counts as deleted unread, so no conclusion of the pass that saw
+    /// it go says nothing was lost. When unsure, the loss is counted. A file that left stays marked
+    /// gone until the next look, so the note the root side writes just after it deletes is not
+    /// counted again; one that comes back is another file, read from its start. A file over and
+    /// read to its length is ended.
+    fn settle(&mut self, files: &[LogFile], charge: bool) {
+        let listed: BTreeMap<&str, &LogFile> = files.iter().map(|f| (f.name.as_str(), f)).collect();
+        let names: Vec<String> = self.left.files.keys().cloned().collect();
+        for name in names {
+            let at = self.left.files[&name].clone();
+            let f = listed.get(name.as_str());
+            let other = f.is_some_and(|f| at.gone || at.inode != f.inode || at.offset > f.len);
+            if f.is_none() || other {
+                // One marked gone was let go when it was seen to go.
+                self.batch.lets_go(&name, !at.gone && !at.ended, charge);
+            }
+            if at.gone || other {
+                self.left.files.remove(&name);
+            } else if f.is_none() {
+                self.left.files.get_mut(&name).expect("listed above").gone = true;
+            } else if f.is_some_and(|f| f.over && f.len == at.offset) {
+                self.left.files.get_mut(&name).expect("listed above").ended = true;
+            }
+        }
+    }
+
+    /// `read`, except that a file that fails after lines of other files were read since the last
+    /// write leaves those lines to be written first: the reader stands as it was before the
+    /// file and has lines left, and the file is left out (`left_out`), so that the write does
+    /// not conclude the log read whole, and the look after it fails at the file with nothing else
+    /// read. A match before a file that cannot be read is not held back by it. Before the store
+    /// holds a conclusion nothing is written of part of the log (`holds_back`), so the file fails
+    /// the reading at once.
+    fn read_keeping(
+        &mut self,
+        dir: &Path,
+        name: &str,
+        over: bool,
+        arrivals: bool,
+        now: i64,
+        budget: u64,
+    ) -> Result<bool, (String, Option<i32>)> {
+        let before =
+            (self.concluded && self.batch.owed()).then(|| (self.left.clone(), self.batch.clone()));
+        let read = self.read(dir, name, over, arrivals, now, budget);
+        if let Err(failed) = &read
+            && let Some((left, batch)) = before
+        {
+            (self.left, self.batch, self.more) = (left, batch, true);
+            self.left_out = Some(failed.clone());
+            return Ok(true);
+        }
+        read
+    }
+
+    /// Reads one log file of `dir` from its place: `over` says its hour is over
+    /// (`LogFile::over`), `arrivals` that its lines say what arrives (`writing`). Whether the
+    /// file was there.
+    fn read(
+        &mut self,
+        dir: &Path,
+        name: &str,
+        over: bool,
+        arrivals: bool,
+        now: i64,
+        budget: u64,
+    ) -> Result<bool, (String, Option<i32>)> {
+        let rules = self.rules;
+        let Reader { left, batch, .. } = self;
+        let mut into = Into {
+            batch,
+            last_seq: &mut left.last_seq,
+            file_seq: &mut left.file_seq,
+            arrivals: arrivals.then_some(&mut left.arrivals),
+            pending: &mut left.pending,
+            now,
+            rules,
+            file: name.to_string(),
+            budget,
+        };
+        let Some(read) = read_file(dir, name, left.files.get(name), over, &mut into)? else {
+            return Ok(false);
+        };
+        self.times.insert(name.to_string(), read.mtime);
+        self.left.files.insert(
+            name.to_string(),
+            FileAt::of(read.inode, &read.head, read.to, read.ended),
+        );
+        self.more = read.more;
+        Ok(true)
+    }
+
+    /// A look or a read failed: nothing read since the last write is taken.
+    fn fail(&mut self, why: String, errno: Option<i32>) {
+        self.found = Found::Failed(why, errno);
+        self.more = false;
+    }
+
+    /// What was read since the last write, written in `tx` as one: every log file gone with its
+    /// rows, how far each file was read, the counts, a row of the record for every match, and
+    /// for a rule that raises a finding, the finding with its evidence and its journal entry.
+    /// With `conclude`, or when the store holds no reading of the level, also the conclusion:
+    /// the state, what the collector said, whether file events are collected, the cap, the
+    /// coverage, and old counts deleted. A file left out (`left_out`) makes that conclusion a
+    /// failed reading with why, the lines before it written all the same. `None`, with nothing
+    /// written, when the store's frontier is not the one this reader began from: another reader
+    /// read since, and this one reloads (`reload`) and reads again. The generation the store gave
+    /// each file is taken into the frontier at once; a write the caller does not commit is let go
+    /// with it (`forget`, `reload`). The caller commits and then calls `wrote`.
+    pub fn write(
+        &mut self,
+        tx: &Transaction,
+        run_id: &str,
+        machine: &str,
+        now: i64,
+        conclude: bool,
+    ) -> rusqlite::Result<Option<Outcome>> {
+        if left(tx)? != self.base {
+            return Ok(None);
+        }
+        let conclude = conclude || state(tx)?.is_none();
+        let awake = Awake::read(tx)?;
+        let times: Vec<i64> = self.times.values().copied().collect();
+        let dir = self.root.join(LOG);
+        let mut out = Outcome {
+            caught_up: self.caught_up(),
+            failed: self.left_out.as_ref().map(|(why, _)| why.clone()),
+            ..Outcome::default()
+        };
+        // What the conclusion rests on: a pass that left a file out failed, whatever it read.
+        let failed;
+        let found = match (&self.found, &self.left_out) {
+            (Found::Read, Some((why, errno))) => {
+                failed = Found::Failed(why.clone(), *errno);
+                &failed
+            }
+            (found, _) => found,
+        };
+        match &self.found {
+            Found::NotLooked => return Ok(Some(out)),
+            Found::NotInstalled => {
+                out.state = NOT_INSTALLED;
+                put_awake(tx, None)?;
+                put_level(
+                    tx,
+                    now,
+                    NOT_INSTALLED,
+                    None,
+                    (None, None),
+                    (None, None, None),
+                )?;
+                for table in ["event_files", "event_arrival", "event_marks", "event_cap"] {
+                    tx.execute(&format!("DELETE FROM {table}"), [])?;
+                }
+                // Nothing continues: an install after this starts its numbering anew. The files
+                // held were let go by the look that found no collector (`settle`), and the
+                // frontier is the store's as this write leaves it.
+                self.left = Left {
+                    files: std::mem::take(&mut self.left.files),
+                    ..Left::default()
+                };
+            }
+            // Nothing is taken as read.
+            Found::Failed(why, _) => {
+                out.state = FAILED;
+                out.failed = Some(why.clone());
+                tx.execute(
+                    "INSERT INTO event_level (id, read_at, state, reason) VALUES (1, ?1, ?2, ?3)
+                     ON CONFLICT (id) DO UPDATE SET read_at = excluded.read_at,
+                         state = excluded.state, said_by = NULL, said = NULL,
+                         reason = excluded.reason",
+                    params![now, FAILED, why],
+                )?;
+                put_cap(tx, &log_cap(&self.root))?;
+            }
+            Found::Read => {
+                let l = &self.left;
+                let b = &self.batch;
+                let (state, said, kept) = judge(&dir, self.installed_at, &times, now, &awake);
+                out.state = state;
+                let seqs = (
+                    l.last_seq.map(|s| s as i64),
+                    b.version.map(|v| v as i64),
+                    l.counted.as_deref(),
+                );
+                // The level's row is there before any row of the record, which keeps in it the
+                // largest number that went (`remove_file`).
+                if conclude {
+                    put_awake(tx, kept.as_ref())?;
+                    let said = said.as_ref().map(|(by, s)| (*by, s.as_str()));
+                    let written = times.iter().copied().max();
+                    put_level(tx, now, state, written, said.unzip(), seqs)?;
+                    if let Found::Failed(why, _) = found {
+                        out.state = FAILED;
+                        tx.execute(
+                            "UPDATE event_level SET state = ?1, reason = ?2, said_by = NULL,
+                                 said = NULL",
+                            params![FAILED, why],
+                        )?;
+                    }
+                } else {
+                    tx.execute(
+                        "UPDATE event_level SET last_seq = ?1, version = COALESCE(?2, version),
+                             counted = ?3",
+                        params![seqs.0, seqs.1, seqs.2],
+                    )?;
+                }
+                let seq = |k: usize| l.file_seq[k].map(|s| s as i64);
+                // Whether file events are collected is part of the conclusion: a write that
+                // concludes nothing leaves it as the last conclusion did.
+                tx.execute(
+                    "INSERT INTO event_files (id, collected, why, last_create, last_rename)
+                     VALUES (1, ?1, ?2, ?3, ?4)
+                     ON CONFLICT (id) DO UPDATE SET
+                         collected = CASE WHEN ?5 THEN excluded.collected ELSE collected END,
+                         why = CASE WHEN ?5 THEN excluded.why ELSE why END,
+                         last_create = excluded.last_create, last_rename = excluded.last_rename",
+                    params![
+                        self.collects.is_ok(),
+                        self.collects.as_ref().err().map(|e| e.why),
+                        seq(0),
+                        seq(1),
+                        conclude
+                    ],
+                )?;
+                if conclude || l.arrivals != self.base.arrivals {
+                    put_arrivals(tx, &l.arrivals)?;
+                }
+                tx.execute(
+                    "INSERT INTO event_marks (id, pending) VALUES (1, ?1)
+                     ON CONFLICT (id) DO UPDATE SET pending = excluded.pending",
+                    [l.pending as i64],
+                )?;
+                if conclude {
+                    put_cap(tx, &log_cap(&self.root))?;
+                }
+            }
+        }
+        // What was read, and the files let go, whether the look found the log or no collector.
+        if matches!(self.found, Found::Read | Found::NotInstalled) {
+            let b = &self.batch;
+            let files = put_files(tx, &left(tx)?.files, &self.left.files, &b.gone)?;
+            put_counts(tx, now, &b.tally, &b.file_tally, b.lacked)?;
+            // The gone mark is below every row this write records.
+            if b.went {
+                give_gone(tx)?;
+            }
+            out.opened = record(tx, run_id, machine, now, &b.matched, &files)?;
+            out.starts = b.tally.starts;
+            out.matches = b.matched.order.len();
+            for (name, id) in files {
+                self.left.files.get_mut(&name).expect("written from it").id = id;
+            }
+        }
+        tx.execute("UPDATE event_level SET evaluated_at = ?1", [now])?;
+        if let Some(id) = self.evaluator {
+            tx.execute(
+                "UPDATE event_level SET evaluator = ?1, evaluator_at_end = ?2, evaluator_at = ?3",
+                params![id, out.caught_up, now],
+            )?;
+        }
+        if conclude {
+            conclude_level(tx, machine, run_id, now, found, self.collects.as_ref())?;
+        }
+        Ok(Some(out))
+    }
+
+    /// Lets go of what was read since the last write, which could not be written: it is read
+    /// again from where the last write left the log, at the next look.
+    pub fn forget(&mut self) {
+        self.left = self.base.clone();
+        self.batch = Batch::default();
+        self.found = Found::NotLooked;
+        self.more = false;
+        self.left_out = None;
+    }
+
+    /// What was written by `write` is committed: it is the frontier now. A look that failed is
+    /// forgotten with what it read, and the next look reads it again.
+    pub fn wrote(&mut self) {
+        self.left_out = None;
+        match self.found {
+            Found::Failed(..) => {
+                self.left = self.base.clone();
+                self.found = Found::NotLooked;
+            }
+            _ => self.base = self.left.clone(),
+        }
+        self.concluded |= !matches!(self.found, Found::NotLooked);
+        self.batch = Batch::default();
     }
 }
 
-/// Reads the log under `root` from where `left` says, at `now`, and evaluates every program
-/// start read against `rules`. The time the Mac was awake is counted from `awake`. With a
-/// `pass`, one step of it (`Pass`); without, every file.
-fn look(
-    root: &Path,
-    left: &Left,
+/// Writes how far each log file was read, from `stored` to `now`: a file that left, or that is
+/// another file under its name (`FileAt::goes_on`), goes with its rows (`remove_file`), and
+/// each other file's place moves on. The ids of the files read, by name, for the record.
+fn put_files(
+    tx: &Transaction,
+    stored: &BTreeMap<String, FileAt>,
+    now: &BTreeMap<String, FileAt>,
+    gone: &BTreeSet<String>,
+) -> rusqlite::Result<BTreeMap<String, i64>> {
+    // Whether it is the same file was decided against the file itself, as it was listed and read
+    // (`relist`, `FileAt::goes_on`): a file taken for another one is in `gone`.
+    for name in stored.keys() {
+        if gone.contains(name) || !now.contains_key(name) {
+            remove_file(tx, name)?;
+        }
+    }
+    let mut ids = BTreeMap::new();
+    for (name, at) in now {
+        tx.execute(
+            "INSERT INTO event_file (name, inode, head_len, head, offset, ended, gone)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (name) DO UPDATE SET head_len = excluded.head_len,
+                 head = excluded.head, offset = excluded.offset, ended = excluded.ended,
+                 gone = excluded.gone",
+            params![
+                name,
+                at.inode as i64,
+                at.head_len as i64,
+                at.head,
+                at.offset as i64,
+                at.ended,
+                at.gone
+            ],
+        )?;
+        let id: i64 = tx.query_row("SELECT id FROM event_file WHERE name = ?1", [name], |r| {
+            r.get(0)
+        })?;
+        ids.insert(name.clone(), id);
+    }
+    Ok(ids)
+}
+
+/// Takes a log file's row out of the store, with every row of the record on its lines, and keeps
+/// the largest number of a row of the record that ever went (`event_level.removed_seq`), so that
+/// a caller of `immunity matches` whose place is before it is told rows are gone. The one way a
+/// row of the record goes.
+fn remove_file(tx: &Transaction, name: &str) -> rusqlite::Result<()> {
+    tx.execute(
+        "UPDATE event_level SET removed_seq = MAX(removed_seq,
+             (SELECT COALESCE(MAX(r.seq), 0) FROM rule_line r JOIN event_file f ON f.id = r.file
+              WHERE f.name = ?1))",
+        [name],
+    )?;
+    tx.execute(
+        "DELETE FROM rule_line WHERE file IN (SELECT id FROM event_file WHERE name = ?1)",
+        [name],
+    )?;
+    tx.execute("DELETE FROM event_file WHERE name = ?1", [name])?;
+    Ok(())
+}
+
+/// Matches read in a file that left, or became another file, before they were written
+/// (`Matched::dropped`): they are given a number of the record that no row holds, and it is kept
+/// as the largest that went, so a caller of `immunity matches` whose place is before it is told
+/// matches are gone. `sqlite_sequence` is SQLite's own count of `rule_line`'s numbers, which it
+/// lets a program raise; a number raised there is never given to a row.
+fn give_gone(tx: &Transaction) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO sqlite_sequence (name, seq) SELECT 'rule_line', 0
+         WHERE NOT EXISTS (SELECT 1 FROM sqlite_sequence WHERE name = 'rule_line')",
+        [],
+    )?;
+    tx.execute(
+        "UPDATE sqlite_sequence SET seq = seq + 1 WHERE name = 'rule_line'",
+        [],
+    )?;
+    tx.execute(
+        "UPDATE event_level SET removed_seq =
+             (SELECT seq FROM sqlite_sequence WHERE name = 'rule_line')",
+        [],
+    )?;
+    Ok(())
+}
+
+/// The span of a row of `event_count`, in seconds: what one reader reads in ten seconds is added
+/// to one row, so a day holds at most 8,640 rows and as many more as full checks started, where
+/// the watcher before the evaluator wrote two rows every ten seconds. The status and the pages
+/// read the rows by time (`Since`), and an answer of `immunity matches` reads `event_total`.
+const COUNT_EVERY: i64 = 10;
+
+/// The counts `event_total` keeps, in its order: each of `Tally`, of `FileTally`, and for each
+/// of `MARKS` the writes in which some judged line did not give it.
+pub const TOTALS: usize = 16;
+const TOTAL_COLUMNS: [&str; TOTALS] = [
+    "starts",
+    "lost",
+    "unknown_gaps",
+    "unreadable",
+    "other",
+    "removed_cap",
+    "removed_unread",
+    "files",
+    "files_lost",
+    "files_unknown_gaps",
+    "files_unreadable",
+    "lacked_0",
+    "lacked_1",
+    "lacked_2",
+    "lacked_3",
+    "lacked_4",
+];
+
+/// Adds what one write read to the row of `event_count` of its ten seconds (`COUNT_EVERY`), the
+/// latest row, unless a full check started since that row was begun: then a new row is begun,
+/// which carries where the journal stood, so the check's start orders it whatever the clock
+/// (`Since::Check`). The row bears the time of its latest write: a loss added to it is in every
+/// window of time that holds the second it was read, and stays in one at most nine seconds longer
+/// than it alone would, which says less is covered, never more (`Since::At`). And raises the
+/// running totals (`event_total`). Nothing read writes nothing.
+fn put_counts(
+    tx: &Transaction,
     now: i64,
-    rules: &'static Rules,
-    awake: &Awake,
-    was: Option<&Pass>,
-) -> Found {
-    let opened = match open(root) {
-        Ok(opened) => opened,
-        Err(None) => return Found::NotInstalled,
-        Err(Some((why, errno))) => return Found::Failed(why, errno),
-    };
-    let Opened {
-        installed_at,
-        collects,
-        dir,
-        files: listed,
-        ..
-    } = opened;
-    let mut tally = Tally::default();
-    let mut file_tally = FileTally::default();
-    let mut matched = Matched::default();
-    if let Err(e) = removed(&dir, left, &mut tally) {
-        let why = format!("{REMOVED} in the event level's log: {e}");
-        return Found::Failed(why, e.raw_os_error());
+    t: &Tally,
+    f: &FileTally,
+    lacked: Lacked,
+) -> rusqlite::Result<()> {
+    let n = [
+        t.starts,
+        t.lost,
+        t.unknown_gaps,
+        t.unreadable,
+        t.other,
+        t.removed_cap,
+        t.removed_unread,
+        f.files,
+        f.lost,
+        f.unknown_gaps,
+        f.unreadable,
+        i64::from(lacked.bits()),
+    ];
+    if n.iter().all(|c| *c == 0) {
+        return Ok(());
     }
-    let mut last_seq = left.last_seq;
-    let mut file_seq = left.file_seq;
-    let mut arrivals = left.arrivals;
-    let mut pending = left.pending;
-    let mut version = None;
-    let mut files = Vec::new();
-    let mut listed_read = BTreeMap::new();
-    let mut times = Vec::new();
-    let place = |f: &LogFile| left.files.get(&f.name).copied();
-    let now_written = writing(&listed, place, was.and_then(|p| p.writing));
-    let left_after = |k: usize| listed[k + 1..].iter().any(|f| unread(f, place(f)));
-    let step = was.map(|p| {
-        let next = |f: &LogFile| p.after.is_none_or(|a| f.key > a) && unread(f, place(f));
-        listed.iter().position(next)
-    });
-    for (i, f) in listed.iter().enumerate() {
-        let name = &f.name;
-        // Not this step's file: its time, and its place where it still fits the file as listed;
-        // one that does not, as after the file was emptied, is its start, as a reading saves it.
-        if step.is_some_and(|k| k != Some(i)) {
-            times.push(f.mtime.0);
-            let fits = |&(inode, to): &(u64, u64)| inode == f.inode && to <= f.len;
-            // An empty file no step selects has its start as its place, as a reading saves it.
-            let saved = place(f).or((f.len == 0).then_some((f.inode, 0)));
-            let kept = saved.map(|p| if fits(&p) { p } else { (f.inode, 0) });
-            files.extend(kept.map(|(inode, to)| (name.clone(), inode, to)));
-            continue;
-        }
-        let mut into = Into {
-            tally: &mut tally,
-            file_tally: &mut file_tally,
-            last_seq: &mut last_seq,
-            file_seq: &mut file_seq,
-            version: &mut version,
-            arrivals: (now_written == Some(i)).then_some(&mut arrivals),
-            lacked: None,
-            pending: &mut pending,
+    let added = tx.execute(
+        "UPDATE event_count SET starts = starts + ?2, lost = lost + ?3,
+             unknown_gaps = unknown_gaps + ?4, unreadable = unreadable + ?5, other = other + ?6,
+             removed_cap = removed_cap + ?7, removed_unread = removed_unread + ?8,
+             files = files + ?9, files_lost = files_lost + ?10,
+             files_unknown_gaps = files_unknown_gaps + ?11,
+             files_unreadable = files_unreadable + ?12, lacked = lacked | ?13,
+             at = MAX(at, ?1)
+         WHERE id = (SELECT MAX(id) FROM event_count) AND at / ?14 = ?1 / ?14
+           AND NOT EXISTS (SELECT 1 FROM journal j
+                           WHERE j.entry = 'run_started' AND j.seq > event_count.journal_seq)",
+        params![
             now,
-            rules,
-            matched: &mut matched,
-            file: String::new(),
-            inode: 0,
-            queue: None,
-        };
-        // The same file is read on from where it was left; another file of that name, or one
-        // shorter than what was read, from its start.
-        let from = |meta: &std::fs::Metadata| match left.files.get(name) {
-            Some((inode, offset)) if *inode == meta.ino() && *offset <= meta.len() => *offset,
-            _ => 0,
-        };
-        match read_file(&dir, name, from, f.over, &mut into) {
-            Ok(Some(read)) => {
-                times.push(read.mtime);
-                files.push((name.clone(), read.inode, read.to));
-                listed_read.insert(name.clone(), (f.inode, f.len));
-            }
-            // Deleted by the root side between the listing and now.
-            Ok(None) => {}
-            Err((why, errno)) => return Found::Failed(why, errno),
-        }
+            n[0],
+            n[1],
+            n[2],
+            n[3],
+            n[4],
+            n[5],
+            n[6],
+            n[7],
+            n[8],
+            n[9],
+            n[10],
+            n[11],
+            COUNT_EVERY
+        ],
+    )?;
+    if added == 0 {
+        tx.execute(
+            "INSERT INTO event_count (journal_seq, at, starts, lost, unknown_gaps, unreadable,
+                                      other, removed_cap, removed_unread, files, files_lost,
+                                      files_unknown_gaps, files_unreadable, lacked)
+             VALUES ((SELECT COALESCE(MAX(seq), 0) FROM journal),
+                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                now, n[0], n[1], n[2], n[3], n[4], n[5], n[6], n[7], n[8], n[9], n[10], n[11]
+            ],
+        )?;
     }
-    let mut pass = match step {
-        Some(Some(k)) if left_after(k) => Pass {
-            after: Some(listed[k].key),
-            writing: now_written.map(|i| listed[i].key),
-            seen: None,
+    let lacked = lacked.0.map(i64::from);
+    let raise: Vec<String> = TOTAL_COLUMNS
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("{c} = {c} + ?{}", i + 1))
+        .collect();
+    tx.execute(
+        &format!(
+            "INSERT INTO event_total VALUES (1{}) ON CONFLICT (id) DO NOTHING",
+            ", 0".repeat(TOTALS)
+        ),
+        [],
+    )?;
+    let by: Vec<i64> = n[..11].iter().copied().chain(lacked).collect();
+    tx.execute(
+        &format!("UPDATE event_total SET {}", raise.join(", ")),
+        rusqlite::params_from_iter(by),
+    )?;
+    Ok(())
+}
+
+/// The running totals of every count since the store was made (`event_total`), in the order of
+/// `TOTAL_COLUMNS`: all 0 before any line was read.
+pub fn totals(conn: &Connection) -> rusqlite::Result<[i64; TOTALS]> {
+    let row = conn
+        .query_row(
+            &format!(
+                "SELECT {} FROM event_total WHERE id = 1",
+                TOTAL_COLUMNS.join(", ")
+            ),
+            [],
+            |r| {
+                let mut n = [0; TOTALS];
+                for (i, v) in n.iter_mut().enumerate() {
+                    *v = r.get(i)?;
+                }
+                Ok(n)
+            },
+        )
+        .optional()?;
+    Ok(row.unwrap_or([0; TOTALS]))
+}
+
+/// What the lines counted between two sets of totals held, the later less the earlier: the
+/// counts, and what some judged line did not give.
+pub fn counted_between(
+    earlier: &[i64; TOTALS],
+    later: &[i64; TOTALS],
+) -> (Tally, FileTally, Lacked) {
+    let d: Vec<i64> = later.iter().zip(earlier).map(|(l, e)| l - e).collect();
+    (
+        Tally {
+            starts: d[0],
+            lost: d[1],
+            unknown_gaps: d[2],
+            unreadable: d[3],
+            other: d[4],
+            removed_cap: d[5],
+            removed_unread: d[6],
         },
-        _ => Pass::default(),
+        FileTally {
+            files: d[7],
+            lost: d[8],
+            unknown_gaps: d[9],
+            unreadable: d[10],
+        },
+        Lacked(std::array::from_fn(|i| d[11 + i] > 0)),
+    )
+}
+
+/// The conclusion of a reading: old counts deleted, and the coverage of program starts and of
+/// file events, one row each in place of the one before, as samples keep theirs.
+fn conclude_level(
+    tx: &Transaction,
+    machine: &str,
+    run_id: &str,
+    now: i64,
+    found: &Found,
+    collects: Result<&(), &NotCollected>,
+) -> rusqlite::Result<()> {
+    // A count since the latest finished full check, or since the start of a check that has not
+    // finished, stays, so a clock stepped forward never takes a loss out of `lost_since_check`;
+    // with no check started, two days are kept.
+    let spared = spared_from(tx)?.unwrap_or(i64::MAX);
+    tx.execute(
+        "DELETE FROM event_count WHERE at < ?1 AND journal_seq < ?2",
+        [now - KEEP, spared],
+    )?;
+    tx.execute(
+        "DELETE FROM rule_match WHERE hour < ?1",
+        [(now - KEEP_MATCHES) / HOUR],
+    )?;
+    let state = state(tx)?.unwrap_or_default();
+    let (completeness, reason, cause): (&str, Option<String>, Option<Cause>) = match found {
+        Found::NotInstalled => (
+            "none",
+            Some("the event level is not installed".to_string()),
+            Some(Cause::NotGiven),
+        ),
+        Found::Failed(why, _) => ("none", Some(why.clone()), Some(Cause::Failed)),
+        _ => covered(&state, &tally_since(tx, Since::At(now - DAY))?.0),
     };
-    // The early look starts from what this step read: a file it read as long as it was
-    // listed, any other as far as it was read.
-    let looked = files.iter().map(|(n, i, to)| {
-        let len = listed_read.get(n).filter(|(inode, _)| inode == i);
-        (n.clone(), (*i, *to, len.map_or(*to, |&(_, len)| len)))
-    });
-    pass.seen = Some(Seen {
-        looked: looked.collect(),
-    });
-    let written = times.iter().copied().max();
-    let (state, said, kept) = judge(&dir, installed_at, &times, now, awake);
-    Found::Read(Box::new(Log {
-        tally,
-        file_tally,
-        matched,
-        files,
-        last_seq,
-        file_seq,
-        version,
-        written,
-        state,
-        said,
-        collects,
-        arrivals,
-        pending,
-        kept,
-        pass,
-    }))
+    let gap = match found {
+        Found::Failed(_, errno) => Gap::failed(*errno),
+        _ => Gap::when(cause),
+    };
+    tx.execute(
+        "DELETE FROM coverage WHERE reader = ?1 AND scope = ?2 AND kind IN (?3, ?4)",
+        params![READER, machine, KIND, KIND_FILES],
+    )?;
+    let reading = Reading {
+        reader: READER,
+        scope: machine,
+        kind: KIND,
+        run_id,
+        at: now,
+        observed_at: now,
+    };
+    crate::store::put_coverage(tx, &reading, completeness, reason.as_deref(), &gap)?;
+    // File events have coverage of their own while the level runs; otherwise the level's
+    // state says why nothing is recorded, once.
+    if matches!(found, Found::Read) && state == RUNNING {
+        let last_day = tally_since(tx, Since::At(now - DAY))?;
+        let (completeness, reason, cause) = files_covered(collects, &last_day.0, &last_day.1);
+        // What the collector records could not be read: as the system said, with its number.
+        let gap = match collects {
+            Err(n) if n.cause == Cause::Failed => Gap::failed(n.errno),
+            _ => Gap::when(cause),
+        };
+        let files = Reading {
+            kind: KIND_FILES,
+            ..reading
+        };
+        crate::store::put_coverage(tx, &files, completeness, reason.as_deref(), &gap)?;
+    }
+    Ok(())
+}
+
+/// Evaluates the rules over every line of the event log under `root` as it is now, from the
+/// start of each file: what would have matched, for tuning before the findings are trusted.
+pub fn replay(root: &Path, now: i64) -> Replay {
+    let mut r = Reader::at(root, Left::default());
+    r.relist(now, u64::MAX, |_, _| {});
+    match r.found {
+        Found::Failed(why, _) => Replay::Failed(why),
+        Found::Read => Replay::Read {
+            tally: r.batch.tally,
+            file_tally: r.batch.file_tally,
+            matched: r.batch.matched,
+        },
+        _ => Replay::NotInstalled,
+    }
+}
+
+/// One reading of the event level under `root`, at `now`, recorded in `tx`, as a full check
+/// reads it: everything from the store's frontier to the end of the log, and the conclusion.
+pub fn read(
+    tx: &Transaction,
+    run_id: &str,
+    machine: &str,
+    root: &Path,
+    now: i64,
+) -> rusqlite::Result<Outcome> {
+    let mut r = Reader::load(tx, root)?;
+    r.relist(now, u64::MAX, |_, _| {});
+    let out = r.write(tx, run_id, machine, now, true)?;
+    // The frontier was read in this transaction, which holds the write lock.
+    Ok(out.unwrap_or_default())
 }
 
 /// The cap of the log under `root`, in bytes, as the installed tidy job is given it: the fourth
@@ -1789,6 +2545,18 @@ impl Lacked {
         }
     }
 
+    /// As `event_count.lacked` keeps it: one bit for each of `MARKS`, in their order.
+    fn bits(self) -> u8 {
+        self.0
+            .iter()
+            .enumerate()
+            .fold(0, |bits, (i, lacked)| bits | (u8::from(*lacked) << i))
+    }
+
+    fn from_bits(bits: u8) -> Lacked {
+        Lacked(std::array::from_fn(|i| bits & (1 << i) != 0))
+    }
+
     /// What of `KEEPS` some judged line of `kind` did not give.
     pub fn of(&self, kind: crate::sigma::Kind) -> Keeps {
         self.0
@@ -1822,51 +2590,65 @@ fn of(keeps: Keeps) -> impl Iterator<Item = &'static (&'static str, &'static str
         .map(|(_, k)| k)
 }
 
-/// The root side's notes of what it deleted, `<when> <file> <bytes> age|cap` a line; a note
-/// not in that form is skipped. Empty when it has deleted nothing.
-fn notes(dir: &Path) -> std::io::Result<Vec<(i64, String, u64, String)>> {
+/// A note of the root side's: its whole line's SHA-256, and the file, its size and why when the
+/// note is in its form.
+type Note = (String, Option<(String, u64, String)>);
+
+/// The root side's notes of what it deleted, `<when> <file> <bytes> age|cap` a line. A line still
+/// being written is not taken. Empty when it has deleted nothing.
+fn notes(dir: &Path) -> std::io::Result<Vec<Note>> {
     let text = match std::fs::read_to_string(dir.join(REMOVED)) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
     Ok(text
-        .lines()
-        .filter_map(|note| {
+        .split_inclusive('\n')
+        .filter_map(|note| note.strip_suffix('\n'))
+        .map(|note| {
             let words: Vec<&str> = note.split(' ').collect();
-            let [when, name, bytes, why] = words[..] else {
-                return None;
+            let said = match words[..] {
+                [when, name, bytes, why] if when.parse::<i64>().is_ok() => bytes
+                    .parse()
+                    .ok()
+                    .map(|b| (name.to_string(), b, why.to_string())),
+                _ => None,
             };
-            Some((
-                when.parse().ok()?,
-                name.to_string(),
-                bytes.parse().ok()?,
-                why.to_string(),
-            ))
+            (crate::sha256::hex(note.as_bytes()), said)
         })
         .collect())
 }
 
-/// Counts what the root side's notes say it deleted since the last reading: files deleted to
-/// stay under the size cap, and files deleted before this reader read them to their end. A
-/// file was read to its end when the position this reader keeps for its name is the size the
-/// note gives. A name with no position kept was never read, and a file shorter than that
-/// position is not the one read, so it cannot be told and is counted unread.
-fn removed(dir: &Path, left: &Left, tally: &mut Tally) -> std::io::Result<()> {
-    for (when, name, bytes, why) in notes(dir)? {
-        if left.counted.is_some_and(|at| when <= at) {
+/// Counts what the root side's notes say it deleted since the last note counted: files deleted
+/// to stay under the size cap, and files deleted before this reader read them to their end. The
+/// notes after the last one counted are the new ones, found by the last one's hash: tidy.sh stamps
+/// a note with the second its run began, so neither a time nor a clock set back tells which notes
+/// are new, and it keeps the file short by keeping its end, so neither does a place in it. A note
+/// names one deletion of a file whose name holds the second it was started, so no two notes are
+/// the same line; when the last one counted is no longer there, every note is new. A file was read
+/// to its end when the place this reader keeps for its name is the size the note gives; a name with
+/// no place kept was never read, and counts unread if it held a byte. A file a note names leaves
+/// with its rows; one marked gone was counted when it was seen to go (`settle`).
+fn removed(dir: &Path, left: &mut Left, batch: &mut Batch) -> std::io::Result<()> {
+    let notes = notes(dir)?;
+    let counted = left.counted.as_deref();
+    let new = counted.and_then(|c| notes.iter().rposition(|(hash, _)| hash == c));
+    for (_, note) in &notes[new.map_or(0, |i| i + 1)..] {
+        let Some((name, bytes, why)) = note else {
             continue;
-        }
+        };
         if why == "cap" {
-            tally.removed_cap += 1;
+            batch.tally.removed_cap += 1;
         }
-        if left
-            .files
-            .get(&name)
-            .is_none_or(|(_, offset)| *offset != bytes)
-        {
-            tally.removed_unread += 1;
+        match left.files.remove(name) {
+            // Let go when it was seen to go.
+            Some(at) if at.gone => {}
+            Some(at) => batch.lets_go(name, at.offset != *bytes, true),
+            None => batch.tally.removed_unread += i64::from(*bytes > 0),
         }
+    }
+    if let Some((hash, _)) = notes.last() {
+        left.counted = Some(hash.clone());
     }
     Ok(())
 }
@@ -1876,63 +2658,89 @@ enum Stop {
     Schema(String),
 }
 
-/// Where a reading puts what it reads.
+/// Where a reading puts what it reads: the reader's batch, and the parts of its frontier the
+/// lines move on.
 struct Into<'a> {
-    tally: &'a mut Tally,
-    file_tally: &'a mut FileTally,
+    batch: &'a mut Batch,
     last_seq: &'a mut Option<u64>,
     file_seq: &'a mut [Option<u64>; 2],
-    version: &'a mut Option<u64>,
-    /// What the lines say of each of `KEEPS`, taken on line by line, while the core's reading
-    /// reads the file the collector is writing now (`writing`); `None` for any other file, and
-    /// always for `immunity matches`, which tells what the core's latest reading stored.
+    /// What the lines say of each of `KEEPS`, taken on line by line, while the reading reads the
+    /// file the collector is writing now (`writing`); `None` for any other file.
     arrivals: Option<&'a mut Arrivals>,
-    /// For `immunity matches`: what of `KEEPS` the lines it judged did not give.
-    lacked: Option<&'a mut Lacked>,
     /// Markers read whose number in eslogger's numbering no gap has taken in yet.
     pending: &'a mut u64,
     /// The time of the reading: a line whose time cannot be read is taken to be of it.
     now: i64,
     rules: &'static Rules,
-    matched: &'a mut Matched,
-    /// The log file being read, by its name and inode: where each line evaluated is.
+    /// The log file being read, by its name: where each line evaluated is.
     file: String,
-    inode: u64,
-    /// For `immunity matches`: every event that matched, with where its line is, and when to
-    /// stop. The core's own reading keeps none.
-    queue: Option<&'a mut Sink>,
+    /// How many bytes of whole lines it reads (`Batch::bytes`) before it stops at a line's end
+    /// and writes.
+    budget: u64,
 }
 
 impl Into<'_> {
     /// Evaluates one event against the rules of its kind. This is the one place an event is
-    /// evaluated: what the core's reading counts and raises, and what `immunity matches` gives,
-    /// both come from this call, so the two cannot disagree on what matched. `line` is where
-    /// the event's line begins and `len` its length. Returns whether the queue is full.
-    fn judge(&mut self, subject: Subject, line: u64, len: usize) -> bool {
+    /// evaluated: what the store records, counts and raises comes from this call. `begins` is
+    /// where the event's line begins, and `line` the line, its newline left out.
+    fn judge(&mut self, subject: Subject, begins: u64, line: &[u8]) {
         let matches = self.rules.evaluate(subject);
         if matches.is_empty() {
-            return false;
+            return;
         }
         let at = LineAt {
             file: self.file.clone(),
-            inode: self.inode,
-            offset: line,
+            row: 0,
+            offset: begins,
         };
-        self.matched.add(&matches, subject, &at);
-        let Some(q) = self.queue.as_deref_mut() else {
-            return false;
+        self.batch
+            .matched
+            .add(&matches, subject, &at, &line_hash(line));
+    }
+}
+
+/// The longest line read. A program start's arguments and environment together are at most
+/// `ARG_MAX`, 1 MiB on macOS (`sysctl kern.argmax`), the filter keeps no environment, and JSON
+/// writes a byte in at most six (`\u0000`), so no whole line the filter writes is longer than
+/// about 6 MiB, the rest of the message with it. A longer line is no message of the filter's: it
+/// is counted as a line that could not be read, and so not judged, and passed over to its end
+/// without being kept in memory whole.
+const LINE: usize = 8 << 20;
+
+/// What the next line of a log file is.
+enum Next {
+    /// A whole line, its newline included, of this many bytes, in the buffer.
+    Line(usize),
+    /// A whole line longer than `LINE`, of this many bytes, not kept.
+    Long(usize),
+    /// The end, or a line still being written.
+    End,
+}
+
+/// Reads the next line of `lines` into `buf`, keeping at most `LINE` bytes of it.
+fn next_line(lines: &mut impl BufRead, buf: &mut Vec<u8>) -> std::io::Result<Next> {
+    buf.clear();
+    let (mut n, mut long) = (0, false);
+    loop {
+        let available = lines.fill_buf()?;
+        if available.is_empty() {
+            return Ok(Next::End);
+        }
+        let (take, ends) = match available.iter().position(|b| *b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (available.len(), false),
         };
-        q.matches += matches.len();
-        q.bytes += len * matches.len();
-        q.hits.push(Hit {
-            at,
-            event: match subject {
-                Subject::Start(s) => Evidence::Start(s.clone()),
-                Subject::File(f) => Evidence::File(f.clone()),
-            },
-            matched: matches.iter().map(|m| (m.file, m.meta)).collect(),
-        });
-        q.matches >= q.limit || q.bytes >= BYTES
+        long |= buf.len() + take > LINE;
+        if long {
+            buf.clear();
+        } else {
+            buf.extend_from_slice(&available[..take]);
+        }
+        n += take;
+        lines.consume(take);
+        if ends {
+            return Ok(if long { Next::Long(n) } else { Next::Line(n) });
+        }
     }
 }
 
@@ -1940,46 +2748,56 @@ impl Into<'_> {
 struct Upto {
     /// The offset after the last whole line read.
     to: u64,
-    /// Where the last whole line read begins, when one was read.
-    last: Option<u64>,
-    /// It stopped because the queue was full, before the end of what the file holds.
+    /// It stopped at its budget, before the end of what the file holds.
     full: bool,
 }
 
-/// Reads the whole lines of `file` from `from` on, counts them, evaluates each program start
-/// and file event against the rules, and says where it stopped: at the end, at a line still
-/// being written, or when the queue is full.
+/// Reads the whole lines of `file` from `from` on, counts them, and evaluates each program
+/// start and file event against the rules, until the end, a line still being written, or the
+/// budget.
 fn read_from(mut file: std::fs::File, from: u64, into: &mut Into) -> Result<Upto, Stop> {
     file.seek(SeekFrom::Start(from)).map_err(Stop::Io)?;
     let mut lines = BufReader::new(file);
     let mut at = from;
-    let mut last = None;
     let mut buf = Vec::new();
     loop {
-        buf.clear();
-        let n = lines.read_until(b'\n', &mut buf).map_err(Stop::Io)?;
-        // The end, or a line still being written: left for the next reading.
-        if n == 0 || buf.last() != Some(&b'\n') {
+        // At the budget, more is left only where a byte is.
+        if into.batch.bytes >= into.budget {
+            let left = lines.fill_buf().map_err(Stop::Io)?;
             return Ok(Upto {
                 to: at,
-                last,
-                full: false,
+                full: !left.is_empty(),
             });
         }
+        let n = match next_line(&mut lines, &mut buf).map_err(Stop::Io)? {
+            Next::End => {
+                return Ok(Upto {
+                    to: at,
+                    full: false,
+                });
+            }
+            Next::Long(n) => {
+                into.batch.tally.unreadable += 1;
+                at += n as u64;
+                into.batch.bytes += n as u64;
+                continue;
+            }
+            Next::Line(n) => n,
+        };
         let begins = at;
         at += n as u64;
-        last = Some(begins);
-        let full = match line(&buf[..n - 1]).map_err(Stop::Schema)? {
+        into.batch.bytes += n as u64;
+        match line(&buf[..n - 1]).map_err(Stop::Schema)? {
             Line::Exec {
                 seq,
                 version: v,
                 start,
             } => {
-                let t = &mut *into.tally;
+                let t = &mut into.batch.tally;
                 let counts = (&mut t.lost, &mut t.unknown_gaps);
                 count_seq(seq, into.last_seq, counts, into.pending);
                 t.starts += 1;
-                *into.version = v.or(*into.version);
+                into.batch.version = v.or(into.batch.version);
                 if let Some(arrivals) = into.arrivals.as_deref_mut() {
                     arrivals.line(
                         crate::sigma::Kind::Process,
@@ -1988,14 +2806,14 @@ fn read_from(mut file: std::fs::File, from: u64, into: &mut Into) -> Result<Upto
                         second_of(&start.timestamp, into.now),
                     );
                 }
-                if let Some(lacked) = into.lacked.as_deref_mut() {
-                    let kind = crate::sigma::Kind::Process;
-                    lacked.line(kind, start.kept, filled_start(&start));
-                }
-                into.judge(Subject::Start(&start), begins, n)
+                let kind = crate::sigma::Kind::Process;
+                into.batch
+                    .lacked
+                    .line(kind, start.kept, filled_start(&start));
+                into.judge(Subject::Start(&start), begins, &buf[..n - 1])
             }
             Line::File { kind, seq, event } => {
-                let t = &mut *into.file_tally;
+                let t = &mut into.batch.file_tally;
                 if let Some(seq) = seq {
                     let last = &mut into.file_seq[kind];
                     count_seq(seq, last, (&mut t.lost, &mut t.unknown_gaps), into.pending);
@@ -2011,37 +2829,20 @@ fn read_from(mut file: std::fs::File, from: u64, into: &mut Into) -> Result<Upto
                                 second_of(&e.timestamp, into.now),
                             );
                         }
-                        if let Some(lacked) = into.lacked.as_deref_mut() {
-                            lacked.line(crate::sigma::Kind::File, e.kept, filled_file(&e));
-                        }
-                        into.judge(Subject::File(&e), begins, n)
+                        into.batch
+                            .lacked
+                            .line(crate::sigma::Kind::File, e.kept, filled_file(&e));
+                        into.judge(Subject::File(&e), begins, &buf[..n - 1])
                     }
-                    None => {
-                        t.unreadable += 1;
-                        false
-                    }
+                    None => t.unreadable += 1,
                 }
             }
-            Line::Other => {
-                into.tally.other += 1;
-                false
-            }
-            Line::Unreadable => {
-                into.tally.unreadable += 1;
-                false
-            }
+            Line::Other => into.batch.tally.other += 1,
+            Line::Unreadable => into.batch.tally.unreadable += 1,
             Line::Marker => {
-                into.tally.unreadable += 1;
+                into.batch.tally.unreadable += 1;
                 *into.pending += 1;
-                false
             }
-        };
-        if full {
-            return Ok(Upto {
-                to: at,
-                last,
-                full: true,
-            });
         }
     }
 }
@@ -2050,24 +2851,24 @@ fn read_from(mut file: std::fs::File, from: u64, into: &mut Into) -> Result<Upto
 struct FileRead {
     inode: u64,
     mtime: i64,
-    /// Its length when it was read.
-    len: u64,
+    /// Its first bytes, at most `HEAD`, of those read.
+    head: Vec<u8>,
     /// Every byte before this was read.
     to: u64,
-    /// Where the last line read begins, a line that could not be read included.
-    last: Option<u64>,
-    /// It stopped because the queue was full.
-    full: bool,
+    /// It stopped at its budget with whole lines left.
+    more: bool,
+    /// Its hour is over and it was read to its length (`FileAt::ended`).
+    ended: bool,
 }
 
-/// Reads one log file of `dir` from the offset `from` gives for it, as the core's reading and
-/// `immunity matches` both do. `over` says that its hour is over (`LogFile::over`). `None` when
-/// the root side deleted it between the listing and now. A failure is the reason, in the
-/// program's words.
+/// Reads one log file of `dir` on from where `held` says it was read, when it is the same file
+/// (`FileAt::goes_on`), else from its start. `over` says that its hour is over
+/// (`LogFile::over`). `None` when the root side deleted it between the listing and now. A failure
+/// is the reason, in the program's words.
 fn read_file(
     dir: &Path,
     name: &str,
-    from: impl FnOnce(&std::fs::Metadata) -> u64,
+    held: Option<&FileAt>,
     over: bool,
     into: &mut Into,
 ) -> Result<Option<FileRead>, (String, Option<i32>)> {
@@ -2081,43 +2882,50 @@ fn read_file(
         Err(e) => return Err(failed(&e)),
     };
     let meta = file.metadata().map_err(|e| failed(&e))?;
-    let from = from(&meta);
+    let mut head = head_of(&file, meta.len()).map_err(|e| failed(&e))?;
+    let goes_on = held.is_some_and(|h| h.goes_on(meta.ino(), &head, meta.len()));
+    let from = held.filter(|_| goes_on).map_or(0, |h| h.offset);
+    // Another file under the name: what was read of the one held and not written is not written
+    // against this one, and what it held past its place counts as deleted unread unless it was
+    // ended.
+    if let Some(h) = held.filter(|_| !goes_on) {
+        into.batch.lets_go(name, !h.ended, true);
+    }
     into.file = name.to_string();
-    into.inode = meta.ino();
     let upto = match read_from(file, from, into) {
         Ok(upto) => upto,
         Err(Stop::Io(e)) => return Err(failed(&e)),
         Err(Stop::Schema(why)) => return Err((why, None)),
     };
-    let mut read = FileRead {
-        inode: meta.ino(),
-        mtime: meta.mtime(),
-        len: meta.len(),
-        to: upto.to,
-        last: upto.last,
-        full: upto.full,
-    };
+    let mut to = upto.to;
     // A file of an hour that is over is not written to again. rotatelogs moves to the next
     // hour's file at whatever it read from the pipe, so a line can end in the old file without
     // its newline and go on at the start of the new one: the end left here is counted as a
     // line that could not be read, once.
-    if !upto.full && upto.to < meta.len() && over {
-        into.tally.unreadable += 1;
-        read.last = Some(upto.to);
-        read.to = meta.len();
+    if !upto.full && to < meta.len() && over {
+        into.batch.tally.unreadable += 1;
+        to = meta.len();
     }
-    Ok(Some(read))
+    head.truncate(to.min(HEAD as u64) as usize);
+    Ok(Some(FileRead {
+        inode: meta.ino(),
+        mtime: meta.mtime(),
+        head,
+        to,
+        more: upto.full,
+        ended: over && !upto.full,
+    }))
 }
 
 /// The log as a look at the source finds it: when the collector was installed, whether it is
 /// established to record file events, the log folder and its files in the order of their
-/// hours, and how many other files the folder holds.
+/// hours.
 struct Opened {
     installed_at: i64,
     collects: Result<(), NotCollected>,
     dir: std::path::PathBuf,
     files: Vec<LogFile>,
-    /// Files in the log folder that are not the collector's own, by their names: not read.
+    /// How many files in the folder are not the collector's.
     foreign: u64,
 }
 
@@ -2211,15 +3019,6 @@ fn real_hour(hour: u64) -> bool {
 /// a second from 0 to 60, as `strftime(3)` writes a leap second.
 fn real_second(second: u64) -> bool {
     real_hour(second / 10_000) && second / 100 % 100 < 60 && second % 100 <= 60
-}
-
-/// The name of the log file a key is of.
-fn name_of(key: Key) -> String {
-    let stamp = |n: u64| format!("{:08}T{:06}", n / 1_000_000, n % 1_000_000);
-    match key.run {
-        0 => format!("{PREFIX}{:08}T{:02}{SUFFIX}", key.at / 100, key.at % 100),
-        run => format!("{PREFIX}{}-{}{SUFFIX}", stamp(run), stamp(key.at)),
-    }
 }
 
 /// Which of `files` the collector is writing now, as far as a look can tell: of those holding
@@ -2596,17 +3395,6 @@ fn tail(path: &Path) -> std::io::Result<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// What a reading came to, for the caller: the state, the reason when it failed, how many
-/// program starts it took, and how many findings the rules opened.
-pub struct Outcome {
-    pub state: &'static str,
-    pub failed: Option<String>,
-    pub starts: i64,
-    pub opened: usize,
-    /// The pass that follows a step, for the caller to take once the step committed (`Pass`).
-    pub pass: Pass,
-}
-
 /// The level's state as the latest reading left it, without reading anything else; `None`
 /// before any reading.
 pub fn state(conn: &Connection) -> rusqlite::Result<Option<String>> {
@@ -2662,252 +3450,20 @@ fn collected(conn: &Connection) -> rusqlite::Result<(bool, Option<String>)> {
         .unwrap_or((false, None)))
 }
 
-/// One reading of the event level under `root`, at `now`, recorded in `tx`: the state, the
-/// counts, where each file was read up to, and coverage of this machine, one row in place of
-/// the one before, as samples keep theirs. With a `pass`, of one step of it (`Pass`); without,
-/// of every file, as a full check reads it. A step that leaves log after its file writes what it
-/// counted and where it is, and leaves the state, what was said, whether file events are
-/// collected and the coverage of the last whole reading standing. With no reading of the level
-/// in the store there is nothing to leave standing, and the reading is whole, as it was before
-/// readings in steps: nothing is read in part where no conclusion stands.
-pub fn read(
-    tx: &Transaction,
-    run_id: &str,
-    machine: &str,
-    root: &Path,
-    now: i64,
-    pass: Option<&Pass>,
-) -> rusqlite::Result<Outcome> {
-    let pass = if state(tx)?.is_some() { pass } else { None };
-    let left = left(tx)?;
-    let awake = Awake::read(tx)?;
-    let found = look(root, &left, now, Rules::shipped(), &awake, pass);
-    let standing = matches!(&found, Found::Read(log) if log.pass.more());
-    // The row stands on its own, so a failed reading leaves it for the next one.
-    match &found {
-        Found::Read(log) => put_awake(tx, log.kept.as_ref())?,
-        Found::NotInstalled => put_awake(tx, None)?,
-        Found::Failed(..) => {}
-    }
-    let mut opened = 0;
-    let state = match &found {
-        Found::NotInstalled => NOT_INSTALLED,
-        Found::Failed(..) => FAILED,
-        Found::Read(log) => log.state,
-    };
-    match &found {
-        // Nothing to continue: an install after this starts its numbering anew.
-        Found::NotInstalled => {
-            put_level(tx, now, state, None, (None, None), (None, None, None))?;
-            tx.execute("DELETE FROM event_files", [])?;
-            tx.execute("DELETE FROM event_arrival", [])?;
-            tx.execute("DELETE FROM event_marks", [])?;
-            tx.execute("DELETE FROM event_cap", [])?;
-        }
-        // Nothing is taken as read.
-        Found::Failed(why, _) => {
-            tx.execute(
-                "INSERT INTO event_level (id, read_at, state, reason) VALUES (1, ?1, ?2, ?3)
-                 ON CONFLICT (id) DO UPDATE SET read_at = excluded.read_at,
-                     state = excluded.state, said_by = NULL, said = NULL,
-                     reason = excluded.reason",
-                params![now, state, why],
-            )?;
-            put_cap(tx, &log_cap(root))?;
-        }
-        Found::Read(log) => {
-            tx.execute("DELETE FROM event_file", [])?;
-            for (name, inode, offset) in &log.files {
-                tx.execute(
-                    "INSERT INTO event_file (name, inode, offset) VALUES (?1, ?2, ?3)",
-                    params![name, *inode as i64, *offset as i64],
-                )?;
-            }
-            // Each count carries where the journal stood, so a full check's start orders it
-            // whatever the clock (`Since::Check`).
-            let t = &log.tally;
-            tx.execute(
-                "INSERT INTO event_count (journal_seq, at, starts, lost, unknown_gaps, unreadable,
-                                          other, removed_cap, removed_unread)
-                 VALUES ((SELECT COALESCE(MAX(seq), 0) FROM journal),
-                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    now,
-                    t.starts,
-                    t.lost,
-                    t.unknown_gaps,
-                    t.unreadable,
-                    t.other,
-                    t.removed_cap,
-                    t.removed_unread
-                ],
-            )?;
-            let f = &log.file_tally;
-            tx.execute(
-                "INSERT INTO event_file_count (journal_seq, at, files, lost, unknown_gaps,
-                                               unreadable)
-                 VALUES ((SELECT COALESCE(MAX(seq), 0) FROM journal), ?1, ?2, ?3, ?4, ?5)",
-                params![now, f.files, f.lost, f.unknown_gaps, f.unreadable],
-            )?;
-            let seq = |k: usize| log.file_seq[k].map(|s| s as i64);
-            // Whether file events are collected is part of the conclusion: a standing step
-            // leaves it as the last whole reading did.
-            tx.execute(
-                "INSERT INTO event_files (id, collected, why, last_create, last_rename)
-                 VALUES (1, ?1, ?2, ?3, ?4)
-                 ON CONFLICT (id) DO UPDATE SET
-                     collected = CASE WHEN ?5 THEN collected ELSE excluded.collected END,
-                     why = CASE WHEN ?5 THEN why ELSE excluded.why END,
-                     last_create = excluded.last_create, last_rename = excluded.last_rename",
-                params![
-                    log.collects.is_ok(),
-                    log.collects.as_ref().err().map(|e| e.why),
-                    seq(0),
-                    seq(1),
-                    standing
-                ],
-            )?;
-            put_arrivals(tx, &log.arrivals)?;
-            tx.execute(
-                "INSERT INTO event_marks (id, pending) VALUES (1, ?1)
-                 ON CONFLICT (id) DO UPDATE SET pending = excluded.pending",
-                [log.pending as i64],
-            )?;
-            put_cap(tx, &log_cap(root))?;
-            opened = record(tx, run_id, machine, now, &log.matched)?;
-            // A line of a file the reading no longer finds cannot be asked about again.
-            tx.execute(
-                "DELETE FROM rule_line WHERE NOT EXISTS (SELECT 1 FROM event_file e
-                     WHERE e.name = rule_line.file AND e.inode = rule_line.inode)",
-                [],
-            )?;
-            let (by, said) = match &log.said {
-                Some((by, said)) => (Some(*by), Some(said.as_str())),
-                None => (None, None),
-            };
-            if standing {
-                tx.execute(
-                    "UPDATE event_level SET last_seq = ?1, version = COALESCE(?2, version),
-                         counted = ?3",
-                    params![
-                        log.last_seq.map(|s| s as i64),
-                        log.version.map(|v| v as i64),
-                        now
-                    ],
-                )?;
-            } else {
-                put_level(
-                    tx,
-                    now,
-                    state,
-                    log.written,
-                    (by, said),
-                    (
-                        log.last_seq.map(|s| s as i64),
-                        log.version.map(|v| v as i64),
-                        Some(now),
-                    ),
-                )?;
-            }
-        }
-    }
-    // A count since the latest finished full check, or since the start of a check that has not
-    // finished, stays, so a clock stepped forward never takes a loss out of `lost_since_check`;
-    // with no check started, two days are kept.
-    let spared = spared_from(tx)?.unwrap_or(i64::MAX);
-    for table in ["event_count", "event_file_count"] {
-        tx.execute(
-            &format!("DELETE FROM {table} WHERE at < ?1 AND journal_seq < ?2"),
-            [now - KEEP, spared],
-        )?;
-    }
-    tx.execute(
-        "DELETE FROM rule_match WHERE hour < ?1",
-        [(now - KEEP_MATCHES) / HOUR],
-    )?;
-    if !standing {
-        let (completeness, reason, cause): (&str, Option<String>, Option<Cause>) = match &found {
-            Found::NotInstalled => (
-                "none",
-                Some("the event level is not installed".to_string()),
-                Some(Cause::NotGiven),
-            ),
-            Found::Failed(why, _) => ("none", Some(why.clone()), Some(Cause::Failed)),
-            Found::Read(log) => covered(log.state, &tally_since(tx, Since::At(now - DAY))?),
-        };
-        let gap = match &found {
-            Found::Failed(_, errno) => Gap::failed(*errno),
-            _ => Gap::when(cause),
-        };
-        tx.execute(
-            "DELETE FROM coverage WHERE reader = ?1 AND scope = ?2 AND kind = ?3",
-            params![READER, machine, KIND],
-        )?;
-        let reading = Reading {
-            reader: READER,
-            scope: machine,
-            kind: KIND,
-            run_id,
-            at: now,
-            observed_at: now,
-        };
-        crate::store::put_coverage(tx, &reading, completeness, reason.as_deref(), &gap)?;
-        // File events have coverage of their own while the level runs; otherwise the level's
-        // state, above, says why nothing is recorded, once.
-        tx.execute(
-            "DELETE FROM coverage WHERE reader = ?1 AND scope = ?2 AND kind = ?3",
-            params![READER, machine, KIND_FILES],
-        )?;
-        if let Found::Read(log) = &found
-            && log.state == RUNNING
-        {
-            let (completeness, reason, cause) = files_covered(
-                &log.collects,
-                &tally_since(tx, Since::At(now - DAY))?,
-                &file_tally_since(tx, Since::At(now - DAY))?,
-            );
-            // What the collector records could not be read: as the system said, with its number.
-            let gap = match &log.collects {
-                Err(n) if n.cause == Cause::Failed => Gap::failed(n.errno),
-                _ => Gap::when(cause),
-            };
-            crate::store::put_coverage(
-                tx,
-                &Reading {
-                    kind: KIND_FILES,
-                    ..reading
-                },
-                completeness,
-                reason.as_deref(),
-                &gap,
-            )?;
-        }
-    }
-    let (starts, failed, pass) = match found {
-        Found::Read(log) => (log.tally.starts, None, log.pass),
-        Found::Failed(why, _) => (0, Some(why), Pass::default()),
-        Found::NotInstalled => (0, None, Pass::default()),
-    };
-    Ok(Outcome {
-        state,
-        starts,
-        failed,
-        opened,
-        pass,
-    })
-}
-
-/// Records what the rules matched in a reading: every rule's count by the hour, and for a rule
-/// that raises a finding, the finding, its count and its latest starts. Returns how many
-/// findings were opened.
+/// Records what the rules matched in a reading: every rule's count by the hour; for a rule that
+/// raises a finding, the finding, its count and its latest events; and a row of the record for
+/// every match, of every rule, in the order it was judged, with the finding it went to. `files`
+/// gives each log file's row by its name. Returns how many findings were opened.
 fn record(
     tx: &Transaction,
     run_id: &str,
     machine: &str,
     now: i64,
     matched: &Matched,
+    files: &BTreeMap<String, i64>,
 ) -> rusqlite::Result<usize> {
     let mut opened = 0;
+    let mut went = BTreeMap::new();
     for (id, hits) in &matched.rules {
         tx.execute(
             "INSERT INTO rule_match (hour, rule, matches) VALUES (?1, ?2, ?3)
@@ -2943,25 +3499,26 @@ fn record(
             )?;
             opened += 1;
         }
-        let mut line = tx.prepare(
-            "INSERT OR REPLACE INTO rule_line (file, inode, offset, rule, finding)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-        )?;
-        for l in &hits.lines {
-            line.execute(params![
-                l.file,
-                l.inode as i64,
-                l.offset as i64,
-                rule,
-                finding
-            ])?;
-        }
         // The first is kept apart only when the latest no longer hold it.
         let first = hits
             .first
             .iter()
             .filter(|_| hits.count > hits.latest.len() as i64);
         keep(tx, &finding, now, hits.count, first.chain(&hits.latest))?;
+        went.insert(rule, finding);
+    }
+    // A match judged twice would be a second row of the same line and rule, which the table
+    // refuses: the write fails rather than count it again.
+    let mut row = tx.prepare(
+        "INSERT INTO rule_line (file, offset, line, rule, finding) VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    for (at, line, meta) in &matched.order {
+        let Some(file) = files.get(&at.file) else {
+            let why = format!("{} was read and has no row of its own", at.file);
+            return Err(rusqlite::Error::ToSqlConversionFailure(why.into()));
+        };
+        let finding = went.get(meta.name.as_str());
+        row.execute(params![file, at.offset as i64, line, meta.name, finding])?;
     }
     Ok(opened)
 }
@@ -3164,65 +3721,22 @@ pub enum Replay {
     },
 }
 
-/// Evaluates the rules over every line of the event log under `root` as it is now, from the
-/// start of each file: what would have matched, for tuning before the findings are trusted.
-pub fn replay(root: &Path, now: i64) -> Replay {
-    match look(
-        root,
-        &Left::default(),
-        now,
-        Rules::shipped(),
-        &Awake::default(),
-        None,
-    ) {
-        Found::NotInstalled => Replay::NotInstalled,
-        Found::Failed(why, _) => Replay::Failed(why),
-        Found::Read(log) => Replay::Read {
-            tally: log.tally,
-            file_tally: log.file_tally,
-            matched: log.matched,
-        },
-    }
-}
-
-// ---- The queue of matches: `immunity matches` reads the log again from a caller's place. ----
-//
-// The store keeps no event. The queue is the day's log read again, evaluated by the same
-// `Into::judge` as the core's own reading, from a place the caller keeps. The place holds what
-// the core's own reading keeps for itself in `event_file`: per log file, its identity and how far
-// it was read. One point in an ordering of the files by name would not do: a clock set ahead
-// leaves a file of a later hour while lines go on into an earlier one, a reinstall within an
-// hour starts a file of the same name again, and a file can be deleted before it was read.
-
-/// The most bytes of matched lines one answer of `immunity matches` holds, each line counted once
-/// for every rule it matched. An argument list is never cut and can be a megabyte, so the
-/// count of matches alone does not keep an answer small.
-pub const BYTES: usize = 4 << 20;
-/// The most log files a place holds. The root side deletes a file not written to for a day, and
-/// a file holds at most an hour or 128 MiB, so a day's log is about 25 files, one more for each
-/// 128 MiB written and one more each time the filter started again: a day of a building Mac at
-/// the rates the installer states is about 170. A log of more cannot be read on from a place,
-/// and an answer fails rather than leave files out of it.
-const MAX_FILES: usize = 4096;
-/// The version of a place's encoding, its first number. This build writes it and reads only
-/// it: a place of another version is refused as any text that is not a place is.
-const PLACE_VERSION: u64 = 3;
-
-/// Where a line of the log is: its file's name and inode, and the byte offset where the line
-/// begins. A log file is only appended to, so a line keeps its place until its file is deleted,
-/// and the inode tells the file from another of the same name made after it.
+/// Where a line of the log is: its file's name, the generation of the name it was read in (the
+/// file's row, `event_file.id`, never given twice; 0 before it is written), and the byte offset
+/// where the line begins. A log file is only appended to, so a line keeps its place until its
+/// file is deleted, and the generation tells the file from another of the same name made after it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LineAt {
     pub file: String,
-    pub inode: u64,
+    pub row: i64,
     pub offset: u64,
 }
 
 /// A line's place as `immunity matches` gives it in `position`: its file's name without `exec-`
-/// and `.jsonl`, the file's inode and the offset, such as
-/// `20261004T000013-20261004T000000-48151623-4096`, or `20261004T00-48151623-4096` in a file an
-/// earlier collector named by its hour. The core's own words, for a reader to keep and compare
-/// whole; nothing reads it back.
+/// and `.jsonl`, the file's generation and the offset, such as
+/// `20261004T000013-20261004T000000-17-4096`, or `20261004T00-17-4096` in a file an earlier
+/// collector named by its hour. The core's own words, for a reader to keep and compare whole; a
+/// verdict reads it back.
 impl std::fmt::Display for LineAt {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         let hour = self
@@ -3230,7 +3744,7 @@ impl std::fmt::Display for LineAt {
             .strip_prefix(PREFIX)
             .and_then(|n| n.strip_suffix(SUFFIX))
             .unwrap_or(&self.file);
-        write!(f, "{hour}-{}-{}", self.inode, self.offset)
+        write!(f, "{hour}-{}-{}", self.row, self.offset)
     }
 }
 
@@ -3240,15 +3754,17 @@ impl LineAt {
     /// place it reads, so a sign, a leading zero or anything left over is refused. A position
     /// names no path: the file is the log file of that hour, looked up in the log folder.
     pub fn parse(text: &str) -> Option<LineAt> {
-        // The inode and the offset are the last two parts: a file's name may hold a dash.
+        // The generation and the offset are the last two parts: a file's name may hold a dash.
         let (rest, offset) = text.rsplit_once('-')?;
-        let (name, inode) = rest.rsplit_once('-')?;
+        let (name, row) = rest.rsplit_once('-')?;
         let file = format!("{PREFIX}{name}{SUFFIX}");
         key_of(&file)?;
+        // Each number is one the store can hold: SQLite's are signed 64 bits.
+        let fits = |n: &str| n.parse::<u64>().ok().filter(|n| i64::try_from(*n).is_ok());
         let at = LineAt {
             file,
-            inode: inode.parse().ok()?,
-            offset: offset.parse().ok()?,
+            row: fits(row)? as i64,
+            offset: fits(offset)?,
         };
         (at.to_string() == text).then_some(at)
     }
@@ -3301,22 +3817,23 @@ fn utc_second(n: u64) -> Option<i64> {
     (secs >= 0 && given.iter().zip(fields).all(|(g, f)| *g == f as i64)).then_some(secs)
 }
 
-/// What the log holds at a position, for a verdict about a match.
+/// What the log holds at a position, for an answer of `immunity matches` and a verdict about a
+/// match.
 pub enum AtLine {
-    /// The log no longer holds it: its file is gone, or a file of that hour now is another one.
+    /// The log no longer holds the line judged: its file is gone, a file of that name now is
+    /// another one, or the line there is not the one judged.
     Gone,
     /// Its file is there and no whole line of an event begins at it.
     NoLine,
-    /// The event whose line begins at it, with the rules it matched, in the order they are
-    /// shipped; none when it matched none.
-    Event(Box<Hit>),
+    /// The event whose line begins at it, and the line's length.
+    Event(Box<Evidence>, usize),
 }
 
-/// Reads the one line at `at` in the log under `root` and evaluates its event at the one place
-/// an event is evaluated (`Into::judge`), as the core's own reading and `immunity matches` do, so a
-/// verdict about a match is about what they matched. Nothing is read from the store or written
-/// to it. A failure is the reason, in the program's words.
-pub fn at_line(root: &Path, at: &LineAt, now: i64) -> Result<AtLine, String> {
+/// Reads the one line at `at` in the log under `root`, in the file of `inode`, and parses its
+/// event, when the line is the one judged: its hash is `line` (`line_hash`). Nothing is
+/// evaluated: what matched it is what the record says (`recorded`). Nothing is read from the
+/// store or written to it. A failure is the reason, in the program's words.
+pub fn at_line(root: &Path, at: &LineAt, inode: u64, line: &str) -> Result<AtLine, String> {
     let failed = |e: &dyn std::fmt::Display| format!("{} in the event level's log: {e}", at.file);
     let file = match std::fs::File::open(root.join(LOG).join(&at.file)) {
         Ok(f) => f,
@@ -3324,7 +3841,7 @@ pub fn at_line(root: &Path, at: &LineAt, now: i64) -> Result<AtLine, String> {
         Err(e) => return Err(failed(&e)),
     };
     let meta = file.metadata().map_err(|e| failed(&e))?;
-    if meta.ino() != at.inode {
+    if meta.ino() != inode {
         return Ok(AtLine::Gone);
     }
     // A log file is only appended to: a position past its end was never a line in it.
@@ -3343,452 +3860,254 @@ pub fn at_line(root: &Path, at: &LineAt, now: i64) -> Result<AtLine, String> {
         }
     }
     let mut buf = Vec::new();
-    let n = lines.read_until(b'\n', &mut buf).map_err(|e| failed(&e))?;
-    if buf.last() != Some(&b'\n') {
+    let Next::Line(n) = next_line(&mut lines, &mut buf).map_err(|e| failed(&e))? else {
         return Ok(AtLine::NoLine);
+    };
+    if line_hash(&buf[..n - 1]) != line {
+        return Ok(AtLine::Gone);
     }
-    let parsed = line(&buf[..n - 1])?;
-    let (mut tally, mut file_tally) = (Tally::default(), FileTally::default());
-    let (mut last_seq, mut file_seq, mut version) = (None, [None; 2], None);
-    let mut matched = Matched::default();
-    let mut pending = 0;
-    let mut sink = Sink {
-        hits: Vec::new(),
-        matches: 0,
-        bytes: 0,
-        limit: usize::MAX,
-    };
-    let mut into = Into {
-        tally: &mut tally,
-        file_tally: &mut file_tally,
-        last_seq: &mut last_seq,
-        file_seq: &mut file_seq,
-        version: &mut version,
-        arrivals: None,
-        lacked: None,
-        pending: &mut pending,
-        now,
-        rules: Rules::shipped(),
-        matched: &mut matched,
-        file: at.file.clone(),
-        inode: at.inode,
-        queue: Some(&mut sink),
-    };
-    let event = match parsed {
-        Line::Exec { start, .. } => {
-            into.judge(Subject::Start(&start), at.offset, n);
-            Evidence::Start(*start)
-        }
+    Ok(match self::line(&buf[..n - 1])? {
+        Line::Exec { start, .. } => AtLine::Event(Box::new(Evidence::Start(*start)), n),
         Line::File {
             event: Some(event), ..
-        } => {
-            into.judge(Subject::File(&event), at.offset, n);
-            Evidence::File(*event)
-        }
-        _ => return Ok(AtLine::NoLine),
-    };
-    Ok(AtLine::Event(Box::new(sink.hits.pop().unwrap_or(Hit {
-        at: at.clone(),
-        event,
-        matched: Vec::new(),
-    }))))
+        } => AtLine::Event(Box::new(Evidence::File(*event)), n),
+        _ => AtLine::NoLine,
+    })
 }
 
-/// A caller's place in the log, as `immunity matches` prints it in `continue_after` and takes it
-/// in `--after`: for each log file, where its name puts it (`Key`), its inode, how far it was
-/// read, and whether it was over (`LogFile::over`) when it was read to its end; the last number
-/// eslogger gave each kind of event read, and the filter's markers no gap has taken in yet, so
-/// that a gap at the seam between two answers is counted once. What arrives is not in it:
-/// `immunity matches` tells what the core's latest reading stored.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Place {
-    /// The last `seq_num` of a program start, a file created and a file renamed.
-    seq: [Option<u64>; 3],
-    pending: u64,
-    /// In the order of their keys, each key once.
-    files: Vec<Kept>,
-}
-
-/// One log file in a place.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct Kept {
-    key: Key,
-    inode: u64,
-    /// Every byte before it was read.
-    offset: u64,
-    /// Read to its end, and over: no line is left in it unread.
-    finished: bool,
-}
-
-/// A place is printed as lower-case hexadecimal of a run of numbers, each an unsigned varint in
-/// protobuf's encoding, written and read by prost: the encoding's version, 3; each of the three
-/// last numbers plus one, 0 for none; the markers pending; how many files; then for each file
-/// the difference of its run from the file's before (from 0 for the first); when the run is the
-/// same, the difference of its start from the file's before (from 0 for the first), else its
-/// start, doubled, plus one when it is finished; its inode; and its offset. Hexadecimal, because
-/// sixteen characters pass through a shell and an argument parser untouched and are checked one
-/// by one, and it needs no encoder of someone else's format but the varint, which is prost's. A
-/// day of 25 files is about 360 bytes, so about 730 characters.
-impl std::fmt::Display for Place {
-    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        let bytes = self.encode();
-        bytes.iter().try_for_each(|b| write!(f, "{b:02x}"))
-    }
-}
-
-impl Place {
-    /// The place's numbers as varints.
-    fn encode(&self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        let mut put = |n: u64| prost::encoding::encode_varint(n, &mut bytes);
-        put(PLACE_VERSION);
-        for s in self.seq {
-            put(s.map_or(0, |s| s + 1));
-        }
-        put(self.pending);
-        put(self.files.len() as u64);
-        let mut before = Key { run: 0, at: 0 };
-        for k in &self.files {
-            put(k.key.run - before.run);
-            let at = if k.key.run == before.run {
-                k.key.at - before.at
-            } else {
-                k.key.at
-            };
-            put((at << 1) | u64::from(k.finished));
-            put(k.inode);
-            put(k.offset);
-            before = k.key;
-        }
-        bytes
-    }
-
-    /// A place as `immunity matches` prints it; `None` for any other text, a place of another
-    /// version of the encoding among them. Read strictly: at most `MAX_FILES` files, each of a
-    /// key some log file's name can give and later than the one before, and the text exactly as
-    /// this build prints the place it reads. That last check also holds the text to lower-case
-    /// hexadecimal, to its length, and to nothing left over, and no two texts are one place. A
-    /// place never names a path: a file is only looked up among those the log folder lists.
-    pub fn parse(text: &str) -> Option<Place> {
-        let bytes: Vec<u8> = text
-            .as_bytes()
-            .chunks(2)
-            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
-            .collect::<Option<_>>()?;
-        let mut buf = bytes.as_slice();
-        let mut next = || prost::encoding::decode_varint(&mut buf).ok();
-        if next()? != PLACE_VERSION {
-            return None;
-        }
-        let mut place = Place::default();
-        for s in &mut place.seq {
-            *s = next()?.checked_sub(1);
-        }
-        place.pending = next()?;
-        let n = next()?;
-        if n > MAX_FILES as u64 {
-            return None;
-        }
-        let mut before = Key { run: 0, at: 0 };
-        for _ in 0..n {
-            let run = before.run.checked_add(next()?)?;
-            let step = next()?;
-            let at = if run == before.run {
-                if step >> 1 == 0 {
-                    return None;
-                }
-                before.at.checked_add(step >> 1)?
-            } else {
-                step >> 1
-            };
-            let key = Key { run, at };
-            if !key.real() {
-                return None;
-            }
-            place.files.push(Kept {
-                key,
-                finished: step & 1 == 1,
-                inode: next()?,
-                offset: next()?,
-            });
-            before = key;
-        }
-        let printed: String = place.encode().iter().map(|b| format!("{b:02x}")).collect();
-        (printed == text).then_some(place)
-    }
-}
-
-/// One event that matched, with the rules it matched.
-#[derive(Debug)]
-pub struct Hit {
+/// One row of the record, as `immunity matches` lists it and a verdict checks it: its number,
+/// its line's place, the inode of its file and the hash of the line judged.
+#[derive(Debug, PartialEq)]
+pub struct Recorded {
+    pub seq: i64,
     pub at: LineAt,
-    pub event: Evidence,
-    /// The rules it matched, each by its file and what it says of itself, in the order they
-    /// are shipped.
-    pub matched: Vec<(&'static str, &'static Meta)>,
+    pub inode: u64,
+    pub line: String,
+    /// The rule's name, its set and its id.
+    pub rule: String,
+    pub finding: Option<String>,
 }
 
-/// What `immunity matches` collects while it reads, and when it stops.
-struct Sink {
-    hits: Vec<Hit>,
-    matches: usize,
-    bytes: usize,
+const RECORDED: &str = "SELECT r.seq, f.name, f.id, r.offset, f.inode, r.line, r.rule, r.finding
+     FROM rule_line r JOIN event_file f ON f.id = r.file";
+
+fn recorded_row(r: &rusqlite::Row) -> rusqlite::Result<Recorded> {
+    Ok(Recorded {
+        seq: r.get(0)?,
+        at: LineAt {
+            file: r.get(1)?,
+            row: r.get(2)?,
+            offset: r.get::<_, i64>(3)? as u64,
+        },
+        inode: r.get::<_, i64>(4)? as u64,
+        line: r.get(5)?,
+        rule: r.get(6)?,
+        finding: r.get(7)?,
+    })
+}
+
+/// The rows of the record after the number `after`, in the order they were written, at most
+/// `limit`.
+pub fn recorded_after(
+    conn: &Connection,
+    after: i64,
     limit: usize,
+) -> rusqlite::Result<Vec<Recorded>> {
+    let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+    conn.prepare(&format!(
+        "{RECORDED} WHERE r.seq > ?1 ORDER BY r.seq LIMIT ?2"
+    ))?
+    .query_map(params![after, limit], recorded_row)?
+    .collect()
 }
 
-/// What `immunity matches` read of the log after a place.
-#[derive(Debug)]
-pub struct Stretch {
-    pub hits: Vec<Hit>,
-    pub tally: Tally,
-    pub file_tally: FileTally,
-    /// The place to read on from.
-    pub place: Place,
-    /// It stopped at its limit with whole lines left to read.
-    pub more: bool,
-    /// Lines the place asked after had not read are gone: deleted, or their file replaced, and
-    /// never evaluated here.
-    pub gone: bool,
-    /// When they are gone, where the log kept goes on: the first line of the first file kept at
-    /// or after the hour of the lines that are gone.
-    pub kept_from: Option<LineAt>,
-    pub state: &'static str,
-    pub said: Option<(&'static str, String)>,
-    pub written: Option<i64>,
-    pub collects: Result<(), NotCollected>,
-    /// Files in the log folder that are not the collector's own: not read.
-    pub foreign: u64,
-    /// What of `KEEPS` the lines it judged did not give, by kind.
-    pub lacked: Lacked,
-}
-
-/// What `immunity matches` found.
-#[derive(Debug)]
-pub enum Queue {
-    /// The collector is not installed. Uninstalling deletes the log, so lines a place had not
-    /// read are `gone`.
-    NotInstalled {
-        gone: bool,
-    },
-    Failed(String),
-    Read(Box<Stretch>),
-}
-
-/// Reads the log under `root` on from `after`, or from the oldest line kept, until it ends or
-/// `limit` matches are taken, evaluating every program start and file event as the core's own
-/// reading does. Nothing is read from the store or written to it.
-///
-/// A file the place holds with the same inode is read on from its offset. A file it does not
-/// hold is read from its start, whatever its name; so is one of a held name with another inode,
-/// or shorter than the offset, which is another file. A held file that is gone, or replaced,
-/// had lines the place had not read when the root side's note of its deletion gives a size other
-/// than the offset, or, with no note, when it was not finished: then the answer says the
-/// lines are `gone`.
-pub fn queue(root: &Path, after: Option<&Place>, limit: usize, now: i64, awake: &Awake) -> Queue {
-    let Opened {
-        installed_at,
-        collects,
-        dir,
-        files,
-        foreign,
-    } = match open(root) {
-        Ok(opened) => opened,
-        Err(None) => {
-            return Queue::NotInstalled {
-                gone: after.is_some_and(|p| p.files.iter().any(|k| !k.finished)),
-            };
-        }
-        Err(Some((why, _))) => return Queue::Failed(why),
-    };
-    if files.len() > MAX_FILES {
-        return Queue::Failed(format!(
-            "the event level's log holds {} files, more than the {MAX_FILES} a place in it holds",
-            files.len()
-        ));
-    }
-    let failed = |name: &str, e: std::io::Error| format!("{name} in the event level's log: {e}");
-    let held = after.cloned().unwrap_or_default();
-    // The most each deleted file held, as the root side noted it.
-    let mut deleted: BTreeMap<String, u64> = BTreeMap::new();
-    match notes(&dir) {
-        Ok(notes) => {
-            for (_, name, bytes, _) in notes {
-                let most = deleted.entry(name).or_default();
-                *most = (*most).max(bytes);
-            }
-        }
-        Err(e) => return Queue::Failed(failed(REMOVED, e)),
-    }
-    // Whether a file the place held, now gone or replaced, had lines the place did not read. The
-    // root side's note says how much it held when it was deleted, and only as much as the place
-    // read is no more: a shorter file is not the one read, as in `removed`. Without a note, as
-    // after an uninstall, only a file read to its end with its hour over held no more.
-    let unread = |k: &Kept| match deleted.get(&name_of(k.key)) {
-        Some(bytes) => *bytes != k.offset,
-        None => !k.finished,
-    };
-    let held_of: BTreeMap<Key, &Kept> = held.files.iter().map(|k| (k.key, k)).collect();
-    // The keys of files the place held whose unread lines are gone.
-    let mut gone: Vec<Key> = held
-        .files
-        .iter()
-        .filter(|k| files.binary_search_by_key(&k.key, |f| f.key).is_err() && unread(k))
-        .map(|k| k.key)
-        .collect();
-    let mut tally = Tally::default();
-    let mut file_tally = FileTally::default();
-    let mut matched = Matched::default();
-    let mut last_seq = held.seq[0];
-    let mut file_seq = [held.seq[1], held.seq[2]];
-    let mut pending = held.pending;
-    let mut version = None;
-    let mut lacked = Lacked::default();
-    let mut sink = Sink {
-        hits: Vec::new(),
-        matches: 0,
-        bytes: 0,
-        limit,
-    };
-    let mut place = Place::default();
-    let mut more = false;
-    let mut stopped = files.len();
-    for (k, f) in files.iter().enumerate() {
-        let mut into = Into {
-            tally: &mut tally,
-            file_tally: &mut file_tally,
-            last_seq: &mut last_seq,
-            file_seq: &mut file_seq,
-            version: &mut version,
-            arrivals: None,
-            lacked: Some(&mut lacked),
-            pending: &mut pending,
-            now,
-            rules: Rules::shipped(),
-            matched: &mut matched,
-            file: String::new(),
-            inode: 0,
-            queue: Some(&mut sink),
-        };
-        // The same file is read on from where the place left it. Another of its name, or one
-        // shorter than the place read, is another file, read from its start, and the one the
-        // place held is replaced.
-        let was = held_of.get(&f.key).copied();
-        let mut replaced = false;
-        let from = |m: &std::fs::Metadata| match was {
-            Some(k) if k.inode == m.ino() && k.offset <= m.len() => k.offset,
-            other => {
-                replaced = other.is_some();
-                0
-            }
-        };
-        let read = match read_file(&dir, &f.name, from, f.over, &mut into) {
-            Ok(Some(read)) => read,
-            // Deleted between the listing and now.
-            Ok(None) => {
-                gone.extend(was.filter(|k| unread(k)).map(|k| k.key));
-                continue;
-            }
-            Err((why, _)) => return Queue::Failed(why),
-        };
-        if replaced {
-            gone.extend(was.filter(|k| unread(k)).map(|k| k.key));
-        }
-        place.files.push(Kept {
-            key: f.key,
-            inode: read.inode,
-            offset: read.to,
-            finished: f.over && read.to == read.len,
-        });
-        if read.full {
-            more = match more_after(&dir, &files, k, read.to) {
-                Ok(more) => more,
-                Err(e) => return Queue::Failed(failed(&f.name, e)),
-            };
-            stopped = k + 1;
-            break;
-        }
-    }
-    // The files after where it stopped keep what the place held of them; the next answer tells
-    // whether they are still the same files.
-    place.files.extend(
-        files[stopped..]
-            .iter()
-            .filter_map(|f| held_of.get(&f.key).map(|k| (*k).clone())),
-    );
-    place.seq = [last_seq, file_seq[0], file_seq[1]];
-    place.pending = pending;
-    let gone_at = gone.into_iter().min();
-    let kept_from = gone_at.and_then(|g| {
-        let f = files.iter().find(|f| f.key >= g)?;
-        let inode = std::fs::metadata(dir.join(&f.name)).ok()?.ino();
-        Some(LineAt {
-            file: f.name.clone(),
-            inode,
-            offset: 0,
-        })
-    });
-    let times: Vec<i64> = files.iter().map(|f| f.mtime.0).collect();
-    let written = times.iter().copied().max();
-    let (state, said, _) = judge(&dir, installed_at, &times, now, awake);
-    Queue::Read(Box::new(Stretch {
-        hits: sink.hits,
-        tally,
-        file_tally,
-        place,
-        more,
-        gone: gone_at.is_some(),
-        kept_from,
-        state,
-        said,
-        written,
-        collects,
-        foreign,
-        lacked,
-    }))
-}
-
-/// Whether a whole line is left after `to` in `files[k]`, or anything in a file after it. A
-/// line still being written at the end of the file is not.
-fn more_after(dir: &Path, files: &[LogFile], k: usize, to: u64) -> std::io::Result<bool> {
-    let mut file = std::fs::File::open(dir.join(&files[k].name))?;
-    if to < file.metadata()?.len() {
-        file.seek(SeekFrom::Start(to))?;
-        let mut buf = Vec::new();
-        BufReader::new(file).read_until(b'\n', &mut buf)?;
-        if buf.last() == Some(&b'\n') {
-            return Ok(true);
-        }
-    }
-    Ok(files[k + 1..]
-        .iter()
-        .any(|f| std::fs::metadata(dir.join(&f.name)).is_ok_and(|m| m.len() > 0)))
-}
-
-/// Which finding the core's own reading recorded the match of `rule` (by its name) on the line
-/// at `at` as going to, for a line it has read; `None` when no finding holds it. The reading
-/// that read the line made the record's table with the table of where it read up to, so a store
-/// without it fails to read.
-pub fn went_to(conn: &Connection, at: &LineAt, rule: &str) -> rusqlite::Result<Option<String>> {
+/// The row of the record of the rule named `rule` on the line at `at`, in the generation of its
+/// file `at` names, when the record holds one.
+pub fn recorded(conn: &Connection, at: &LineAt, rule: &str) -> rusqlite::Result<Option<Recorded>> {
     conn.query_row(
-        "SELECT finding FROM rule_line
-         WHERE file = ?1 AND inode = ?2 AND offset = ?3 AND rule = ?4",
-        params![at.file, at.inode as i64, at.offset as i64, rule],
-        |r| r.get(0),
+        &format!("{RECORDED} WHERE f.id = ?1 AND f.name = ?2 AND r.offset = ?3 AND r.rule = ?4"),
+        params![at.row, at.file, at.offset as i64, rule],
+        recorded_row,
     )
     .optional()
 }
 
-/// Where the core's own reading has read each log file up to, by name: the file's inode and the
-/// offset before which every byte is read. Empty before any reading.
-pub fn read_up_to(conn: &Connection) -> rusqlite::Result<BTreeMap<String, (u64, u64)>> {
-    conn.prepare("SELECT name, inode, offset FROM event_file")?
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                (r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64),
-            ))
-        })?
-        .collect()
+/// What became of the generation of a log file a position names (`LineAt::row`).
+#[derive(Debug, PartialEq)]
+pub enum Generation {
+    /// The store holds it: every match in it is a row of the record.
+    Held,
+    /// It was given and left the store, with the rows on its lines.
+    Went,
+    /// No file was ever given that number.
+    Never,
+}
+
+pub fn generation(conn: &Connection, at: &LineAt) -> rusqlite::Result<Generation> {
+    let held: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM event_file WHERE id = ?1)",
+        [at.row],
+        |r| r.get(0),
+    )?;
+    Ok(match held {
+        true => Generation::Held,
+        false if at.row > 0 && at.row <= given(conn, "event_file")? => Generation::Went,
+        false => Generation::Never,
+    })
+}
+
+/// The largest number SQLite has given a row of `table`, an AUTOINCREMENT table: 0 before any.
+fn given(conn: &Connection, table: &str) -> rusqlite::Result<i64> {
+    let n: Option<i64> = conn
+        .query_row(
+            "SELECT seq FROM sqlite_sequence WHERE name = ?1",
+            [table],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(n.unwrap_or(0))
+}
+
+/// Where the record stands, for a caller's place: the largest number a row of the record was
+/// ever given, and the largest number of a row that went (`remove_file`, `give_gone`).
+pub fn marks(conn: &Connection) -> rusqlite::Result<(i64, i64)> {
+    let removed: Option<i64> = conn
+        .query_row(
+            "SELECT removed_seq FROM event_level WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok((given(conn, "rule_line")?, removed.unwrap_or(0)))
+}
+
+/// When any reader of the log last wrote how far it read; `None` before any reading.
+pub fn evaluated_at(conn: &Connection) -> rusqlite::Result<Option<i64>> {
+    Ok(conn
+        .query_row(
+            "SELECT evaluated_at FROM event_level WHERE id = 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten())
+}
+
+/// The evaluator that wrote last, as its own write recorded it (`Reader::by_evaluator`): which
+/// one, whether that write's pass reached the end of the log with nothing left to read, and when
+/// it wrote; `None` before any evaluator wrote.
+pub fn evaluator(conn: &Connection) -> rusqlite::Result<Option<(i64, bool, i64)>> {
+    let row: Option<(Option<i64>, Option<bool>, Option<i64>)> = conn
+        .query_row(
+            "SELECT evaluator, evaluator_at_end, evaluator_at FROM event_level WHERE id = 1",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    Ok(row.and_then(|(id, at_end, at)| Some((id?, at_end?, at?))))
+}
+
+/// The collector as its own files say at `now`, the way a reading judges it (`open`, `judge`),
+/// beside what the store says was read of the log. Nothing is evaluated and nothing is written.
+pub enum Source {
+    NotInstalled,
+    /// The launch daemon is there and the log folder, or a file in it, cannot be read: why, in the
+    /// program's words. A folder that is not there is one of these.
+    Failed(String),
+    Read(Box<Looked>),
+}
+
+/// What a look at an installed collector's files found.
+pub struct Looked {
+    /// `running`, `silent`, `refused` or `failing`, by `judge`.
+    pub state: &'static str,
+    /// Who printed what, when the root side printed something after the log was last written.
+    pub said: Option<(&'static str, crate::secrets::Text)>,
+    /// When a log file was last written to.
+    pub written: Option<i64>,
+    pub collects: bool,
+    /// Whether a whole line waits past where the store says its file was read: a file the store
+    /// holds no place for, or holds one for another generation of, from its start.
+    pub waiting: bool,
+    /// How many files in the log folder are not the collector's.
+    pub foreign: u64,
+}
+
+/// Looks at the source at `now` for `immunity matches`, as a reading does before it reads.
+pub fn source_now(conn: &Connection, root: &Path, now: i64) -> rusqlite::Result<Source> {
+    let opened = match open(root) {
+        Ok(opened) => opened,
+        Err(None) => return Ok(Source::NotInstalled),
+        Err(Some((why, _))) => return Ok(Source::Failed(why)),
+    };
+    let left = left(conn)?;
+    let mut waiting = false;
+    for f in &opened.files {
+        // The file read on, as the reader takes it (`FileAt::goes_on`); any other from its start.
+        let held = left.files.get(&f.name).filter(|p| !p.gone);
+        let waits = std::fs::File::open(opened.dir.join(&f.name)).and_then(|file| {
+            let from = match held {
+                Some(p) if p.goes_on(f.inode, &head_of(&file, f.len)?, f.len) => p.offset,
+                _ => 0,
+            };
+            whole_line_from(file, from)
+        });
+        match waits {
+            Ok(true) => {
+                waiting = true;
+                break;
+            }
+            Ok(false) => {}
+            // Deleted since the folder was listed: nothing of it waits.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                let why = format!("{} in the event level's log: {e}", f.name);
+                return Ok(Source::Failed(why));
+            }
+        }
+    }
+    let times: Vec<i64> = opened.files.iter().map(|f| f.mtime.0).collect();
+    let (state, said, _) = judge(
+        &opened.dir,
+        opened.installed_at,
+        &times,
+        now,
+        &Awake::read(conn)?,
+    );
+    Ok(Source::Read(Box::new(Looked {
+        state,
+        said: said.map(|(by, text)| (by, crate::secrets::Text::source(&text))),
+        written: times.iter().copied().max(),
+        collects: opened.collects.is_ok(),
+        waiting,
+        foreign: opened.foreign,
+    })))
+}
+
+/// The first bytes of `file`, of `len` bytes, as many as `FileAt::goes_on` compares.
+fn head_of(file: &std::fs::File, len: u64) -> std::io::Result<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let mut head = vec![0; HEAD.min(len as usize)];
+    let got = file.read_at(&mut head, 0)?;
+    head.truncate(got);
+    Ok(head)
+}
+
+/// Whether `file` holds a newline at or after `from`: a whole line begins there.
+fn whole_line_from(mut file: std::fs::File, from: u64) -> std::io::Result<bool> {
+    file.seek(SeekFrom::Start(from))?;
+    let mut bytes = BufReader::new(file);
+    loop {
+        let buf = bytes.fill_buf()?;
+        if buf.is_empty() {
+            return Ok(false);
+        }
+        if buf.contains(&b'\n') {
+            return Ok(true);
+        }
+        let n = buf.len();
+        bytes.consume(n);
+    }
 }
 
 /// The time eslogger gives an event, RFC 3339 in UTC as it writes it
@@ -3827,7 +4146,7 @@ pub fn instant(text: &str) -> Option<(i64, u32)> {
 /// could not be made out, or a line could not be read or an hour was deleted before it was
 /// read, over the last day, which is partial with the cause `covered` gives.
 fn files_covered(
-    collects: &Result<(), NotCollected>,
+    collects: Result<&(), &NotCollected>,
     t: &Tally,
     f: &FileTally,
 ) -> (&'static str, Option<String>, Option<Cause>) {
@@ -3900,14 +4219,14 @@ fn covered(state: &str, t: &Tally) -> (&'static str, Option<String>, Option<Caus
 }
 
 /// The level's row: the state, when the log was last written to, who said what, the last
-/// sequence number and message version read, and up to when notes of deletions are counted.
+/// sequence number and message version read, and the last note of a deletion counted.
 fn put_level(
     tx: &Transaction,
     now: i64,
     state: &str,
     written: Option<i64>,
     (said_by, said): (Option<&str>, Option<&str>),
-    (last_seq, version, counted): (Option<i64>, Option<i64>, Option<i64>),
+    (last_seq, version, counted): (Option<i64>, Option<i64>, Option<&str>),
 ) -> rusqlite::Result<()> {
     // What the collector printed is text from a source, which can quote a command line: kept cut.
     let said = said.map(|s| crate::secrets::Text::source(s).store());
@@ -4012,18 +4331,26 @@ pub fn arrivals(conn: &Connection) -> rusqlite::Result<Arrivals> {
     Ok(arrivals)
 }
 
-/// Where the last reading left off.
-fn left(tx: &Transaction) -> rusqlite::Result<Left> {
+/// Where the last reading left off, as the store holds it.
+fn left(tx: &Connection) -> rusqlite::Result<Left> {
     let files = tx
-        .prepare("SELECT name, inode, offset FROM event_file")?
+        .prepare("SELECT name, id, inode, head_len, head, offset, ended, gone FROM event_file")?
         .query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
-                (r.get::<_, i64>(1)? as u64, r.get::<_, i64>(2)? as u64),
+                FileAt {
+                    id: r.get(1)?,
+                    inode: r.get::<_, i64>(2)? as u64,
+                    head_len: r.get::<_, i64>(3)? as u64,
+                    head: r.get(4)?,
+                    offset: r.get::<_, i64>(5)? as u64,
+                    ended: r.get(6)?,
+                    gone: r.get(7)?,
+                },
             ))
         })?
         .collect::<rusqlite::Result<_>>()?;
-    let row: Option<(Option<i64>, Option<i64>)> = tx
+    let row: Option<(Option<i64>, Option<String>)> = tx
         .query_row(
             "SELECT last_seq, counted FROM event_level WHERE id = 1",
             [],
@@ -4045,7 +4372,7 @@ fn left(tx: &Transaction) -> rusqlite::Result<Left> {
         .optional()?;
     Ok(Left {
         files,
-        last_seq: row.and_then(|r| r.0).map(|s| s as u64),
+        last_seq: row.as_ref().and_then(|r| r.0).map(|s| s as u64),
         file_seq: file_seq.map_or([None, None], |(c, r)| [seq(c), seq(r)]),
         counted: row.and_then(|r| r.1),
         arrivals: arrivals(tx)?,
@@ -4252,11 +4579,13 @@ pub fn level(conn: &Connection, now: i64) -> rusqlite::Result<Option<Level>> {
     // own included; every one when none has finished.
     let check = check_seq(conn)?.unwrap_or(0);
     let (collected, why) = collected(conn)?;
+    let since_check = tally_since(conn, Since::Check(check))?;
+    let last_day = tally_since(conn, Since::At(now - DAY))?;
     let files = Files {
         collected,
         why,
-        since_check: file_tally_since(conn, Since::Check(check))?,
-        last_day: file_tally_since(conn, Since::At(now - DAY))?,
+        since_check: since_check.1,
+        last_day: last_day.1,
     };
     Ok(Some(Level {
         files,
@@ -4270,8 +4599,8 @@ pub fn level(conn: &Connection, now: i64) -> rusqlite::Result<Option<Level>> {
         said: said.map(|s| crate::secrets::Kept::Said.read(&s)),
         reason,
         version,
-        since_check: tally_since(conn, Since::Check(check))?,
-        last_day: tally_since(conn, Since::At(now - DAY))?,
+        since_check: since_check.0,
+        last_day: last_day.0,
         matches_last_day: matches_since(conn, now - DAY)?,
         matches_last_week: matches_since(conn, now - KEEP_MATCHES)?,
         starts_by_hour: starts_by_hour(conn, now)?,
@@ -4376,10 +4705,12 @@ fn matches_since(conn: &Connection, from: i64) -> rusqlite::Result<BTreeMap<Stri
 enum Since {
     /// Those stamped at or after a time: the last day.
     At(i64),
-    /// Those written at or after a journal sequence number, a full check's `run_started`
-    /// (`check_seq`): the check writes it before it reads the log and every write holds the run
-    /// lock, so its own reading and every later one carry a `journal_seq` at or above it and
-    /// every earlier one less, whatever their stamps say.
+    /// Those begun at or after a journal sequence number, a full check's `run_started`
+    /// (`check_seq`): the check commits it before it reads the log, every write of the store
+    /// holds SQLite's write lock, and a row takes its `journal_seq` in the transaction that
+    /// begins it and is added to only while no full check started after that (`put_counts`).
+    /// So the check's own reading and every later one are in rows at or above it and every
+    /// earlier one in rows below, whatever their stamps say.
     Check(i64),
 }
 
@@ -4424,49 +4755,52 @@ fn spared_from(conn: &Connection) -> rusqlite::Result<Option<i64>> {
     Ok(finished.into_iter().chain(open).min())
 }
 
-/// The counts of every reading `since` counts.
-fn tally_since(conn: &Connection, since: Since) -> rusqlite::Result<Tally> {
+/// The counts of every row of `event_count` `since` counts.
+fn tally_since(conn: &Connection, since: Since) -> rusqlite::Result<(Tally, FileTally)> {
     let (rows, at) = since.rows();
+    let (t, f, _) = tally_where(conn, rows, at)?;
+    Ok((t, f))
+}
+
+/// The counts of the rows of `event_count` that `rows` holds of, with its one parameter, and
+/// what some judged line in them did not give.
+fn tally_where(
+    conn: &Connection,
+    rows: &str,
+    at: i64,
+) -> rusqlite::Result<(Tally, FileTally, Lacked)> {
     conn.query_row(
         &format!(
             "SELECT COALESCE(SUM(starts), 0), COALESCE(SUM(lost), 0),
                     COALESCE(SUM(unknown_gaps), 0), COALESCE(SUM(unreadable), 0),
                     COALESCE(SUM(other), 0), COALESCE(SUM(removed_cap), 0),
-                    COALESCE(SUM(removed_unread), 0)
+                    COALESCE(SUM(removed_unread), 0), COALESCE(SUM(files), 0),
+                    COALESCE(SUM(files_lost), 0), COALESCE(SUM(files_unknown_gaps), 0),
+                    COALESCE(SUM(files_unreadable), 0),
+                    COALESCE(MAX(lacked & 1) | MAX(lacked & 2) | MAX(lacked & 4)
+                             | MAX(lacked & 8) | MAX(lacked & 16), 0)
              FROM event_count WHERE {rows}"
         ),
         [at],
         |r| {
-            Ok(Tally {
-                starts: r.get(0)?,
-                lost: r.get(1)?,
-                unknown_gaps: r.get(2)?,
-                unreadable: r.get(3)?,
-                other: r.get(4)?,
-                removed_cap: r.get(5)?,
-                removed_unread: r.get(6)?,
-            })
-        },
-    )
-}
-
-/// The counts of file events of every reading `since` counts.
-fn file_tally_since(conn: &Connection, since: Since) -> rusqlite::Result<FileTally> {
-    let (rows, at) = since.rows();
-    conn.query_row(
-        &format!(
-            "SELECT COALESCE(SUM(files), 0), COALESCE(SUM(lost), 0),
-                    COALESCE(SUM(unknown_gaps), 0), COALESCE(SUM(unreadable), 0)
-             FROM event_file_count WHERE {rows}"
-        ),
-        [at],
-        |r| {
-            Ok(FileTally {
-                files: r.get(0)?,
-                lost: r.get(1)?,
-                unknown_gaps: r.get(2)?,
-                unreadable: r.get(3)?,
-            })
+            Ok((
+                Tally {
+                    starts: r.get(0)?,
+                    lost: r.get(1)?,
+                    unknown_gaps: r.get(2)?,
+                    unreadable: r.get(3)?,
+                    other: r.get(4)?,
+                    removed_cap: r.get(5)?,
+                    removed_unread: r.get(6)?,
+                },
+                FileTally {
+                    files: r.get(7)?,
+                    lost: r.get(8)?,
+                    unknown_gaps: r.get(9)?,
+                    unreadable: r.get(10)?,
+                },
+                Lacked::from_bits(r.get(11)?),
+            ))
         },
     )
 }
@@ -4854,158 +5188,6 @@ mod tests {
         }
     }
 
-    /// Bytes as lower-case hexadecimal, as a place is printed.
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
-    }
-
-    /// Numbers as varints, as a place encodes them.
-    fn varints(numbers: &[u64]) -> Vec<u8> {
-        let mut out = Vec::new();
-        for n in numbers {
-            prost::encoding::encode_varint(*n, &mut out);
-        }
-        out
-    }
-
-    /// A file of a later collector's, of run `run` started at `at`, both `YYYYMMDDHHMMSS`.
-    fn kept_at(run: u64, at: u64, i: u64, finished: bool) -> Kept {
-        Kept {
-            key: Key { run, at },
-            inode: 150_000_000 + i * 40_000,
-            offset: 300_000_000 + i,
-            finished,
-        }
-    }
-
-    #[test]
-    fn a_place_is_taken_back_only_as_the_core_printed_it_and_a_day_of_it_is_short() {
-        // `--after` comes from a caller. Only the text the core printed is taken: anything
-        // else is refused as a misuse, and nothing in a place names a path. A day of 25 files
-        // fits a command line.
-        let day = Place {
-            seq: [Some(4_000_000), None, Some(0)],
-            pending: 1,
-            files: (0..25u64)
-                .map(|i| {
-                    let run = 20261003000013 + if i < 24 { 0 } else { 1_000_000 };
-                    let at = if i < 24 {
-                        20261003000000 + i * 10_000
-                    } else {
-                        20261004000000
-                    };
-                    kept_at(run, at, i, i < 24)
-                })
-                .collect(),
-        };
-        let text = day.to_string();
-        assert_eq!(Place::parse(&text), Some(day.clone()));
-        assert!(text.len() < 800, "{} characters", text.len());
-        println!("a place of a day of 25 files: {} characters", text.len());
-        let empty = Place::default().to_string();
-        assert_eq!(empty, "030000000000");
-        assert_eq!(Place::parse(&empty), Some(Place::default()));
-        let head = [3, 0, 0, 0, 0];
-        let one = |run: u64, step: u64| hex(&varints(&[&head[..], &[1, run, step, 7, 9]].concat()));
-        assert!(Place::parse(&one(20261004000013, 20261004000000 << 1)).is_some());
-        let two = |run: u64, step: u64| {
-            hex(&varints(
-                &[
-                    &head[..],
-                    &[
-                        2,
-                        20261004000013,
-                        20261004000000 << 1,
-                        7,
-                        9,
-                        run,
-                        step,
-                        8,
-                        9,
-                    ],
-                ]
-                .concat(),
-            ))
-        };
-        // The same run, a later start; a later run, any start.
-        assert!(Place::parse(&two(0, 2)).is_some());
-        assert!(Place::parse(&two(1, 20261003000000 << 1)).is_some());
-        let most = |n: u64| Place {
-            files: (0..n)
-                .map(|i| {
-                    let second = i / 3600 * 10_000 + i / 60 % 60 * 100 + i % 60;
-                    kept_at(20261001000000, 20261001000000 + second, i, false)
-                })
-                .collect(),
-            ..Place::default()
-        };
-        let full = most(MAX_FILES as u64);
-        assert_eq!(Place::parse(&full.to_string()), Some(full));
-        let too_many = most(MAX_FILES as u64 + 1).to_string();
-        for bad in [
-            String::new(),
-            "../../../etc/x".to_string(),
-            text.to_uppercase(),
-            format!("{text}00"),
-            text[..text.len() - 1].to_string(),
-            format!(" {text}"),
-            hex(&varints(&[3, 0, 0, 0, 0])),
-            hex(&varints(&[0, 0, 0, 0, 0])),
-            // The same numbers in a longer varint: one place, one text.
-            "820000000000000000000000".to_string(),
-            // Seconds that are not seconds, and a file that does not follow the one before.
-            one(20261004000013, 20261304000000 << 1),
-            one(20261004000013, 20261004240000 << 1),
-            one(20261004000013, 20261004006000 << 1),
-            one(20261004000013, 20261004000061 << 1),
-            one(20261304000013, 20261004000000 << 1),
-            one(120261004000013, 20261004000000 << 1),
-            one(20261004000013, 0),
-            one(0, 20261004000000 << 1),
-            two(0, 0),
-            two(0, 1),
-            // Version 3 holds nothing of what arrives.
-            hex(&varints(&[3, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0])),
-            hex(&varints(&[3, 0, 0, 0, 0, 3, 7, 0, 0, 0, 0, 0, 0])),
-            too_many,
-            "0".repeat(20_000),
-        ] {
-            assert_eq!(Place::parse(&bad), None, "{bad}");
-        }
-    }
-
-    #[test]
-    fn a_place_of_an_earlier_encoding_is_refused_and_never_read_on() {
-        // A place is read only in the encoding this build prints. One an earlier build printed,
-        // version 1 or 2, is refused as any other text is, so `--after` fails and never reads as
-        // nothing new after it.
-        let held = |numbers: &[u64]| hex(&varints(numbers));
-        let version_1 = held(&[1, 5, 0, 0, 2, 2026100400 << 1 | 1, 7, 90, 2 << 1, 8, 30]);
-        let version_2 = held(&[
-            2,
-            5,
-            0,
-            0,
-            1,
-            3 + 7,
-            0,
-            1,
-            2,
-            0,
-            1,
-            20261004000013,
-            20261004000000 << 1,
-            7,
-            90,
-        ]);
-        for bad in [version_1, version_2] {
-            assert_eq!(Place::parse(&bad), None, "{bad}");
-        }
-        // The same numbers under this build's version are a place.
-        let now = held(&[3, 5, 0, 0, 1, 1, 20261004000013, 20261004000000 << 1, 7, 90]);
-        assert!(Place::parse(&now).is_some());
-    }
-
     #[test]
     fn only_a_file_named_as_a_collector_names_one_is_a_log_file_and_names_sort_as_written() {
         // A file in the log folder is the collector's only in an exact form a collector writes,
@@ -5027,13 +5209,6 @@ mod tests {
                 at: 2026123123
             })
         );
-        assert_eq!(
-            name_of(Key {
-                run: 0,
-                at: 2026100409
-            }),
-            "exec-20261004T09.jsonl"
-        );
         let new = "exec-20261004T093012-20261004T090000.jsonl";
         let k = key_of(new).unwrap();
         assert_eq!(
@@ -5043,7 +5218,6 @@ mod tests {
                 at: 20261004090000
             }
         );
-        assert_eq!(name_of(k), new);
         let later_in_run = key_of("exec-20261004T093012-20261004T094511.jsonl").unwrap();
         let next_run = key_of("exec-20261004T100002-20261004T100000.jsonl").unwrap();
         let leap = key_of("exec-20261231T235960-20261231T235960.jsonl").unwrap();
@@ -5693,7 +5867,8 @@ mod tests {
 
     #[test]
     fn counts_older_than_two_days_are_deleted_so_the_store_does_not_grow_with_the_readings() {
-        // The watcher reads at every sample for as long as the Mac runs.
+        // The watcher reads for as long as the Mac runs. A reading that read nothing writes no
+        // row of counts; each of these reads a program start.
         let dir = crate::common::Scratch::at(
             std::env::temp_dir().join(format!("immunity-events-keep-{}", std::process::id())),
         );
@@ -5703,15 +5878,22 @@ mod tests {
         std::fs::write(&plist, "<plist/>").unwrap();
         let mut conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
         let now = 1_791_000_000;
-        let read = |conn: &mut rusqlite::Connection, at: i64| {
+        let mut text = String::new();
+        let mut read = |conn: &mut rusqlite::Connection, at: i64, seq: u64| {
+            text.push_str(&(exec(seq, OBJECT) + "\n"));
+            std::fs::write(
+                dir.join("root").join(LOG).join("exec-20261004T00.jsonl"),
+                &text,
+            )
+            .unwrap();
             let tx = conn.transaction().unwrap();
             crate::store::put_entity(&tx, "machine:mac").unwrap();
-            read(&tx, "events-1", "machine:mac", &dir.join("root"), at, None).unwrap();
+            read(&tx, "events-1", "machine:mac", &dir.join("root"), at).unwrap();
             tx.commit().unwrap();
         };
-        read(&mut conn, now - KEEP - 1);
-        read(&mut conn, now - KEEP + 1);
-        read(&mut conn, now);
+        read(&mut conn, now - KEEP - 1, 1);
+        read(&mut conn, now - KEEP + 1, 2);
+        read(&mut conn, now, 3);
         let kept: Vec<i64> = conn
             .prepare("SELECT at FROM event_count ORDER BY at")
             .unwrap()
@@ -5739,7 +5921,7 @@ mod tests {
         let read = |conn: &mut rusqlite::Connection, at: i64| {
             let tx = conn.transaction().unwrap();
             crate::store::put_entity(&tx, "machine:mac").unwrap();
-            read(&tx, "events-1", "machine:mac", &dir.join("root"), at, None).unwrap();
+            read(&tx, "events-1", "machine:mac", &dir.join("root"), at).unwrap();
             tx.commit().unwrap();
             basis(conn).unwrap()
         };
@@ -5801,7 +5983,7 @@ mod tests {
             std::fs::write(&log, &text).unwrap();
             let tx = conn.transaction().unwrap();
             crate::store::put_entity(&tx, "machine:mac").unwrap();
-            read(&tx, "events-1", "machine:mac", &dir.join("root"), at, None).unwrap();
+            read(&tx, "events-1", "machine:mac", &dir.join("root"), at).unwrap();
             tx.commit().unwrap();
         }
         let l = level(&conn, now).unwrap().unwrap();
@@ -5835,25 +6017,8 @@ mod tests {
             &[now],
         );
         sql("INSERT INTO event_files (id, collected) VALUES (1, 0)", &[]);
-        let restart = |at: i64| {
-            sql(
-                "INSERT INTO event_count VALUES ((SELECT COALESCE(MAX(seq), 0) FROM journal),
-                     ?1, 1, 0, ?2, 0, 0, 0, 0)",
-                &[at, 1],
-            )
-        };
-        let read = |at: i64, files_lost: i64| {
-            sql(
-                "INSERT INTO event_count VALUES ((SELECT COALESCE(MAX(seq), 0) FROM journal),
-                     ?1, 1, 0, 0, 0, 0, 0, 0)",
-                &[at],
-            );
-            sql(
-                "INSERT INTO event_file_count VALUES ((SELECT COALESCE(MAX(seq), 0) FROM journal),
-                     ?1, 1, ?2, 0, 0)",
-                &[at, files_lost],
-            );
-        };
+        let restart = |at: i64| counted(&conn, at, [1, 1, 0, 0]);
+        let read = |at: i64, files_lost: i64| counted(&conn, at, [1, 0, 1, files_lost]);
         let note = |at: i64, run: &str, entry: &str| {
             crate::store::journal_note(&conn, at, run, entry, "").unwrap()
         };
@@ -5947,7 +6112,7 @@ mod tests {
             std::fs::write(&log, &lines).unwrap();
             let tx = conn.transaction().unwrap();
             crate::store::put_entity(&tx, "machine:mac").unwrap();
-            read(&tx, "events-1", "machine:mac", &root, at, None).unwrap();
+            read(&tx, "events-1", "machine:mac", &root, at).unwrap();
             tx.commit().unwrap();
         };
         let lost = |conn: &Connection| level(conn, start).unwrap().unwrap().lost_since_check();
@@ -5996,7 +6161,7 @@ mod tests {
             std::fs::write(&log, &lines).unwrap();
             let tx = conn.transaction().unwrap();
             crate::store::put_entity(&tx, "machine:mac").unwrap();
-            read(&tx, "events-1", "machine:mac", &root, at, None).unwrap();
+            read(&tx, "events-1", "machine:mac", &root, at).unwrap();
             tx.commit().unwrap();
         };
         crate::store::journal_note(&conn, start, "first", "run_started", "").unwrap();
@@ -6042,19 +6207,10 @@ mod tests {
         std::fs::write(dir.join(LOG).join("exec-20261004T00.jsonl"), &text).unwrap();
         let rules = Rules::shipped();
         let t = std::time::Instant::now();
-        let found = look(
-            &dir,
-            &Left::default(),
-            1_791_000_000,
-            rules,
-            &Awake::default(),
-            None,
-        );
+        let found = whole_log(&dir, &Left::default(), 1_791_000_000);
         let took = t.elapsed();
         let _ = std::fs::remove_dir_all(&dir);
-        let Found::Read(log) = found else {
-            panic!("{found:?}");
-        };
+        let log = found.batch;
         assert_eq!((log.tally.starts, log.tally.lost), (n as i64, 0));
         let counts: Vec<(&str, i64)> = log
             .matched
@@ -6140,7 +6296,6 @@ mod tests {
                     "machine:mac",
                     &dir.join("root"),
                     1_791_000_000,
-                    None,
                 )
                 .unwrap();
                 tx.commit().unwrap();
@@ -6191,19 +6346,10 @@ mod tests {
         }
         std::fs::write(dir.join(LOG).join("exec-20261004T00.jsonl"), &text).unwrap();
         let t = std::time::Instant::now();
-        let found = look(
-            &dir,
-            &Left::default(),
-            1_791_000_000,
-            Rules::shipped(),
-            &Awake::default(),
-            None,
-        );
+        let found = whole_log(&dir, &Left::default(), 1_791_000_000);
         let took = t.elapsed();
         let _ = std::fs::remove_dir_all(&dir);
-        let Found::Read(log) = found else {
-            panic!("{found:?}");
-        };
+        let log = found.batch;
         assert_eq!(
             log.file_tally,
             FileTally {
@@ -6387,19 +6533,27 @@ mod tests {
         assert_eq!(said.caveats.len(), said.notes.len());
     }
 
+    /// A row of counts as a reading writes it, begun at `at` after the journal's latest entry:
+    /// program starts, restarts of their numbering, file events and file events lost.
+    fn counted(conn: &Connection, at: i64, [starts, unknown_gaps, files, files_lost]: [i64; 4]) {
+        conn.execute(
+            "INSERT INTO event_count (journal_seq, at, starts, lost, unknown_gaps, unreadable,
+                 other, removed_cap, removed_unread, files, files_lost, files_unknown_gaps,
+                 files_unreadable, lacked)
+             VALUES ((SELECT COALESCE(MAX(seq), 0) FROM journal), ?1, ?2, 0, ?3, 0, 0, 0, 0, ?4,
+                     ?5, 0, 0, 0)",
+            params![at, starts, unknown_gaps, files, files_lost],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn the_series_by_hour_adds_up_to_the_count_of_the_day_and_puts_each_reading_in_its_hour() {
         // The panel and the page draw the day as 24 bars beside its count. A bar that loses a
         // reading at the edge of the day, or counts one twice, makes the drawing disagree
         // with the number next to it.
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE event_count (at INTEGER NOT NULL, starts INTEGER NOT NULL,
-                 lost INTEGER NOT NULL, unknown_gaps INTEGER NOT NULL,
-                 unreadable INTEGER NOT NULL, other INTEGER NOT NULL,
-                 removed_cap INTEGER NOT NULL, removed_unread INTEGER NOT NULL);",
-        )
-        .unwrap();
+        let dir = crate::common::Scratch::new("events-series");
+        let conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
         let now = 1_791_000_000;
         for (at, starts) in [
             (now - DAY - 1, 1_000),    // older than the day: in neither
@@ -6411,18 +6565,14 @@ mod tests {
             (now, 2),                  // this reading: the last hour
             (now + 90, 4),             // a clock set back: the last hour, as the day counts it
         ] {
-            conn.execute(
-                "INSERT INTO event_count VALUES (?1, ?2, 0, 0, 0, 0, 0, 0)",
-                params![at, starts],
-            )
-            .unwrap();
+            counted(&conn, at, [starts, 0, 0, 0]);
         }
         let h = starts_by_hour(&conn, now).unwrap();
         assert_eq!(h.ends_at, now);
         assert_eq!(h.counts.len(), HOURS);
         assert_eq!(
             h.counts.iter().sum::<i64>(),
-            tally_since(&conn, Since::At(now - DAY)).unwrap().starts
+            tally_since(&conn, Since::At(now - DAY)).unwrap().0.starts
         );
         assert_eq!((h.counts[0], h.counts[1]), (8, 3));
         assert_eq!((h.counts[21], h.counts[22], h.counts[23]), (11, 0, 11));
@@ -6432,14 +6582,8 @@ mod tests {
     fn the_minutes_of_the_last_hour_add_up_to_the_last_hour_of_the_day() {
         // The panel draws the last hour by the minute and the page the day by the hour: the
         // two drawings must not disagree about the same hour.
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE event_count (at INTEGER NOT NULL, starts INTEGER NOT NULL,
-                 lost INTEGER NOT NULL, unknown_gaps INTEGER NOT NULL,
-                 unreadable INTEGER NOT NULL, other INTEGER NOT NULL,
-                 removed_cap INTEGER NOT NULL, removed_unread INTEGER NOT NULL);",
-        )
-        .unwrap();
+        let dir = crate::common::Scratch::new("events-series");
+        let conn = crate::store::open_or_make(&dir.join("store.db")).unwrap();
         let now = 1_791_000_000;
         for (at, starts) in [
             (now - HOUR, 1_000),  // an hour old: the hour before, in neither
@@ -6449,11 +6593,7 @@ mod tests {
             (now - 59, 7),        // the last minute
             (now + 90, 4),        // a clock set back: the last minute
         ] {
-            conn.execute(
-                "INSERT INTO event_count VALUES (?1, ?2, 0, 0, 0, 0, 0, 0)",
-                params![at, starts],
-            )
-            .unwrap();
+            counted(&conn, at, [starts, 0, 0, 0]);
         }
         let m = starts_by_minute(&conn, now).unwrap();
         let h = starts_by_hour(&conn, now).unwrap();
@@ -6704,22 +6844,20 @@ mod tests {
             .unwrap();
     }
 
-    /// A reading of the log under `root` on from `left`: what it says arrives, and where it left
-    /// off, for the next.
+    /// A reader of the log under `root` from `left`, which has read every whole line to the end.
+    fn whole_log(root: &Path, left: &Left, now: i64) -> Reader {
+        let mut r = Reader::at(root, left.clone());
+        r.relist(now, u64::MAX, |_, _| {});
+        assert!(
+            matches!(r.found, Found::Read),
+            "the log is read: {:?}",
+            r.found
+        );
+        r
+    }
+
     fn looked(root: &Path, left: &Left, now: i64) -> Left {
-        let Found::Read(log) = look(root, left, now, Rules::shipped(), &Awake::default(), None)
-        else {
-            panic!("the log is read");
-        };
-        Left {
-            files: log
-                .files
-                .iter()
-                .map(|(name, inode, to)| (name.clone(), (*inode, *to)))
-                .collect(),
-            arrivals: log.arrivals,
-            ..Left::default()
-        }
+        whole_log(root, left, now).left
     }
 
     #[test]
@@ -6817,7 +6955,7 @@ mod tests {
         let read = |conn: &mut rusqlite::Connection| {
             let tx = conn.transaction().unwrap();
             crate::store::put_entity(&tx, "machine:mac").unwrap();
-            read(&tx, "events-1", "machine:mac", &root, now, None).unwrap();
+            read(&tx, "events-1", "machine:mac", &root, now).unwrap();
             tx.commit().unwrap();
             told(&arrivals(conn).unwrap())
         };
@@ -7263,7 +7401,7 @@ mod tests {
             let mut conn = crate::store::open_or_make(&path).unwrap();
             let tx = conn.transaction().unwrap();
             crate::store::put_entity(&tx, "machine:mac").unwrap();
-            let state = read(&tx, "events-1", "machine:mac", root, now, None)
+            let state = read(&tx, "events-1", "machine:mac", root, now)
                 .unwrap()
                 .state;
             tx.commit().unwrap();

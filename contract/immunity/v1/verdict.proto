@@ -30,8 +30,9 @@
 // events.
 //
 // The event log keeps about a day. A `suspicious` verdict about a match whose line is no longer in
-// the log (the file its position names is gone, or another file has its name now) is still
-// recorded and raises its finding, with no event kept, and `RecordedVerdict.event_gone` says so:
+// the log (the file its position names is gone, another file has its name now, or the line there
+// is not the one the core judged) is still recorded and raises its finding, with no event kept,
+// and `RecordedVerdict.event_gone` says so:
 // the core did not read the event again and did not check that the rule matched it, and the
 // meaning of the finding it raises says so. The rule must still be one this build ships, the
 // position one `immunity matches` prints, and the time its file's name gives a real one, not later

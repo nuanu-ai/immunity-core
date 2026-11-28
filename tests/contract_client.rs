@@ -6,7 +6,7 @@
 mod common;
 
 use serde_json::Value;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
@@ -124,10 +124,16 @@ impl Mac {
     }
 
     /// The position of the log's line at `offset`, as `immunity matches` prints it.
+    /// A line's position as `immunity matches` prints it: in the generation of the log file the
+    /// store holds.
     fn position(&self, offset: usize) -> String {
-        let log = self.path("system").join(LOG).join(H00);
-        let inode = std::fs::metadata(log).unwrap().ino();
-        format!("20261004T00-{inode}-{offset}")
+        let generation: i64 = rusqlite::Connection::open(self.path("store.db"))
+            .unwrap()
+            .query_row("SELECT id FROM event_file WHERE name = ?1", [H00], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        format!("20261004T00-{generation}-{offset}")
     }
 
     fn immunity(&self, args: &[&str]) -> Output {

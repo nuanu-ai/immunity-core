@@ -138,10 +138,21 @@ impl Dir {
         std::fs::metadata(self.log().join(name)).unwrap().ino()
     }
 
-    /// A match's position in a log file, as the answer gives it.
+    /// A match's position in a log file, as the answer gives it: in the generation of the file
+    /// the store holds now.
     fn position(&self, name: &str, offset: usize) -> String {
         let hour = &name["exec-".len()..name.len() - ".jsonl".len()];
-        format!("{hour}-{}-{offset}", self.inode(name))
+        format!("{hour}-{}-{offset}", self.generation(name))
+    }
+
+    /// The generation of the log file `name` the store holds, its row.
+    fn generation(&self, name: &str) -> i64 {
+        rusqlite::Connection::open(self.store())
+            .unwrap()
+            .query_row("SELECT id FROM event_file WHERE name = ?1", [name], |r| {
+                r.get(0)
+            })
+            .unwrap()
     }
 
     /// `immunity <args> <more> --store <this store>`, to be run.
@@ -214,8 +225,16 @@ impl Dir {
             .clone()
     }
 
-    /// `immunity matches <args>` over this root and store, as it ran.
+    /// `immunity matches <args>` over this root and store, as it ran, after a reading of the
+    /// log by the core, as the watcher's evaluator reads every line within a second: the answer
+    /// is the record of what the core read.
     fn matches_output(&self, args: &[&str]) -> Output {
+        self.run();
+        self.matches_unread(args)
+    }
+
+    /// `immunity matches <args>` over this root and store, with no reading of the log before it.
+    fn matches_unread(&self, args: &[&str]) -> Output {
         let root = self.root();
         let mut more: Vec<&std::ffi::OsStr> = vec![root.as_os_str()];
         more.extend(args.iter().map(std::ffi::OsStr::new));
@@ -237,11 +256,12 @@ impl Dir {
         serde_json::from_slice(&out.stdout).unwrap()
     }
 
-    /// `immunity matches <args>` in binary: its stdout.
+    /// `immunity matches <args>` in binary, with no reading of the log before it, so that it
+    /// answers from the store a `matches` before it read: its stdout.
     fn matches_binary(&self, args: &[&str]) -> Vec<u8> {
         let mut args = args.to_vec();
         args.push("--proto");
-        let out = self.matches_output(&args);
+        let out = self.matches_unread(&args);
         assert!(out.status.success());
         out.stdout
     }
@@ -729,7 +749,7 @@ fn a_signer_value_of_the_wrong_shape_is_absent_and_the_line_is_still_read_judged
     dir.append(H00, &lines);
     let m = dir.matches(&[]);
     assert_eq!(rules_of(&m), [PADDING, AXIOS].repeat(flags.len()), "{m:#}");
-    let stretch = &m["stretch"];
+    let stretch = &m["evaluated"];
     assert_eq!(
         (
             &stretch["program_starts"],
@@ -898,7 +918,7 @@ fn holders<'a>(v: &'a Value, key: &'a str, marker: &str, out: &mut Vec<&'a str>)
 }
 
 /// Reads an answer through every page of `limit` matches, from `after`: the matches, the
-/// stretches' tallies of program starts, unreadable lines, lost starts and file events, and the
+/// answers' tallies of program starts, unreadable lines, lost starts and file events, and the
 /// place to read on from.
 fn pages(dir: &Dir, after: Option<String>, limit: &str) -> (Vec<Value>, [i64; 4], String) {
     let mut after = after;
@@ -922,7 +942,7 @@ fn pages(dir: &Dir, after: Option<String>, limit: &str) -> (Vec<Value>, [i64; 4]
         .iter()
         .enumerate()
         {
-            sums[i] += m["stretch"][k].as_i64().unwrap();
+            sums[i] += m["evaluated"][k].as_i64().unwrap();
         }
         after = m["continue_after"].as_str().map(str::to_string);
         if m["more"] == false {
@@ -936,8 +956,8 @@ fn pages(dir: &Dir, after: Option<String>, limit: &str) -> (Vec<Value>, [i64; 4]
 fn a_match_says_which_finding_it_went_to_as_the_core_recorded_it_with_the_person_s_answer() {
     // The response layer looks into what the core is not sure of, so it gets every match of
     // every level with the event whole. A high one names the finding the core's own reading
-    // put it in, with that finding's state now, so a match the person already answered is not
-    // taken for a new one; or it says the core has not read it yet.
+    // put it in, in the transaction that recorded the match, with that finding's state now, so a
+    // match the person already answered is not taken for a new one.
     let dir = Dir::new("levels");
     dir.install();
     dir.run();
@@ -957,7 +977,12 @@ fn a_match_says_which_finding_it_went_to_as_the_core_recorded_it_with_the_person
     assert_eq!(rules_of(&m), [PADDING, SW_VERS]);
     let (high, medium) = (&m["matches"][0], &m["matches"][1]);
     assert_eq!(high["position"], dir.position(H00, 0));
-    assert_eq!(raised_of(&m), [r("not_read_yet"), r("below_high")]);
+    let [first] = <[String; 1]>::try_from(dir.findings_of(PADDING)).unwrap();
+    assert_eq!(raised_of(&m), [to(&first, "open"), r("below_high")]);
+    assert_eq!(
+        m["matches"][0]["findings"][0]["rule"],
+        format!("sigma:{PADDING}")
+    );
     assert_eq!(
         medium["rule"],
         json!({
@@ -1031,16 +1056,6 @@ fn a_match_says_which_finding_it_went_to_as_the_core_recorded_it_with_the_person
         })
     );
 
-    // Once the core's own reading has read it, the high match names its finding.
-    dir.run();
-    let [first] = <[String; 1]>::try_from(dir.findings_of(PADDING)).unwrap();
-    let m = dir.matches(&[]);
-    assert_eq!(raised_of(&m), [to(&first, "open"), r("below_high")]);
-    assert_eq!(
-        m["matches"][0]["findings"][0]["rule"],
-        format!("sigma:{PADDING}")
-    );
-
     // The person marks it expected; a repeat goes to the same finding, and both matches say
     // it was answered.
     dir.report(&["finding", &first, "expected", "--reason", "invented"]);
@@ -1060,7 +1075,6 @@ fn a_match_says_which_finding_it_went_to_as_the_core_recorded_it_with_the_person
     // it went to, the closed one too, whatever the times the findings were last seen.
     dir.report(&["finding", &first, "seen"]);
     dir.append(H00, &start(4, &now_time(), "/bin/sh", "/bin/dd", &DD));
-    assert_eq!(raised_of(&dir.matches(&[]))[3], r("not_read_yet"));
     dir.run();
     let second = dir
         .findings_of(PADDING)
@@ -1089,10 +1103,9 @@ fn a_match_says_which_finding_it_went_to_as_the_core_recorded_it_with_the_person
 
 #[test]
 fn a_line_read_with_no_finding_says_so_and_a_store_without_the_record_fails_and_is_never_guessed() {
-    // A match the core's own reading read, and that no finding holds, says so; it is never tied
-    // to a finding by a guess. A store of this format keeps which finding each match went to
-    // from its first reading: one that lacks the record is damaged, and the answer fails rather
-    // than say that no finding holds a match.
+    // A match whose row of the record names no finding says so; it is never tied to a finding
+    // by a guess. A store of this format keeps every match with the finding it went to: one that
+    // lacks the record is damaged, and the answer fails rather than say that nothing matched.
     let dir = Dir::new("unrecorded");
     dir.install();
     dir.run();
@@ -1101,8 +1114,9 @@ fn a_line_read_with_no_finding_says_so_and_a_store_without_the_record_fails_and_
     let [first] = <[String; 1]>::try_from(dir.findings_of(PADDING)).unwrap();
     assert_eq!(raised_of(&dir.matches(&[])), [to(&first, "open")]);
     let store = rusqlite::Connection::open(dir.store()).unwrap();
-    // As a build that lacked the rule leaves it: read, and nothing recorded of it.
-    store.execute("DELETE FROM rule_line", []).unwrap();
+    store
+        .execute("UPDATE rule_line SET finding = NULL", [])
+        .unwrap();
     assert_eq!(raised_of(&dir.matches(&[])), [r("no_finding")]);
     // A file the reading no longer finds takes its record with it.
     dir.append(H00, &dd(3));
@@ -1112,7 +1126,7 @@ fn a_line_read_with_no_finding_says_so_and_a_store_without_the_record_fails_and_
             .query_row("SELECT COUNT(*) FROM rule_line", [], |r| r.get(0))
             .unwrap()
     };
-    assert_eq!(count(), 1);
+    assert_eq!(count(), 2);
     dir.append(H01, &git(4));
     dir.tidy_away(H00);
     dir.run();
@@ -1120,7 +1134,7 @@ fn a_line_read_with_no_finding_says_so_and_a_store_without_the_record_fails_and_
     dir.append(H01, &dd(5));
     dir.run();
     store.execute_batch("DROP TABLE rule_line").unwrap();
-    let out = dir.matches_output(&["--json"]);
+    let out = dir.matches_unread(&["--json"]);
     assert_eq!(out.status.code(), Some(3));
     let failure: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(
@@ -1138,27 +1152,28 @@ fn a_line_read_with_no_finding_says_so_and_a_store_without_the_record_fails_and_
 }
 
 #[test]
-fn not_read_yet_is_no_promise_a_line_deleted_before_the_core_read_it_raises_nothing() {
-    // `not_read_yet` says the core's reading has not reached the line, not that it will: a
-    // line deleted first is never read and no finding holds it. A reader that kept the place
-    // is told the lines are gone.
+fn a_line_deleted_before_the_core_read_it_raises_nothing_and_is_counted_as_removed_unread() {
+    // A line the core has not read is in no answer, and a line deleted before it read it is
+    // never read and no finding holds it: a reader that kept the place is told that a file
+    // went with lines the core had not read, never left to take the silence for calm.
     let dir = Dir::new("deleted-unread");
     dir.install();
     dir.run();
     dir.append(H00, &(git(1) + &dd(2)));
-    let m = dir.matches(&[]);
-    assert_eq!(raised_of(&m), [r("not_read_yet")]);
+    let m = dir.matches_unread(&["--json"]);
+    let m: Value = serde_json::from_slice(&m.stdout).unwrap();
+    assert_eq!(m["matches"], json!([]));
     let place = m["continue_after"].as_str().unwrap().to_string();
     dir.append(H00, &dd(3));
     dir.append(H01, &git(4));
+    // Notes are counted by the second after the reading before.
+    common::next_second();
     dir.tidy_away(H00);
+    common::next_second();
     dir.run();
     assert!(dir.findings_of(PADDING).is_empty());
     let m = dir.matches(&["--after", &place]);
-    assert_eq!(
-        (&m["stretch"]["gone"], &m["stretch"]["kept_from"]),
-        (&json!(true), &json!(dir.position(H01, 0)))
-    );
+    assert_eq!(m["evaluated"]["files_removed_unread"], 1, "{m:#}");
     assert_eq!(m["matches"], json!([]));
 }
 
@@ -1219,7 +1234,7 @@ fn what_immunity_matches_gives_and_what_the_core_s_reading_counts_agree_for_the_
         })
         .collect();
     assert_eq!(given, replayed);
-    let s = &m["stretch"];
+    let s = &m["evaluated"];
     let r = &replay;
     assert_eq!(
         (&s["program_starts"], &s["file_events"]),
@@ -1298,7 +1313,7 @@ fn reading_on_from_the_place_given_gives_the_rest_and_nothing_twice_across_the_t
             ),
         ]
     );
-    let s = &whole["stretch"];
+    let s = &whole["evaluated"];
     assert_eq!(
         (
             &s["program_starts"],
@@ -1321,15 +1336,15 @@ fn reading_on_from_the_place_given_gives_the_rest_and_nothing_twice_across_the_t
     dir.append(H01, &dd(9));
     let next = dir.matches(&["--after", &after]);
     assert_eq!(next["matches"].as_array().unwrap().len(), 1);
-    assert_eq!(next["stretch"]["program_starts_lost"], 0);
+    assert_eq!(next["evaluated"]["program_starts_lost"], 0);
     // A gap at the seam is counted exactly, however far back the number before it is.
     let at = next["continue_after"].as_str().unwrap().to_string();
     dir.append(H01, &dd(12));
     let gap = dir.matches(&["--after", &at]);
     assert_eq!(
         (
-            &gap["stretch"]["program_starts_lost"],
-            &gap["stretch"]["program_starts_unknown_losses"]
+            &gap["evaluated"]["program_starts_lost"],
+            &gap["evaluated"]["program_starts_unknown_losses"]
         ),
         (&json!(2), &json!(0))
     );
@@ -1338,7 +1353,7 @@ fn reading_on_from_the_place_given_gives_the_rest_and_nothing_twice_across_the_t
     dir.append(H01, &dd(1));
     let restarted = dir.matches(&["--after", &at]);
     assert_eq!(
-        restarted["stretch"]["program_starts_unknown_losses"], 1,
+        restarted["evaluated"]["program_starts_unknown_losses"], 1,
         "{restarted:#}"
     );
 }
@@ -1364,7 +1379,7 @@ fn a_clock_set_ahead_and_back_skips_no_line_and_hides_no_match() {
     assert_eq!(sums, [2, 0, 0, 0]);
     let m = dir.matches(&["--after", &place]);
     assert_eq!(
-        (&m["matches"], &m["stretch"]["gone"]),
+        (&m["matches"], &m["evaluated"]["gone"]),
         (&json!([]), &json!(false))
     );
     // The file of the later hour is deleted by the tidy job a day on, read to its end; the
@@ -1373,7 +1388,7 @@ fn a_clock_set_ahead_and_back_skips_no_line_and_hides_no_match() {
     dir.append(H00, &dd(4));
     let m = dir.matches(&["--after", &place]);
     assert_eq!(rules_of(&m), [PADDING]);
-    assert_eq!(m["stretch"]["gone"], false);
+    assert_eq!(m["evaluated"]["gone"], false);
     // The real hour's file is not over while it is still written to after the later one, so a
     // line still being written at its end is left for the next answer, not counted lost.
     let place = m["continue_after"].as_str().unwrap().to_string();
@@ -1384,7 +1399,7 @@ fn a_clock_set_ahead_and_back_skips_no_line_and_hides_no_match() {
     dir.append(H00, head);
     let m = dir.matches(&["--after", &place]);
     assert_eq!(
-        (&m["matches"], &m["stretch"]["unreadable_lines"]),
+        (&m["matches"], &m["evaluated"]["unreadable_lines"]),
         (&json!([]), &json!(0))
     );
     dir.append(H00, rest);
@@ -1395,9 +1410,9 @@ fn a_clock_set_ahead_and_back_skips_no_line_and_hides_no_match() {
 #[test]
 fn a_file_made_again_under_the_same_name_is_read_from_its_start_shorter_or_longer() {
     // Uninstalled and installed again within one hour, the collector writes a new file of the
-    // same name. A place in the old one is not a place in it: the new file is read from its
-    // start, whether it is shorter or longer than the place, and the lines the old one held
-    // unread are gone.
+    // same name, shorter or longer than the old one was read. It is read from its start: its
+    // match is given at its first line, once, and its position names the new file. The old file
+    // may have held lines no reading read, so the old place is told they are gone.
     for (tag, lines) in [("shorter", 1), ("longer", 12)] {
         let dir = Dir::new(tag);
         dir.install();
@@ -1407,30 +1422,22 @@ fn a_file_made_again_under_the_same_name_is_read_from_its_start_shorter_or_longe
             .as_str()
             .unwrap()
             .to_string();
+        let old = dir.inode(H00);
         dir.uninstall();
         let m = dir.matches(&["--after", &place]);
-        assert_eq!(
-            (
-                &m["collector"]["state"],
-                &m["stretch"]["gone"],
-                &m["continue_after"]
-            ),
-            (&json!("not_installed"), &json!(true), &Value::Null)
-        );
+        assert_eq!(m["collector"]["state"], "not_installed");
         dir.install();
         dir.append(H00, &(dd(1) + &(2..=lines).map(git).collect::<String>()));
+        assert_ne!(dir.inode(H00), old);
         let m = dir.matches(&["--after", &place]);
         assert_eq!(rules_of(&m), [PADDING], "{tag}");
-        assert_eq!(
-            (&m["stretch"]["gone"], &m["stretch"]["kept_from"]),
-            (&json!(true), &json!(dir.position(H00, 0))),
-            "{tag}"
-        );
-        // A position names the new file, never a line of the old one.
+        assert_eq!(m["evaluated"]["gone"], true, "{tag}");
         assert_eq!(m["matches"][0]["position"], dir.position(H00, 0));
+        let again = dir.matches(&["--after", m["continue_after"].as_str().unwrap()]);
+        assert_eq!(again["matches"], json!([]));
     }
-    // A file emptied in place keeps its inode and is shorter than the place: it too is read
-    // from its start, and what it held is gone.
+    // A file emptied in place keeps its inode and is shorter than where it was read: it too is
+    // read from its start.
     let dir = Dir::new("emptied");
     dir.install();
     dir.run();
@@ -1447,91 +1454,7 @@ fn a_file_made_again_under_the_same_name_is_read_from_its_start_shorter_or_longe
     dir.append(H00, &dd(1));
     let m = dir.matches(&["--after", &place]);
     assert_eq!(rules_of(&m), [PADDING]);
-    assert_eq!(m["stretch"]["gone"], true);
-}
-
-#[test]
-fn a_file_the_place_held_is_gone_only_when_lines_in_it_were_not_read() {
-    // A file deleted after the place read it to its end, with its hour over, lost nothing;
-    // one deleted with lines after the place, or with its end not yet reached, did.
-    let dir = Dir::new("gone");
-    dir.install();
-    dir.run();
-    let place = |args: &[&str]| -> String {
-        dir.matches(args)["continue_after"]
-            .as_str()
-            .unwrap()
-            .to_string()
-    };
-    dir.append(H00, &(git(1) + &git(2)));
-    // Taken while H00 was the newest file: its end not seen.
-    let early = place(&[]);
-    std::thread::sleep(Duration::from_millis(20));
-    dir.append(H01, &git(3));
-    // Taken once H00's hour was over and it was read to its end.
-    let over = place(&[]);
-    // A clock set back writes to H00 again, and then forward to H01.
-    dir.append(H00, &dd(4));
-    std::thread::sleep(Duration::from_millis(20));
-    dir.append(H01, &git(5));
-    let finished = place(&[]);
-    dir.tidy_away(H00);
-    let m = dir.matches(&["--after", &finished]);
-    assert_eq!(
-        (
-            &m["stretch"]["gone"],
-            &m["stretch"]["kept_from"],
-            &m["matches"]
-        ),
-        (&json!(false), &Value::Null, &json!([]))
-    );
-    // The root side's note says H00 held more than the earlier places read: those lines are
-    // gone, and the log kept goes on in H01. A later note of a smaller file of the same name
-    // does not take that back.
-    dir.append("removed", &format!("0 {H00} 1 age\n"));
-    for p in [&early, &over] {
-        let m = dir.matches(&["--after", p]);
-        assert_eq!(
-            (&m["stretch"]["gone"], &m["stretch"]["kept_from"]),
-            (&json!(true), &json!(dir.position(H01, 0)))
-        );
-        assert_eq!(m["matches"], json!([]));
-    }
-    // Deleted without a note, a file whose end the place had not seen is gone, and with
-    // nothing kept there is nowhere to go on from.
-    std::fs::remove_file(dir.log().join(H01)).unwrap();
-    let m = dir.matches(&["--after", &finished]);
-    assert_eq!(
-        (&m["stretch"]["gone"], &m["stretch"]["kept_from"]),
-        (&json!(true), &Value::Null)
-    );
-    // An answer that stopped at its limit in a file whose hour is over had not read it to its
-    // end either.
-    let (h02, h03) = ("exec-20261004T02.jsonl", "exec-20261004T03.jsonl");
-    dir.append(h02, &(dd(6) + &dd(7)));
-    std::thread::sleep(Duration::from_millis(20));
-    dir.append(h03, &git(8));
-    let stopped = place(&["--limit", "1"]);
-    std::fs::remove_file(dir.log().join(h02)).unwrap();
-    let m = dir.matches(&["--after", &stopped]);
-    assert_eq!(
-        (&m["stretch"]["gone"], &m["stretch"]["kept_from"]),
-        (&json!(true), &json!(dir.position(h03, 0)))
-    );
-    // A note of a file shorter than where the place read it to its end is not the file the
-    // place read, as the core's own reading counts it: what that one held is gone.
-    let (h04, h05) = ("exec-20261004T04.jsonl", "exec-20261004T05.jsonl");
-    dir.append(h04, &git(9));
-    std::thread::sleep(Duration::from_millis(20));
-    dir.append(h05, &git(10));
-    let read = place(&[]);
-    std::fs::remove_file(dir.log().join(h04)).unwrap();
-    dir.append("removed", &format!("0 {h04} 1 age\n"));
-    let m = dir.matches(&["--after", &read]);
-    assert_eq!(
-        (&m["stretch"]["gone"], &m["stretch"]["kept_from"]),
-        (&json!(true), &json!(dir.position(h05, 0)))
-    );
+    assert_eq!(m["matches"][0]["position"], dir.position(H00, 0));
 }
 
 /// A place as an earlier build printed it, version 1: the last numbers, then for each
@@ -1601,7 +1524,7 @@ fn a_log_an_earlier_collector_began_and_a_later_one_went_on_is_read_in_the_order
             dir.position(n2, 0),
         ]
     );
-    assert_eq!(whole["stretch"]["program_starts_lost"], 0);
+    assert_eq!(whole["evaluated"]["program_starts_lost"], 0);
     let (paged, sums, _) = pages(&dir, None, "1");
     assert_eq!(&json!(paged), &whole["matches"]);
     assert_eq!(sums, [6, 0, 0, 0]);
@@ -1725,14 +1648,12 @@ fn no_collector_and_no_log_is_an_answer_that_says_so_and_names_the_rules_that_ju
         (
             &m["collector"]["state"],
             &m["collector"]["status_state"],
-            &m["continue_after"],
             &m["more"],
-            &m["stretch"]["gone"]
+            &m["evaluated"]["gone"]
         ),
         (
             &json!("not_installed"),
             &json!("not_installed"),
-            &Value::Null,
             &json!(false),
             &json!(false)
         )
@@ -1752,14 +1673,17 @@ fn no_collector_and_no_log_is_an_answer_that_says_so_and_names_the_rules_that_ju
             .all(|u| u["detail_text"] == "the event level is not installed")
     );
     // Uninstalling deletes the log. A place in an empty log lost nothing with it; a place in a
-    // file still being written did.
+    // file still being written did, since lines may have come that no reading read.
     dir.install();
     let empty = dir.matches(&[])["continue_after"]
         .as_str()
         .unwrap()
         .to_string();
     dir.uninstall();
-    assert_eq!(dir.matches(&["--after", &empty])["stretch"]["gone"], false);
+    assert_eq!(
+        dir.matches(&["--after", &empty])["evaluated"]["gone"],
+        false
+    );
     dir.install();
     dir.append(H00, &git(1));
     std::thread::sleep(Duration::from_millis(20));
@@ -1769,7 +1693,7 @@ fn no_collector_and_no_log_is_an_answer_that_says_so_and_names_the_rules_that_ju
         .unwrap()
         .to_string();
     dir.uninstall();
-    assert_eq!(dir.matches(&["--after", &place])["stretch"]["gone"], true);
+    assert_eq!(dir.matches(&["--after", &place])["evaluated"]["gone"], true);
 }
 
 #[test]
@@ -1780,7 +1704,7 @@ fn without_a_store_the_answer_is_a_failure_that_never_parses_as_a_calm_message()
     let dir = Dir::new("no-store");
     dir.install();
     dir.append(H00, &dd(1));
-    let out = dir.matches_output(&["--json"]);
+    let out = dir.matches_unread(&["--json"]);
     assert_eq!(out.status.code(), Some(3));
     let failure: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(
@@ -1796,32 +1720,26 @@ fn without_a_store_the_answer_is_a_failure_that_never_parses_as_a_calm_message()
     assert!(said.ends_with("`immunity run` makes it"), "{said}");
     let parsed: v1::Matches = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(parsed.format, 0);
-    let out = dir.matches_output(&[]);
+    let out = dir.matches_unread(&[]);
     assert_eq!((out.status.code(), out.stdout.len()), (Some(3), 0));
-    // A log that cannot be read is a failure of the same shape.
+    // A log the evaluator cannot read is an answer that says it failed, with why, and a
+    // collector a reader built before 1.41.0 does not take for running.
     dir.run();
     dir.append(
         H00,
         "{\"schema_version\":2,\"seq_num\":2,\"time\":\"2026-10-04T00:00:02Z\",\"event\":{\"exec\":{}}}\n",
     );
-    let out = dir.matches_output(&["--json"]);
-    assert_eq!(out.status.code(), Some(1));
-    let failure: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let m = dir.matches(&[]);
+    let e = &m["evaluated"];
     assert_eq!(
-        (&failure["errors"][0]["code"], failure.get("format")),
-        (&json!("log_unreadable"), None)
+        (&e["state"], &m["collector"]["state"]),
+        (&json!("failed"), &json!("failed")),
+        "{m:#}"
     );
-    // A log of more files than a place holds fails rather than leave files out of the place.
-    std::fs::write(dir.log().join(H00), "").unwrap();
-    for i in 0..=4096 {
-        let (h, m, s) = (i / 3600, i / 60 % 60, i % 60);
-        dir.append(
-            &format!("exec-20261001T000000-20261001T{h:02}{m:02}{s:02}.jsonl"),
-            "",
-        );
-    }
-    let out = dir.matches_output(&["--json"]);
-    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        e["reason_text"].as_str().is_some_and(|r| !r.is_empty()),
+        "{e:#}"
+    );
 }
 
 #[test]
@@ -2003,7 +1921,7 @@ fn unreadable_lines_are_counted_and_the_rules_that_judge_nothing_are_named_with_
             + &git(2)),
     );
     let m = dir.matches(&[]);
-    let s = &m["stretch"];
+    let s = &m["evaluated"];
     assert_eq!(
         (
             &s["program_starts"],
@@ -2013,12 +1931,9 @@ fn unreadable_lines_are_counted_and_the_rules_that_judge_nothing_are_named_with_
         (&json!(2), &json!(1), &json!(1))
     );
     assert_eq!(m["collector"]["file_events_collected"], false);
-    // An earlier collector keeps none of what a later one keeps, and the answer names it once
-    // the core's reading has read its lines; until then nothing is known of it.
+    // An earlier collector keeps none of what a later one keeps, and the answer names it.
     let all = json!(["identity", "script", "signature"]);
-    assert_eq!(m["collector"]["not_yet_known"], all);
-    dir.run();
-    assert_eq!(dir.matches(&[])["collector"]["not_kept"], all);
+    assert_eq!(m["collector"]["not_kept"], all);
     let unevaluated = m["unevaluated"].as_array().unwrap();
     let in_part = unevaluated.iter().find(|u| u["file"] == IN_PART).unwrap();
     assert_eq!(
@@ -2842,7 +2757,7 @@ fn a_secret_on_a_command_line_reaches_no_answer_and_no_file_and_the_rules_beside
         start["cuts"],
         json!([{ "argument": 2, "kind": "gitleaks:curl-auth-user", "length": 24 }])
     );
-    assert_eq!(raised_of(&before)[0].0, "not_read_yet");
+    assert_eq!(raised_of(&before)[0].0, "finding");
     let found = [dir.findings_named(JAMF), dir.findings_named(CREDENTIALS)].concat();
     assert_eq!(found.len(), 2, "{found:?}");
 
@@ -3024,12 +2939,14 @@ fn the_limit_holds_and_more_says_when_it_cut() {
         (m["matches"].as_array().unwrap().len(), &m["more"]),
         (2, &json!(true))
     );
-    assert_eq!(m["stretch"]["program_starts"], 2);
     let rest = dir.matches(&["--after", m["continue_after"].as_str().unwrap()]);
     assert_eq!(
         (rest["matches"].as_array().unwrap().len(), &rest["more"]),
         (3, &json!(false))
     );
+    // The counts of answers read on one from another add up: every line once.
+    let starts = |a: &Value| a["evaluated"]["program_starts"].as_i64().unwrap();
+    assert_eq!(starts(&m) + starts(&rest), 5);
     // A limit that falls on the last line leaves nothing more; one that falls on the last line
     // of an hour leaves the next hour's; a line still being written is not more.
     assert_eq!(dir.matches(&["--limit", "5"])["more"], false);
@@ -3158,8 +3075,17 @@ fn the_text_of_matches_is_its_message_and_an_argument_cannot_pose_as_the_program
         level => level,
     };
     assert!(row.starts_with(&format!("  {level} ")), "{row}");
-    let state = m["collector"]["state"].as_str().unwrap().replace('_', " ");
-    assert!(text.contains(&format!("  Collector    {state}")), "{text}");
+    // No watcher runs here: the text says the evaluator is behind and the collector is not
+    // judged running, as the message does.
+    assert_eq!(m["evaluated"]["behind"], "no_watcher");
+    assert!(
+        text.contains("  Evaluator    behind: no watcher runs"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  Collector    not judged running here"),
+        "{text}"
+    );
     for reference in [
         first["position"].as_str().unwrap(),
         first["rule"]["name"].as_str().unwrap(),

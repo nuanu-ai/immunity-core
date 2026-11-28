@@ -72,9 +72,10 @@ fi
 # checks the store and takes the run lock, or `store::write_held`, for a step of the watcher, which
 # holds the lock across its steps. Only a connection that can write writes, so the rule is held on
 # where one is opened, in the same files and with the same tests left out as the rule above. Left
-# out by name: the full check (`run`) and the watcher's two readings, which hold the lock and open
-# the store themselves. A `use` of those functions, which would hide them under another name, is
-# refused anywhere.
+# out by name: the full check (`run`) and the watcher's reading (`read_held`), which hold the lock
+# and open the store themselves, and the watcher's evaluator (`connect` in src/evaluator.rs), which
+# takes the run lock for each write and opens the store under it. A `use` of those functions, which
+# would hide them under another name, is refused anywhere.
 if writes=$(printf '%s\n' "$sources" | /usr/bin/grep -vxE \
   'src/store\.rs|src/.*/tests(\.rs|/.*)' | /usr/bin/tr '\n' '\0' |
   /usr/bin/xargs -0 /usr/bin/awk '
@@ -85,7 +86,7 @@ if writes=$(printf '%s\n' "$sources" | /usr/bin/grep -vxE \
   match($0, /^ *(pub(\([a-z]+\))? )?fn [a-z0-9_]+/) {
     fn = substr($0, RSTART, RLENGTH); sub(/.* /, "", fn) }
   /store::(open|open_or_make)\(|Connection::open/ &&
-    FILENAME ":" fn !~ /^src\/(main\.rs:(run|read_events_held)|watch\.rs:read_held)$/ ||
+    FILENAME ":" fn !~ /^src\/(main\.rs:run|watch\.rs:read_held|evaluator\.rs:connect)$/ ||
     /store::write_held\(/ && FILENAME ":" fn !~ /^src\/watch\.rs:(sample|mark)$/ ||
     /^ *use crate::store::.*(open|write_held)/ {
     print FILENAME ":" FNR ": " $0 }'); then

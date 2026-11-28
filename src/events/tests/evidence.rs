@@ -47,7 +47,6 @@ fn a_finding_about_a_file_keeps_who_signed_the_program_that_wrote_it_as_the_line
         "machine:mac",
         &dir.join("root"),
         1_791_000_000,
-        None,
     )
     .unwrap();
     tx.commit().unwrap();

@@ -3,50 +3,60 @@
 //! (`contract/immunity/v1/matches.proto`). The response layer reads it to look into what the core
 //! is not sure of.
 //!
-//! Nothing is written to the store. The queue is the day's log read again from the caller's
-//! place by `events::queue`, which evaluates every event with the same call the core's own
-//! reading makes (`Into::judge` in `src/events.rs`), so the two cannot disagree about what
-//! matched. The place is the one the core's own reading keeps for itself, per log file its
-//! identity and how far it was read, printed as an opaque token (`events::Place`). The store is
-//! only read: whether the core's own reading has read a line yet, which finding its match went
-//! to, and the collector's state as `immunity status` serves it.
+//! Nothing is written to the store and nothing is evaluated. The answer is the record the
+//! evaluator keeps (`rule_line`, see `events::record`): a row for every match of every rule, by a
+//! number never given twice, each with its line's place and the finding it went to. The event is
+//! read again from the log at that place (`events::at_line`), and given only when it is the line
+//! judged. The caller's place is the store's id, the number of the last row it was given and the
+//! running totals of the counts its answer reached (`events::totals`), printed as an opaque token
+//! (`Place`); a place from another store, or one this version cannot read, is refused with what to
+//! do.
 //!
-//! No false calm. An answer with no matches says how many lines were read and evaluated, how
-//! many could not be, what eslogger's numbering says was lost, whether lines were deleted
-//! before they were read, the collector's state, and which rules judge nothing here and why. A
-//! collector that is not installed is an answer that says so, not a failure. A store that is not
-//! there, or cannot be read, is a failure: without it the answer could not say what became of a
-//! match.
-//!
-//! Which finding a match went to is what the core's own reading recorded when it read the line
-//! (`rule_line`), never a guess.
+//! No false calm. An answer with no matches says how far the evaluator has read and whether it
+//! reads now (`Evaluated`), what the lines it counted after the caller's place held, what was
+//! lost, unreadable or deleted before it was read, whether rows the caller had not been given went
+//! with their files, the collector's state, and which rules judge nothing here and why. All of it
+//! is read in one transaction, so the rows, the counts and how far the evaluator read are of one
+//! moment. A store that is not there, or cannot be read, is a failure.
 
 use crate::contract::{v1, value_of};
-use crate::events::{
-    self, Arrival, Arrivals, Evidence, Hit, Lacked, LineAt, Place, Queue, Stretch,
-};
+use crate::events::{self, Arrival, Arrivals, AtLine, Evidence, Lacked};
 use crate::known::whole;
-use crate::outcome::{Code, Outcome};
+use crate::outcome::Outcome;
 use crate::secrets::Args;
 use crate::sigma::{Kind, Meta, Placement, Reason, Rules};
 use crate::{answer, findings, known, store, verdict};
 use rusqlite::Connection;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 /// The version of the contract this build prints.
 const FORMAT: u32 = 1;
 /// How many matches one answer holds unless `--limit` says otherwise. A match of a program
 /// start is about a kilobyte of JSON and half that in binary, measured on invented logs, so the
-/// default answer is about a megabyte; `events::BYTES` keeps one with very long command lines
-/// small too.
+/// default answer is about a megabyte; `BYTES` keeps one with very long command lines small too.
 pub const LIMIT: usize = 1000;
+/// The most bytes of matched lines one answer holds, each line counted once for every rule it
+/// matched. An argument list is never cut and can be a megabyte, so the count of matches alone
+/// does not keep an answer small.
+pub const BYTES: usize = 4 << 20;
+/// The version of a place's encoding, its first number. This build writes it and reads only it.
+const PLACE_VERSION: u64 = 4;
+/// How long the evaluator may be silent while a whole line waits past where the store says it
+/// read, before it is taken as not advancing, in seconds. While it reads it writes at least once
+/// a second (`evaluator::IDLE`), and the time of its write is kept to the second, so a healthy
+/// evaluator is at most two seconds old by it; three leaves a second for a write that waits on
+/// SQLite's lock.
+const LATE: i64 = 3;
 
-const AFTER: &str = "--after takes the place an answer of immunity matches printed in continue_after, whole and as printed; for a place this version cannot read, such as one an earlier version printed, run immunity matches without --after to start from the oldest line kept";
+const AFTER: &str = "--after takes the place an answer of immunity matches printed in continue_after, whole and as printed; for a place this version cannot read, such as one an earlier version printed, run immunity matches without --after to start from the oldest match kept";
+const OTHER_STORE: &str = "the place given with --after was printed for another store, or for this one before it was made again: run immunity matches without --after to start from the oldest match kept";
 
-/// Why rules for file events judge nothing while the collector is not installed.
+/// Why rules for file events judge nothing while the collector is not installed, and before the
+/// store holds any reading of it.
 const NOT_INSTALLED: &str = "the event level is not installed";
+const NOT_READ: &str = "the store holds no reading of the event level yet";
 
 /// `immunity matches`.
 pub struct MatchesArgs {
@@ -77,11 +87,14 @@ pub fn parse(
             }
             "--limit" => {
                 single = true;
+                // More than the record can hold is all of it: the number is capped before any
+                // arithmetic, so it never wraps.
                 limit = crate::value(it, &arg)?
-                    .parse::<usize>()
+                    .parse::<u64>()
                     .ok()
                     .filter(|n| *n > 0)
-                    .ok_or("--limit takes a whole number of at least 1")?;
+                    .ok_or("--limit takes a whole number of at least 1")?
+                    .min(i64::MAX as u64 - 1) as usize;
             }
             _ => return Err(format!("unexpected argument: {arg}")),
         }
@@ -97,10 +110,87 @@ pub fn parse(
     })
 }
 
+/// A caller's place in the record: the store it was printed for, the number of the last row of
+/// the record it was given, and the running totals of the counts its answer reached
+/// (`events::totals`): the next answer gives the rows after the one and the totals now less these.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Place {
+    store: [u8; 16],
+    seq: u64,
+    totals: [u64; events::TOTALS],
+}
+
+/// A place is printed as lower-case hexadecimal of a run of unsigned varints in protobuf's
+/// encoding, written and read by prost: the encoding's version, 4; the sixteen bytes of the
+/// store's id, one varint each; the row of the record; and the totals, in the store's order.
+/// Hexadecimal, because it passes through a shell and an argument parser untouched and is checked
+/// character by character.
+impl std::fmt::Display for Place {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let bytes = self.encode();
+        bytes.iter().try_for_each(|b| write!(f, "{b:02x}"))
+    }
+}
+
+impl Place {
+    /// The place in the store whose id is `store`, as `store::id` gives it.
+    fn of(store: &str, seq: i64, totals: &[i64; events::TOTALS]) -> Option<Place> {
+        let bytes: Vec<u8> = (store.as_bytes().chunks(2))
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+            .collect::<Option<_>>()?;
+        let mut kept = [0; events::TOTALS];
+        for (k, t) in kept.iter_mut().zip(totals) {
+            *k = u64::try_from(*t).ok()?;
+        }
+        Some(Place {
+            store: bytes.try_into().ok()?,
+            seq: u64::try_from(seq).ok()?,
+            totals: kept,
+        })
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut put = |n: u64| prost::encoding::encode_varint(n, &mut bytes);
+        put(PLACE_VERSION);
+        self.store.iter().for_each(|b| put(u64::from(*b)));
+        put(self.seq);
+        self.totals.iter().for_each(|t| put(*t));
+        bytes
+    }
+
+    /// A place as `immunity matches` prints it; `None` for any other text, a place of another
+    /// version of the encoding among them. The text must be exactly what this build prints for
+    /// the place it reads: lower case, nothing left over, and no two texts one place.
+    pub fn parse(text: &str) -> Option<Place> {
+        let bytes: Vec<u8> = (text.as_bytes().chunks(2))
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+            .collect::<Option<_>>()?;
+        let mut buf = bytes.as_slice();
+        let mut next = || prost::encoding::decode_varint(&mut buf).ok();
+        if next()? != PLACE_VERSION {
+            return None;
+        }
+        let mut store = [0u8; 16];
+        for b in &mut store {
+            *b = u8::try_from(next()?).ok()?;
+        }
+        let seq = next()?;
+        let mut totals = [0; events::TOTALS];
+        for t in &mut totals {
+            *t = next()?;
+        }
+        let place = Place { store, seq, totals };
+        (place.to_string() == text).then_some(place)
+    }
+}
+
 /// Why an answer could not be given.
 enum Failure {
     Store(Outcome),
     Log(String),
+    /// The place given was not printed for this store, or names rows it never gave.
+    Place,
 }
 
 /// Answers `immunity matches` in the form asked, or fails as every command of the contract does,
@@ -116,209 +206,282 @@ pub fn matches_cmd(args: &MatchesArgs) -> ExitCode {
         Err(Failure::Log(why)) => (
             answer::error(
                 "log_unreadable",
-                "the event log could not be read, so nothing was evaluated",
+                "the event log could not be read, so the events of the matches cannot be read again",
                 "immunity matches --json",
                 &why,
             ),
             1,
         ),
+        Err(Failure::Place) => (
+            answer::error("usage", OTHER_STORE, "immunity matches --json", ""),
+            crate::EXIT_USAGE,
+        ),
     };
     answer::fail("matches", args.form, error, exit)
-}
-
-/// What the store says about the log, read in one transaction.
-struct Held {
-    /// Where the core's own reading has read each log file up to.
-    read_to: BTreeMap<String, (u64, u64)>,
-    /// The collector's state as `immunity status` serves it (`events::served`), and when it
-    /// was read.
-    state: Option<(String, i64)>,
-    /// The findings by id, as a match names them.
-    findings: BTreeMap<String, v1::FindingRef>,
-    /// What arrives, as the latest reading stored it: not yet known before any.
-    arrivals: Arrivals,
 }
 
 fn read(args: &MatchesArgs, now: i64) -> Result<v1::Matches, Failure> {
     read_with(Rules::shipped(), args, now)
 }
 
-/// `read`, naming in `unevaluated` these rules. Matching itself is the shipped rules'.
+/// `read`, naming in `unevaluated` these rules. What matched is what the record holds.
 fn read_with(rules: &Rules, args: &MatchesArgs, now: i64) -> Result<v1::Matches, Failure> {
-    read_through(rules, args, now, |awake| {
-        let after_place = args.after.as_ref().map(|(_, p)| p);
-        events::queue(&args.system_root, after_place, args.limit, now, awake)
-    })
-}
-
-/// `read_with`, with the event log read by `log`.
-///
-/// The event log is read with no lock on the store, so a check or a watcher can commit while it
-/// is read. Only what the time awake is counted from and the store's id are read before the
-/// log; everything the answer says about the store comes from one transaction opened after it,
-/// at least as new as the hits. An older count of the time awake can only make the collector
-/// look silent sooner. A store replaced while the log was read is refused.
-fn read_through(
-    rules: &Rules,
-    args: &MatchesArgs,
-    now: i64,
-    log: impl FnOnce(&events::Awake) -> Queue,
-) -> Result<v1::Matches, Failure> {
     if !args.store.is_file() {
         return Err(Failure::Store(crate::store::absent(&args.store)));
     }
-    let (awake, id) = store::read(&args.store, |tx| {
-        Ok((events::Awake::read(tx)?, store::id(tx)?))
-    })
-    .map_err(Failure::Store)?;
-    let queue = log(&awake);
-    store::read(&args.store, |tx| answered(rules, args, now, tx, id, queue))
-        .map_err(Failure::Store)?
-        .map_err(Failure::Log)
+    store::read(&args.store, |tx| answered(rules, args, now, tx)).map_err(Failure::Store)?
 }
 
-/// The answer of `read_through` from `queue`, the event log read, and `tx`, a read of the store
-/// opened after it; `Err` with why the log could not be read. `id` is the store's id read before
-/// the log.
+/// The answer, read in `tx`, one read of the store: the rows after the caller's place, the
+/// counts after it, how far the evaluator read, and the lines of the rows read again from the
+/// log.
 fn answered(
     rules: &Rules,
     args: &MatchesArgs,
     now: i64,
     tx: &Connection,
-    id: String,
-    queue: Queue,
-) -> Result<Result<v1::Matches, String>, Box<dyn std::error::Error>> {
-    if store::id(tx)? != id {
-        let why = "the store was replaced while the event log was read; ask again";
-        return Err(Outcome::new(Code::Moved, why).into());
-    }
-    let held = Held {
-        read_to: events::read_up_to(tx)?,
-        // As `immunity status` serves it, by a reading of the watcher's lock file of its own.
-        state: {
-            let failed =
-                crate::watch::failures(tx, &crate::watch::Lock::read(&crate::home(&args.store)))?;
-            events::served(tx, &failed, now)?.map(|l| (l.state, l.read_at))
-        },
-        findings: finding_refs(tx, now)?,
-        arrivals: events::arrivals(tx)?,
+) -> Result<Result<v1::Matches, Failure>, Box<dyn std::error::Error>> {
+    let id = store::id(tx)?;
+    let (given, removed) = events::marks(tx)?;
+    let totals = events::totals(tx)?;
+    let (seq, from) = match &args.after {
+        None => (0, [0; events::TOTALS]),
+        Some((_, p)) => {
+            let ours = Place::of(&id, 0, &[0; events::TOTALS]).is_some_and(|o| o.store == p.store);
+            // A number past any this store gave, or past what its totals reached, was never
+            // printed by it; one that does not fit the store's numbers is no place at all.
+            let seq = i64::try_from(p.seq).ok().filter(|s| *s <= given);
+            let mut from = [0; events::TOTALS];
+            let fits = from
+                .iter_mut()
+                .zip(&p.totals)
+                .zip(&totals)
+                .all(|((f, p), now)| {
+                    i64::try_from(*p).is_ok_and(|p| {
+                        *f = p;
+                        p <= *now
+                    })
+                });
+            match seq {
+                Some(seq) if ours && fits => (seq, from),
+                _ => return Ok(Err(Failure::Place)),
+            }
+        }
     };
-    let after = args.after.as_ref();
+    let home = crate::home(&args.store);
+    let lock = crate::watch::Lock::read(&home);
+    let failed = crate::watch::failures(tx, &lock)?;
+    let level = events::served(tx, &failed, now)?;
+    let refs = finding_refs(tx, now)?;
     let mut answer = v1::Matches {
         format: FORMAT,
         answered_at: now,
-        after: after.map(|(text, _)| text.clone()),
-        store_id: Some(id),
+        after: args.after.as_ref().map(|(text, _)| text.clone()),
+        store_id: Some(id.clone()),
         ..Default::default()
     };
-    let status_state = |c: &mut v1::Collector| {
-        c.status_state = held
-            .state
-            .as_ref()
-            .map(|(s, _)| value_of::<v1::CollectorState>(s));
-        c.status_read_at = held.state.as_ref().map(|(_, at)| *at);
-    };
-    match queue {
-        Queue::Failed(why) => return Ok(Err(why)),
-        Queue::NotInstalled { gone } => {
-            let mut collector = v1::Collector {
-                state: v1::CollectorState::NotInstalled as i32,
-                ..Default::default()
-            };
-            status_state(&mut collector);
-            answer.collector = Some(collector);
-            answer.stretch = Some(v1::Stretch {
-                gone,
-                ..Default::default()
-            });
-            answer.unevaluated = unevaluated(rules, &Err(NOT_INSTALLED.to_string()), None, None);
+    // The rows after the place, one more than asked to tell whether more are left.
+    let rows = events::recorded_after(tx, seq, args.limit + 1)?;
+    let mut last = seq;
+    let mut bytes = 0;
+    let mut gone = removed > seq;
+    for row in &rows {
+        if answer.matches.len() == args.limit || bytes >= BYTES {
+            answer.more = true;
+            break;
         }
-        Queue::Read(s) => {
-            let mut collector = collector(&s, &held.arrivals);
-            status_state(&mut collector);
-            for hit in &s.hits {
-                let event = event(&hit.event);
-                for (file, meta) in &hit.matched {
-                    let (raised, mut findings) = raised(tx, &held, hit, meta)?;
-                    let position = hit.at.to_string();
-                    // The response layer's verdicts about the match, read by the match; the
-                    // finding its latest suspicious one went to is named after the core's.
-                    let said = verdict::listed(
-                        tx,
-                        "position = ?1 AND rule = ?2",
-                        &[&position, &meta.name],
-                    )?;
-                    if let Some(f) = said.2.iter().rev().find_map(|v| v.finding.as_ref())
-                        && let Some(r) = held.findings.get(f)
-                    {
-                        findings.push(r.clone());
-                    }
-                    answer.matches.push(v1::RuleMatch {
-                        verdicts: verdict::verdicts(
-                            said,
-                            answer.store_id.as_deref(),
-                            &held.findings,
-                            None,
-                        ),
-                        position,
-                        rule: Some(rule(file, meta)),
-                        event: Some(event.clone()),
-                        raised: raised as i32,
-                        findings,
-                    });
-                }
+        let event = match events::at_line(&args.system_root, &row.at, row.inode, &row.line) {
+            Ok(AtLine::Event(e, len)) => {
+                bytes += len;
+                Some(e)
             }
-            answer.collector = Some(collector);
-            answer.stretch = Some(stretch(&s));
-            answer.unevaluated = unevaluated(
-                rules,
-                &s.collects.clone().map_err(|n| n.reason()),
-                Some(&held.arrivals),
-                Some(&s.lacked),
-            );
-            answer.continue_after = Some(s.place.to_string());
-            answer.more = s.more;
+            // The line judged went from the log a moment ago, or another line is in its place:
+            // the match is given, and that its event is gone said.
+            Ok(AtLine::Gone | AtLine::NoLine) => {
+                gone = true;
+                None
+            }
+            Err(why) => return Ok(Err(Failure::Log(why))),
+        };
+        let loaded = Rules::shipped().by_name(&row.rule);
+        let (rule, (raised, mut findings)) =
+            match loaded.and_then(|l| Some((l.file, l.meta.as_ref()?))) {
+                Some((file, meta)) => (
+                    rule(file, meta),
+                    raised(meta, row.finding.as_deref(), &refs),
+                ),
+                // A rule this build no longer ships, recorded by an earlier build of the same format:
+                // given by its name, never left out, and what it raised left to the reader.
+                None => (
+                    v1::Rule {
+                        name: row.rule.clone(),
+                        ..Default::default()
+                    },
+                    (v1::Raised::Unspecified, Vec::new()),
+                ),
+            };
+        let position = row.at.to_string();
+        // The response layer's verdicts about the match, read by the match; the finding its
+        // latest suspicious one went to is named after the core's.
+        let said = verdict::listed(tx, "position = ?1 AND rule = ?2", &[&position, &row.rule])?;
+        if let Some(f) = said.2.iter().rev().find_map(|v| v.finding.as_ref())
+            && let Some(r) = refs.get(f)
+        {
+            findings.push(r.clone());
         }
+        answer.matches.push(v1::RuleMatch {
+            verdicts: verdict::verdicts(said, Some(&id), &refs, None),
+            position,
+            rule: Some(rule),
+            event: event.as_deref().map(self::event),
+            raised: raised as i32,
+            findings,
+        });
+        last = row.seq;
     }
+    // With nothing left, the next answer starts after every number given so far: a row is given a
+    // number larger than any before it, so none can come before it later.
+    if !answer.more {
+        last = last.max(given);
+    }
+    // The counts are the totals now less the place's.
+    let (tally, file_tally, lacked) = events::counted_between(&from, &totals);
+    // The source as its own files say now, never as the last conclusion left it.
+    let source = events::source_now(tx, &args.system_root, now)?;
+    let waiting = match &source {
+        events::Source::Failed(why) => Err(why),
+        events::Source::Read(s) => Ok(s.waiting),
+        events::Source::NotInstalled => Ok(false),
+    };
+    let state = evaluator(tx, &home, &lock, level.as_ref(), waiting, now)?;
+    let n = |v: i64| v.max(0) as u64;
+    let evaluated = v1::Evaluated {
+        state: state.0 as i32,
+        behind: state.1 as i32,
+        reason_text: state.2.map(|r| whole(&r)),
+        read_until_at: events::evaluated_at(tx)?,
+        program_starts: n(tally.starts),
+        file_events: n(file_tally.files),
+        other: n(tally.other),
+        unreadable_lines: n(tally.unreadable),
+        unreadable_file_events: n(file_tally.unreadable),
+        program_starts_lost: n(tally.lost),
+        program_starts_unknown_losses: n(tally.unknown_gaps),
+        file_events_lost: n(file_tally.lost),
+        file_events_unknown_losses: n(file_tally.unknown_gaps),
+        files_removed_unread: n(tally.removed_unread),
+        gone,
+    };
+    answer.collector = Some(collector(level.as_ref(), &evaluated, &source));
+    // Not installed as the source says now, whatever the last conclusion said.
+    answer.unevaluated = match &level {
+        _ if matches!(source, events::Source::NotInstalled) => {
+            unevaluated(rules, &Err(NOT_INSTALLED.to_string()), None, None)
+        }
+        Some(l) => {
+            use rusqlite::OptionalExtension;
+            // Why file events are not collected, with what the system said when the record of
+            // what the collector records could not be read: as the files' coverage keeps it.
+            let collects = match l.files.collected {
+                true => Ok(()),
+                false => Err(tx
+                    .query_row(
+                        "SELECT reason FROM coverage WHERE reader = ?1 AND kind = ?2
+                         AND cause = 'failed' ORDER BY id DESC LIMIT 1",
+                        rusqlite::params![events::READER, events::KIND_FILES],
+                        |r| r.get::<_, Option<String>>(0),
+                    )
+                    .optional()?
+                    .flatten()
+                    .or_else(|| l.files.why.clone())
+                    .unwrap_or_default()),
+            };
+            unevaluated(rules, &collects, Some(&l.arrivals), Some(&lacked))
+        }
+        // Before any reading of the level, nothing is known of what it records.
+        None => unevaluated(
+            rules,
+            &Err(NOT_READ.to_string()),
+            Some(&Arrivals::default()),
+            None,
+        ),
+    };
+    answer.evaluated = Some(evaluated);
+    answer.continue_after = Place::of(&id, last, &totals).map(|p| p.to_string());
     Ok(Ok(answer))
 }
 
-/// What became of a match among the findings, and the findings it went to.
+/// Whether the evaluator has read the log up to about now, why not, and what failed, from the
+/// evaluator's own writes and never from the times of the log's files. Failed when the level is
+/// served failed, or when the log folder or a file in it cannot be read (`waiting`, with why).
+/// Current only when a live watcher holds its lock, the evaluator that wrote last is the one its
+/// lock file names, it has read every whole line it listed since its start, and either no whole
+/// line waits past where the store says it read (`waiting`) or it wrote within `LATE` seconds of
+/// now, either way. Else behind: no watcher; another evaluator wrote last, or this one has not
+/// caught up since its start; or it has been silent while a line waits, because a full check holds
+/// the store or because it stalled.
+fn evaluator(
+    tx: &Connection,
+    home: &Path,
+    lock: &crate::watch::Lock,
+    level: Option<&events::Level>,
+    waiting: Result<bool, &String>,
+    now: i64,
+) -> rusqlite::Result<(v1::EvaluatorState, v1::BehindReason, Option<String>)> {
+    use v1::{BehindReason as Why, EvaluatorState as State};
+    if let Some(l) = level.filter(|l| l.state == events::FAILED) {
+        return Ok((State::Failed, Why::Unspecified, l.reason.clone()));
+    }
+    let waiting = match waiting {
+        Ok(waiting) => waiting,
+        Err(why) => return Ok((State::Failed, Why::Unspecified, Some(why.clone()))),
+    };
+    let behind = |why| Ok((State::Behind, why, None));
+    if !lock.watcher_alive() {
+        return behind(Why::NoWatcher);
+    }
+    let Some((id, caught_up, at)) = events::evaluator(tx)? else {
+        return behind(Why::CatchingUp);
+    };
+    if lock.evaluator() != Some(id) || !caught_up {
+        return behind(Why::CatchingUp);
+    }
+    if waiting && (now - at).abs() > LATE {
+        return match crate::check_running(tx, home)? {
+            true => behind(Why::StoreHeld),
+            false => behind(Why::NotAdvancing),
+        };
+    }
+    Ok((State::Current, Why::Unspecified, None))
+}
+
+/// What became of a match among the findings, and the findings it went to: what the evaluator
+/// recorded with the match, `finding`.
 fn raised(
-    conn: &Connection,
-    held: &Held,
-    hit: &Hit,
     meta: &Meta,
-) -> rusqlite::Result<(v1::Raised, Vec<v1::FindingRef>)> {
+    finding: Option<&str>,
+    refs: &BTreeMap<String, v1::FindingRef>,
+) -> (v1::Raised, Vec<v1::FindingRef>) {
     // A rule raises by its level; one whose set states none has a value of its own, so that
     // `below_high` keeps the meaning it had.
     if meta.level.is_none() {
-        return Ok((v1::Raised::LevelNotStated, Vec::new()));
+        return (v1::Raised::LevelNotStated, Vec::new());
     }
     if !meta.raises() {
-        return Ok((v1::Raised::BelowHigh, Vec::new()));
+        return (v1::Raised::BelowHigh, Vec::new());
     }
-    let at: &LineAt = &hit.at;
-    let read = held
-        .read_to
-        .get(&at.file)
-        .is_some_and(|(inode, to)| *inode == at.inode && at.offset < *to);
-    if !read {
-        return Ok((v1::Raised::NotReadYet, Vec::new()));
-    }
-    Ok(match events::went_to(conn, at, &meta.name)? {
+    match finding {
         Some(id) => {
-            // Every finding of a shipped rule is among them; the id alone stands for one that
-            // is not.
-            let finding = held.findings.get(&id).cloned();
-            let finding = finding.unwrap_or(v1::FindingRef {
-                id,
+            // Every finding of a shipped rule is among them; the id alone stands for one that is
+            // not.
+            let finding = refs.get(id).cloned().unwrap_or(v1::FindingRef {
+                id: id.to_string(),
                 ..Default::default()
             });
             (v1::Raised::Finding, vec![finding])
         }
         None => (v1::Raised::NoFinding, Vec::new()),
-    })
+    }
 }
 
 /// Every finding in the store, by id, as `immunity project` and the others name one.
@@ -475,34 +638,56 @@ pub fn cuts(args: &Args) -> Vec<v1::Cut> {
         .collect()
 }
 
-fn stretch(s: &Stretch) -> v1::Stretch {
-    let n = |v: i64| v.max(0) as u64;
-    v1::Stretch {
-        program_starts: n(s.tally.starts),
-        file_events: n(s.file_tally.files),
-        other: n(s.tally.other),
-        unreadable_lines: n(s.tally.unreadable),
-        unreadable_file_events: n(s.file_tally.unreadable),
-        program_starts_lost: n(s.tally.lost),
-        program_starts_unknown_losses: n(s.tally.unknown_gaps),
-        file_events_lost: n(s.file_tally.lost),
-        file_events_unknown_losses: n(s.file_tally.unknown_gaps),
-        gone: s.gone,
-        kept_from: s.kept_from.as_ref().map(LineAt::to_string),
-    }
-}
-
-/// The collector as the stretch found it. What arrives is the core's latest reading's
-/// (`arrivals`), as of `status_read_at`: a stretch read from a place may stop anywhere, and only
-/// the core reads every file to its end and so knows which one is being written.
-fn collector(s: &Stretch, arrivals: &Arrivals) -> v1::Collector {
+/// The collector as its own files say at the answer (`source`), as a reading judges it: not
+/// installed, refused, failing or silent as they say, and failed when its log cannot be read. Its
+/// state is `running` only while the answer can be quiet by what `evaluated` holds: else `failed`
+/// or `behind`, so that a reader built before `evaluated` never takes the answer for quiet. What
+/// arrives is the evaluator's latest conclusion's (`level`), as of `status_read_at`.
+fn collector(
+    level: Option<&events::Level>,
+    e: &v1::Evaluated,
+    source: &events::Source,
+) -> v1::Collector {
+    let looked = match source {
+        events::Source::Read(s) => Some(s.as_ref()),
+        _ => None,
+    };
+    let whole = e.unreadable_lines
+        + e.unreadable_file_events
+        + e.program_starts_lost
+        + e.program_starts_unknown_losses
+        + e.file_events_lost
+        + e.file_events_unknown_losses
+        + e.files_removed_unread
+        == 0
+        && !e.gone;
+    use v1::CollectorState as C;
+    let state = match (source, e.state()) {
+        (_, v1::EvaluatorState::Failed) | (events::Source::Failed(_), _) => C::Failed as i32,
+        (events::Source::NotInstalled, _) => C::NotInstalled as i32,
+        (events::Source::Read(s), state) if s.state == events::RUNNING => {
+            match state == v1::EvaluatorState::Current && whole {
+                true => C::Running as i32,
+                false => C::Behind as i32,
+            }
+        }
+        (events::Source::Read(s), _) => value_of::<C>(s.state),
+    };
+    let none = Arrivals::default();
+    let arrivals = level.map_or(&none, |l| &l.arrivals);
     v1::Collector {
-        state: value_of::<v1::CollectorState>(s.state),
-        said_by: s.said.as_ref().map(|(by, _)| by.to_string()),
-        said_text: s.said.as_ref().map(|(_, said)| crate::secrets::said(said)),
-        written_at: s.written,
-        file_events_collected: s.collects.is_ok(),
-        foreign_files: s.foreign,
+        state,
+        said_by: looked
+            .and_then(|s| s.said.as_ref())
+            .map(|(by, _)| by.to_string()),
+        said_text: looked
+            .and_then(|s| s.said.as_ref())
+            .map(|(_, said)| said.said()),
+        written_at: looked.and_then(|s| s.written),
+        file_events_collected: looked.is_some_and(|s| s.collects),
+        status_state: level.map(|l| value_of::<C>(&l.state)),
+        status_read_at: level.map(|l| l.read_at),
+        foreign_files: looked.map_or(0, |s| s.foreign),
         not_kept: named(arrivals, Arrival::NotKept),
         kept_never_filled: named(arrivals, Arrival::Kept(None)),
         not_yet_known: named(arrivals, Arrival::Unknown),
@@ -522,7 +707,6 @@ fn collector(s: &Stretch, arrivals: &Arrivals) -> v1::Collector {
                 since,
             })
             .collect(),
-        ..Default::default()
     }
 }
 
@@ -632,13 +816,23 @@ mod tests {
     use super::*;
     use crate::events::{NEVER_FILLED, NO_LONGER, NOT_KEPT, NOT_YET_KNOWN};
 
+    const NOW: i64 = 1_791_090_000;
+
     /// A reading of the log under `root` by the core, as `immunity run` makes one, into `store`.
     fn core_reads(store: &std::path::Path, root: &std::path::Path) {
-        let mut conn = crate::store::open_or_make(store).unwrap();
-        let tx = conn.transaction().unwrap();
-        crate::store::put_entity(&tx, "machine:mac").unwrap();
-        events::read(&tx, "events-1", "machine:mac", root, 1_791_090_000, None).unwrap();
-        tx.commit().unwrap();
+        core_reads_at(store, root, NOW);
+    }
+
+    /// The evaluator the watcher of these tests runs, by which `core_reads` reads.
+    const EVALUATOR: i64 = 7;
+
+    /// A watcher that holds the store in `dir`, ready, running `EVALUATOR`, started before every
+    /// reading of these tests: the lock is this process's, as a watcher's is its own.
+    fn watching(dir: &std::path::Path) -> std::fs::File {
+        let lock = store::lock_watch(dir).unwrap().unwrap();
+        let text = format!("1791000000\nheartbeat {EVALUATOR}\nready");
+        std::fs::write(dir.join(store::WATCH_LOCK), text).unwrap();
+        lock
     }
 
     /// A start of `dd if=/dev/zero bs=1 count=1`, which "Binary Padding - MacOS", marked high,
@@ -672,27 +866,26 @@ mod tests {
         };
         format!(
             r#"{{"schema_version":1,"seq_num":1,"time":"2026-10-04T00:00:03.000003Z","process":{{"executable":{{"path":"/usr/bin/curl"}}{who}}},"event":{{"create":{{"destination":"/Users/example/a"}}}}}}"#
-        ) + "
-"
+        ) + "\n"
     }
 
     /// Writes `text` as the log file `name` under `root`, last written `ago` seconds before
-    /// the reading.
+    /// `NOW`.
     fn log_file(root: &std::path::Path, name: &str, text: &str, ago: u64) {
         let path = root.join(events::LOG).join(name);
         std::fs::write(&path, text).unwrap();
         let f = std::fs::File::options().append(true).open(&path).unwrap();
-        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_791_090_000 - ago);
+        let at = std::time::UNIX_EPOCH + std::time::Duration::from_secs(NOW as u64 - ago);
         f.set_modified(at).unwrap();
     }
 
     #[test]
     fn paging_tells_what_arrives_as_the_core_s_latest_reading_stored_it() {
-        // No false calm. A stretch read from a place stops at its limit anywhere in the log, so
-        // a file no longer written can be the last it read: after a downgrade, the later
-        // collector's file, which sorts after the earlier one's; after a clock set back, the
-        // file written with the clock ahead. What `collector` and `unevaluated` say arrives is
-        // the core's latest reading, on every page.
+        // No false calm. Pages of the record stop at their limit anywhere, so a file no longer
+        // written can hold the last match a page gives: after a downgrade, the later collector's
+        // file, which sorts after the earlier one's; after a clock set back, the file written
+        // with the clock ahead. What `collector` and `unevaluated` say arrives is the core's
+        // latest reading, on every page.
         let rules = crate::sigma::testing::process_kept();
         for (tag, files, said) in [
             (
@@ -716,15 +909,8 @@ mod tests {
                 (vec![], vec!["identity"], 0),
             ),
         ] {
-            let dir = crate::common::Scratch::at(std::env::temp_dir().join(format!(
-                "immunity-matches-page-{tag}-{}",
-                std::process::id()
-            )));
-            let root = dir.join("root");
-            std::fs::create_dir_all(root.join(events::LOG)).unwrap();
-            let plist = root.join(events::PLIST);
-            std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-            std::fs::write(&plist, "<plist/>").unwrap();
+            let (dir, root) = installed_root(&format!("page-{tag}"));
+            std::fs::remove_file(root.join(events::COLLECTS)).unwrap();
             for (n, (name, form, ago)) in files.iter().enumerate() {
                 let seq = 10 * n as u64;
                 // The file being written: who the program started is arrived, then stopped.
@@ -746,7 +932,7 @@ mod tests {
                     single: true,
                     system_root: root.clone(),
                 };
-                let answer = read_with(&rules, &args, 1_791_090_000).ok().unwrap();
+                let answer = read_with(&rules, &args, NOW).ok().unwrap();
                 pages += 1;
                 let c = answer.collector.as_ref().unwrap();
                 let stopped: Vec<&str> = c
@@ -771,7 +957,7 @@ mod tests {
                 let place = answer.continue_after.unwrap();
                 after = Some((place.clone(), Place::parse(&place).unwrap()));
             }
-            assert!(pages > 6, "{tag}: {pages} pages");
+            assert_eq!(pages, 6, "{tag}");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
@@ -805,7 +991,7 @@ mod tests {
             single: false,
             system_root: root.to_path_buf(),
         };
-        read_with(rules, &args, 1_791_090_000).ok().unwrap()
+        read_with(rules, &args, NOW).ok().unwrap()
     }
 
     /// `git status`, which no shipped rule matches, in the forms `dd` writes.
@@ -821,8 +1007,9 @@ mod tests {
     /// Quiet as `matches.proto` defines it: nothing matched, and nothing says what was not seen.
     fn quiet(a: &v1::Matches) -> bool {
         let c = a.collector.as_ref().unwrap();
-        let s = a.stretch.as_ref().unwrap();
+        let s = a.evaluated.as_ref().unwrap();
         a.matches.is_empty()
+            && s.state == v1::EvaluatorState::Current as i32
             && c.state == v1::CollectorState::Running as i32
             && c.file_events_collected
             && s.program_starts > 0
@@ -832,6 +1019,7 @@ mod tests {
             && s.file_events_unknown_losses == 0
             && s.unreadable_lines == 0
             && s.unreadable_file_events == 0
+            && s.files_removed_unread == 0
             && !s.gone
             && a.unevaluated.is_empty()
     }
@@ -846,27 +1034,39 @@ mod tests {
     }
 
     #[test]
-    fn a_quiet_answer_rests_on_the_lines_it_read_and_not_on_an_older_reading_of_the_core() {
+    fn a_quiet_answer_rests_on_the_lines_counted_after_the_place_and_not_on_an_older_reading() {
         // No false calm. The core read while the later collector wrote, so the store says the
-        // script arrives. Then the earlier collector is put back, or the app stays closed, and
-        // the core reads nothing more. An answer over the earlier collector's starts, which lack
-        // the script's key, names the rule that reads it, since that rule was asked about none
-        // of them, while `collector` goes on giving the store's reading at `status_read_at`. The
-        // same for a file event without its signer and a rule that reads the signer. An answer
-        // over lines that give it is quiet again: what is named is of the lines read.
+        // script arrives. Then lines of the earlier collector come into a file that sorts before
+        // the file being written, which goes on: an answer whose counts hold them names the rule
+        // that reads the script, since that rule was asked about none of them, while
+        // `collector` goes on giving what the file being written says arrives. The same for a
+        // file event without its signer and a rule that reads the signer. An answer over lines
+        // that give it is quiet again: what is named is of the lines counted after the place.
         let rules = crate::sigma::testing::process_kept();
         let (dir, root) = installed_root("stale");
-        let later = "exec-20261004T000013-20261004T000000.jsonl";
+        let _watcher = watching(&dir);
+        let later = "exec-20261004T000013-20261004T010000.jsonl";
         let text = git(1, "kept") + &git(2, "kept") + &created("kept");
         log_file(&root, later, &text, 300);
         let store = dir.join("store.db");
         core_reads(&store, &root);
         let first = ask(&rules, &store, &root, None);
-        assert!(first.unevaluated.is_empty(), "{:?}", first.unevaluated);
+        assert!(quiet(&first), "{first:?}");
         assert!(ask(&signer(), &store, &root, None).unevaluated.is_empty());
         let earlier = git(3, "old") + &git(4, "old") + &created("old");
-        log_file(&root, "exec-20261004T00.jsonl", &earlier, 100);
+        log_file(
+            &root,
+            "exec-20261004T000013-20261004T000000.jsonl",
+            &earlier,
+            400,
+        );
+        let text = text + &git(5, "kept");
+        log_file(&root, later, &text, 60);
         let place = first.continue_after.clone().unwrap();
+        // Lines the core has not read are in no answer, and the answer is not quiet over them.
+        let unread = ask(&rules, &store, &root, Some(&place));
+        assert!(!quiet(&unread));
+        core_reads(&store, &root);
         let not_in_lines = [(
             v1::UnevaluatedReason::NotCollected as i32,
             Some(events::NOT_IN_LINES),
@@ -875,54 +1075,59 @@ mod tests {
         let c = next.collector.as_ref().unwrap();
         let arriving: Vec<&str> = c.arriving.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(arriving, ["identity", "script", "signature"]);
-        assert_eq!(c.status_read_at, Some(1_791_090_000));
+        assert_eq!(c.status_read_at, Some(NOW));
         assert!(!quiet(&next));
         assert_eq!(named(&next), not_in_lines);
         let files = ask(&signer(), &store, &root, Some(&place));
         assert_eq!(named(&files), not_in_lines);
-        let place = next.continue_after.clone().unwrap();
-        let text = text + &git(5, "kept") + &git(6, "kept");
+        // Each row of counts is given in one answer, so the earlier lines are behind a place once
+        // an answer gave their row.
+        let text = text + &git(6, "kept");
         log_file(&root, later, &text, 50);
+        core_reads_at(&store, &root, NOW + 10);
+        let place = ask(&rules, &store, &root, Some(&place))
+            .continue_after
+            .unwrap();
+        let text = text + &git(7, "kept") + &git(8, "kept");
+        log_file(&root, later, &text, 40);
+        core_reads_at(&store, &root, NOW + 30);
         let after = ask(&rules, &store, &root, Some(&place));
-        assert_eq!(after.stretch.as_ref().unwrap().program_starts, 2);
+        assert_eq!(after.evaluated.as_ref().unwrap().program_starts, 2);
         assert!(quiet(&after), "{:?}", after.unevaluated);
-        assert!(
-            ask(&signer(), &store, &root, Some(&place))
-                .unevaluated
-                .is_empty()
-        );
-        // Each kind speaks for its own rules: starts that give everything and one file event
-        // without its signer name the rule that reads the signer, and not the one about starts.
-        let place = after.continue_after.clone().unwrap();
-        let text = text + &git(7, "kept") + &created("old");
-        log_file(&root, later, &text, 20);
-        let mixed = ask(&rules, &store, &root, Some(&place));
-        assert!(mixed.unevaluated.is_empty(), "{:?}", mixed.unevaluated);
-        assert_eq!(
-            named(&ask(&signer(), &store, &root, Some(&place))),
-            not_in_lines
-        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `core_reads` at `at`: a reading of every whole line and a conclusion, as the evaluator
+    /// `EVALUATOR` writes one.
+    fn core_reads_at(store: &std::path::Path, root: &std::path::Path, at: i64) {
+        let mut conn = crate::store::open_or_make(store).unwrap();
+        let tx = conn.transaction().unwrap();
+        crate::store::put_entity(&tx, "machine:mac").unwrap();
+        let mut r = events::Reader::load(&tx, root).unwrap();
+        r.by_evaluator(EVALUATOR);
+        r.relist(at, u64::MAX, |_, _| {});
+        r.write(&tx, "events-1", "machine:mac", at, true)
+            .unwrap()
+            .unwrap();
+        tx.commit().unwrap();
     }
 
     #[test]
     fn a_group_filled_on_some_lines_by_nature_is_judged_by_the_core_s_latest_reading_alone() {
         // The limit as it stands, pinned so that a change that closes it has a test to turn
         // round. One start without a script cannot tell no script by nature from a field the
-        // collector stopped filling, so only the core's reading, counting its bound, tells the
-        // second. Until it has, an answer over 1,500 starts with the script null is quiet; once
-        // it has, the rule that reads the script is named as no longer watching. No shipped rule
-        // reads such a group (`events::tests::every_kept_field_a_shipped_rule_reads_is_...`);
-        // the test set ties the script to the working directory.
+        // collector stopped filling, so only the evaluator's conclusion, counting its bound,
+        // tells the second. Until it has counted 1,000 such starts of the file being written,
+        // an answer is quiet over them; once it has, the rule that reads the script is named as
+        // no longer watching. No shipped rule reads such a group
+        // (`events::tests::every_kept_field_a_shipped_rule_reads_is_...`); the test set ties the
+        // script to the working directory.
         let rules = crate::sigma::testing::process_kept();
         let (dir, root) = installed_root("script-null");
+        let _watcher = watching(&dir);
         let text = git(1, "kept") + &git(2, "kept");
-        log_file(
-            &root,
-            "exec-20261004T000013-20261004T000000.jsonl",
-            &text,
-            300,
-        );
+        let first = "exec-20261004T000013-20261004T000000.jsonl";
+        log_file(&root, first, &text, 300);
         let store = dir.join("store.db");
         core_reads(&store, &root);
         let place = ask(&rules, &store, &root, None).continue_after.unwrap();
@@ -938,17 +1143,14 @@ mod tests {
                 )
         };
         assert!(null(3).contains(r#""script":null"#) && null(3).contains(r#""path":"/tmp""#));
-        let text: String = (3..1503).map(null).collect();
-        log_file(
-            &root,
-            "exec-20261004T000013-20261004T010000.jsonl",
-            &text,
-            100,
-        );
+        let second = "exec-20261004T000013-20261004T010000.jsonl";
+        log_file(&root, second, &(3..503).map(null).collect::<String>(), 100);
+        core_reads_at(&store, &root, NOW + 10);
         let before = ask(&rules, &store, &root, Some(&place));
-        assert_eq!(before.stretch.as_ref().unwrap().program_starts, 1500);
+        assert_eq!(before.evaluated.as_ref().unwrap().program_starts, 500);
         assert!(quiet(&before), "{:?}", before.unevaluated);
-        core_reads(&store, &root);
+        log_file(&root, second, &(3..1503).map(null).collect::<String>(), 50);
+        core_reads_at(&store, &root, NOW + 30);
         let after = ask(&rules, &store, &root, Some(&place));
         let stopped = &after.collector.as_ref().unwrap().no_longer_arriving;
         assert_eq!(
@@ -968,43 +1170,33 @@ mod tests {
         // The signer of file events is filled on every line, so one line without it, null or
         // without its key, names the rule that reads it while the store says it arrives.
         let rules = signer();
-        let (dir, root) = installed_root("signer-null");
-        let text = git(1, "kept") + &created("kept");
-        log_file(
-            &root,
-            "exec-20261004T000013-20261004T000000.jsonl",
-            &text,
-            300,
-        );
-        let store = dir.join("store.db");
-        core_reads(&store, &root);
-        let first = ask(&rules, &store, &root, None);
-        assert!(first.unevaluated.is_empty(), "{:?}", first.unevaluated);
-        let place = first.continue_after.unwrap();
         let signed = r#""signing_id":"com.example.tool""#;
         let null = created("kept").replace(signed, r#""signing_id":null"#);
         let absent = created("kept").replace(&format!(",{signed}"), "");
-        for (what, line) in [("null", null), ("absent", absent)] {
+        for (what, line, why) in [("null", null, NO_LONGER), ("absent", absent, NOT_KEPT)] {
+            let (dir, root) = installed_root(&format!("signer-{what}"));
+            let text = git(1, "kept") + &created("kept");
+            let name = "exec-20261004T000013-20261004T000000.jsonl";
+            log_file(&root, name, &text, 300);
+            let store = dir.join("store.db");
+            core_reads(&store, &root);
+            let first = ask(&rules, &store, &root, None);
+            assert!(first.unevaluated.is_empty(), "{:?}", first.unevaluated);
+            let place = first.continue_after.unwrap();
             assert!(!line.contains(signed), "{what}");
-            let text = git(3, "kept") + &line;
-            log_file(
-                &root,
-                "exec-20261004T000013-20261004T010000.jsonl",
-                &text,
-                100,
-            );
+            log_file(&root, name, &(text + &git(3, "kept") + &line), 100);
+            core_reads_at(&store, &root, NOW + 10);
             let a = ask(&rules, &store, &root, Some(&place));
-            assert_eq!(a.stretch.as_ref().unwrap().file_events, 1, "{what}");
+            assert_eq!(a.evaluated.as_ref().unwrap().file_events, 1, "{what}");
+            // The latest line, read by the core, says the signer no longer arrives, or is not
+            // kept by the collector that wrote it.
             assert_eq!(
                 named(&a),
-                [(
-                    v1::UnevaluatedReason::NotCollected as i32,
-                    Some(events::NOT_IN_LINES)
-                )],
+                [(v1::UnevaluatedReason::NotCollected as i32, Some(why))],
                 "{what}"
             );
+            let _ = std::fs::remove_dir_all(&dir);
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     use crate::sigma::ELASTIC;
@@ -1104,13 +1296,13 @@ mod tests {
             );
             u.detail_text.clone()
         };
-        let answer = read_with(&rules, &args, 1_791_000_000).ok().unwrap();
+        let answer = read_with(&rules, &args, NOW).ok().unwrap();
         let c = answer.collector.as_ref().unwrap();
         assert_eq!(c.not_yet_known, ["identity", "script", "signature"]);
         assert!(c.not_kept.is_empty() && c.arriving.is_empty());
         assert_eq!(unevaluated_why(&answer).as_deref(), Some(NOT_YET_KNOWN));
         core();
-        let answer = read_with(&rules, &args, 1_791_000_000).ok().unwrap();
+        let answer = read_with(&rules, &args, NOW).ok().unwrap();
         let c = answer.collector.as_ref().unwrap();
         assert_eq!(c.not_kept, ["identity", "script", "signature"]);
         assert!(c.kept_never_filled.is_empty() && c.arriving.is_empty());
@@ -1118,7 +1310,7 @@ mod tests {
         // A later collector's line that carries the script empty: kept, never filled.
         std::fs::write(&log, start(1, "") + &start(2, r#""script":null,"#)).unwrap();
         core();
-        let answer = read_with(&rules, &args, 1_791_000_000).ok().unwrap();
+        let answer = read_with(&rules, &args, NOW).ok().unwrap();
         assert_eq!(
             answer.collector.as_ref().unwrap().kept_never_filled,
             ["script"]
@@ -1133,7 +1325,7 @@ mod tests {
         )
         .unwrap();
         core();
-        let answer = read_with(&rules, &args, 1_791_000_000).ok().unwrap();
+        let answer = read_with(&rules, &args, NOW).ok().unwrap();
         assert_eq!(
             answer.collector.as_ref().unwrap().arriving,
             [v1::Arriving {
@@ -1141,34 +1333,17 @@ mod tests {
                 since: 1_791_072_002
             }]
         );
-        // This answer read the earlier collector's start too, which the rule was not asked
-        // about, and says so.
+        // The counts of this answer hold the earlier collector's start too, which the rule was
+        // not asked about, and it says so.
         assert_eq!(
             unevaluated_why(&answer).as_deref(),
             Some(events::NOT_IN_LINES)
         );
-        // An answer that reads on from a place where nothing new was written says what the
-        // core's reading stored, and names nothing.
-        let place = answer.continue_after.clone().unwrap();
-        let again = read_with(
-            &rules,
-            &MatchesArgs {
-                store: args.store.clone(),
-                form: answer::Form::Json,
-                after: Some((place.clone(), Place::parse(&place).unwrap())),
-                limit: LIMIT,
-                single: false,
-                system_root: root.clone(),
-            },
-            1_791_000_000,
-        )
-        .ok()
-        .unwrap();
-        assert!(again.unevaluated.is_empty(), "{:?}", again.unevaluated);
         // With no collector the state says nothing is judged, and no rule about program
         // starts is put down to what a collector that is not there keeps.
         std::fs::remove_file(&plist).unwrap();
-        let answer = read_with(&rules, &args, 1_791_000_000).ok().unwrap();
+        core();
+        let answer = read_with(&rules, &args, NOW).ok().unwrap();
         assert_eq!(
             answer.collector.as_ref().unwrap().state,
             v1::CollectorState::NotInstalled as i32
@@ -1177,55 +1352,16 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn matches_counts_the_time_awake_from_the_core_s_row_and_leaves_the_row_as_it_was() {
-        // The last line is five hours old by the calendar, and the core's reading kept that
-        // the Mac has been awake no time without one, as after a night asleep.
-        let dir = crate::common::Scratch::at(
-            std::env::temp_dir().join(format!("immunity-matches-awake-{}", std::process::id())),
-        );
-        let root = dir.join("root");
-        std::fs::create_dir_all(root.join(events::LOG)).unwrap();
-        let plist = root.join(events::PLIST);
-        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
-        std::fs::write(&plist, "<plist/>").unwrap();
-        log_file(&root, "exec-20261004T00.jsonl", &dd(1, "kept"), 5 * 3600);
-        let store = dir.join("store.db");
-        core_reads(&store, &root);
-        let row = || -> String {
-            let conn = crate::store::open(&store).unwrap();
-            let sql = "SELECT value FROM meta WHERE key = 'event_level_awake'";
-            conn.query_row(sql, [], |r| r.get(0)).unwrap()
-        };
-        let slept = row().rsplit_once(' ').unwrap().0.to_string() + " 0";
-        crate::store::open(&store)
-            .unwrap()
-            .execute(
-                "UPDATE meta SET value = ?1 WHERE key = 'event_level_awake'",
-                [&slept],
-            )
-            .unwrap();
-        let args = MatchesArgs {
-            store: store.clone(),
-            form: answer::Form::Json,
-            after: None,
-            limit: 10,
-            single: true,
-            system_root: root.clone(),
-        };
-        let answer = read(&args, 1_791_090_010).ok().unwrap();
-        let state = answer.collector.unwrap().state;
-        let left = row();
-        let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(state, v1::CollectorState::Running as i32);
-        assert_eq!(left, slept);
-    }
-
     /// A store holding the core's reading of one line under a root installed for `tag`, and
     /// what `immunity matches` is asked of it.
     fn one_line(tag: &str) -> (crate::common::Scratch, MatchesArgs) {
         let (dir, root) = installed_root(tag);
-        log_file(&root, "exec-20261004T00.jsonl", &dd(1, "kept"), 10);
+        log_file(
+            &root,
+            "exec-20261004T00.jsonl",
+            &(dd(1, "kept") + &git(2, "kept")),
+            10,
+        );
         let store = dir.join("store.db");
         core_reads(&store, &root);
         let args = MatchesArgs {
@@ -1248,11 +1384,10 @@ mod tests {
         let (dir, args) = one_line("watcher-failed");
         let now = 1_791_090_010;
         let lock = store::lock_watch(&dir).unwrap().unwrap();
-        std::fs::write(dir.join(store::WATCH_LOCK), "1791000000\nheartbeat\nready").unwrap();
+        let text = format!("1791000000\nheartbeat {EVALUATOR}\nready");
+        std::fs::write(dir.join(store::WATCH_LOCK), text).unwrap();
         let said = || {
-            let state = read_through(Rules::shipped(), &args, now, |awake| {
-                events::queue(&args.system_root, None, LIMIT, now, awake)
-            });
+            let state = read_with(Rules::shipped(), &args, now);
             let state = state.ok().unwrap().collector.unwrap().status_state;
             let status = store::read(&args.store, |tx| {
                 let st = crate::status::state(tx, &dir, now)?;
@@ -1363,48 +1498,502 @@ mod tests {
         assert_eq!(files.map(|u| u.since), Some(Some(1)), "{ids:?}");
     }
 
-    #[test]
-    fn matches_holds_no_lock_on_the_store_while_it_reads_the_log() {
-        let (dir, args) = one_line("unlocked");
-        let mut committed = None;
-        let answered = read_through(Rules::shipped(), &args, 1_791_090_000, |awake| {
-            // Where the log is read, a writer that waits for nothing begins and commits.
-            let mut writer = rusqlite::Connection::open(&args.store).unwrap();
-            writer.busy_timeout(std::time::Duration::ZERO).unwrap();
-            let tx = writer
-                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-                .unwrap();
-            tx.execute("INSERT INTO meta (key, value) VALUES ('example', 'x')", [])
-                .unwrap();
-            committed = Some(tx.commit());
-            events::queue(&args.system_root, None, LIMIT, 1_791_090_000, awake)
-        });
-        let _ = std::fs::remove_dir_all(&dir);
-        assert!(matches!(committed, Some(Ok(()))), "{committed:?}");
-        assert!(answered.is_ok());
+    /// A log file of one run of the collector.
+    const NAME: &str = "exec-20261004T000013-20261004T000000.jsonl";
+
+    /// `sw_vers -productVersion`, which a rule marked medium matches, in the forms `dd` writes.
+    fn sw_vers(seq: u64) -> String {
+        git(seq, "kept")
+            .replace(
+                r#""args":["git","status"]"#,
+                r#""args":["sw_vers","-productVersion"]"#,
+            )
+            .replace(r#""path":"/usr/bin/git""#, r#""path":"/usr/bin/sw_vers""#)
+    }
+
+    /// A store in which the core read a log of a match of a high rule, a match of a medium one and
+    /// a start nothing matches, under a collector that records file events, with a watcher
+    /// started before that reading.
+    fn scene(tag: &str) -> (crate::common::Scratch, std::path::PathBuf, std::fs::File) {
+        let (dir, root) = installed_root(tag);
+        let watcher = watching(&dir);
+        let text = dd(1, "kept") + &sw_vers(2) + &git(3, "kept") + &created("kept");
+        log_file(&root, NAME, &text, 300);
+        core_reads(&dir.join("store.db"), &root);
+        (dir, root, watcher)
+    }
+
+    fn asked(
+        dir: &std::path::Path,
+        root: &std::path::Path,
+        after: Option<&str>,
+        limit: usize,
+        now: i64,
+    ) -> v1::Matches {
+        let args = MatchesArgs {
+            store: dir.join("store.db"),
+            form: answer::Form::Json,
+            after: after.map(|p| (p.to_string(), Place::parse(p).unwrap())),
+            limit,
+            single: false,
+            system_root: root.to_path_buf(),
+        };
+        read(&args, now).ok().unwrap()
+    }
+
+    fn evaluator_of(a: &v1::Matches) -> (v1::EvaluatorState, v1::BehindReason) {
+        let e = a.evaluated.as_ref().unwrap();
+        (e.state(), e.behind())
     }
 
     #[test]
-    fn a_store_replaced_while_the_log_is_read_is_refused_as_unreadable() {
-        let (dir, args) = one_line("replaced");
-        let (other, replacing) = one_line("replacing");
-        let answered = read_through(Rules::shipped(), &args, 1_791_090_000, |awake| {
-            // The store's file with its `-wal` and `-shm`, as a store is moved.
-            let files = |s: &std::path::Path| [s.to_path_buf()].into_iter().chain(store::beside(s));
-            for (from, to) in files(&replacing.store).zip(files(&args.store)) {
-                std::fs::rename(from, to).unwrap();
-            }
-            events::queue(&args.system_root, None, LIMIT, 1_791_090_000, awake)
-        });
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&other);
-        let Err(Failure::Store(o)) = answered else {
-            panic!("a replaced store was answered from");
+    fn a_place_is_taken_back_only_as_this_build_printed_it() {
+        // `--after` comes from a caller. Only the text the core printed is taken: anything else,
+        // a place of an earlier encoding among it, is refused as a misuse.
+        let id = "0123456789abcdef0123456789abcdef";
+        let place = Place::of(id, 4_000_000, &[17; events::TOTALS]).unwrap();
+        let text = place.to_string();
+        assert_eq!(Place::parse(&text), Some(place));
+        assert!(text.len() < 128, "{text}");
+        let hex = |numbers: &[u64]| -> String {
+            let mut bytes = Vec::new();
+            numbers
+                .iter()
+                .for_each(|n| prost::encoding::encode_varint(*n, &mut bytes));
+            bytes.iter().map(|b| format!("{b:02x}")).collect()
         };
-        assert_eq!(o.code, Code::Moved, "{o}");
+        let mut numbers = vec![PLACE_VERSION];
+        numbers.extend([0u64; 16]);
+        numbers.push(5);
+        numbers.extend([7; events::TOTALS]);
+        assert!(Place::parse(&hex(&numbers)).is_some());
+        let mut version_3 = numbers.clone();
+        version_3[0] = 3;
+        let mut wide = numbers.clone();
+        wide[1] = 256;
+        for bad in [
+            String::new(),
+            text.to_uppercase(),
+            format!("{text}00"),
+            text[..text.len() - 2].to_string(),
+            format!(" {text}"),
+            hex(&version_3),
+            hex(&wide),
+            hex(&numbers[..18]),
+            // The same numbers in a longer varint: one place, one text.
+            format!("84{}", &hex(&numbers)[2..]).replacen("84", "8400", 1),
+            "0".repeat(20_000),
+        ] {
+            assert_eq!(Place::parse(&bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn a_place_from_another_store_or_past_what_this_store_gave_is_refused() {
+        // A place printed for another store, or for this one before it was made again, would
+        // read on from a number that means nothing here: refused, never an empty answer. So is
+        // one whose totals are past the store's, or whose numbers do not fit the store's.
+        let (dir, root, _w) = scene("place-other");
+        let first = asked(&dir, &root, None, LIMIT, NOW);
+        let id = first.store_id.clone().unwrap();
+        let totals = events::totals(&store::open(&dir.join("store.db")).unwrap()).unwrap();
+        let mut past = totals;
+        past[3] += 1;
+        let mut wrapped = Place::of(&id, 2, &totals).unwrap();
+        wrapped.seq = u64::MAX;
+        let mut wrapped_total = Place::of(&id, 2, &totals).unwrap();
+        wrapped_total.totals[0] = u64::MAX;
+        let other = "f".repeat(32);
+        let args = |p: Place| MatchesArgs {
+            store: dir.join("store.db"),
+            form: answer::Form::Json,
+            after: Some((p.to_string(), p)),
+            limit: LIMIT,
+            single: false,
+            system_root: root.clone(),
+        };
+        for p in [
+            Place::of(&other, 0, &totals).unwrap(),
+            Place::of(&id, 99, &totals).unwrap(),
+            Place::of(&id, 0, &past).unwrap(),
+            wrapped,
+            wrapped_total,
+        ] {
+            assert!(matches!(read(&args(p), NOW), Err(Failure::Place)), "{p:?}");
+        }
+        assert!(read(&args(Place::of(&id, 2, &totals).unwrap()), NOW).is_ok());
+    }
+
+    #[test]
+    fn a_limit_past_what_the_record_can_hold_gives_every_match_and_never_wraps() {
+        // `--limit` is the caller's: the largest number it takes is capped before any sum, so an
+        // answer never skips the record as one of no matches.
+        let (dir, root, _w) = scene("limit-wraps");
+        let mut options = answer::Options::default();
+        let given = ["--limit", "18446744073709551615", "--system-root"].map(String::from);
+        let it = given.into_iter().chain([root.display().to_string()]);
+        let mut args = parse(it, &mut options).unwrap();
+        args.store = dir.join("store.db");
+        let a = read(&args, NOW).ok().unwrap();
+        assert_eq!((a.matches.len(), a.more), (2, false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn every_match_of_every_level_is_given_once_in_the_order_recorded_and_pages_miss_none() {
+        // The record holds a row for every match of every rule, high or not; an answer gives
+        // them in the order they were recorded, each once, however it is paged, and says what
+        // each raised.
+        let (dir, root, _w) = scene("every-level");
+        let whole = asked(&dir, &root, None, LIMIT, NOW);
+        let said = |a: &v1::Matches| -> Vec<(String, String, i32)> {
+            let rule = |m: &v1::RuleMatch| m.rule.as_ref().unwrap().name.clone();
+            a.matches
+                .iter()
+                .map(|m| (m.position.clone(), rule(m), m.raised))
+                .collect()
+        };
+        let all = said(&whole);
+        assert_eq!(all.len(), 2, "{all:?}");
+        assert_eq!(all[0].2, v1::Raised::Finding as i32);
+        assert_eq!(all[1].2, v1::Raised::BelowHigh as i32);
         assert!(
-            o.detail.contains("replaced while the event log was read"),
-            "{o}"
+            whole.matches[0].findings.len() == 1 && whole.matches.iter().all(|m| m.event.is_some())
         );
+        assert!(!whole.more);
+        let (mut paged, mut after) = (Vec::new(), None::<String>);
+        for _ in 0..10 {
+            let page = asked(&dir, &root, after.as_deref(), 1, NOW);
+            paged.extend(said(&page));
+            after = page.continue_after.clone();
+            if !page.more {
+                break;
+            }
+        }
+        assert_eq!(paged, all);
+        // Read on from the last place: nothing new, and nothing again.
+        assert!(
+            asked(&dir, &root, after.as_deref(), LIMIT, NOW)
+                .matches
+                .is_empty()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_a_watcher_current_and_nothing_lost_an_answer_with_no_match_is_quiet() {
+        // The other side of every case below: quiet is reachable, so its tests test something.
+        let (dir, root, _w) = scene("quiet");
+        let place = asked(&dir, &root, None, LIMIT, NOW).continue_after;
+        let text =
+            dd(1, "kept") + &sw_vers(2) + &git(3, "kept") + &created("kept") + &git(4, "kept");
+        log_file(&root, NAME, &text, 200);
+        core_reads_at(&dir.join("store.db"), &root, NOW + 10);
+        let place = asked(&dir, &root, place.as_deref(), LIMIT, NOW + 10).continue_after;
+        log_file(&root, NAME, &(text + &git(5, "kept")), 100);
+        core_reads_at(&dir.join("store.db"), &root, NOW + 20);
+        // Over rules that all judge here, so that `unevaluated` is empty.
+        let args = MatchesArgs {
+            store: dir.join("store.db"),
+            form: answer::Form::Json,
+            after: place
+                .as_deref()
+                .map(|p| (p.to_string(), Place::parse(p).unwrap())),
+            limit: LIMIT,
+            single: false,
+            system_root: root.clone(),
+        };
+        let rules = crate::sigma::testing::process_kept();
+        let a = read_with(&rules, &args, NOW + 20).ok().unwrap();
+        assert_eq!(evaluator_of(&a).0, v1::EvaluatorState::Current);
+        assert!(quiet(&a), "{a:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_no_watcher_an_answer_is_behind_and_never_quiet() {
+        // No watcher reads the log, so lines written since the latest full check are read by
+        // none: an answer says so, and a reader built before `evaluated` sees the collector not
+        // running.
+        let (dir, root, w) = scene("no-watcher");
+        drop(w);
+        let a = asked(&dir, &root, None, LIMIT, NOW);
+        assert_eq!(
+            evaluator_of(&a),
+            (v1::EvaluatorState::Behind, v1::BehindReason::NoWatcher)
+        );
+        assert_eq!(
+            a.collector.unwrap().state,
+            v1::CollectorState::Behind as i32
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_watcher_whose_evaluator_did_not_write_last_or_left_lines_to_read_is_catching_up() {
+        // Current rests on the evaluator's own writes: another evaluator wrote last, as after a
+        // restart of the watcher in the same second, or of the evaluator's thread under an old
+        // start time; or its last write left lines to read. Either way, behind.
+        let (dir, root, w) = scene("catching-up");
+        drop(w);
+        let _lock = store::lock_watch(&dir).unwrap().unwrap();
+        let lock = |evaluator: &str| {
+            let text = format!("1791000000\nheartbeat{evaluator}\nready");
+            std::fs::write(dir.join(store::WATCH_LOCK), text).unwrap();
+        };
+        let behind = (v1::EvaluatorState::Behind, v1::BehindReason::CatchingUp);
+        for other in ["", " 8"] {
+            lock(other);
+            let a = asked(&dir, &root, None, LIMIT, NOW);
+            assert_eq!(evaluator_of(&a), behind, "{other:?}");
+            assert!(!quiet(&a));
+        }
+        lock(&format!(" {EVALUATOR}"));
+        assert_eq!(
+            evaluator_of(&asked(&dir, &root, None, LIMIT, NOW)).0,
+            v1::EvaluatorState::Current
+        );
+        // A new evaluator whose write left lines to read is behind, and current once it wrote the
+        // rest; then a backlog comes, and its first write is behind again, however fresh.
+        lock(" 9");
+        let mut conn = store::open(&dir.join("store.db")).unwrap();
+        let mut r = events::Reader::load(&conn, &root).unwrap();
+        r.by_evaluator(9);
+        let more = [(1, behind.0), (u64::MAX, v1::EvaluatorState::Current)];
+        let mut text = dd(1, "kept") + &sw_vers(2) + &git(3, "kept") + &created("kept");
+        for (i, (budget, want)) in more.iter().chain(&more).copied().enumerate() {
+            if i % 2 == 0 {
+                text += &(sw_vers(4 + i as u64 * 2) + &sw_vers(5 + i as u64 * 2));
+                log_file(&root, NAME, &text, 0);
+            }
+            r.relist(NOW, budget, |_, _| {});
+            let tx = conn.transaction().unwrap();
+            r.write(&tx, "events-1", "machine:mac", NOW, false)
+                .unwrap()
+                .unwrap();
+            tx.commit().unwrap();
+            r.wrote();
+            let a = asked(&dir, &root, None, LIMIT, NOW);
+            assert_eq!(evaluator_of(&a).0, want, "{budget}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_installed_collector_whose_log_folder_is_gone_or_cannot_be_listed_is_failed_at_the_answer()
+    {
+        use std::os::unix::fs::PermissionsExt;
+        // The answer looks at the source itself, never only at the last conclusion: the launch
+        // daemon is there and its log folder cannot be listed, or is not there at all, so the
+        // collector failed, whatever the store says. Past every match, so that the answer reads no
+        // line again.
+        for gone in [false, true] {
+            let (dir, root, _w) = scene(&format!("unlisted-{gone}"));
+            let place = asked(&dir, &root, None, LIMIT, NOW).continue_after;
+            let log = root.join(events::LOG);
+            match gone {
+                true => std::fs::remove_dir_all(&log).unwrap(),
+                false => {
+                    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o000)).unwrap()
+                }
+            }
+            let a = asked(&dir, &root, place.as_deref(), LIMIT, NOW);
+            if !gone {
+                std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            assert_eq!(evaluator_of(&a).0, v1::EvaluatorState::Failed, "{gone}");
+            assert!(a.evaluated.as_ref().unwrap().reason_text.is_some());
+            assert_eq!(
+                a.collector.as_ref().unwrap().state,
+                v1::CollectorState::Failed as i32
+            );
+            assert!(!quiet(&a));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn a_collector_uninstalled_since_the_last_conclusion_is_not_installed_at_the_next_answer() {
+        // Its launch daemon is gone: the answer says so at once, and the rules for file events
+        // judge nothing, whatever the last conclusion said.
+        let (dir, root, _w) = scene("uninstalled-since");
+        std::fs::remove_file(root.join(events::PLIST)).unwrap();
+        let a = asked(&dir, &root, None, LIMIT, NOW);
+        assert_eq!(
+            a.collector.as_ref().unwrap().state,
+            v1::CollectorState::NotInstalled as i32
+        );
+        assert!(
+            a.unevaluated
+                .iter()
+                .any(|u| u.detail_text.as_deref() == Some(NOT_INSTALLED))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refusal_the_collector_wrote_since_the_last_conclusion_is_seen_at_the_next_answer() {
+        // The collector's state is judged from its own files at every answer: eslogger refused
+        // after the evaluator last concluded, and the answer says so at once with what it printed,
+        // never running until the next conclusion.
+        let (dir, root, _w) = scene("refused-since");
+        let said = root.join(events::LOG).join(events::ESLOGGER_SAID);
+        std::fs::write(&said, "ES_NEW_CLIENT_RESULT_ERR_NOT_PERMITTED\n").unwrap();
+        let a = asked(&dir, &root, None, LIMIT, NOW);
+        let c = a.collector.as_ref().unwrap();
+        assert_eq!(
+            (c.state, c.said_by.as_deref()),
+            (v1::CollectorState::Refused as i32, Some("eslogger"))
+        );
+        assert!(!quiet(&a));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_line_waiting_past_the_evaluator_s_place_is_behind_once_it_was_silent_past_the_bound_however_fresh_the_files()
+     {
+        // No false calm. A whole line waits past where the evaluator read, and the evaluator has
+        // not written since: a full check holds the store, or it stalled. The log's files can be
+        // written a moment ago, again and again, by lines after it: what counts is how long the
+        // evaluator has been silent, never when a file was last written.
+        let (dir, root, _w) = scene("stalled");
+        let text =
+            dd(1, "kept") + &sw_vers(2) + &git(3, "kept") + &created("kept") + &dd(4, "kept");
+        log_file(&root, NAME, &text, 0);
+        let late = NOW + LATE + 1;
+        let a = asked(&dir, &root, None, LIMIT, late);
+        assert_eq!(
+            evaluator_of(&a),
+            (v1::EvaluatorState::Behind, v1::BehindReason::NotAdvancing)
+        );
+        // Silent for no more than the bound, it is current; a line not yet whole waits for none.
+        assert_eq!(
+            evaluator_of(&asked(&dir, &root, None, LIMIT, NOW + LATE)).0,
+            v1::EvaluatorState::Current
+        );
+        log_file(&root, NAME, &(text.clone() + "{\"schema"), 0);
+        core_reads_at(&dir.join("store.db"), &root, NOW);
+        assert_eq!(
+            evaluator_of(&asked(&dir, &root, None, LIMIT, late)).0,
+            v1::EvaluatorState::Current
+        );
+        // A file put in place of the one read, shorter than where that was read to, holds its
+        // lines from its start.
+        std::fs::remove_file(root.join(events::LOG).join(NAME)).unwrap();
+        log_file(&root, NAME, &dd(9, "kept"), 0);
+        assert_eq!(
+            evaluator_of(&asked(&dir, &root, None, LIMIT, late)),
+            (v1::EvaluatorState::Behind, v1::BehindReason::NotAdvancing)
+        );
+        log_file(&root, NAME, &(text + &dd(5, "kept")), 0);
+        std::fs::create_dir_all(dir.join(crate::osv::FOLDER)).unwrap();
+        let _check = crate::osv::lock_check(&dir, "run-1").unwrap();
+        let conn = store::open(&dir.join("store.db")).unwrap();
+        store::journal_note(&conn, NOW, "run-1", "run_started", "").unwrap();
+        let a = asked(&dir, &root, None, LIMIT, late);
+        assert_eq!(
+            evaluator_of(&a),
+            (v1::EvaluatorState::Behind, v1::BehindReason::StoreHeld)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_reading_is_failed_with_its_reason_and_the_collector_failed() {
+        let (dir, root, _w) = scene("failed");
+        let conn = store::open(&dir.join("store.db")).unwrap();
+        conn.execute(
+            "INSERT INTO watcher_failed (what, at, detail) VALUES ('events', ?1, 'invented')",
+            [NOW],
+        )
+        .unwrap();
+        let a = asked(&dir, &root, None, LIMIT, NOW);
+        assert_eq!(evaluator_of(&a).0, v1::EvaluatorState::Failed);
+        assert_eq!(
+            a.evaluated.as_ref().unwrap().reason_text.as_deref(),
+            Some("invented")
+        );
+        assert_eq!(
+            a.collector.unwrap().state,
+            v1::CollectorState::Failed as i32
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rows_that_went_with_their_file_past_the_caller_s_place_are_told_gone() {
+        // The caller's place is before two matches; their file leaves the log before it asks:
+        // the answer gives nothing of them and says rows are gone, never a quiet empty answer.
+        // The file was read to its end with its hour over, so a caller given them lost nothing.
+        let (dir, root, _w) = scene("rows-gone");
+        let conn = store::open(&dir.join("store.db")).unwrap();
+        let id = store::id(&conn).unwrap();
+        let totals = events::totals(&conn).unwrap();
+        let before = Place::of(&id, 0, &totals).unwrap().to_string();
+        let later = "exec-20261004T000013-20261004T010000.jsonl";
+        log_file(&root, later, &git(5, "kept"), 100);
+        core_reads_at(&dir.join("store.db"), &root, NOW + 5);
+        let totals = events::totals(&conn).unwrap();
+        std::fs::remove_file(root.join(events::LOG).join(NAME)).unwrap();
+        core_reads_at(&dir.join("store.db"), &root, NOW + 10);
+        let a = asked(&dir, &root, Some(&before), LIMIT, NOW + 10);
+        assert!(a.matches.is_empty());
+        assert!(a.evaluated.as_ref().unwrap().gone);
+        assert!(!quiet(&a));
+        assert_eq!(
+            a.collector.unwrap().state,
+            v1::CollectorState::Behind as i32
+        );
+        // A caller that had been given them is told nothing is gone.
+        let given = Place::of(&id, 2, &totals).unwrap().to_string();
+        assert!(
+            !asked(&dir, &root, Some(&given), LIMIT, NOW + 10)
+                .evaluated
+                .unwrap()
+                .gone
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_listed_match_whose_line_cannot_be_read_again_is_given_without_its_event_and_gone() {
+        // The file left the log after the record was read and before its line: the match is
+        // still given, by its position and rule, with no event, and the answer says so.
+        let (dir, root, _w) = scene("line-gone");
+        std::fs::write(root.join(events::LOG).join(NAME), "").unwrap();
+        let a = asked(&dir, &root, None, LIMIT, NOW);
+        assert_eq!(a.matches.len(), 2);
+        assert!(a.matches.iter().all(|m| m.event.is_none()));
+        assert!(a.evaluated.as_ref().unwrap().gone);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn counts_come_from_totals_that_only_grow_so_answers_read_on_add_up_whatever_the_rows_and_the_clock()
+     {
+        // Answers read on one from another add up to the lines read, none twice and none left
+        // out. A row of counts aged out, or written under a clock set back, takes nothing from
+        // what an answer gives: the totals only grow, and a place holds the totals it reached.
+        let (dir, root, _w) = scene("totals");
+        let store = dir.join("store.db");
+        let starts = |a: &v1::Matches| a.evaluated.as_ref().unwrap().program_starts;
+        let first = asked(&dir, &root, None, LIMIT, NOW);
+        let text = dd(1, "kept") + &sw_vers(2) + &git(3, "kept") + &created("kept");
+        // Read while the clock is ahead, then with it set back, a line that cannot be read.
+        log_file(&root, NAME, &(text.clone() + &git(4, "kept")), 200);
+        core_reads_at(&store, &root, NOW + 3600);
+        log_file(&root, NAME, &(text + &git(4, "kept") + "not a line\n"), 100);
+        core_reads_at(&store, &root, NOW);
+        let conn = store::open(&store).unwrap();
+        conn.execute("DELETE FROM event_count WHERE at < ?1", [NOW + 1])
+            .unwrap();
+        let second = asked(&dir, &root, first.continue_after.as_deref(), LIMIT, NOW);
+        let e = second.evaluated.as_ref().unwrap();
+        assert_eq!((e.program_starts, e.unreadable_lines), (1, 1));
+        assert!(!e.gone);
+        let third = asked(&dir, &root, second.continue_after.as_deref(), LIMIT, NOW);
+        assert_eq!(starts(&third), 0);
+        assert_eq!(starts(&first) + starts(&second), 4);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
